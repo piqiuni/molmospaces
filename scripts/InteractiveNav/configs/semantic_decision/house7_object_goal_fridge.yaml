@@ -1,0 +1,22 @@
+target:
+  enabled: true
+  target_name: "fridge"
+  object_labels: ["fridge", "refrigerator"]
+  standoff_m: 0.90
+  require_interaction: true
+
+candidate:
+  interaction_types: ["portal", "container"]
+  require_current_visibility: true
+  target_require_current_visibility: true
+  target_require_same_room: true
+  target_allow_connected_room: true
+  target_min_visible_pixels: 128
+  max_container_interaction_distance_m: 3.0
+  max_state_age_sec: 300.0
+  container_require_same_room: true
+  container_allow_connected_room: true
+  max_interaction_distance_m: 6.0
+
+policy:
+  target_relevance_weight: 3.0

@@ -110,6 +110,10 @@ class ObjectDetectionNode:
         self.point_stride = max(1, int(config.get("point_stride", 4)))
         self.max_sync_slop_sec = float(config.get("max_sync_slop_sec", 0.2))
         self.skip_if_busy = bool(config.get("skip_if_busy", True))
+        # Timer-driven ROS nodes normally reprocess the latest frame.  A
+        # request/response simulator bridge needs exactly-once inference per
+        # RGB stamp so idle timer ticks do not consume detector replicas.
+        self.process_each_stamp_once = bool(config.get("process_each_stamp_once", False))
         self.default_frame_id = frames.get("camera_frame", "tf_frame_lidar")
         self.projection_frame_id = str(config.get("projection_frame_id", self.default_frame_id) or self.default_frame_id)
         self.world_frame = frames.get("world_frame", "tf_frame_map")
@@ -146,6 +150,7 @@ class ObjectDetectionNode:
         self.latest_frame_id = self.default_frame_id
         self.latest_camera_frame_id = ""
         self.processing = False
+        self.last_processed_stamp = None
 
         self.pub = rospy.Publisher(self.output_topic, String, queue_size=10)
         self.marker_pub = None
@@ -225,6 +230,8 @@ class ObjectDetectionNode:
             depth = self.latest_depth
             camera_info = self.latest_camera_info
             stamp = self.latest_stamp or rospy.Time.now()
+            if self.process_each_stamp_once and self.last_processed_stamp == stamp:
+                return
             depth_stamp = self.latest_depth_stamp
             camera_info_stamp = self.latest_camera_info_stamp
             sensor_frame_id = self.latest_camera_frame_id or self.latest_frame_id or self.default_frame_id
@@ -278,6 +285,8 @@ class ObjectDetectionNode:
                 "detections": detections,
             }
             self.pub.publish(String(data=dumps_compact(payload)))
+            with self.lock:
+                self.last_processed_stamp = stamp
 
             if self.marker_pub is not None and depth is not None and camera_info is not None:
                 if self.debug_markers_use_world and self.tf_listener is not None:

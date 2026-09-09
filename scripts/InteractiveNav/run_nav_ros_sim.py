@@ -1,15 +1,30 @@
 import argparse
 import datetime
+import json
 import logging
 from pathlib import Path
 import struct
+import sys
 import time
+from typing import Any
 import zlib
 
 import mujoco
 import numpy as np
 
-from robot_conversion_patches import patch_droid_config_for_rum
+# Support both ``python scripts/InteractiveNav/run_nav_ros_sim.py`` and
+# package-qualified imports from the native benchmark wrapper.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.InteractiveNav.robot_conversion_patches import patch_droid_config_for_rum
+from scripts.InteractiveNav.semantic_door_occ_runtime import (
+    DoorOccPoseSequenceController,
+    DoorOccRuntimeController,
+)
+from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
+from scripts.InteractiveNav.force_interaction_runtime import ForceDriveConfig
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 from molmo_spaces.configs.camera_configs import (
@@ -28,6 +43,10 @@ from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
+from scripts.InteractiveNav.runtime_target_selection import (
+    load_fixed_container_target,
+    select_far_container_target,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -97,6 +116,44 @@ def maybe_save_debug_snapshot(policy, observation) -> None:
     log.info("Saved debug camera snapshot: %s", path)
 
 
+def log_debug_camera_transform(task, policy) -> None:
+    camera_name = str(getattr(policy, "extra_image_camera_name", "") or "")
+    if not camera_name:
+        return
+    registry = getattr(getattr(task.env, "camera_manager", None), "registry", None)
+    camera = None if registry is None else registry.cameras.get(camera_name)
+    if camera is None:
+        return
+    try:
+        from molmo_spaces.env.data_views import create_mlspaces_body
+
+        base_pose = np.asarray(task.env.current_robot.robot_view.base.pose, dtype=float)
+        reference_name = str(getattr(camera, "_active_reference_body_name", "") or "")
+        if not reference_name:
+            reference_names = list(getattr(camera, "reference_body_names", []) or [])
+            reference_name = str(reference_names[0]) if reference_names else ""
+        reference_pose = np.asarray(
+            create_mlspaces_body(task.env.current_data, reference_name).pose,
+            dtype=float,
+        )
+        camera.update_pose(task.env)
+        camera_position = np.asarray(camera.pos, dtype=float)
+        camera_forward = np.asarray(camera.forward, dtype=float)
+        base_rotation = base_pose[:3, :3]
+        payload = {
+            "camera_name": camera_name,
+            "reference_body_name": reference_name,
+            "reference_in_robot": (np.linalg.inv(base_pose) @ reference_pose).tolist(),
+            "camera_position_robot_m": (
+                base_rotation.T @ (camera_position - base_pose[:3, 3])
+            ).tolist(),
+            "camera_forward_robot": (base_rotation.T @ camera_forward).tolist(),
+        }
+        log.info("DEBUG_CAMERA_TRANSFORM %s", json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        log.exception("Failed to log debug camera transform.")
+
+
 def configure_run_file_logging(output_dir: Path) -> Path:
     """Attach a file logger under the current run output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +171,100 @@ def configure_run_file_logging(output_dir: Path) -> Path:
     )
     root_logger.addHandler(file_handler)
     return log_path
+
+
+class StepTimingDiagnostics:
+    """Persist per-step timings and emit compact percentile summaries."""
+
+    def __init__(self, path: str | Path, window_size: int):
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        self.window_size = max(1, int(window_size))
+        self._records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _stats(records: list[dict[str, Any]], key: str) -> tuple[float, float, float, float]:
+        values = [float(record.get(key, 0.0)) for record in records]
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        return (
+            float(np.mean(values)),
+            float(np.percentile(values, 50)),
+            float(np.percentile(values, 95)),
+            float(np.max(values)),
+        )
+
+    def record(self, step_index: int, metrics: dict[str, float], metadata: dict[str, Any]) -> None:
+        record = {
+            "step_index": int(step_index),
+            "wall_time": time.time(),
+            **{key: float(value) for key, value in metrics.items()},
+            **metadata,
+        }
+        self._records.append(record)
+        if len(self._records) >= self.window_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._records:
+            return
+        with self.path.open("a", encoding="utf-8") as handle:
+            for record in self._records:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+        total = self._stats(self._records, "full_step_ms")
+        policy = self._stats(self._records, "policy_ms")
+        wait = self._stats(self._records, "policy_action_wait_ms")
+        enqueue = self._stats(self._records, "policy_step_frame_enqueue_ms")
+        gt = self._stats(self._records, "policy_realtime_gt_ms")
+        rgb = self._stats(self._records, "policy_rgb_publish_ms")
+        task = self._stats(self._records, "task_core_ms")
+        physics = self._stats(self._records, "task_physics_step_ms")
+        sensors = self._stats(self._records, "task_sensor_polling_ms")
+        slowest = sorted(
+            self._records, key=lambda record: float(record.get("full_step_ms", 0.0)), reverse=True
+        )[:3]
+        timeout_count = sum(bool(record.get("action_timed_out")) for record in self._records)
+        queue_peak = max(int(record.get("step_frame_queue_size", 0)) for record in self._records)
+        queue_capacity = max(int(record.get("step_frame_queue_capacity", 0)) for record in self._records)
+        log.info(
+            "StepTiming window steps=%d-%d n=%d: full avg/p50/p95/max=%.1f/%.1f/%.1f/%.1fms; "
+            "policy=%.1f/%.1f/%.1f/%.1fms [wait avg/p95=%.1f/%.1f, "
+            "frame_enqueue=%.1f/%.1f, gt=%.1f/%.1f, rgb=%.1f/%.1f]; "
+            "task=%.1f/%.1fms [physics=%.1f/%.1f sensors=%.1f/%.1f]; "
+            "frame_queue_peak=%d/%d timeouts=%d; slowest=%s",
+            int(self._records[0]["step_index"]),
+            int(self._records[-1]["step_index"]),
+            len(self._records),
+            *total,
+            *policy,
+            wait[0],
+            wait[2],
+            enqueue[0],
+            enqueue[2],
+            gt[0],
+            gt[2],
+            rgb[0],
+            rgb[2],
+            task[0],
+            task[2],
+            physics[0],
+            physics[2],
+            sensors[0],
+            sensors[2],
+            queue_peak,
+            queue_capacity,
+            timeout_count,
+            ",".join(
+                f"{int(record['step_index'])}:{float(record.get('full_step_ms', 0.0)):.1f}ms"
+                for record in slowest
+            ),
+        )
+        self._records.clear()
+
+    def close(self) -> None:
+        self.flush()
 
 
 def ensure_head_camera_exists(camera_system) -> None:
@@ -201,6 +352,62 @@ def lookat_forward_up(camera_pos: list[float], target_pos: list[float]) -> tuple
     return forward.tolist(), up.tolist()
 
 
+class RuntimeTargetPublisher:
+    def __init__(
+        self,
+        rospy_module,
+        string_message_type,
+        output_path: str,
+        top_k: int,
+        *,
+        selection_mode: str = "random_far_container_object",
+        selection_input_path: str = "",
+    ) -> None:
+        self._rospy = rospy_module
+        self._String = string_message_type
+        self._output_path = Path(output_path).expanduser().resolve() if output_path else None
+        self._top_k = max(1, int(top_k))
+        self._selection_mode = str(selection_mode or "random_far_container_object")
+        self._selection_input_path = str(selection_input_path or "")
+        self._publisher = rospy_module.Publisher(
+            "/semantic_decision/target",
+            string_message_type,
+            queue_size=1,
+            latch=True,
+        )
+
+    def publish(self, task, selection_seed: int) -> dict[str, Any]:
+        import json
+
+        if self._selection_mode == "fixed_container_object":
+            if not self._selection_input_path:
+                raise ValueError(
+                    "fixed_container_object requires --runtime_target_selection_input_path"
+                )
+            context, selection = load_fixed_container_target(self._selection_input_path)
+        else:
+            context, selection = select_far_container_target(
+                task,
+                selection_seed=int(selection_seed),
+                top_k=self._top_k,
+            )
+        gt_publisher = getattr(getattr(task, "policy", None), "_realtime_gt_publisher", None)
+        if not getattr(gt_publisher, "episode_id", ""):
+            context.setdefault("episode_id_hint", f"episode_seed_{int(selection_seed)}")
+        else:
+            context["episode_id"] = str(gt_publisher.episode_id)
+        self._publisher.publish(
+            self._String(data=json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+        )
+        if self._output_path is not None:
+            self._output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._output_path.write_text(
+                json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        return selection
+
+
 class NavRosRolloutRunner(ParallelRolloutRunner):
     @staticmethod
     def patch_config(frozen_config, data=None, exp_config=None):
@@ -221,6 +428,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         end_on_success: bool = False,
     ):
         log.info("Starting task.reset() ...")
+        task.set_history_retention(bool(getattr(policy, "retain_task_history", False)))
         if hasattr(policy, "prepare_episode_reset"):
             policy.prepare_episode_reset()
         observation, _info = task.reset()
@@ -231,6 +439,28 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         policy.task = task
         policy.reset()
+        log_debug_camera_transform(task, policy)
+        door_occ_controller = getattr(policy, "door_occ_test_controller", None)
+        if door_occ_controller is not None:
+            door_occ_controller.prepare(task)
+            observation = task.get_observations()
+            if task.observation_cache:
+                task.observation_cache[0] = observation
+        force_interaction_controller = getattr(policy, "force_interaction_controller", None)
+        if force_interaction_controller is not None:
+            force_interaction_controller.prepare(task)
+            observation = task.get_observations()
+            if task.observation_cache:
+                task.observation_cache[0] = observation
+        runtime_target_publisher = getattr(policy, "runtime_target_publisher", None)
+        if runtime_target_publisher is not None:
+            policy.runtime_target_selection = runtime_target_publisher.publish(
+                task,
+                selection_seed=int(getattr(policy, "runtime_target_seed", episode_seed)),
+            )
+        completion_monitor = getattr(policy, "completion_monitor", None)
+        if completion_monitor is not None:
+            completion_monitor.prepare()
         maybe_save_debug_snapshot(policy, observation)
 
         try:
@@ -256,9 +486,19 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         }
         timing_log_every = max(0, int(getattr(policy, "sim_timing_log_every_n_steps", 20)))
         step_log_every = max(0, int(getattr(policy, "step_log_every_n_steps", 10)))
+        timing_path = str(getattr(policy, "sim_timing_path", "") or "")
+        timing_diagnostics = (
+            StepTimingDiagnostics(timing_path, timing_log_every or 20)
+            if timing_path
+            else None
+        )
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
+                if timing_diagnostics is not None:
+                    timing_diagnostics.close()
                 return False
+            if completion_monitor is not None and completion_monitor.should_stop(step_idx):
+                break
             elapsed_s = time.monotonic() - episode_started_mono
             if scene_timeout_s > 0.0 and elapsed_s >= scene_timeout_s:
                 raise SceneExecutionTimeout(
@@ -266,7 +506,42 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     f"after {step_idx} completed steps"
                 )
 
+            full_step_t0 = time.perf_counter()
+            pre_controller_ms = 0.0
+            pre_observation_ms = 0.0
+            pre_gt_ms = 0.0
+            t0 = time.perf_counter()
+            door_state_changed = bool(
+                door_occ_controller is not None
+                and door_occ_controller.before_step(task, step_idx)
+            )
+            pre_controller_ms += (time.perf_counter() - t0) * 1000.0
+            if door_state_changed:
+                t0 = time.perf_counter()
+                observation = task.get_observations()
+                pre_observation_ms += (time.perf_counter() - t0) * 1000.0
+            force_interaction_controller = getattr(policy, "force_interaction_controller", None)
+            if force_interaction_controller is not None:
+                t0 = time.perf_counter()
+                interaction_result = force_interaction_controller.before_step(task, step_idx)
+                pre_controller_ms += (time.perf_counter() - t0) * 1000.0
+                force_observation = bool(
+                    interaction_result is not None
+                    or force_interaction_controller.consume_force_observation_request()
+                )
+                if force_observation:
+                    t0 = time.perf_counter()
+                    observation = task.get_observations()
+                    pre_observation_ms += (time.perf_counter() - t0) * 1000.0
+                    if task.observation_cache:
+                        task.observation_cache[0] = observation
+                    if hasattr(policy, "publish_realtime_gt_now"):
+                        t0 = time.perf_counter()
+                        policy.publish_realtime_gt_now(step_index=step_idx)
+                        pre_gt_ms += (time.perf_counter() - t0) * 1000.0
+            snapshot_t0 = time.perf_counter()
             maybe_save_debug_snapshot(policy, observation)
+            debug_snapshot_ms = (time.perf_counter() - snapshot_t0) * 1000.0
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
             action_cmd = policy.get_action(observation)
@@ -292,12 +567,58 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                 )
             if action_cmd is None:
                 break
+            if (
+                force_interaction_controller is not None
+                and force_interaction_controller.should_pause_navigation()
+            ):
+                action_cmd = dict(action_cmd)
+                action_cmd.pop("base", None)
+                torso_target = force_interaction_controller.view_torso_target()
+                if torso_target is not None:
+                    action_cmd["torso"] = np.asarray(torso_target, dtype=float)
 
             if step_log_every > 0 and (step_idx < 5 or step_idx % step_log_every == 0):
-                print(f"Step: {step_idx} Action command[base]: {action_cmd['base']}", flush=True)
+                print(
+                    f"Step: {step_idx} Action command[base]: "
+                    f"{action_cmd.get('base', '<hold-current-pose>')}",
+                    flush=True,
+                )
 
+            prepare_gt_snapshot = getattr(
+                policy, "prepare_realtime_gt_snapshot_for_next_step", None
+            )
+            if callable(prepare_gt_snapshot):
+                # task.step creates the post-physics state; the next policy
+                # call publishes GT for that state when its interval is due.
+                prepare_gt_snapshot(step_idx + 1)
             task_t0 = time.perf_counter()
+            task_core_t0 = time.perf_counter()
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            task_core_ms = (time.perf_counter() - task_core_t0) * 1000.0
+            post_controller_ms = 0.0
+            post_observation_ms = 0.0
+            post_gt_ms = 0.0
+            if force_interaction_controller is not None:
+                t0 = time.perf_counter()
+                interaction_result = force_interaction_controller.after_step(task, step_idx)
+                post_controller_ms += (time.perf_counter() - t0) * 1000.0
+                force_observation = bool(
+                    interaction_result is not None
+                    or force_interaction_controller.consume_force_observation_request()
+                )
+                if force_observation:
+                    t0 = time.perf_counter()
+                    observation = task.get_observations()
+                    post_observation_ms += (time.perf_counter() - t0) * 1000.0
+                    if task.observation_cache:
+                        task.observation_cache[0] = observation
+                    if hasattr(policy, "publish_realtime_gt_now"):
+                        t0 = time.perf_counter()
+                        policy.publish_realtime_gt_now(step_index=step_idx)
+                        post_gt_ms += (time.perf_counter() - t0) * 1000.0
+                t0 = time.perf_counter()
+                force_interaction_controller.after_task_step()
+                post_controller_ms += (time.perf_counter() - t0) * 1000.0
             task_ms = (time.perf_counter() - task_t0) * 1000.0
             loop_ms = (time.perf_counter() - loop_t0) * 1000.0
             task_timing = getattr(task, "last_step_timing_ms", {})
@@ -321,24 +642,78 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                 timing_count = 0
                 for key in timing_sums_ms:
                     timing_sums_ms[key] = 0.0
-            step_idx += 1
             # print(f"Observation: {observation}", flush=True)
             # print(f"Reward: {reward}", flush=True)
             # print(f"Terminal: {terminal}", flush=True)
             # print(f"Truncated: {truncated}", flush=True)
             # print(f"Infos: {infos}", flush=True)
+            viewer_ms = 0.0
+            if viewer is not None:
+                viewer_t0 = time.perf_counter()
+                viewer.sync()
+                viewer_ms = (time.perf_counter() - viewer_t0) * 1000.0
+
+            full_step_ms = (time.perf_counter() - full_step_t0) * 1000.0
+            if timing_diagnostics is not None:
+                policy_timing = dict(getattr(policy, "last_timing_ms", {}) or {})
+                metrics = {
+                    "full_step_ms": full_step_ms,
+                    "pre_controller_ms": pre_controller_ms,
+                    "pre_observation_ms": pre_observation_ms,
+                    "pre_gt_ms": pre_gt_ms,
+                    "debug_snapshot_ms": debug_snapshot_ms,
+                    "policy_ms": policy_ms,
+                    "task_ms": task_ms,
+                    "task_core_ms": task_core_ms,
+                    "post_controller_ms": post_controller_ms,
+                    "post_observation_ms": post_observation_ms,
+                    "post_gt_ms": post_gt_ms,
+                    "viewer_ms": viewer_ms,
+                    **{
+                        f"task_{key}_ms": float(value)
+                        for key, value in task_timing.items()
+                    },
+                    **{
+                        f"policy_{key}_ms": float(value)
+                        for key, value in policy_timing.items()
+                    },
+                }
+                step_frame_queue = getattr(policy, "_step_frame_queue", None)
+                timing_diagnostics.record(
+                    step_idx,
+                    metrics,
+                    {
+                        "action_source": str(getattr(policy, "last_action_source", "")),
+                        "action_timed_out": bool(getattr(policy, "last_action_timed_out", False)),
+                        "step_ready": dict(
+                            getattr(policy, "last_step_ready_diagnostics", {}) or {}
+                        ),
+                        "organized_depth_scan": dict(
+                            getattr(policy, "last_depth_scan_diagnostics", {}) or {}
+                        ),
+                        "step_frame_queue_size": 0 if step_frame_queue is None else step_frame_queue.qsize(),
+                        "step_frame_queue_capacity": 0 if step_frame_queue is None else step_frame_queue.maxsize,
+                    },
+                )
+            step_idx += 1
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
                 success = True
                 break
-
-            if viewer is not None:
-                viewer.sync()
 
         try:
             task.env.current_model.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
         except AttributeError:
             log.warning("Sleep flag not reset.")
 
+        if door_occ_controller is not None:
+            door_occ_controller.finalize(step_idx)
+        force_interaction_controller = getattr(policy, "force_interaction_controller", None)
+        if force_interaction_controller is not None:
+            force_interaction_controller.finalize(step_idx)
+        if completion_monitor is not None:
+            completion_monitor.finalize(step_idx)
+        if timing_diagnostics is not None:
+            timing_diagnostics.close()
         success = task.judge_success() if hasattr(task, "judge_success") else success
         return success
 
@@ -440,7 +815,7 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         pos=fixed_camera_pos,
                         forward=forward,
                         up=up,
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -451,11 +826,10 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                     RobotMountedCameraConfig(
                         name=args.debug_front_camera_name,
                         reference_body_names=["robot_0/base", "base"],
-                        camera_offset=debug_camera_offset or [-1.4, 0.0, 1.35],
-                        lookat_offset=debug_camera_lookat_offset or [0.0, 0.0, 0.35],
-                        camera_quaternion=[0.5, 0.5, -0.5, -0.5],
+                        camera_offset=debug_camera_offset or [-1.08, 0.62, 1.60],
+                        lookat_offset=debug_camera_lookat_offset or [0.4, 0.0, 0.95],
                         up_axis="z",
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -565,10 +939,102 @@ def parse_args():
     )
 
     parser.add_argument("--observation_topic", type=str, default="/molmo_spaces/head_camera/image")
+    parser.add_argument(
+        "--observation_queue_size",
+        type=int,
+        default=1,
+        help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
+    )
+    parser.add_argument(
+        "--extra_image_queue_size",
+        type=int,
+        default=16,
+        help="External/debug camera ROS publisher queue; positive values keep large images off the simulation thread.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
     parser.add_argument("--camera_info_topic", type=str, default="/molmo_spaces/head_camera/camera_info")
+    parser.add_argument("--publish_realtime_gt", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--realtime_gt_topic", type=str, default="/semantic_mapping/gt_observations")
+    parser.add_argument("--realtime_gt_camera_name", type=str, default="head_camera")
+    parser.add_argument("--realtime_gt_min_visible_pixels", type=int, default=16)
+    parser.add_argument(
+        "--realtime_gt_min_visible_bbox_short_side_px",
+        type=int,
+        default=1,
+        help="Reject public GT components whose shorter 2-D box side is below this many pixels.",
+    )
+    parser.add_argument(
+        "--realtime_gt_min_portal_bbox_short_side_px",
+        type=int,
+        default=8,
+        help="Stricter short-side gate for doors/portals; rejects one-pixel wall-edge leakage.",
+    )
+    parser.add_argument("--realtime_gt_min_visible_fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--realtime_gt_required_consecutive_observations", type=int, default=2
+    )
+    parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
+    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=4.0)
+    parser.add_argument(
+        "--realtime_gt_emit_interaction_approach_axis",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Explicit rule-oracle mode: publish a joint-derived container front axis. "
+            "Do not enable for detector or MLLM evaluations."
+        ),
+    )
+    parser.add_argument(
+        "--step_frame_dir",
+        type=str,
+        default="",
+        help="Optional directory for asynchronous per-step RGB PNGs and a timestamp manifest.",
+    )
+    parser.add_argument("--step_ready_topic", type=str, default="/semantic_decision/step_ready")
+    parser.add_argument(
+        "--step_capture_ack_topic",
+        type=str,
+        default="/molmo_spaces/step_capture_ack",
+        help="Recorder acknowledgment topic used to freeze each offline raw snapshot before simulation advances.",
+    )
+    parser.add_argument(
+        "--step_capture_ack_barrier_enabled",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--step_capture_ack_timeout_s", type=float, default=2.0)
+    parser.add_argument("--step_ready_barrier_enabled", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument(
+        "--step_ready_warmup_skip_frames",
+        type=int,
+        default=None,
+        help="Independent readiness-barrier warmup; defaults to map_warmup_skip_frames.",
+    )
+    parser.add_argument("--step_ready_timeout_s", type=float, default=30.0)
+    parser.add_argument(
+        "--step_ready_bootstrap_timeout_s",
+        type=float,
+        default=None,
+        help="First-observation readiness wait; defaults to max(5s, step_ready_timeout_s).",
+    )
+    parser.add_argument(
+        "--step_frame_queue_size",
+        type=int,
+        default=4,
+        help="Bounded blocking queue for lossless per-step PNG writing.",
+    )
+    parser.add_argument(
+        "--retain_task_history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retain full task observations/actions; disabled by default for ROS simulation.",
+    )
     parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
     parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--publish_debug_front_camera", type=str_to_bool, nargs="?", const=True, default=True)
@@ -583,13 +1049,103 @@ def parse_args():
     parser.add_argument("--debug_snapshot_path", type=str, default="")
     parser.add_argument("--debug_snapshot_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--fixed_robot_xyyaw", type=str, default="")
+    parser.add_argument("--initial_door_state", choices=["keep", "closed", "open"], default="keep")
+    parser.add_argument("--enable_force_interaction", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--force_interaction_command_topic", default="/semantic_decision/interaction_command")
+    parser.add_argument("--force_interaction_result_topic", default="/semantic_mapping/interaction_result")
+    parser.add_argument("--force_interaction_feedback_topic", default="/semantic_decision/interaction_action_feedback")
+    parser.add_argument("--force_interaction_log_path", default="")
+    parser.add_argument("--force_interaction_close_all_containers_on_prepare", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
+    parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--force_interaction_bypass_unsafe_open_sweep",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Temporarily bypass the predictive refrigerator open-sweep collision "
+            "rejection; physical execution and postcondition checks still run."
+        ),
+    )
+    parser.add_argument(
+        "--force_interaction_execution_mode",
+        choices=["fast", "smooth"],
+        default=None,
+    )
+    parser.add_argument("--force_interaction_transition_steps", type=int, default=None)
+    parser.add_argument(
+        "--force_interaction_drawer_execution_mode",
+        choices=["fast", "smooth"],
+        default="fast",
+    )
+    parser.add_argument("--force_interaction_drawer_transition_steps", type=int, default=5)
+    parser.add_argument("--force_interaction_drawer_observation_steps", type=int, default=1)
+    parser.add_argument(
+        "--force_interaction_drawer_view_restore_settle_steps", type=int, default=2
+    )
+    parser.add_argument(
+        "--force_interaction_drawer_view_restore_max_steps", type=int, default=24
+    )
+    parser.add_argument(
+        "--completion_mode",
+        choices=["disabled", "frontier", "semantic"],
+        default="disabled",
+    )
+    parser.add_argument("--completion_confirmations", type=int, default=3)
+    parser.add_argument("--completion_post_hold_steps", type=int, default=0)
+    parser.add_argument("--completion_status_path", type=str, default="")
+    parser.add_argument(
+        "--runtime_target_selection_mode",
+        type=str,
+        default="none",
+        choices=["none", "random_far_container_object", "fixed_container_object"],
+    )
+    parser.add_argument("--runtime_target_selection_top_k", type=int, default=3)
+    parser.add_argument("--runtime_target_selection_path", type=str, default="")
+    parser.add_argument("--runtime_target_selection_input_path", type=str, default="")
+    parser.add_argument("--door_occ_test_root_name", type=str, default="")
+    parser.add_argument(
+        "--door_occ_test_open_step",
+        type=int,
+        default=-1,
+        help="Enable stationary door OCC test and directly open the selected doorway root at this policy step.",
+    )
+    parser.add_argument("--door_occ_test_transition_path", type=str, default="")
+    parser.add_argument(
+        "--door_occ_test_pose_sequence",
+        type=str,
+        default="",
+        help="Optional step:x,y,yaw,state,label phases separated by '/' for direct-pose OCC tests.",
+    )
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
-    parser.add_argument("--debug_front_camera_offset", type=str, default="-1.4,0.0,1.35")
-    parser.add_argument("--debug_front_camera_lookat_offset", type=str, default="0.0,0.0,0.35")
+    parser.add_argument(
+        "--debug_front_camera_offset",
+        type=str,
+        default="-0.779295308248162,0.9640243904369644,1.600000023841858",
+    )
+    parser.add_argument(
+        "--debug_front_camera_lookat_offset",
+        type=str,
+        default="0.010510587056107079,0.4165302897166183,1.3234916922873792",
+    )
+    parser.add_argument("--debug_front_camera_fov_deg", type=float, default=65.0)
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
-    parser.add_argument("--pointcloud_stride", type=int, default=2)
+    parser.add_argument("--pointcloud_stride", type=int, default=1)
+    parser.add_argument(
+        "--publish_depth_scan",
+        action="store_true",
+        help="Publish an organized-depth planar LaserScan for the global OCC mapper.",
+    )
+    parser.add_argument(
+        "--depth_scan_topic",
+        type=str,
+        default="/molmo_spaces/organized_depth_scan",
+    )
+    parser.add_argument("--pointcloud_self_filter_radius_m", type=float, default=0.32)
     parser.add_argument(
         "--pointcloud_roll_correction_deg",
         type=float,
@@ -674,6 +1230,14 @@ def parse_args():
         help="Republish the current observation while blocking so ROS can initialize and plan.",
     )
     parser.add_argument(
+        "--blocking_republish_pointcloud",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Also republish the same mapping cloud while blocked; disabled to avoid duplicate OCC integration.",
+    )
+    parser.add_argument(
         "--map_warmup_skip_frames",
         type=int,
         default=0,
@@ -705,7 +1269,7 @@ def parse_args():
         "--initial_arm_qpos",
         type=str,
         default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04",
-        help="Comma-separated 7-DoF RBY1 left/right arm initial and hold qpos for ROS navigation runs.",
+        help="Comma-separated 7-DoF RBY1 left/right arm initial qpos for ROS navigation runs.",
     )
     parser.add_argument("--initial_left_arm_qpos", type=str, default="")
     parser.add_argument("--initial_right_arm_qpos", type=str, default="")
@@ -725,6 +1289,12 @@ def parse_args():
         type=int,
         default=20,
         help="Log policy wait, physics, sensor, and full task timing every N simulation steps.",
+    )
+    parser.add_argument(
+        "--sim_timing_path",
+        type=str,
+        default="",
+        help="Per-step JSONL timing output; defaults to <output_dir>/step_timing.jsonl.",
     )
     parser.add_argument(
         "--step_log_every_n_steps",
@@ -799,15 +1369,21 @@ def main():
             config=exp_config,
             task=None,
             observation_topic=args.observation_topic,
+            observation_queue_size=args.observation_queue_size,
+            extra_image_queue_size=args.extra_image_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
             depth_topic=args.depth_topic,
             action_timeout_s=effective_action_timeout_s,
             blocking_observation_republish_period_s=args.blocking_observation_republish_period_s,
+            blocking_republish_pointcloud=args.blocking_republish_pointcloud,
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
+            publish_depth_scan=args.publish_depth_scan,
+            depth_scan_topic=args.depth_scan_topic,
+            pointcloud_self_filter_radius_m=args.pointcloud_self_filter_radius_m,
             pointcloud_roll_correction_deg=args.pointcloud_roll_correction_deg,
             lidar_calib_x_m=args.lidar_calib_x_m,
             lidar_calib_y_m=args.lidar_calib_y_m,
@@ -828,25 +1404,132 @@ def main():
             timing_log_every_n_frames=args.timing_log_every_n_frames,
             extra_image_topic=args.extra_image_topic,
             extra_image_camera_name=args.debug_front_camera_name,
+            publish_realtime_gt=args.publish_realtime_gt,
+            realtime_gt_topic=args.realtime_gt_topic,
+            realtime_gt_camera_name=args.realtime_gt_camera_name,
+            realtime_gt_min_visible_pixels=args.realtime_gt_min_visible_pixels,
+            realtime_gt_min_visible_bbox_short_side_px=(
+                args.realtime_gt_min_visible_bbox_short_side_px
+            ),
+            realtime_gt_min_portal_bbox_short_side_px=(
+                args.realtime_gt_min_portal_bbox_short_side_px
+            ),
+            realtime_gt_min_visible_fraction=args.realtime_gt_min_visible_fraction,
+            realtime_gt_required_consecutive_observations=(
+                args.realtime_gt_required_consecutive_observations
+            ),
+            realtime_gt_step_interval=args.realtime_gt_step_interval,
+            realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
+            realtime_gt_emit_interaction_approach_axis=(
+                args.realtime_gt_emit_interaction_approach_axis
+            ),
+            step_frame_dir=args.step_frame_dir,
+            step_frame_queue_size=args.step_frame_queue_size,
+            step_capture_ack_topic=args.step_capture_ack_topic,
+            step_capture_ack_barrier_enabled=args.step_capture_ack_barrier_enabled,
+            step_capture_ack_timeout_s=args.step_capture_ack_timeout_s,
+            step_ready_topic=args.step_ready_topic,
+            step_ready_barrier_enabled=args.step_ready_barrier_enabled,
+            step_ready_warmup_skip_frames=args.step_ready_warmup_skip_frames,
+            step_ready_timeout_s=args.step_ready_timeout_s,
+            step_ready_bootstrap_timeout_s=args.step_ready_bootstrap_timeout_s,
         )
-        arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
-        left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
-        right_arm_qpos = parse_qpos_csv(args.initial_right_arm_qpos)
-        if left_arm_qpos is None:
-            left_arm_qpos = arm_qpos
-        if right_arm_qpos is None:
-            right_arm_qpos = arm_qpos
-        if left_arm_qpos is not None:
-            policy.default_left_arm_qpos = left_arm_qpos.copy()
-        if right_arm_qpos is not None:
-            policy.default_right_arm_qpos = right_arm_qpos.copy()
         policy.scene_timeout_s = args.scene_timeout_s
         policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts
+    policy.retain_task_history = bool(args.retain_task_history)
     policy.sim_timing_log_every_n_steps = args.sim_timing_log_every_n_steps
+    policy.sim_timing_path = args.sim_timing_path or str(exp_config.output_dir / "step_timing.jsonl")
     policy.step_log_every_n_steps = args.step_log_every_n_steps
     policy.debug_snapshot_path = args.debug_snapshot_path
     policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name
     policy.debug_snapshot_saved = False
+    policy.door_occ_test_controller = None
+    policy.force_interaction_controller = None
+    if args.enable_force_interaction:
+        force_log_path = (
+            Path(args.force_interaction_log_path).expanduser().resolve()
+            if args.force_interaction_log_path
+            else exp_config.output_dir / "force_interaction_events.json"
+        )
+        policy.force_interaction_controller = AtomicForceInteractionController(
+            command_topic=args.force_interaction_command_topic,
+            result_topic=args.force_interaction_result_topic,
+            feedback_topic=args.force_interaction_feedback_topic,
+            output_path=force_log_path,
+            force_config=ForceDriveConfig(
+                max_physics_substeps=args.force_interaction_max_physics_substeps,
+                open_fraction_threshold=args.force_interaction_open_fraction_threshold,
+                assume_success=False,
+            ),
+            close_all_doors_on_prepare=args.initial_door_state == "closed",
+            close_all_containers_on_prepare=args.force_interaction_close_all_containers_on_prepare,
+            interaction_execution_mode=args.force_interaction_execution_mode,
+            interaction_transition_steps=args.force_interaction_transition_steps,
+            drawer_execution_mode=args.force_interaction_drawer_execution_mode,
+            drawer_transition_steps=args.force_interaction_drawer_transition_steps,
+            drawer_observation_steps=args.force_interaction_drawer_observation_steps,
+            drawer_view_restore_settle_steps=(
+                args.force_interaction_drawer_view_restore_settle_steps
+            ),
+            drawer_view_restore_max_steps=(
+                args.force_interaction_drawer_view_restore_max_steps
+            ),
+            bypass_unsafe_open_sweep=(
+                args.force_interaction_bypass_unsafe_open_sweep
+            ),
+            object_id_resolver=(
+                getattr(policy._realtime_gt_publisher, "resolve_public_object_id", None)
+                if getattr(policy, "_realtime_gt_publisher", None) is not None
+                else None
+            ),
+        )
+    if args.runtime_target_selection_mode != "none":
+        from std_msgs.msg import String
+        import rospy
+
+        policy.runtime_target_publisher = RuntimeTargetPublisher(
+            rospy,
+            String,
+            args.runtime_target_selection_path,
+            args.runtime_target_selection_top_k,
+            selection_mode=args.runtime_target_selection_mode,
+            selection_input_path=args.runtime_target_selection_input_path,
+        )
+        policy.runtime_target_seed = int(args.seed)
+        policy.runtime_target_selection = {}
+    if args.completion_mode != "disabled":
+        from ros_completion_monitor import CompletionMonitorConfig, RosCompletionMonitor
+
+        policy.completion_monitor = RosCompletionMonitor(
+            CompletionMonitorConfig(
+                mode=args.completion_mode,
+                frontier_confirmations=max(1, int(args.completion_confirmations)),
+                post_completion_hold_steps=max(0, int(args.completion_post_hold_steps)),
+            ),
+            output_path=args.completion_status_path or exp_config.output_dir / "completion_status.json",
+        )
+    if args.door_occ_test_pose_sequence:
+        transition_path = (
+            Path(args.door_occ_test_transition_path).expanduser().resolve()
+            if args.door_occ_test_transition_path
+            else exp_config.output_dir / "door_occ_test_transitions.json"
+        )
+        policy.door_occ_test_controller = DoorOccPoseSequenceController(
+            root_name=args.door_occ_test_root_name,
+            pose_sequence=args.door_occ_test_pose_sequence,
+            output_path=transition_path,
+        )
+    elif args.door_occ_test_open_step >= 0:
+        transition_path = (
+            Path(args.door_occ_test_transition_path).expanduser().resolve()
+            if args.door_occ_test_transition_path
+            else exp_config.output_dir / "door_occ_test_transitions.json"
+        )
+        policy.door_occ_test_controller = DoorOccRuntimeController(
+            root_name=args.door_occ_test_root_name,
+            open_step=args.door_occ_test_open_step,
+            output_path=transition_path,
+        )
     print("Creating runner ...")
     runner = NavRosRolloutRunner(exp_config)
     print("Starting runner.run() ...")
@@ -854,6 +1537,12 @@ def main():
         print("Running runner.run() ...")
         runner.run(preloaded_policy=policy)
     finally:
+        force_interaction_controller = getattr(policy, "force_interaction_controller", None)
+        if force_interaction_controller is not None:
+            force_interaction_controller.close()
+        completion_monitor = getattr(policy, "completion_monitor", None)
+        if completion_monitor is not None:
+            completion_monitor.close()
         print("Closing policy ...")
         if hasattr(policy, "close"):
             policy.close()

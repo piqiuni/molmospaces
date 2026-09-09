@@ -1,4 +1,4 @@
-robot_radius: 0.30
+robot_radius: 0.25
 obstacle_range: 15.0
 raytrace_range: 15.0
 observation_sources: RGBD_camera

@@ -1,6 +1,6 @@
 # 交互导航项目总览（readme_pi）
 
-最后更新：2026-06-03
+最后更新：2026-08-03
 
 ## 1. 文档定位
 
@@ -51,6 +51,8 @@
 2. 构建能够表达交互状态、交互代价与状态转移的导航表示
 3. 让规划显式考虑导航边、交互触发边与交互后拓扑变化
 4. 用 oracle interaction 或现有 open/close 能力验证交互表示与规划闭环
+5. 证明同一交互导航环境可沿两个正交维度扩展：任务形式从 ObjGoal 扩展到
+   PointGoal / InstructionGoal，采集信息密度从结构化 light 扩展到带视频和状态的 full
 
 换句话说：
 
@@ -63,7 +65,13 @@
 
 ### 4.1 当前主线
 
-c
+- 交互类型主线：通道属性与容器属性，以及二者组成的 mixed 因果链
+- 任务形式主线：ObjGoal、PointGoal、InstructionGoal 直接共享 InteractiveNav V3
+- 数据采集主线：light/full 表示数据丰富度，不作为独立任务类型
+
+这里不设置 `derived_task` 中间数据规范。PointGoal 改写 V3 target/success/oracle
+导航终点，InstructionGoal 改写 policy-facing language 并保留原 V3 交互 GT，因而任务
+扩展与采集方式可以独立组合。
 
 ### 4.2 当前不作为第一阶段主线的内容
 
@@ -91,6 +99,15 @@ c
 
 - 后续 Agent 架构候选能力
 - 长时序语义推理与开放世界扩展方向
+
+当前工程已将 MLLM 作为**可独立消融的增强后端**接入，而不是替代模块化主线：
+
+1. 感知层仅推理交互属性和语义部件，精确关节与控制仍由几何/执行 backend 负责。
+2. 决策层只能在确定性模块生成并过滤后的合法 candidate ID 中评分和选择。
+3. 执行层只生成语义技能序列并验证前后视觉结果，不直接输出力、轨迹或导航坐标。
+
+因此可以分别比较静态语义图、动态规则交互图、MLLM 属性图，规则 cost 与 MLLM
+评分，以及直接原子交互、规则状态验证和 MLLM 技能规划/视觉反馈。
 
 ---
 
@@ -169,6 +186,28 @@ c
 2. 交互状态定义一致
 3. “需要交互”的判断逻辑尽量可对齐
 4. 结果表达能互相支撑，而不是彼此孤立
+
+### 5.4 当前在线闭环与可审计录像
+
+ROS 主线现在把“可复现的状态更新”和“可检查的录像”视为同一个运行时契约，而不是事后拼接的可视化。
+
+```text
+simulator observation (common step/stamp)
+→ raw OCC / semantic mapping / explore_py readiness
+→ semantic decision / executor
+→ action
+→ step_sync + raw snapshot acknowledgment
+→ next simulator step
+```
+
+- **OCC readiness**：决策侧聚合 `semantic_mapping` 与 `explore_py` 的当前 ready 状态；这保证当前地图已进入必要导航链路，但不把尚在异步运行的 room segmentation 或完整 semantic graph 误当作同步完成。
+- **交互后闭环**：planning OCC 可以在已确认的开门结果后先更新可通行区域；room topology 只在确认后的稳定分割结果上更新。因而“规划可先恢复”与“图拓扑随后确认”是有意区分的两个阶段。
+- **录像**：当前语义探索/批测主入口在运行期只保存逐 step 相机 PNG、无损地图 PNG 和 JSONL step boundary；六联图与 MP4 在 recorder 排空后离线重建。这样既能保证相机与状态的逻辑 step 对齐，也能在不重跑仿真的情况下重新生成六联图或修改布局；单 panel raw-only 导出接口仍在收敛中。
+- **审计**：每个 boundary 保存所选地图 receipt、位姿、计划、graph/selection/execution 状态和必要 TF；离线结果保存逐帧 receipt 对齐记录。录像是否有效由帧数、raw writer 的无丢失计数和 alignment sidecar 判定，而不是仅看 MP4 是否可播放。
+
+当前第一阶段 initial scan 是决策层强制的、不可中断的 `SCAN` 行为：map ready 前不发布候选，ready 后先完成 `RGB(N)+fresh-gate(N)` 的 step 配对与 2π 观测，再开放普通导航/交互。默认 `1.25 rad/s × 0.2 s`，最多 40 个控制 step；15 s timeout 按已确认 control step 的逻辑时间计算，墙钟只做 step-sync 停滞保护，因此外部仿真吞吐不会改变每步 `v×dt` 目标。它不等于 MLLM 未启动；规则 METHOD 不调用 MLLM，只有显式 `full_mllm_*` 运行才调用模型。2026-08-03 的 100-step smoke 已验证 SCAN 在 28 个确认控制 step、`6.406 rad` 后成功，并继续进入 `INTERACT` / `NAVIGATE`。
+
+目前 raw-only 离线录像已作为 `run_house7_semantic_exploration_ros_test.zsh` 与语义批测的标准路径；部分旧入口（尤其 V3 evaluator）仍保留 runtime encoder，属于待迁移的兼容路径，不应与新旧产物或性能数据混合比较。具体命令、产物和验收规则见 `test.md`。
 
 ---
 
@@ -276,6 +315,30 @@ c
 - 为后续 benchmark 扩展提供 sanity check
 
 也就是说，第一阶段不是先做“大 benchmark”，而是先做“小而准的闭环验证集”。
+
+---
+
+### 6.4 当前评测标准
+
+详细定义见 [`docs/interactive_navigation_metrics.md`](docs/interactive_navigation_metrics.md)。
+
+当前交互导航评测采用简洁主指标，避免把调试诊断项全部放入论文主表。主指标固定为：
+
+| 指标 | 含义 |
+|------|------|
+| `SR` | 最终任务成功率，沿用 `NavToObj` 的距离阈值加 head-camera 可见性条件 |
+| `SPL` | 成功加权路径效率，失败为 0，成功时按参考路径长度与实际路径长度的比值加权 |
+| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 |
+| `Interaction Precision` | 执行过的交互中，有多少是有效交互 |
+| `Total Cost` | 总代价，首版使用 `path_length + λ * interaction_count` |
+
+其中 `reachability`、`visibility` 和 `enablement` 是 benchmark 设计与论文叙事中的交互收益类型：
+
+- 通道交互主要体现 `reachability`：开门或打开通道后，原本不可达的目标区域变得可达。
+- 容器交互主要体现 `visibility`：打开冰箱、柜门或抽屉后，原本不可见的目标变得可见。
+- 混合交互中的 `enablement` 是中间机制：某个交互不一定直接暴露目标，但会使后续交互或后续导航变得可执行。
+
+这些收益类型不作为主表中的三个独立指标，而作为 `Interaction Success Rate` 的判定依据。报告结果时应按 `all`、`channel`、`container`、`mixed`、`no-interaction` 等 split 展开；无交互样本用于惩罚不必要交互，其 `Interaction Success Rate` 可以记为 `N/A`，但 `Interaction Precision` 和 `Total Cost` 仍然有意义。
 
 ---
 

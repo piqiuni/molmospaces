@@ -123,6 +123,7 @@ Initial map dimensions and resolution:
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include <time.h>
@@ -144,9 +145,292 @@ Initial map dimensions and resolution:
 // compute linear index for given map coords
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
 
+namespace
+{
+double wallElapsedMs(const ros::WallTime& started)
+{
+  return (ros::WallTime::now() - started).toSec() * 1000.0;
+}
+}
+
+struct SlamGMapping::PipelineTimingTrace
+{
+  PipelineTimingTrace(SlamGMapping* owner_in,
+                      const char* source_in,
+                      uint32_t source_seq_in,
+                      const ros::Time& source_stamp_in)
+    : owner(owner_in),
+      source(source_in),
+      started(ros::WallTime::now()),
+      source_seq(source_seq_in),
+      source_stamp_sec(source_stamp_in.isZero() ? 0.0 : source_stamp_in.toSec()),
+      source_age_ms(-1.0),
+      odom_delta_ms(-1.0),
+      event_mask(0),
+      active(false)
+  {
+    std::memset(stage_ms, 0, sizeof(stage_ms));
+    std::memset(stage_seen, 0, sizeof(stage_seen));
+    if (owner != NULL && owner->pipeline_timing_enabled_)
+    {
+      active = true;
+    }
+  }
+
+  ~PipelineTimingTrace()
+  {
+    if (active && owner != NULL)
+      owner->finishPipelineTiming(this);
+  }
+
+  void stage(PipelineTimingStage stage_id, double elapsed_ms)
+  {
+    if (!active || stage_id < 0 || stage_id >= PIPELINE_STAGE_COUNT)
+      return;
+    if (elapsed_ms < 0.0 || !std::isfinite(elapsed_ms))
+      return;
+    const size_t index = static_cast<size_t>(stage_id);
+    stage_ms[index] += elapsed_ms;
+    stage_seen[index] = true;
+  }
+
+  void event(PipelineTimingEvent event_id)
+  {
+    if (!active || event_id < 0 || event_id >= PIPELINE_EVENT_COUNT)
+      return;
+    event_mask |= (static_cast<uint32_t>(1) << static_cast<unsigned int>(event_id));
+  }
+
+  void observeSourceAge(double value_ms)
+  {
+    if (active && std::isfinite(value_ms))
+      source_age_ms = value_ms;
+  }
+
+  void observeOdomDelta(double value_ms)
+  {
+    if (active && std::isfinite(value_ms))
+      odom_delta_ms = value_ms;
+  }
+
+  SlamGMapping* owner;
+  const char* source;
+  ros::WallTime started;
+  uint32_t source_seq;
+  double source_stamp_sec;
+  double source_age_ms;
+  double odom_delta_ms;
+  double stage_ms[PIPELINE_STAGE_COUNT];
+  bool stage_seen[PIPELINE_STAGE_COUNT];
+  uint32_t event_mask;
+  bool active;
+};
+
+void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
+{
+  if (timing_trace == NULL || !timing_trace->active)
+    return;
+
+  timing_trace->stage(
+      PIPELINE_STAGE_CALLBACK_TOTAL, wallElapsedMs(timing_trace->started));
+
+  bool should_log = false;
+  uint64_t window_callbacks = 0;
+  uint64_t window_pointcloud_callbacks = 0;
+  uint64_t window_organized_depth_callbacks = 0;
+  uint64_t event_counts[PIPELINE_EVENT_COUNT];
+  uint64_t stage_counts[PIPELINE_STAGE_COUNT];
+  double stage_total_ms[PIPELINE_STAGE_COUNT];
+  double stage_max_ms[PIPELINE_STAGE_COUNT];
+  uint64_t source_age_count = 0;
+  double source_age_total_ms = 0.0;
+  double source_age_max_ms = 0.0;
+  uint64_t odom_delta_count = 0;
+  double odom_delta_total_ms = 0.0;
+  double odom_delta_max_ms = 0.0;
+
+  {
+    boost::mutex::scoped_lock lock(pipeline_timing_mutex_);
+    ++pipeline_timing_window_callbacks_;
+    if (timing_trace->source != NULL &&
+        std::strcmp(timing_trace->source, "pointcloud") == 0)
+      ++pipeline_timing_window_pointcloud_callbacks_;
+    else
+      ++pipeline_timing_window_organized_depth_callbacks_;
+
+    for (int event = 0; event < PIPELINE_EVENT_COUNT; ++event)
+    {
+      if (timing_trace->event_mask &
+          (static_cast<uint32_t>(1) << static_cast<unsigned int>(event)))
+        ++pipeline_timing_window_event_counts_[event];
+    }
+    for (int stage = 0; stage < PIPELINE_STAGE_COUNT; ++stage)
+    {
+      if (!timing_trace->stage_seen[stage])
+        continue;
+      ++pipeline_timing_window_stage_counts_[stage];
+      pipeline_timing_window_stage_total_ms_[stage] +=
+          timing_trace->stage_ms[stage];
+      pipeline_timing_window_stage_max_ms_[stage] = std::max(
+          pipeline_timing_window_stage_max_ms_[stage],
+          timing_trace->stage_ms[stage]);
+    }
+    if (timing_trace->source_age_ms >= 0.0)
+    {
+      ++pipeline_timing_window_source_age_count_;
+      pipeline_timing_window_source_age_total_ms_ +=
+          timing_trace->source_age_ms;
+      pipeline_timing_window_source_age_max_ms_ = std::max(
+          pipeline_timing_window_source_age_max_ms_,
+          timing_trace->source_age_ms);
+    }
+    if (timing_trace->odom_delta_ms >= 0.0)
+    {
+      ++pipeline_timing_window_odom_delta_count_;
+      pipeline_timing_window_odom_delta_total_ms_ +=
+          timing_trace->odom_delta_ms;
+      pipeline_timing_window_odom_delta_max_ms_ = std::max(
+          pipeline_timing_window_odom_delta_max_ms_,
+          timing_trace->odom_delta_ms);
+    }
+
+    // Finish order can differ from entry order under a multi-threaded spinner,
+    // so use the completed-window count rather than the callback sequence.
+    should_log = pipeline_timing_log_every_ > 0 &&
+                 pipeline_timing_window_callbacks_ >=
+                     static_cast<uint64_t>(pipeline_timing_log_every_);
+    if (should_log)
+    {
+      window_callbacks = pipeline_timing_window_callbacks_;
+      window_pointcloud_callbacks = pipeline_timing_window_pointcloud_callbacks_;
+      window_organized_depth_callbacks =
+          pipeline_timing_window_organized_depth_callbacks_;
+      std::memcpy(event_counts, pipeline_timing_window_event_counts_,
+                  sizeof(event_counts));
+      std::memcpy(stage_counts, pipeline_timing_window_stage_counts_,
+                  sizeof(stage_counts));
+      std::memcpy(stage_total_ms, pipeline_timing_window_stage_total_ms_,
+                  sizeof(stage_total_ms));
+      std::memcpy(stage_max_ms, pipeline_timing_window_stage_max_ms_,
+                  sizeof(stage_max_ms));
+      source_age_count = pipeline_timing_window_source_age_count_;
+      source_age_total_ms = pipeline_timing_window_source_age_total_ms_;
+      source_age_max_ms = pipeline_timing_window_source_age_max_ms_;
+      odom_delta_count = pipeline_timing_window_odom_delta_count_;
+      odom_delta_total_ms = pipeline_timing_window_odom_delta_total_ms_;
+      odom_delta_max_ms = pipeline_timing_window_odom_delta_max_ms_;
+      pipeline_timing_window_callbacks_ = 0;
+      pipeline_timing_window_pointcloud_callbacks_ = 0;
+      pipeline_timing_window_organized_depth_callbacks_ = 0;
+      std::memset(pipeline_timing_window_event_counts_, 0,
+                  sizeof(pipeline_timing_window_event_counts_));
+      std::memset(pipeline_timing_window_stage_counts_, 0,
+                  sizeof(pipeline_timing_window_stage_counts_));
+      std::memset(pipeline_timing_window_stage_total_ms_, 0,
+                  sizeof(pipeline_timing_window_stage_total_ms_));
+      std::memset(pipeline_timing_window_stage_max_ms_, 0,
+                  sizeof(pipeline_timing_window_stage_max_ms_));
+      pipeline_timing_window_source_age_count_ = 0;
+      pipeline_timing_window_source_age_total_ms_ = 0.0;
+      pipeline_timing_window_source_age_max_ms_ = 0.0;
+      pipeline_timing_window_odom_delta_count_ = 0;
+      pipeline_timing_window_odom_delta_total_ms_ = 0.0;
+      pipeline_timing_window_odom_delta_max_ms_ = 0.0;
+    }
+  }
+
+  if (!should_log)
+    return;
+
+  const double callback_avg = stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL] > 0
+      ? stage_total_ms[PIPELINE_STAGE_CALLBACK_TOTAL] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL])
+      : 0.0;
+  const double filter_avg = stage_counts[PIPELINE_STAGE_FILTER] > 0
+      ? stage_total_ms[PIPELINE_STAGE_FILTER] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_FILTER])
+      : 0.0;
+  const double transform_avg = stage_counts[PIPELINE_STAGE_TRANSFORM] > 0
+      ? stage_total_ms[PIPELINE_STAGE_TRANSFORM] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_TRANSFORM])
+      : 0.0;
+  const double filtered_publish_avg =
+      stage_counts[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH] > 0
+          ? stage_total_ms[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH] /
+                static_cast<double>(
+                    stage_counts[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH])
+          : 0.0;
+  const double projection_avg = stage_counts[PIPELINE_STAGE_PROJECTION] > 0
+      ? stage_total_ms[PIPELINE_STAGE_PROJECTION] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_PROJECTION])
+      : 0.0;
+  const double add_scan_avg = stage_counts[PIPELINE_STAGE_ADD_SCAN] > 0
+      ? stage_total_ms[PIPELINE_STAGE_ADD_SCAN] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_ADD_SCAN])
+      : 0.0;
+  const double update_map_avg = stage_counts[PIPELINE_STAGE_UPDATE_MAP] > 0
+      ? stage_total_ms[PIPELINE_STAGE_UPDATE_MAP] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_UPDATE_MAP])
+      : 0.0;
+  const double map_publish_avg = stage_counts[PIPELINE_STAGE_MAP_PUBLISH] > 0
+      ? stage_total_ms[PIPELINE_STAGE_MAP_PUBLISH] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_MAP_PUBLISH])
+      : 0.0;
+  const double source_age_avg = source_age_count > 0
+      ? source_age_total_ms / static_cast<double>(source_age_count)
+      : -1.0;
+  const double odom_delta_avg = odom_delta_count > 0
+      ? odom_delta_total_ms / static_cast<double>(odom_delta_count)
+      : -1.0;
+
+  ROS_INFO(
+      "[struct_mapping] pipeline_timing window=%llu callbacks"
+      "[pointcloud=%llu organized_depth=%llu] "
+      "last{source=%s seq=%u stamp=%.6f age=%.2fms odom_dt=%.2fms} "
+      "ingress_ms_avg/max{age=%.2f/%.2f odom_dt=%.2f/%.2f} "
+      "counts{processed=%llu throttled=%llu stale_drop=%llu stale_accept=%llu "
+      "unsynced_drop=%llu transform_fail=%llu projection_fail=%llu "
+      "filtered_publish=%llu mapper_init=%llu add_attempt=%llu add_ok=%llu "
+      "add_reject=%llu map_update=%llu map_publish=%llu} "
+      "ms_avg/max{callback=%.2f/%.2f filter=%.2f/%.2f "
+      "transform=%.2f/%.2f filtered_publish=%.2f/%.2f projection=%.2f/%.2f "
+      "addScan=%.2f/%.2f updateMap=%.2f/%.2f map_publish=%.2f/%.2f}",
+      static_cast<unsigned long long>(window_callbacks),
+      static_cast<unsigned long long>(window_pointcloud_callbacks),
+      static_cast<unsigned long long>(window_organized_depth_callbacks),
+      timing_trace->source != NULL ? timing_trace->source : "unknown",
+      timing_trace->source_seq, timing_trace->source_stamp_sec,
+      timing_trace->source_age_ms, timing_trace->odom_delta_ms,
+      source_age_avg, source_age_max_ms, odom_delta_avg, odom_delta_max_ms,
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_PROCESSED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_THROTTLED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_STALE_DROP]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_STALE_ACCEPTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_UNSYNCED_DROP]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_TRANSFORM_FAILURE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_PROJECTION_FAILURE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_FILTERED_CLOUD_PUBLISH]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAPPER_INITIALIZED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_ATTEMPT]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_ACCEPTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_REJECTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_UPDATE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_PUBLISHED]),
+      callback_avg, stage_max_ms[PIPELINE_STAGE_CALLBACK_TOTAL],
+      filter_avg, stage_max_ms[PIPELINE_STAGE_FILTER],
+      transform_avg, stage_max_ms[PIPELINE_STAGE_TRANSFORM],
+      filtered_publish_avg,
+      stage_max_ms[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH],
+      projection_avg, stage_max_ms[PIPELINE_STAGE_PROJECTION],
+      add_scan_avg, stage_max_ms[PIPELINE_STAGE_ADD_SCAN],
+      update_map_avg, stage_max_ms[PIPELINE_STAGE_UPDATE_MAP],
+      map_publish_avg, stage_max_ms[PIPELINE_STAGE_MAP_PUBLISH]);
+}
+
 SlamGMapping::SlamGMapping():
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
+  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL)
 {
   seed_ = time(NULL);
   init();
@@ -154,7 +438,8 @@ SlamGMapping::SlamGMapping():
 
 SlamGMapping::SlamGMapping(ros::NodeHandle& nh, ros::NodeHandle& pnh):
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0),node_(nh), private_nh_(pnh), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
+  laser_count_(0),node_(nh), private_nh_(pnh), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL)
 {
   seed_ = time(NULL);
   init();
@@ -162,7 +447,8 @@ SlamGMapping::SlamGMapping(ros::NodeHandle& nh, ros::NodeHandle& pnh):
 
 SlamGMapping::SlamGMapping(long unsigned int seed, long unsigned int max_duration_buffer):
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL),
+  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL),
   seed_(seed), tf_(ros::Duration(1.0)) // 减少TF缓存时间到1秒，避免占用过多内存
 {
   init();
@@ -208,6 +494,36 @@ void SlamGMapping::init()
     scan_filter_queue_size_ = 1;
   if (scan_filter_queue_size_ < 1)
     scan_filter_queue_size_ = 1;
+  private_nh_.param("scan_filter_tolerance_sec", scan_filter_tolerance_sec_, 0.03);
+  scan_filter_tolerance_sec_ = std::max(0.0, scan_filter_tolerance_sec_);
+  private_nh_.param("pipeline_timing_enabled", pipeline_timing_enabled_, false);
+  private_nh_.param("pipeline_timing_log_every", pipeline_timing_log_every_, 20);
+  pipeline_timing_log_every_ = std::max(1, pipeline_timing_log_every_);
+  pipeline_timing_window_callbacks_ = 0;
+  pipeline_timing_window_pointcloud_callbacks_ = 0;
+  pipeline_timing_window_organized_depth_callbacks_ = 0;
+  std::memset(pipeline_timing_window_event_counts_, 0,
+              sizeof(pipeline_timing_window_event_counts_));
+  std::memset(pipeline_timing_window_stage_counts_, 0,
+              sizeof(pipeline_timing_window_stage_counts_));
+  std::memset(pipeline_timing_window_stage_total_ms_, 0,
+              sizeof(pipeline_timing_window_stage_total_ms_));
+  std::memset(pipeline_timing_window_stage_max_ms_, 0,
+              sizeof(pipeline_timing_window_stage_max_ms_));
+  pipeline_timing_window_source_age_count_ = 0;
+  pipeline_timing_window_source_age_total_ms_ = 0.0;
+  pipeline_timing_window_source_age_max_ms_ = 0.0;
+  pipeline_timing_window_odom_delta_count_ = 0;
+  pipeline_timing_window_odom_delta_total_ms_ = 0.0;
+  pipeline_timing_window_odom_delta_max_ms_ = 0.0;
+  private_nh_.param("mapping_scan_source", mapping_scan_source_, std::string("pointcloud"));
+  private_nh_.param("mapping_scan_topic", mapping_scan_topic_,
+                    std::string("/molmo_spaces/organized_depth_scan"));
+  if (mapping_scan_source_ != "pointcloud" && mapping_scan_source_ != "organized_depth")
+  {
+    ROS_WARN("Unknown mapping_scan_source='%s'; falling back to pointcloud", mapping_scan_source_.c_str());
+    mapping_scan_source_ = "pointcloud";
+  }
 
   private_nh_.param("transform_publish_period", transform_publish_period_, 0.05);
 
@@ -288,6 +604,35 @@ void SlamGMapping::init()
     filter_height_tolerance_ = 0.5;  // 默认保留±0.5米范围
   if(!private_nh_.getParam("filter_height_frame", filter_height_frame_))
     filter_height_frame_ = base_frame_;
+  private_nh_.param("pointcloud_scan_range_max", pointcloud_scan_range_max_, 8.0);
+  private_nh_.param("pointcloud_scan_no_return_margin_m", pointcloud_scan_no_return_margin_m_, 0.05);
+  private_nh_.param("pointcloud_scan_angle_increment_deg", pointcloud_scan_angle_increment_deg_, 0.5);
+  private_nh_.param("pointcloud_scan_height_min", pointcloud_scan_height_min_, 0.05);
+  private_nh_.param("pointcloud_scan_height_max", pointcloud_scan_height_max_, 1.10);
+  private_nh_.param("pointcloud_scan_min_points_per_beam", pointcloud_scan_min_points_per_beam_, 3);
+  private_nh_.param("pointcloud_scan_cluster_min_points", pointcloud_scan_cluster_min_points_, 6);
+  private_nh_.param("pointcloud_scan_cluster_gap_abs_m", pointcloud_scan_cluster_gap_abs_m_, 0.08);
+  private_nh_.param("pointcloud_scan_cluster_gap_rel", pointcloud_scan_cluster_gap_rel_, 0.02);
+  private_nh_.param("pointcloud_scan_cluster_quantile", pointcloud_scan_cluster_quantile_, 0.25);
+  private_nh_.param("pointcloud_scan_support_bins", pointcloud_scan_support_bins_, 2);
+  private_nh_.param("pointcloud_scan_min_support_neighbors", pointcloud_scan_min_support_neighbors_, 1);
+  private_nh_.param("pointcloud_scan_support_tolerance_abs_m", pointcloud_scan_support_tolerance_abs_m_, 0.10);
+  private_nh_.param("pointcloud_scan_support_tolerance_rel", pointcloud_scan_support_tolerance_rel_, 0.03);
+  pointcloud_scan_range_max_ = std::max(1.0, pointcloud_scan_range_max_);
+  pointcloud_scan_no_return_margin_m_ = std::max(
+      1e-3, std::min(pointcloud_scan_no_return_margin_m_,
+                      pointcloud_scan_range_max_ - 1e-3));
+  pointcloud_scan_angle_increment_deg_ = std::max(0.1, pointcloud_scan_angle_increment_deg_);
+  pointcloud_scan_height_max_ = std::max(pointcloud_scan_height_min_, pointcloud_scan_height_max_);
+  pointcloud_scan_min_points_per_beam_ = std::max(1, pointcloud_scan_min_points_per_beam_);
+  pointcloud_scan_cluster_min_points_ = std::max(1, pointcloud_scan_cluster_min_points_);
+  pointcloud_scan_cluster_gap_abs_m_ = std::max(0.0, pointcloud_scan_cluster_gap_abs_m_);
+  pointcloud_scan_cluster_gap_rel_ = std::max(0.0, pointcloud_scan_cluster_gap_rel_);
+  pointcloud_scan_cluster_quantile_ = std::max(0.0, std::min(1.0, pointcloud_scan_cluster_quantile_));
+  pointcloud_scan_support_bins_ = std::max(0, pointcloud_scan_support_bins_);
+  pointcloud_scan_min_support_neighbors_ = std::max(0, pointcloud_scan_min_support_neighbors_);
+  pointcloud_scan_support_tolerance_abs_m_ = std::max(0.0, pointcloud_scan_support_tolerance_abs_m_);
+  pointcloud_scan_support_tolerance_rel_ = std::max(0.0, pointcloud_scan_support_tolerance_rel_);
   
   // 障碍物膨胀参数
   if(!private_nh_.getParam("enable_obstacle_inflation", enable_obstacle_inflation_))
@@ -356,15 +701,33 @@ void SlamGMapping::startLiveSlam()
       node_, "registered_scan", scan_filter_queue_size_);
   scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(
       *scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
-  scan_filter_->setTolerance(ros::Duration(0.03));
+  scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
   scan_filter_->registerCallback([this](auto msg){ pointCloudCallback(msg); });
+  if (mapping_scan_source_ == "organized_depth")
+  {
+    organized_depth_scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::LaserScan>(
+        node_, mapping_scan_topic_, scan_filter_queue_size_);
+    organized_depth_scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(
+        *organized_depth_scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
+    organized_depth_scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
+    organized_depth_scan_filter_->registerCallback(
+        [this](const sensor_msgs::LaserScan::ConstPtr& msg) { laserCallback(msg); });
+  }
 
   transform_thread_ = new boost::thread(boost::bind(&SlamGMapping::publishLoop, this, transform_publish_period_));
   ROS_INFO("SLAM GMapping started. Waiting for TF and scan data...");
-  ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2)");
+  ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2) for filtered cloud/local costmap");
+  if (mapping_scan_source_ == "organized_depth")
+    ROS_INFO("Global mapping scan source: organized_depth (%s)", mapping_scan_topic_.c_str());
+  else
+    ROS_INFO("Global mapping scan source: pointcloud (/registered_scan)");
   ROS_INFO("Target odom frame: %s", odom_frame_.c_str());
   ROS_INFO("Subscribed to odom topic: %s", odom_topic_.c_str());
   ROS_INFO("Scan filter queue size: %d", scan_filter_queue_size_);
+  ROS_INFO("Scan filter TF tolerance: %.3fs", scan_filter_tolerance_sec_);
+  ROS_INFO("Pipeline timing telemetry: %s (log every %d delivered callbacks)",
+           pipeline_timing_enabled_ ? "enabled" : "disabled",
+           pipeline_timing_log_every_);
   ROS_INFO("Publishing map to topic: /struct_mapping/occ_map");
   ROS_INFO("Subscribed to reset topic: %s", reset_topic_.c_str());
 }
@@ -507,6 +870,10 @@ SlamGMapping::~SlamGMapping()
     delete scan_filter_;
   if (scan_filter_sub_)
     delete scan_filter_sub_;
+  if (organized_depth_scan_filter_)
+    delete organized_depth_scan_filter_;
+  if (organized_depth_scan_filter_sub_)
+    delete organized_depth_scan_filter_sub_;
 }
 
 bool
@@ -726,10 +1093,13 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
                              scan.intensities[src_idx] > 0.0f);
       const float r = scan.ranges[src_idx];
 
-      // 对于前向深度相机生成的伪360scan：
-      // 未观测波束必须忽略（设为 > maxRange），避免被错误当成“远距离自由空间”。
+      // For a forward RGB-D pseudo scan, a missing beam is outside the camera
+      // FoV (or lacks reliable depth), not a max-range free-space ray.  The
+      // projector explicitly encodes a *supported far return* as a finite
+      // no-return value with intensity=2; only that value is allowed to clear
+      // free space.  An unobserved NaN remains ignored by GMapping.
       if (!observed || !std::isfinite(r) || r < scan.range_min)
-        ranges_double[i] = maxRange_ + 1.0;
+        ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
     }
@@ -742,7 +1112,7 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
       const float r = scan.ranges[i];
 
       if (!observed || !std::isfinite(r) || r < scan.range_min)
-        ranges_double[i] = maxRange_ + 1.0;
+        ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
     }
@@ -774,12 +1144,15 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
 void
 SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud)
 {
+  PipelineTimingTrace timing_trace(
+      this, "pointcloud", cloud->header.seq, cloud->header.stamp);
   if (enable_time_sync_guard_)
   {
     const ros::Time now = ros::Time::now();
     if (!cloud->header.stamp.isZero())
     {
       const double cloud_age_sec = (now - cloud->header.stamp).toSec();
+      timing_trace.observeSourceAge(cloud_age_sec * 1000.0);
       if (cloud_age_sec > max_cloud_age_sec_)
       {
         if (enforce_cloud_age_drop_)
@@ -789,6 +1162,7 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
               "Drop stale pointcloud: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
               cloud_age_sec,
               max_cloud_age_sec_);
+          timing_trace.event(PIPELINE_EVENT_STALE_DROP);
           return;
         }
         ROS_WARN_THROTTLE(
@@ -796,58 +1170,88 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
             "Stale pointcloud accepted (no drop): age=%.3fs exceeds max_cloud_age_sec=%.3fs",
             cloud_age_sec,
             max_cloud_age_sec_);
+        timing_trace.event(PIPELINE_EVENT_STALE_ACCEPTED);
       }
     }
 
     double odom_dt_sec = 0.0;
-    if (!hasMatchedOdomStamp(cloud->header.stamp, &odom_dt_sec))
+    const bool odom_matched = hasMatchedOdomStamp(cloud->header.stamp, &odom_dt_sec);
+    timing_trace.observeOdomDelta(odom_dt_sec * 1000.0);
+    if (!odom_matched)
     {
       ROS_WARN_THROTTLE(
           2.0,
           "Drop unsynced pointcloud: nearest odom dt=%.4fs exceeds threshold=%.4fs",
           odom_dt_sec,
           max_odom_cloud_time_diff_);
+      timing_trace.event(PIPELINE_EVENT_UNSYNCED_DROP);
       return;
     }
   }
 
-  laser_count_++;
-  if ((laser_count_ % throttle_scans_) != 0)
-    return;
+  const bool map_from_pointcloud = mapping_scan_source_ == "pointcloud";
+  if (map_from_pointcloud)
+  {
+    laser_count_++;
+    if ((laser_count_ % throttle_scans_) != 0)
+    {
+      timing_trace.event(PIPELINE_EVENT_THROTTLED);
+      return;
+    }
+    if(laser_count_ % 50 == 0)  // 每50帧输出一次
+      ROS_INFO("Received point cloud data, processed %d scans so far", laser_count_ / throttle_scans_);
+  }
+  timing_trace.event(PIPELINE_EVENT_PROCESSED);
 
   static ros::Time last_map_update(0,0);
-  
-  // 输出调试信息：接收到点云数据
-  if(laser_count_ % 50 == 0)  // 每50帧输出一次
-    ROS_INFO("Received point cloud data, processed %d scans so far", laser_count_ / throttle_scans_);
 
   // 创建点云副本用于滤波（避免修改原始消息）
+  const ros::WallTime filter_started = ros::WallTime::now();
   sensor_msgs::PointCloud2 filtered_cloud = *cloud;
   
   // 应用高度滤波
   filterPointCloudByHeight(filtered_cloud);
+  timing_trace.stage(PIPELINE_STAGE_FILTER, wallElapsedMs(filter_started));
 
   // GMapping only supports planar laser frames. The incoming /registered_scan may
   // follow the real head-camera pose (with pitch/roll), so we level it into the
   // robot base frame before synthesizing the 2D scan used by gmapping.
-  if(!transformPointCloudToFrame(filtered_cloud, base_frame_))
+  const ros::WallTime transform_started = ros::WallTime::now();
+  const bool transform_ok = transformPointCloudToFrame(filtered_cloud, base_frame_);
+  timing_trace.stage(PIPELINE_STAGE_TRANSFORM, wallElapsedMs(transform_started));
+  if(!transform_ok)
   {
     ROS_WARN_THROTTLE(2.0, "Failed to transform pointcloud into base frame for planar gmapping");
+    timing_trace.event(PIPELINE_EVENT_TRANSFORM_FAILURE);
     return;
   }
   
   // 发布滤波后的点云
   if (filtered_cloud_pub_.getNumSubscribers() > 0)
   {
+    const ros::WallTime filtered_publish_started = ros::WallTime::now();
     filtered_cloud_pub_.publish(filtered_cloud);
+    timing_trace.stage(
+        PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH,
+        wallElapsedMs(filtered_publish_started));
+    timing_trace.event(PIPELINE_EVENT_FILTERED_CLOUD_PUBLISH);
   }
+
+  // In organized-depth mode PointCloud2 remains the local-costmap input, but
+  // only the base-frame LaserScan is allowed to update global GMapping.
+  if (!map_from_pointcloud)
+    return;
 
   // Convert PointCloud2 to LaserScan
   sensor_msgs::LaserScan scan;
+  const ros::WallTime projection_started = ros::WallTime::now();
   sensor_msgs::PointCloud2::ConstPtr filtered_cloud_ptr = boost::make_shared<sensor_msgs::PointCloud2>(filtered_cloud);
-  if(!convertPointCloudToLaserScan(filtered_cloud_ptr, scan))
+  const bool projection_ok = convertPointCloudToLaserScan(filtered_cloud_ptr, scan);
+  timing_trace.stage(PIPELINE_STAGE_PROJECTION, wallElapsedMs(projection_started));
+  if(!projection_ok)
   {
     ROS_WARN("Failed to convert point cloud to laser scan");
+    timing_trace.event(PIPELINE_EVENT_PROJECTION_FAILURE);
     return;
   }
 
@@ -861,13 +1265,19 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
       return;
     }
     got_first_scan_ = true;
+    timing_trace.event(PIPELINE_EVENT_MAPPER_INITIALIZED);
     ROS_INFO("Mapper initialized successfully!");
   }
 
   GMapping::OrientedPoint odom_pose;
 
-  if(addScan(scan, odom_pose))
+  timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ATTEMPT);
+  const ros::WallTime add_scan_started = ros::WallTime::now();
+  const bool scan_accepted = addScan(scan, odom_pose);
+  timing_trace.stage(PIPELINE_STAGE_ADD_SCAN, wallElapsedMs(add_scan_started));
+  if(scan_accepted)
   {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ACCEPTED);
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
@@ -907,11 +1317,15 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 
     if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
     {
-      updateMap(scan);
+      timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
+      const ros::WallTime update_map_started = ros::WallTime::now();
+      updateMap(scan, &timing_trace);
+      timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
       last_map_update = cloud->header.stamp;
       ROS_INFO("Map updated at time %.2f", cloud->header.stamp.toSec());
     }
   } else {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_REJECTED);
     ROS_DEBUG("cannot process scan");
     ROS_WARN_THROTTLE(5.0, "Cannot process scan - check TF and odometry data");
   }
@@ -920,9 +1334,51 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 void
 SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 {
+  PipelineTimingTrace timing_trace(
+      this, "organized_depth", scan->header.seq, scan->header.stamp);
+  if (mapping_scan_source_ != "organized_depth")
+    return;
+
+  if (enable_time_sync_guard_)
+  {
+    const ros::Time now = ros::Time::now();
+    if (!scan->header.stamp.isZero())
+    {
+      const double scan_age_sec = (now - scan->header.stamp).toSec();
+      timing_trace.observeSourceAge(scan_age_sec * 1000.0);
+      if (scan_age_sec > max_cloud_age_sec_ && enforce_cloud_age_drop_)
+      {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Drop stale organized depth scan: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
+            scan_age_sec, max_cloud_age_sec_);
+        timing_trace.event(PIPELINE_EVENT_STALE_DROP);
+        return;
+      }
+      if (scan_age_sec > max_cloud_age_sec_)
+        timing_trace.event(PIPELINE_EVENT_STALE_ACCEPTED);
+    }
+    double odom_dt_sec = 0.0;
+    const bool odom_matched = hasMatchedOdomStamp(scan->header.stamp, &odom_dt_sec);
+    timing_trace.observeOdomDelta(odom_dt_sec * 1000.0);
+    if (!odom_matched)
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "Drop unsynced organized depth scan: nearest odom dt=%.4fs exceeds threshold=%.4fs",
+          odom_dt_sec, max_odom_cloud_time_diff_);
+      timing_trace.event(PIPELINE_EVENT_UNSYNCED_DROP);
+      return;
+    }
+  }
+
   laser_count_++;
   if ((laser_count_ % throttle_scans_) != 0)
+  {
+    timing_trace.event(PIPELINE_EVENT_THROTTLED);
     return;
+  }
+  timing_trace.event(PIPELINE_EVENT_PROCESSED);
 
   static ros::Time last_map_update(0,0);
 
@@ -932,12 +1388,18 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     if(!initMapper(*scan))
       return;
     got_first_scan_ = true;
+    timing_trace.event(PIPELINE_EVENT_MAPPER_INITIALIZED);
   }
 
   GMapping::OrientedPoint odom_pose;
 
-  if(addScan(*scan, odom_pose))
+  timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ATTEMPT);
+  const ros::WallTime add_scan_started = ros::WallTime::now();
+  const bool scan_accepted = addScan(*scan, odom_pose);
+  timing_trace.stage(PIPELINE_STAGE_ADD_SCAN, wallElapsedMs(add_scan_started));
+  if(scan_accepted)
   {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ACCEPTED);
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
@@ -963,12 +1425,18 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 
     if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
     {
-      updateMap(*scan);
+      timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
+      const ros::WallTime update_map_started = ros::WallTime::now();
+      updateMap(*scan, &timing_trace);
+      timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
       last_map_update = scan->header.stamp;
       ROS_DEBUG("Updated the map");
     }
   } else
+  {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_REJECTED);
     ROS_DEBUG("cannot process scan");
+  }
 }
 
 void SlamGMapping::odomCallback(const nav_msgs::Odometry::ConstPtr& odom)
@@ -1001,7 +1469,8 @@ SlamGMapping::computePoseEntropy()
 }
 
 void
-SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
+SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
+                        PipelineTimingTrace* timing_trace)
 {
   ROS_DEBUG("Update map");
   boost::mutex::scoped_lock map_lock (map_mutex_);
@@ -1112,12 +1581,25 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
     inflateObstacles(map_.map);
   }
 
-  //make sure to set the header information on the map
-  map_.map.header.stamp = ros::Time::now();
+  // Preserve the scan source identity through OCC.  The semantic readiness
+  // barrier uses this exact seq/stamp watermark to prove that a simulator
+  // observation has reached room segmentation and the unified graph; stamping
+  // the map with wall time would make that proof impossible.
+  map_.map.header.seq = scan.header.seq;
+  map_.map.header.stamp = scan.header.stamp.isZero()
+      ? ros::Time::now()
+      : scan.header.stamp;
   map_.map.header.frame_id = tf_.resolve( map_frame_ );
 
+  const ros::WallTime map_publish_started = ros::WallTime::now();
   sst_.publish(map_.map);
   sstm_.publish(map_.map.info);
+  if (timing_trace != NULL)
+  {
+    timing_trace->stage(
+        PIPELINE_STAGE_MAP_PUBLISH, wallElapsedMs(map_publish_started));
+    timing_trace->event(PIPELINE_EVENT_MAP_PUBLISHED);
+  }
 }
 
 bool 
@@ -1145,62 +1627,231 @@ void SlamGMapping::publishTransform()
 
 bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::ConstPtr& cloud, sensor_msgs::LaserScan& scan)
 {
-  // Set basic scan parameters
+  const ros::WallTime projection_started = ros::WallTime::now();
   scan.header = cloud->header;
   scan.header.frame_id = cloud->header.frame_id;
-  
-  // Set scan parameters (these should be configurable)
-  scan.angle_min = -M_PI;
-  scan.angle_max = M_PI;
-  scan.angle_increment = M_PI / 180.0; // 1 degree resolution
+
+  // Build a circular set of bin centres. Unlike the former `2*pi/inc + 1`
+  // calculation, this has no duplicate +/-pi beam.
+  const double requested_increment =
+      pointcloud_scan_angle_increment_deg_ * M_PI / 180.0;
+  const int num_beams = std::max(
+      1, static_cast<int>(std::lround((2.0 * M_PI) / requested_increment)));
+  scan.angle_increment = (2.0 * M_PI) / static_cast<double>(num_beams);
+  scan.angle_min = -M_PI + 0.5 * scan.angle_increment;
+  scan.angle_max = scan.angle_min +
+                   static_cast<double>(num_beams - 1) * scan.angle_increment;
   scan.time_increment = 0.0;
-  scan.scan_time = 0.1; // 10 Hz
+  scan.scan_time = 0.1;
   scan.range_min = 0.1;
-  scan.range_max = 30.0;
-  
-  // Calculate number of beams
-  int num_beams = (scan.angle_max - scan.angle_min) / scan.angle_increment + 1;
-  scan.ranges.resize(num_beams);
-  scan.intensities.resize(num_beams);
-  
-  // Initialize all ranges to max range (unknown)
-  std::fill(scan.ranges.begin(), scan.ranges.end(), scan.range_max);
-  std::fill(scan.intensities.begin(), scan.intensities.end(), 0.0);
-  
-  // Convert point cloud to laser scan
+  scan.range_max = pointcloud_scan_range_max_;
+  scan.ranges.assign(num_beams, std::numeric_limits<float>::quiet_NaN());
+  scan.intensities.assign(num_beams, 0.0f);
+
+  std::vector<std::vector<float> > beam_ranges(
+      static_cast<size_t>(num_beams));
+  // A far finite point is not a hit in the local map, but it is valid evidence
+  // that the camera ray stayed clear all the way to our mapping horizon. Keep
+  // that evidence separate from finite in-range obstacle samples; a completely
+  // empty bin still remains unknown because it may be outside the camera FoV.
+  std::vector<size_t> beam_no_return_samples(
+      static_cast<size_t>(num_beams), 0);
+  size_t finite_points = 0;
+  size_t planar_points = 0;
+  size_t no_return_points = 0;
+
   sensor_msgs::PointCloud2ConstIterator<float> iter_x(*cloud, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iter_y(*cloud, "y");
   sensor_msgs::PointCloud2ConstIterator<float> iter_z(*cloud, "z");
-  
   for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
   {
-    // Skip invalid points
-    if (std::isnan(*iter_x) || std::isnan(*iter_y) || std::isnan(*iter_z))
+    if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y) ||
+        !std::isfinite(*iter_z))
       continue;
-      
-    // Calculate range and angle
-    double range = sqrt(*iter_x * *iter_x + *iter_y * *iter_y);
-    double angle = atan2(*iter_y, *iter_x);
-    
-    // Skip points outside range
-    if (range < scan.range_min || range > scan.range_max)
+    ++finite_points;
+
+    if (*iter_z < pointcloud_scan_height_min_ ||
+        *iter_z > pointcloud_scan_height_max_)
       continue;
-    
-    // Find corresponding beam index
-    int beam_index = (angle - scan.angle_min) / scan.angle_increment;
-    
-    // Clamp beam index to valid range
-    if (beam_index < 0) beam_index = 0;
-    if (beam_index >= num_beams) beam_index = num_beams - 1;
-    
-    // Update range if this is closer
-    if (range < scan.ranges[beam_index])
+
+    const double range = std::hypot(*iter_x, *iter_y);
+    if (range < scan.range_min)
+      continue;
+
+    double angle = std::atan2(*iter_y, *iter_x);
+    // atan2 may return +pi. Keep every return in [-pi, pi) before binning.
+    if (angle >= M_PI)
+      angle -= 2.0 * M_PI;
+    const int beam_index = std::max(
+        0, std::min(num_beams - 1, static_cast<int>(std::floor(
+            (angle + M_PI) / scan.angle_increment))));
+    if (range >= scan.range_max)
     {
-      scan.ranges[beam_index] = range;
-      scan.intensities[beam_index] = 1.0; // Simple intensity
+      ++beam_no_return_samples[static_cast<size_t>(beam_index)];
+      ++no_return_points;
+      continue;
     }
+    beam_ranges[static_cast<size_t>(beam_index)].push_back(
+        static_cast<float>(range));
+    ++planar_points;
   }
-  
+
+  std::vector<float> candidate_ranges(
+      static_cast<size_t>(num_beams), std::numeric_limits<float>::quiet_NaN());
+  std::vector<uint8_t> candidate_observed(static_cast<size_t>(num_beams), 0);
+  std::vector<uint8_t> candidate_no_return(static_cast<size_t>(num_beams), 0);
+  size_t rejected_sparse = 0;
+  size_t rejected_near_cluster = 0;
+  size_t no_return_fallbacks = 0;
+  size_t candidate_count = 0;
+  const float no_return_range = static_cast<float>(
+      scan.range_max - pointcloud_scan_no_return_margin_m_);
+
+  // Keep the nearest coherent range surface in each bearing.  An unreliable
+  // close edge must not suppress separately supported far free-space evidence,
+  // but a coherent near cluster always wins over that farther background.
+  for (int i = 0; i < num_beams; ++i)
+  {
+    std::vector<float>& samples = beam_ranges[static_cast<size_t>(i)];
+    const bool has_supported_far =
+        beam_no_return_samples[static_cast<size_t>(i)] >=
+        static_cast<size_t>(pointcloud_scan_min_points_per_beam_);
+    const auto select_no_return_fallback = [&]()
+    {
+      candidate_ranges[static_cast<size_t>(i)] = no_return_range;
+      candidate_observed[static_cast<size_t>(i)] = 1;
+      candidate_no_return[static_cast<size_t>(i)] = 1;
+      ++candidate_count;
+      ++no_return_fallbacks;
+    };
+
+    if (samples.size() <
+        static_cast<size_t>(pointcloud_scan_min_points_per_beam_))
+    {
+      // A supported set of far finite samples authorizes free-space carving.
+      // Sparse in-range points are usually mixed edge/background pixels, not a
+      // reliable obstacle surface.  They must not suppress continuous far
+      // evidence, but a coherent near cluster below still always wins.
+      if (has_supported_far)
+        select_no_return_fallback();
+      else
+        ++rejected_sparse;
+      continue;
+    }
+    std::sort(samples.begin(), samples.end());
+
+    size_t nearest_cluster_end = 1;
+    while (nearest_cluster_end < samples.size())
+    {
+      const float previous = samples[nearest_cluster_end - 1];
+      const float current = samples[nearest_cluster_end];
+      const float cluster_gap = static_cast<float>(std::max(
+          pointcloud_scan_cluster_gap_abs_m_,
+          pointcloud_scan_cluster_gap_rel_ * static_cast<double>(previous)));
+      if (current - previous > cluster_gap)
+        break;
+      ++nearest_cluster_end;
+    }
+
+    if (nearest_cluster_end <
+        static_cast<size_t>(pointcloud_scan_cluster_min_points_))
+    {
+      // Several in-range samples without a coherent nearest cluster are not a
+      // verified obstacle.  If this angular bin also has enough continuous
+      // depth beyond the scan horizon, retain the latter as a no-return ray.
+      // This avoids leaving an observed free corridor unknown merely because
+      // of a few depth-edge samples in the same 0.5-degree bin.
+      if (has_supported_far)
+        select_no_return_fallback();
+      else
+        ++rejected_near_cluster;
+      continue;
+    }
+
+    const size_t quantile_offset = std::min(
+        nearest_cluster_end - 1,
+        static_cast<size_t>(std::floor(
+            pointcloud_scan_cluster_quantile_ *
+            static_cast<double>(nearest_cluster_end - 1))));
+    candidate_ranges[static_cast<size_t>(i)] = samples[quantile_offset];
+    candidate_observed[static_cast<size_t>(i)] = 1;
+    ++candidate_count;
+  }
+
+  std::vector<uint8_t> observed(static_cast<size_t>(num_beams), 0);
+  size_t rejected_angular_support = 0;
+  for (int i = 0; i < num_beams; ++i)
+  {
+    if (!candidate_observed[static_cast<size_t>(i)])
+      continue;
+
+    if (pointcloud_scan_min_support_neighbors_ <= 0 ||
+        pointcloud_scan_support_bins_ <= 0)
+    {
+      observed[static_cast<size_t>(i)] = 1;
+      continue;
+    }
+
+    int support_count = 0;
+    const float candidate_range = candidate_ranges[static_cast<size_t>(i)];
+    for (int offset = 1; offset <= pointcloud_scan_support_bins_; ++offset)
+    {
+      for (int direction = -1; direction <= 1; direction += 2)
+      {
+        const int neighbor =
+            (i + direction * offset + num_beams) % num_beams;
+        if (!candidate_observed[static_cast<size_t>(neighbor)])
+          continue;
+        const float neighbor_range =
+            candidate_ranges[static_cast<size_t>(neighbor)];
+        const float support_tolerance = static_cast<float>(std::max(
+            pointcloud_scan_support_tolerance_abs_m_,
+            pointcloud_scan_support_tolerance_rel_ * static_cast<double>(
+                std::max(candidate_range, neighbor_range))));
+        if (std::fabs(neighbor_range - candidate_range) <= support_tolerance)
+          ++support_count;
+      }
+    }
+
+    if (support_count >= pointcloud_scan_min_support_neighbors_)
+      observed[static_cast<size_t>(i)] = 1;
+    else
+      ++rejected_angular_support;
+  }
+
+  size_t accepted_beams = 0;
+  size_t accepted_no_return_beams = 0;
+  for (int i = 0; i < num_beams; ++i)
+  {
+    if (!observed[static_cast<size_t>(i)])
+      continue;
+    scan.ranges[static_cast<size_t>(i)] =
+        candidate_ranges[static_cast<size_t>(i)];
+    // Intensities encode source semantics for local overwrite consumers:
+    // 1.0 = obstacle hit, 2.0 = supported no-return/free-space ray. GMapping
+    // treats both as observed finite beams.
+    scan.intensities[static_cast<size_t>(i)] =
+        candidate_no_return[static_cast<size_t>(i)] ? 2.0f : 1.0f;
+    ++accepted_beams;
+    if (candidate_no_return[static_cast<size_t>(i)])
+      ++accepted_no_return_beams;
+  }
+
+  if (laser_count_ % 50 == 0)
+  {
+    const double projection_ms =
+        (ros::WallTime::now() - projection_started).toSec() * 1000.0;
+    ROS_INFO(
+        "PointCloud scan projection source_seq=%u beams=%d finite=%zu planar=%zu far=%zu "
+        "candidates=%zu accepted=%zu no_return=%zu fallback_no_return=%zu rejected[sparse=%zu near_cluster=%zu "
+        "angular=%zu] elapsed=%.2fms",
+        cloud->header.seq, num_beams, finite_points, planar_points, no_return_points,
+        candidate_count, accepted_beams, accepted_no_return_beams,
+        no_return_fallbacks,
+        rejected_sparse, rejected_near_cluster,
+        rejected_angular_support, projection_ms);
+  }
+
   return true;
 }
 
@@ -1692,7 +2343,11 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
     if (!std::isfinite(measured_range) || measured_range < scan.range_min)
       continue;
 
-    const bool valid_hit = measured_range < scan.range_max;
+    // The point-cloud pseudo scan reserves intensity=2 for a valid depth
+    // no-return ray: it clears free cells but must never create an occupied
+    // endpoint. Keep legacy intensity=1 beams as obstacle returns.
+    const bool no_return = scan.intensities[i] >= 1.5f;
+    const bool valid_hit = !no_return && measured_range < scan.range_max;
     const double trace_range = std::min(measured_range, usable_radius);
     if (trace_range <= 0.0)
       continue;

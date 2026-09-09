@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
+  <arg name="override_config_file" default=""/>
+
+  <node name="semantic_candidate_node"
+        pkg="semantic_decision_py_pkg"
+        type="semantic_candidate_node.py"
+        output="screen">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam if="$(eval arg('override_config_file') != '')"
+              file="$(arg override_config_file)"
+              command="load"/>
+  </node>
+
+  <node name="semantic_rule_decision_node"
+        pkg="semantic_decision_py_pkg"
+        type="semantic_rule_decision_node.py"
+        output="screen">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam if="$(eval arg('override_config_file') != '')"
+              file="$(arg override_config_file)"
+              command="load"/>
+  </node>
+
+  <node name="semantic_behavior_executor"
+        pkg="semantic_decision_py_pkg"
+        type="semantic_behavior_executor.py"
+        output="screen">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam if="$(eval arg('override_config_file') != '')"
+              file="$(arg override_config_file)"
+              command="load"/>
+  </node>
+</launch>

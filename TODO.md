@@ -1,6 +1,6 @@
 # 交互导航阶段分析与 TODO
 
-最后更新：2026-07-01
+最后更新：2026-08-03
 
 ## 1. 当前课题定位
 
@@ -235,7 +235,8 @@
 - [ ] 建立 `nav + oracle open` baseline
 - [ ] 建立 `interactive graph planner` baseline
 - [ ] 建立 `ROS modular detector-only` baseline
-- [ ] 输出首版指标：Navigation SR / Oracle SR / SPL / Path Efficiency / Need-Interaction Detection Acc
+- [ ] 输出首版主指标：SR / SPL / Interaction Success Rate / Interaction Precision / Total Cost
+- [ ] 将 reachability / visibility / enablement 作为 benchmark 分层与 Interaction Success 的判定依据，而不是主表中的独立指标
 
 ## Phase 4：第二阶段语音交互导航
 
@@ -291,16 +292,48 @@
 - [ ] 形成 detector 输入、交互状态、规划决策、执行结果的统一记录格式
 - [ ] 能导出用于后续 agent / end-to-end 方法训练的数据样本
 
+### Phase 6 任务形式扩展（2026-07-27）
+
+- [x] V3 schema 直接支持 `nav_to_point` target、成功条件和 terminal oracle navigate，
+  不引入 `derived_task`。
+- [x] 完成 PointGoal demo：从 V3 channel episode 的机器人膨胀 occupancy 采样普通可达或
+  interaction-aware 目标点，并保留 GT path；提供原始 `scene_split` 普通可达采样入口。
+- [x] 完成 InstructionGoal 规则 demo：由 V3 oracle 导航/交互动作生成 hidden、partial、
+  explicit 三种自然语言指令，并保存实体与 plan step grounding。
+- [x] 接入结构化 plan + 路径走廊 graph 的 LLM 输入，以及 full H5 按 segment 抽关键帧的
+  VLM 输入；支持 mock/command/http 后端。
+- [x] 在真实 V3 benchmark 上完成 interaction-aware PointGoal、原始 scene_split PointGoal、
+  rule InstructionGoal，以及真实 full H5 关键帧 + mock-VLM 封装 smoke。
+- [ ] 接入真实外部 VLM API 后，人工评估视频指令自然度、视觉证据选择与 grounding；
+  当前只验证了不访问外部服务的 mock 后端和完整数据通路。
+- [ ] 将 PointGoal runtime task/success evaluator 接入统一 benchmark evaluation；当前阶段
+  已完成数据生成与 schema demo，尚未把 `nav_to_point` 作为正式在线评测任务注册。
+
+### Phase 6 当前 mixed 数据推进状态（2026-07-15）
+
+- [x] 从 `container_rough_catalog_v1` 二次生产 crossing rough：任一全开 GT path 穿过 interactive door 即保留；关闭门阻断目标且门前几何提示仍可达只作为 `mixed_required_verified` 子集标签，不再作为 rough 输入门槛。门前提示不视为 manipulation-validated 操作姿态。
+- [x] mixed 精采集直接输出 `interactive_nav_v3`，不经过 V2 中间数据。
+- [x] mixed 生产校验覆盖真实门/容器 joint readback、初始失败、开门恢复、目标可见性解锁、终态 NavToObj 成功和 leave-one-interaction-out 最小性。
+- [x] 完成 10 条 mixed V3 小样本端到端 smoke。
+- [x] 完成 crossing/required 拆分后的全量扫描：712 house、2603 pair、失败 0，得到 1609 个 crossing pair、覆盖 456 house；其中 917 个/262 house 为 required 子集，另有 692 个 crossing-only pair。真正无 crossing pair 的 house 为 256 个。旧 443-house 预筛仅覆盖其中 369 个 crossing house，并漏掉 87 个 crossing house，已明确禁止用于输入筛选。
+- [x] 完成 crossing-only rough 双状态俯视诊断脚本与 24-house 分层图册：显示全开 rough GT path、单门关闭后的重规划路径、交互对象和全部 scene object AABB。
+- [x] 完成代表性 mixed V3 场景的五步 GT storyboard：自动选择单关键门 + Fridge 样本，按起点、门前关/开、冰箱前关/开独立重放机器人 pathpoint、交互真值与右肩后上方视角，作为后续连续 GT 视频插值入口。
+- [ ] 对 crossing-only 的闭门可达性做独立重放稳定性复核：当前 24-house 图册发现 house 351/candidate 427 的 catalog/replay 不一致；同时存在较多闭门前后几何路径长度近零或为负的边界样本，需要在正式配额前确定重扫、最小 detour 或路径区域裕量规则。
+- [ ] 基于 full rough 分布确定正式 mixed benchmark 的场景、目标类别、路径长度和交互链配额。
+
 ## Phase 7：Agent 架构与端到端基线
 
 目标：在模块化方法和数据基础稳定后，进一步搭建 agent 化与端到端基线。
 
 阶段完成标准建议：
 
-- [ ] 定义 Agent 架构中的感知、记忆、规划、交互执行接口
-- [ ] 建立基于交互图的 Agent baseline
+- [x] 定义模块化 MLLM 感知属性、候选评分、技能规划与视觉验证接口
+- [x] 建立基于交互图的规则 baseline，并保留三模块独立消融开关
 - [ ] 建立端到端架构 baseline，作为与模块化方法的对照
 - [ ] 对比模块化方法与端到端方法在成功率、鲁棒性、可解释性上的差异
+- [x] 建立覆盖三个模块的 JSON 题库、House 7 视觉样例绑定和 latency/TPS 评测工具
+- [ ] 解决当前模型网关对 Qwen/DeepSeek Responses 请求只返回空元数据的问题
+- [ ] 使用支持视觉输入的模型完成属性推理和交互前后验证对比
 
 ---
 
@@ -316,28 +349,138 @@
 - [ ] 明确 MolmoSpaces 侧交互信息来源：GT / oracle 为主
 - [ ] 明确 ROS 侧交互信息来源：detector-only 为主
 - [ ] 明确“需要交互”的 planner 判定条件
-- [ ] 明确开门后地图/图状态更新的最小机制
+- [x] 完成 GT 快速版开门状态回写与 OCC 更新：首次有效关节值作为闭合参考，门完全打开后由 semantic 层持续清空闭合门整体 AABB，发布 planning OCC 与门洞增量更新，并由 move_base global costmap 实际消费
+- [x] 暂时将 custom `openslam_gmapping 0.2.1` 纳入仓库跟踪，保留 odometry-locked、scan-matching yaw lock 和单次平移修正限幅接口，避免标准 RoboStack 包缺少 `setUseOdometryPose()` / `setScanMatchingCorrectionLimits()` 导致 `struct_mapping_pkg` 无法编译
+- [ ] 后续将完整 vendored `openslam_gmapping` 收敛为基于 RoboStack `ros-noetic-openslam-gmapping 0.2.1` 的最小三文件补丁或独立 overlay 包，并补充标准包兼容检测与构建测试
 - [ ] 固定一组 `obj-goal` / `point-goal` 的最小验证场景与 episode，不先追求大规模
 - [ ] 明确下个月 AAAI 投稿所需的最小实验包与文档产物
 
 ## 4.2 建图与表征 TODO
 
 - [ ] 梳理 `interaction_graph_store.py` 当前已经表达的节点、边、状态与限制
-- [ ] 明确 door 在统一图中是否始终作为 `portal` 使用
+- [x] 明确 restricted-GT door 在公开图中统一为 generic `door_<ordinal>`（doorframe / doorway /
+  door leaf 不再区分）；内部仍使用 `portal` 拓扑类型，GT/source 名称不进入公开图或 MLLM 上下文
 - [ ] 明确 room connectivity 是显式边还是由规则动态生成
-- [ ] 定义交互状态最小集合：`unknown / closed / open`，是否需要 `locked`
-- [ ] 定义第一阶段必须保留的交互属性字段，避免 schema 过重
+- [x] 定义交互状态最小集合：`unknown / open / ajar / closed / static_open / blocked`，并保留 state/capability 的 source、confidence、observed_step、evidence
+- [x] 定义第一阶段必须保留的交互属性字段，规则状态只接受 executor feedback，MLLM 可接受 visual attribute patch
 - [ ] 明确 navigation hints 是调试视图、过渡接口，还是 planner 正式输入
 - [ ] 建立更通用的交互属性分类框架：通道属性 / 容器属性
 - [ ] 将设备与开关类交互保留为后续拓展，而不是第一阶段一级分类
+- [ ] 为房间拓扑新增独立的 height-banded `topology_occ`：仅供 `RoomSegmenter` 使用，保留约
+  `1.0–1.85 m` 的结构性点云层，避免低矮家具把自由空间切成暂态 room；不得替代导航 raw/planning OCC。
 
 ## 4.3 感知与状态来源 TODO
 
 - [ ] 明确 MolmoSpaces 侧 GT 字段到统一 observation 的映射表
 - [ ] 明确 ROS detector-only 管线需要输出哪些最小交互字段
-- [ ] 明确 door 检测成功之外还缺哪些交互属性字段
-- [ ] 明确 door state 是从关节值直接读，还是从图像/几何间接估计
+- [x] 明确 door 检测成功之外还缺少可操作性、状态、证据来源和观测步字段；初始 portal 仅是几何/可见性观测
+- [x] 明确 door state 来源边界：规则方法只由实际交互反馈更新；MLLM 方法由视觉属性 patch 或实际交互反馈更新，GT 关节状态不直接发布
+- [x] House7 door-only rule 验收：公开 `door_0001`–`door_0004` 均进入规则交互候选；两扇
+  articulated door 由 closed→open，两个无可操作门体的 generic door 由反馈标为 `static_open`，
+  不再泄露 `doorframe` / `doorway` 子类型
+- [x] 收敛 static portal 的执行语义：executor result 直接结束交互，不等待 verification timeout；
+  `static_open` 保持可通行但不创建 synthetic child room、不触发 post-open OCC/room/costmap 链路，
+  也不生成强制门后 traversal subgoal
+- [x] GT 快速版门状态（仅模拟器内部/evaluator，不进入实时语义输入）：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
+- [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
+- [ ] 定义 post-open 门后 free-space 证据：只接受相机视锥内的有限回波或有支持的 no-return ray；
+  开门后用有界回望/扇扫补观测，绝不由 local costmap 或门状态直接把全局未知区域置 free。
+
+## 4.4 已梳理的 MolmoSpaces GT / 交互接口
+
+当前已新增探索脚本：
+
+- `scripts/InteractiveNav/explore_molmo_interactions.py`
+  - `inspect-scene`：枚举场景中的 door / cabinet / drawer / fridge / microwave 等 articulation，以及 lights
+  - `nav-gt`：在 `nav_to_obj` 采样结果上，读取固定起点、目标与 GT path
+  - `door-path-study`：固定起终点后，切换指定 door 的 open / closed 状态并重算路径
+  - `set-articulation`：对通用 articulation object 直接设置 joint open fraction
+  - `task-config-template`：导出固定 `nav_to_obj` / `door_opening` / `open_close` episode 的配置草稿
+  - `action-schema`：导出 navigation / door / container 的 oracle 或 planner action 模板
+  - `benchmark-episode-template`：导出 `benchmark_schema.EpisodeSpec` 级别的 JSON 骨架
+  - `integration-recipe`：导出导航层如何调用 oracle / planner 交互的接线伪代码
+  - `env-check`：检查当前环境是否具备实跑 scene 的基本条件
+
+当前已新增配套说明：
+
+- `scripts/InteractiveNav/molmo_interaction_interfaces.md`
+  - 汇总 task config、GT 接口、step action、灯光控制现状
+- `scripts/InteractiveNav/molmo_gt_workflow.md`
+  - 按 `2.1 -> 3.2` 目标串成可执行工作流
+- `scripts/InteractiveNav/molmo_objective_status.md`
+  - 按目标编号逐项整理当前证据、完成项与剩余缺口
+- `scripts/InteractiveNav/molmo_runtime_validation.md`
+  - 记录真实在 `mlspaces` 环境中运行时遇到的 cache / network blocker
+
+当前已确认的环境侧 blocker：
+
+- 真实 scene-loading 需要可写资源缓存目录：
+  - 推荐 `MLSPACES_CACHE_DIR=/tmp/molmo-spaces-resources`
+- 若本机已有 `~/.cache/molmo-spaces-resources`，可在 `/tmp` 建一个 proxy cache 根目录，并把现有 `robots / scenes / objects / grasps / benchmarks / test_data` 软链进去
+- Linux headless 环境建议显式设置：
+  - `MUJOCO_GL=egl`
+  - `PYOPENGL_PLATFORM=egl`
+- 当前已真实验证：
+  - `inspect-scene` 可在 `train_10_ceiling.xml` 上成功输出 4 个 door、10 个 articulated objects、1 个 light
+  - `nav-gt` 可真实跑到 `scene loading -> occupancy map -> nav_to_obj task sample -> target selection`
+- 当前剩余真实问题已从“scene 无法加载”收敛为：
+  - 某些 house 会在 `NavGoalSampler` 上失败，拿不到 nav goal
+  - `door-path-study` 仍需在更合适的 house 上继续筛选
+
+当前确认的 GT path 代码链路：
+
+- `scripts/datagen/run_pipeline.py --task_type nav_to_obj --policy planner`
+- `NavToObjTaskSampler.init_scene()`：为 house 生成 occupancy map，并存到 `task.occupancy_map`
+- `AStarNavToObjPolicy / AStarPlanner`：基于 occupancy map + graph search 生成 waypoint path
+- 需要注意：现有 `AStarPlanner` 默认按 `model_path` 重建 map，不直接消费运行时 door state
+- 因此若要做“固定起终点 + 改门状态 + 重算 GT path”，应优先使用 live model/data 重新建图，而不是只调用现成 policy
+
+当前确认的固定 episode 入口：
+
+- 固定导航起点：`NavToObjTaskConfig.robot_base_pose`
+- 固定导航目标实例：`NavToObjTaskConfig.pickup_obj_name`
+- 固定目标候选集：`NavToObjTaskConfig.pickup_obj_candidates`
+- 固定 door episode：`DoorOpeningTaskConfig.door_body_name`、`robot_base_pose`、`articulated_joint_range`、`articulated_joint_reset_state`
+- 固定通用 container/open-close episode：`OpeningTaskConfig.joint_name`、`joint_index`、`joint_start_position`
+
+当前确认的状态修改接口：
+
+- 通道属性（door）：
+  - `Door(name, env.current_data)`
+  - `get_hinge_joint_index()`
+  - `get_joint_range(i)`
+  - `set_joint_position(i, position)`
+- 容器属性（drawer / cabinet / fridge / microwave / oven / dishwasher 等）：
+  - `ObjectManager.get_object_by_name(name)` 返回 `MlSpacesArticulationObject`
+  - `joint_names / get_joint_range(i) / get_joint_position(i) / set_joint_position(i, position)`
+- door 打开任务和通用 open/close 任务是两条独立 task 线：
+  - `DoorOpeningTask / DoorOpeningTaskSampler / opening_solver.py`
+  - `OpeningTask / OpenTaskSampler / open_close_planner_policy.py`
+
+当前确认的 step-level action 接口：
+
+- `task.step(action)` 接受单环境 `dict` 或多环境 `list[dict]`
+- `done` 是保留字段，`task.step()` 会先剥离，再标记 episode 结束
+- 导航 policy 输出：
+  - `{\"base\": waypoint, \"done\": False}`
+  - 结束时为 `{\"done\": True, ...base noop...}`
+- 若只想让导航层“直接开关门/容器”做 GT study，当前最自然的接口不是单独 task action，而是：
+  - door：`Door(...).set_joint_position(...)`
+  - container：`MlSpacesArticulationObject.set_joint_position(...)`
+- door opening solver 输出：
+  - 分 phase 生成 `base / arm / gripper / head / done` 组合动作
+- 通用 container open/close planner：
+  - 通过 `OpeningTask + OpenClosePlannerPolicy` 执行，不是单独的“open drawer” primitive API
+
+关于灯光 / 开关类交互的当前判断：
+
+- 代码里已有 light 元数据和随机化器：
+  - `molmo_spaces/env/mj_extensions.py`
+  - `molmo_spaces/env/arena/randomization/lighting.py`
+- 当前更像“场景随机化 / 低层属性控制”，不是完整任务接口
+- 低层可直接读写 `model.light_active[light_id]`
+- 目前没有与 `nav_to_obj` / `OpeningTask` 对齐的高层 `light-switch task`，因此应先视为 future extension，而不是第一阶段主线
 - [ ] 为后续 container / movable obstacle 预留观测字段
 - [ ] 为 future extension 中的 switch / light / curtain 类交互预留扩展字段
 
@@ -349,6 +492,103 @@
 - [ ] 设计最小失败处理：门不可开 / 状态未知 / 交互后仍不可达
 - [ ] 定义最小日志字段，便于后续复盘每次失败点
 
+### 4.4.1 ROS 运行时启动观测与 SCAN 行为（2026-08-03）
+
+- [x] 将启动旋转从 `ExplorePy -> /cmd_vel` 的旁路逻辑收敛为
+  `semantic decision -> semantic executor -> bridge` 的显式 `SCAN` 行为；决策层只输出
+  高层 scan 目标，执行层才产生逐 step 的低层旋转命令。
+- [x] 第一阶段先实现**必选且不可中断**的 episode-start `SCAN`：在普通
+  `EXPLORE / NAVIGATE / INTERACT` 候选派发前完成整圈观测，并将 `SCANNING`、累计转角、
+  每步命令、完成原因和失败原因写入 decision trace、execution feedback 与离线录像。
+- [x] 修复 scan 的 step 事务：按 `step_index` 缓存并原子匹配 `RGB(N)` 与 action-window
+  gate `N`，每个 evaluator action 最多消费一条 scan 命令；记录乱序、过期、重复和缺失
+  token，不能再以单个 `latest_*_step` 的相等判断作为配对条件。
+- [x] 固定第一阶段的验收边界：默认目标为 `2π`，在 `1.25 rad/s × 0.2 s/action` 下正常
+  约需 26 个控制 action（最多 28 个）；只有达到转角/覆盖条件才可标记 `SCAN_COMPLETE`。
+  `timeout_s=15 s` 按已确认 evaluator control step × `dt` 的逻辑时间计算，`40 step` 为硬上限；wall-clock 只用于已发送命令未收到 step-sync 的 liveness 故障，二者都只能产生显式 `SCAN_FAILED`，不得悄悄放行普通候选。
+- [x] 为上述强制 scan 增加小范围重排/丢包单测和 100-step 运行 smoke：应从首帧起看到
+  `SCAN` selection，scan 不能由 timeout 结束，完成后才进入普通语义行为。
+- [ ] **后续阶段，暂不实现：**支持可中断 `SCAN`。达到最小转角/观测覆盖后，如决策层发现
+  高关联目标或高收益交互候选，可用带原因与证据的 preemption 将 `SCAN` 切换到目标行为；
+  需要最小覆盖、收益阈值和滞回规则，避免 scan/目标之间振荡。
+- [ ] 将普通 `move_base` 的无 step-id `latest Twist` 路径纳入逐 step 可复现性审计：记录
+  `pre/target/post pose`、`cmd_vel`、`dt`、`sim_time_delta` 与跟踪残差；评估是否也需要
+  step-indexed pull 协议。当前仅保证每个 bridge action 的目标按固定 `v × dt` 构造，
+  不保证位置 PD 下的真实位移严格相等。
+- [x] 收敛交互接近位姿契约：move_base 返回后只轮询至多 N 个 fresh evaluator/simulator step 位姿
+  （当前 N=5），不以墙钟超时判失败；按同一几何契约验证，失败时尝试候选持久化 fallback pose，
+  并将实际有效 `effective_goal_xyyaw` 同步给 bridge、状态和离线 renderer。全部 pose poll/fallback
+  耗尽时立即排除该 pose-sensitive candidate 后重选；真实对象/动作失败仍保留 cooldown。
+
+### 4.4.2 运行时录像统一化（2026-08-03）
+
+- [x] 统一 semantic wrapper/batch recorder：逐 step 保存原始 PNG + JSON/manifest，drain 后
+  由离线 renderer 构建 MP4；录像完整性与语义导航正确性分开验收。
+- [x] 将离线六联图显示参数写入 raw `visualization_config`：图 3 使用 1.5x、图 5 使用
+  1.8x 世界坐标缩放；图 5 默认仅显示交互目标和 room 标签，避免对象文本遮挡且保持图元对齐。
+- [x] 为已确认 `make_plan_unreachable` 的交互终态增加正常早停：连续 20 个 observation step
+  无可执行候选且至少 3 次独立确认时发布 `EXPLORATION_STALLED`，正常收尾 raw recorder 与
+  离线 MP4；不能以通用 `timeout_noop` 异常替代该路径。
+- [x] 终态清除活动交互选择：发布 `semantic_selection.active=false` 并保留终态 feedback/history；
+  recorder 和离线 renderer 只渲染 active selection，防止最后一个 subgoal、箭头或交互标签在
+  IDLE/FAILED 帧中残留。House7 通道+容器 1500-horizon 回归在 446 step 正常早停，446/446 raw 与
+  离线帧 exact 对齐，覆盖 4 个 generic door 和 refrigerator 交互。
+- [ ] 将仍使用 legacy runtime encoder 的 V3 evaluator 与三场景 GT 入口迁移到同一
+  raw-only recorder/drain/offline-render 流程，并补回归测试。
+- [ ] 为 raw-only renderer 增加按 panel 导出的离线接口；当前仅支持完整离线六联图，
+  不能把 legacy saved-panel 功能误认为 raw-only 功能。
+
+### 4.4.3 严格 OCC→room→graph 性能（2026-08-05）
+
+- [x] 将 active-portal pocket 保留路径中的两次 Python 四邻域 BFS 替换为严格等价的
+  OpenCV 四邻域 labels + NumPy 筛选；保留 scan-order、八邻域 cut-touch、stable room ID 与
+  low-confidence pocket 语义。
+- [x] room-only overlay 在没有**已确认** open portal 时直接使用 raw OCC；pending planning
+  clear 不进入 room topology，避免整图 data/mask 双拷贝。
+- [x] 增加严格 topology cache：仅在 geometry、三值 OCC、confirmed portal revision 与
+  temporal state 都稳定时复用 room result；每个 raw source N 仍提交 room/graph 并发布 ready。
+- [x] room worker commit 立即发布 source-pinned core bundle（room grid、planning OCC、unified
+  graph、ready）；可视 markers 和持久化仍由低频 timer 处理。
+- [x] graph store 缓存同一 room grid 的聚合 statistics，仍推进 geometry stability、relation
+  rebuild 与 graph revision；merge/redirect 一律失效缓存。
+- [x] 为 struct mapping 增加 pointcloud→OCC 分段 telemetry。当前 smoke 显示 GMapping
+  `updateMap` 仅约 4–7 ms；定位到 `tf::MessageFilter` 的历史 30 ms tolerance 会要求
+  `stamp + 30 ms` 的未来 TF，而 bridge keepalive 为 250 ms，从而形成约 200 ms ingress 等待。
+- [x] 将 scan MessageFilter tolerance 参数化。50-step strict smoke 以
+  `SCAN_FILTER_TOLERANCE_SEC=0.0` 将 pointcloud ingress 从约 206.6 ms 降至约 57.6 ms，
+  且 50/50 source-pinned ready、无 transform/unsynced/stale/projection drop；默认仍保留
+  0.03 以避免未经视觉回归即改变基线。
+- [ ] 用 recorder-enabled fixed-seed smoke 对比 tolerance 0.03/0.0 的 OCC、local/global
+  costmap 与轨迹；同时评估较快 OCC publish 后 costmap 5 Hz update-loop warning 的实际影响。
+- [x] 在 NavToObjTask 的单次 `get_and_cache_all_step_information()` 动态作用域内缓存
+  visibility/reward；`try/finally` 后立即清空，不跨 step 或外部状态改变复用。50-step
+  strict smoke 的 `task_sensor_polling` 从约 94.5 ms 降至约 33.1 ms；新增 unit test 覆盖
+  同事务复用、下一事务刷新与事务外实时读取。
+- [x] 保持 `tf_keepalive_period_s=0.25`，不以提高 keepalive 频率修复 ingress：tolerance=0
+  时点云已有同 stamp TF，提频只会增加 cached-pose TF/odom 流量与潜在伪静止时间戳风险。
+- [x] realtime-GT 仅在下一 policy step 到达 GT interval 时，从同一 post-physics task state
+  捕获私有 head-camera segmentation snapshot；16/17 hit 的 strict 50-step smoke 中 active GT
+  从 83.30 ms 降至 61.62 ms。snapshot 不进入 ROS/recorder，qpos/time/camera 变化或
+  `force=True` interaction observation 一律退回 fresh render；禁止每 step 捕获（会抵消收益）。
+- [x] realtime-GT 关闭 semantic mapping 的 legacy `/registered_scan` 订阅，避免无消费者的
+  PointCloud2 反序列化；detector/offline-GT 保持原行为，误发 legacy scene input 会节流告警。
+- [x] step timing 增加 ready 后等待、fresh `/cmd_vel`/action topic 延迟与 GT snapshot hit，
+  将 costmap/DWA 调度延迟与 bridge readiness 分开计量；不改变 5 Hz controller/costmap 频率。
+- [x] 关闭无人订阅的 DWA trajectory/cost-grid debug PointCloud 发布；不改变 local plan、costmap
+  或控制决策。后续如需量化其单独收益，补 DWA-debug on/off 的固定 command-stream A/B。
+- [x] 完成 local costmap 5 Hz→10 Hz 隔离 A/B（DWA controller 与 publish 仍为 5 Hz）：10 Hz
+  未达到 100 ms deadline，loop 中位约 222 ms、full-step 355.15→369.44 ms、timeout noop
+  11→20/50；因此默认继续保留 5 Hz。
+- [x] 增加 metadata-only costmap latency probe，记录 raw/filtered PointCloud2、local costmap、
+  local plan 与 cmd_vel 的 receipt/stamp；5 Hz 50-step 中 filtered cloud→下一 local costmap
+  publish 为 p50 106 ms / p95 291 ms，header→header p50 170 ms / p95 352 ms。该值是端到端
+  表观延迟，不等于 `updateMap` 内部纯耗时。
+- [x] 完成 house7 1000-step raw-only recorder + 离线六联图：1000/1000 step boundary 持久化、
+  1000/1000 exact video alignment、drop/error=0；`full_step` 平均 527.92 ms，后 500 step
+  因连续 timeout noop 约 600 ms/step。视频与原始数据位于 `/home/ldl/tmp/house7_interactive_rule_1000step_6panel_20260806_001`。
+- [ ] 如需精确拆分 `costmap_2d::updateMap` 与 `DWAPlannerROS::computeVelocityCommands`，维护
+  外部 ROS navigation overlay 的专用计时 build；仓库当前不含这些源码，不能用修改频率替代测量。
+
 ## 4.5 实验与评估 TODO
 
 - [ ] 设计 MolmoSpaces 论文主线对比实验：`pure nav` vs `nav + oracle open` vs `interactive planner`
@@ -358,6 +598,62 @@
 - [ ] 先形成小样本 sanity check，再考虑自动 benchmark 生成
 - [ ] 明确第一版论文图/表最可能来自哪些实验结果
 - [ ] 明确 obj-goal 与 point-goal 两个设置下是否共用一套指标与主表
+
+### 4.5.1 当前固定评测标准
+
+详细定义见 [`docs/interactive_navigation_metrics.md`](docs/interactive_navigation_metrics.md)。
+
+主评测表保持简洁，只报告 5 个方法无关指标：
+
+| 指标 | 定义 | 备注 |
+|------|------|------|
+| `SR` | 最终任务成功率，即满足 `NavToObj` 的距离阈值和 head-camera 可见性条件 | 主结果指标 |
+| `SPL` | 成功加权路径效率，失败计 0，成功时按参考路径长度与实际路径长度的比值加权 | 参考路径应来自允许必要交互后的可行计划，而不是纯静态地图 |
+| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 | door 看 reachability，container 看 visibility，mixed 看必要交互链是否完成并最终服务目标成功 |
+| `Interaction Precision` | 执行过的交互中，有多少是有效交互 | 用于惩罚乱开无关门、无关容器或重复无效交互 |
+| `Total Cost` | `path_length + λ * interaction_count` | 后续可扩展为 door / container / failed interaction 的不同权重 |
+
+说明：
+
+- `reachability`、`visibility` 和 `enablement` 是论文叙事、benchmark 构建和 `Interaction Success Rate` 判定的核心语义，不作为主表中三个并列指标。
+- `Interaction Success Rate` 在不同 split 下使用不同判定：通道交互要求恢复可达性，容器交互要求揭示目标或满足目标可见性，混合交互要求完成必要交互链并最终满足导航成功条件。
+- 无交互样本必须保留，用于评估方法是否克制；其 `Interaction Success Rate` 可记为 `N/A`，但 `Interaction Precision`、`interaction_count` 和 `Total Cost` 仍然参与分析。
+- 主结果应按 `all`、`channel`、`container`、`mixed`、`no-interaction` split 展开，并同时报告 macro average，避免某一类样本数量过大主导总体结论。
+
+### 4.5.2 对应脚本规划
+
+后续脚本优先保持以下职责分离：
+
+1. `collect_mixed_rough_catalog.py`
+   - 输入：`container_rough_catalog_v1` 与原始 `nav_to_obj` benchmark 起点。
+   - 输出：`mixed_rough_catalog_v1`，保留所有实测全开 GT path 穿 interactive door 的 crossing 候选，并额外标注 `mixed_required_verified` 子集。
+   - 规则：粗筛的入选门槛只有 GT path 穿门；闭门阻断、门前提示可达属于诊断与优先级标签。粗筛不复用 V2 fine episode，也不把容器中心粗目标冒充最终交互位姿。
+
+2. `build_mixed_interaction_benchmark.py`
+   - 输入：一个或多个 `mixed_rough_catalog_v1`。
+   - 输出：直接符合统一 `interactive_nav_v3` 定义的 mixed benchmark。
+   - 规则：真实容器交互位姿必须再次满足穿门/关门阻断条件；所有 interaction、initial state、success evidence 和 minimality 均来自 MuJoCo/readback 实测。
+   - 规则：不把 `oracle_plan` 暴露给 policy；只作为 evaluator / scorer 的 GT 标签与参考计划。
+
+3. `interactive_nav_v3.py` 统一校验入口
+   - 结构：公共校验 + channel/container/mixed 场景专用校验。
+   - 兼容：保留 `validate_channel_v3_episode`、`validate_container_v3_episode`、`validate_mixed_v3_episode` 专用入口。
+
+4. `evaluate_interactive_nav_dataset.py`
+   - 输入：v3 benchmark JSON。
+   - 输出：数据集质量报告，而不是 policy 性能报告。
+   - 检查：schema validity、无占位字段、`interaction_requirement` 分布、split 分布、`success_evidence` 状态、必要交互链与 prerequisite 一致性、no-interaction 样本是否确实不包含 interactions。
+
+5. `score_interactive_nav_run.py`
+   - 输入：v3 benchmark JSON + policy rollout 输出。
+   - 输出：主指标表和 per-episode 诊断。
+   - 主指标：`SR`、`SPL`、`Interaction Success Rate`、`Interaction Precision`、`Total Cost`。
+   - 输出 split：`all`、`channel`、`container`、`mixed`、`no-interaction`，并保留每个 episode 的失败原因用于附录分析。
+
+6. `summarize_interactive_nav_results.py`
+   - 输入：一个或多个 scorer 输出。
+   - 输出：论文表格用 CSV / Markdown。
+   - 作用：对多个方法统一生成主表，避免每个方法单独写统计脚本。
 
 ## 4.6 中远期规划 TODO
 

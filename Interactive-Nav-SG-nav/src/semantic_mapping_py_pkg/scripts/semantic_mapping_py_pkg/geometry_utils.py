@@ -11,10 +11,73 @@ def euclidean_2d(a, b):
     return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
 
 
-def world_to_grid(x, y, grid_info):
-    mx = int((float(x) - grid_info.origin.position.x) / grid_info.resolution)
-    my = int((float(y) - grid_info.origin.position.y) / grid_info.resolution)
-    if mx < 0 or my < 0 or mx >= grid_info.width or my >= grid_info.height:
+def grid_origin_yaw(grid_info):
+    """Return the planar rotation of an OccupancyGrid origin.
+
+    Some lightweight test fixtures and older callers only provide an origin
+    position.  They describe an axis-aligned map, so treat a missing
+    orientation as the identity quaternion.
+    """
+
+    orientation = getattr(getattr(grid_info, "origin", None), "orientation", None)
+    x = float(getattr(orientation, "x", 0.0))
+    y = float(getattr(orientation, "y", 0.0))
+    z = float(getattr(orientation, "z", 0.0))
+    w = float(getattr(orientation, "w", 1.0))
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def grid_to_world(mx, my, grid_info, center=True):
+    """Convert an OccupancyGrid cell coordinate to world coordinates."""
+
+    resolution = float(grid_info.resolution)
+    if resolution <= 0.0:
+        raise ValueError("OccupancyGrid resolution must be positive")
+    offset = 0.5 if center else 0.0
+    local_x = (float(mx) + offset) * resolution
+    local_y = (float(my) + offset) * resolution
+    yaw = grid_origin_yaw(grid_info)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    origin = grid_info.origin.position
+    return (
+        float(origin.x) + cos_yaw * local_x - sin_yaw * local_y,
+        float(origin.y) + sin_yaw * local_x + cos_yaw * local_y,
+    )
+
+
+def world_to_grid(x, y, grid_info, check_bounds=True):
+    """Convert world coordinates to OccupancyGrid cell coordinates.
+
+    ROS OccupancyGrid origins include both a translation and a yaw.  The
+    inverse rotation is required before converting the local metric position
+    into a cell index.  Callers that draw clipped map primitives may opt out
+    of bounds checking and receive off-grid endpoint coordinates.
+    """
+
+    resolution = float(grid_info.resolution)
+    if resolution <= 0.0:
+        return None
+    origin = grid_info.origin.position
+    dx = float(x) - float(origin.x)
+    dy = float(y) - float(origin.y)
+    yaw = grid_origin_yaw(grid_info)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    local_x = cos_yaw * dx + sin_yaw * dy
+    local_y = -sin_yaw * dx + cos_yaw * dy
+    # The inverse rotation can turn an exact cell boundary into a value such
+    # as 2.9999999999999996.  Keep that numerical noise from moving portal
+    # cuts or object samples into the preceding cell.
+    boundary_epsilon = 1e-9
+    mx = int(math.floor(local_x / resolution + boundary_epsilon))
+    my = int(math.floor(local_y / resolution + boundary_epsilon))
+    if check_bounds and (
+        mx < 0 or my < 0 or mx >= grid_info.width or my >= grid_info.height
+    ):
         return None
     return mx, my
 

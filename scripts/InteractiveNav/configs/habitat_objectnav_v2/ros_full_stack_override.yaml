@@ -1,0 +1,65 @@
+frames:
+  world_frame: habitat_v2_map
+  base_frame: habitat_v2_base
+  camera_frame: habitat_v2_camera
+
+topics:
+  rgb_image: /habitat_v2/full/rgb
+  depth_image: /habitat_v2/full/depth
+  camera_info: /habitat_v2/full/camera_info
+  # Keep the planning grid as the explorer contract: a focused 00813 A/B showed
+  # that substituting sparse raw evidence starved all routeable candidates.  Raw
+  # evidence is still published separately for recorder/audit comparison; the
+  # Habitat-specific footprint values below reduce the extra safety projection.
+  occupancy_grid: /struct_mapping/occ_map
+  odom: /odom
+
+object_detection:
+  backend: yoloe_pf_box3d
+  provider: external_http
+  external_url: http://127.0.0.1:12219/detect
+  timeout: 20.0
+  include_depth: false
+  confidence_threshold: 0.35
+  publish_rate: 20.0
+  max_sync_slop_sec: 0.2
+  skip_if_busy: true
+  process_each_stamp_once: true
+  projection_frame_id: habitat_v2_camera
+  class_mapping: /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/configs/habitat_objectnav_v2/objectnav_v2_yoloe_class_mapping.json
+
+room_inference:
+  backend: object_rules
+  publish_rate: 5.0
+  min_confidence: 0.2
+
+room_mllm:
+  enabled: false
+
+semantic_map:
+  enable_object_mapping: true
+  enable_scene_mapping: false
+  subscribe_pointcloud: false
+  step_ready_require_room_graph: false
+  graph_min_observations: 1
+  room_min_component_cells: 12
+  room_core_min_component_cells: 20
+  room_geometry_stability_frames: 2
+
+interaction_graph:
+  scene_id: habitat_objectnav_v2
+
+candidate:
+  interaction_types: []
+  max_frontier_candidates: 12
+  # The bridge already synchronizes the detector result to the exact Habitat
+  # RGB stamp.  A single current high-confidence observation may therefore be
+  # offered as a NAVIGATE candidate; M2 and M3 remain separate gates.
+  target_min_consecutive_observations: 1
+
+startup_scan:
+  enabled: false
+
+exploration:
+  external_behavior_control: true
+  initial_spin_enabled: false

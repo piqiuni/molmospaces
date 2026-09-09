@@ -1,0 +1,435 @@
+step_ready_enabled: true
+step_ready_topic: "/semantic_decision/step_ready"
+step_ready_required_modules: ["semantic_mapping", "explore_py"]
+# The strict semantic-mapping token also turns this on automatically.  This
+# explicit switch is useful for smoke tests that want to reject mixed sources
+# before a strict mapper token has been observed.
+step_ready_require_exact_source: false
+
+topics:
+  explorer_status: "/explore_py/status"
+  explorer_proposals: "/explore_py/proposals"
+  unified_graph: "/semantic_mapping/unified_graph"
+  odom: "/odom"
+  candidates: "/semantic_decision/candidates"
+  target_context: "/semantic_decision/target"
+  goal_status: "/semantic_decision/goal_status"
+  selected_behavior: "/semantic_decision/selected_behavior"
+  preempt_request: "/semantic_decision/preempt_request"
+  behavior_feedback: "/semantic_decision/behavior_feedback"
+  recovery_request: "/semantic_decision/recovery_request"
+  recovery_feedback: "/semantic_decision/recovery_feedback"
+  execution_state: "/semantic_decision/execution_state"
+  explore_command: "/explore_py/command"
+  explore_feedback: "/explore_py/behavior_feedback"
+  interaction_command: "/semantic_decision/interaction_command"
+  interaction_result: "/semantic_mapping/interaction_result"
+  attribute_updates: "/semantic_mapping/attribute_updates"
+  attribute_refresh_requests: "/semantic_mapping/attribute_refresh_requests"
+  move_base: "/move_base"
+  cmd_vel: "/cmd_vel"
+  cmd_vel_stamped: "/cmd_vel_stamped"
+  occupancy: "/move_base/local_costmap/costmap"
+  # Raw SLAM source and the semantic StaticLayer input used by the global
+  # planner.  A post-open traversal gates across both before reading costmap.
+  raw_occupancy_grid: "/struct_mapping/occ_map"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  global_costmap: "/move_base/global_costmap/costmap"
+  global_costmap_updates: "/move_base/global_costmap/costmap_updates"
+  local_plan: "/move_base/DWAPlannerROS/local_plan"
+
+mission:
+  mode: "semantic_interaction_exploration"
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "rule_verified"
+
+candidate:
+  max_frontier_candidates: 12
+  interaction_types: ["portal", "container"]
+  container_require_same_room: false
+  container_allow_connected_room: false
+  max_state_age_sec: 300.0
+  min_state_confidence: 0.5
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
+  # Unset by default: the candidate node derives this as true for the rule
+  # lane (attempt an opaque unknown portal once) and false for model runs
+  # (wait for visual MLLM evidence).  An ablation may override explicitly.
+  # portal_unknown_default_interact: true
+  portal_standoff_m: 0.85
+  container_standoff_m: 0.5
+  # Drawer containers use the same nominal approach distance as other
+  # containers.  Keep this explicit so a future task can tune drawers without
+  # accidentally restoring the old, shorter 0.25 m distance.
+  drawer_standoff_m: 0.5
+  interaction_safety_margin_m: 0.25
+  interaction_ready_distance_m: 0.45
+  interaction_ready_yaw_tolerance_rad: 0.55
+  require_current_visibility: false
+  # Portal-specific visibility may be enabled without removing remembered
+  # container planning candidates.  Successful open state remains in the graph;
+  # this gate applies only while generating a new portal INTERACT candidate.
+  portal_require_current_visibility: false
+  portal_min_visible_pixels: 128
+  portal_min_visible_fraction: 0.2
+  target_standoff_m: 1.0
+  target_max_state_age_sec: 300.0
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: false
+  target_require_visibility_verification: true
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
+  target_arrival_tolerance_m: 0.35
+  # Containers without a fresh M1 front/oblique view are approached from a
+  # bounded four-view ring; M1 then refreshes the visible state at the pose.
+  container_multiview_enabled: true
+  container_multiview_face_count: 4
+  container_m1_face_selection_enabled: false
+  fridge_multiview_angular_scale: 1.0
+  # Leave unset here: the candidate node enables the fresh front-surface gate
+  # only for the dynamic-M1 lane.  A rule/oracle ablation remains explicit.
+  # container_pre_action_mllm: true
+  container_pre_action_observation_max_attempts: 4
+  # A two-stage container has a finite outer M1 staging ring.  Do not terminal
+  # it after the legacy four visual checks while unvisited safe outer poses
+  # remain; this value is clamped to the generated ring length.
+  container_two_stage_observation_max_attempts: 12
+  # Opt-in simplified contract for generated model-lane candidates.  When true,
+  # the selected container anchor is simultaneously the navigation, M1, and
+  # physical-action pose.  Legacy/rule callers keep the staged contract.
+  container_anchor_shared_pose_enabled: false
+  drawer_navigation_anchor_aabb_fan_enabled: false
+  drawer_navigation_anchor_fan_clearances_m: [0.60, 0.95, 1.30]
+  drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
+
+policy:
+  backend: "rule"
+  exploration_gain_weight: 1.0
+  visibility_gain_weight: 0.8
+  semantic_gain_weight: 0.6
+  target_relevance_weight: 3.0
+  confidence_weight: 0.25
+  priority_weight: 0.45
+  distance_cost_weight: 0.45
+  distance_normalization_m: 6.0
+  interaction_cost_weight: 0.30
+  staleness_cost_weight: 0.35
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  continuity_bonus: 0.25
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 0.0
+  minimum_score: -1000000000.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
+  success_cooldown_s: 5.0
+  failure_retry_delay_s: 2.0
+  # A container whose complete anchor batch is unreachable is deferred as a
+  # whole; do not spend the next decision cycle immediately replaying it.
+  container_anchor_unreachable_cooldown_s: 60.0
+  # Also suppress the unchanged target for a deterministic number of simulator
+  # observations; wall time alone is unstable under parallel evaluation load.
+  container_anchor_unreachable_cooldown_steps: 300
+  # After a portal open, retain the crossing candidate until the *same* portal
+  # is publicly open/traversable and a fresh capture has reached the graph.
+  # The evaluator continues advancing RGB-D/scan steps while decision making
+  # waits; any timeout only falls back to executor-side make_plan waiting.
+  post_interaction_refresh_enabled: true
+  post_interaction_refresh_min_candidate_updates: 2
+  post_interaction_refresh_timeout_s: 30.0
+  post_interaction_refresh_require_graph_revision: true
+  post_interaction_refresh_require_observation_step: true
+  post_interaction_refresh_require_portal_open_confirmation: true
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
+  repeat_guard_min_visible_area_shrink_m2: 0.5
+
+model:
+  mode: "disabled"
+  command: ""
+  endpoint: ""
+  api_key_env: "OPENAI_API_KEY"
+  model: "qwen3.6-35b-a3b"
+  protocol: "openai_chat"
+  timeout_s: 3.0
+  reasoning_effort: "off"
+  metrics_path: ""
+  max_graph_nodes: 80
+  max_graph_edges: 160
+  max_tokens: 256
+  selection_granularity: "candidate"
+  candidate_top_k: 8
+  navigate_quota: 1
+  interaction_quota: 3
+  explore_quota: 4
+  max_frontiers_per_room: 2
+  max_candidates_per_region: 1
+  explore_min_visible_gain_ratio: 0.25
+  explore_visible_unknown_area_weight: 0.50
+  explore_new_room_bonus: 0.70
+  explore_potential_child_room_bonus: 0.25
+  explore_room_target_affinity_bonus: 0.20
+  explore_room_target_mismatch_penalty: 0.60
+  room_target_mismatch_confidence_threshold: 0.75
+  reserve_unentered_room_frontier_slots: 1
+  suppress_semantic_container_mismatch: true
+  pre_score_guard_margin: 0.75
+  history_region_size_m: 1.0
+  stale_goal_position_tolerance_m: 0.35
+  stale_goal_yaw_tolerance_rad: 0.50
+  full_image_max_side_px: 960
+  crop_max_side_px: 512
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+  # A material raw frontier that has no currently safe viewpoint is not map
+  # exhaustion.  Wait for a bounded number of fresh observations, then surface
+  # it as EXPLORATION_STALLED rather than falsely reporting exhausted.
+  retryable_frontier_stall_min_steps: 50
+  retryable_frontier_stall_confirmations: 3
+  # Three terminal move-base approach failures make one concrete interaction
+  # subgoal planner-unreachable for the rest of this episode.
+  interaction_approach_failure_limit: 3
+  # Once a concrete INTERACT candidate reaches the failure limit above, if no
+  # executable replacement appears for this many simulator observations, end
+  # the exploration attempt rather than advancing silent timeout/noop steps to
+  # the task horizon.
+  # This is intentionally observation-step based (not ROS message count) and
+  # is reset as soon as a normal scan or any executable replacement appears.
+  terminal_no_plan_exit_enabled: true
+  no_executable_candidate_min_steps: 20
+  no_executable_candidate_confirmations: 3
+
+startup_scan:
+  # Phase-1 bootstrap behavior: the decision layer must select SCAN before
+  # regular EXPLORE/NAVIGATE/INTERACT candidates become available.
+  enabled: true
+  angle_rad: 6.283185307179586
+  angular_speed_rad_s: 1.25
+  # RosBridge converts each accepted cmd_vel to exactly w * policy_dt.
+  control_dt_s: 0.2
+  # Logical evaluator-control time, not wall clock: this keeps slow ROS or
+  # rendering throughput from changing the executed scan trajectory.
+  timeout_s: 15.0
+  max_control_steps: 40
+  # Wall clock is only a liveness guard after a sent command receives no ack.
+  step_sync_stall_timeout_s: 5.0
+  max_pending_steps: 32
+  pair_max_age_s: 0.75
+
+executor:
+  map_frame: "tf_frame_map"
+  base_frame: "tf_frame_base_link"
+  navigation_timeout_s: 180.0
+  interaction_navigation_timeout_s: 180.0
+  interaction_timeout_s: 30.0
+  # A grounded drawer scan has a finite evaluator-step macro.  While those
+  # steps keep arriving, do not let host/render wall time turn it into a false
+  # failure.  The cap covers the strict public schema maximum of eight regions
+  # at smooth(5)+observe(3)+close(5), plus bounded delivery slack.
+  drawer_scan_execution_step_budget_authoritative: true
+  drawer_scan_execution_max_task_steps: 120
+  drawer_scan_execution_step_budget_margin: 8
+  drawer_scan_execution_step_sync_stall_timeout_s: 5.0
+  drawer_scan_execution_wall_cap_s: 180.0
+  interaction_observation_timeout_s: 30.0
+  interaction_observation_poll_interval_s: 0.05
+  # A container reaches the paired inner action pose only after one causally
+  # later, direct-front M1 observation at the *outer* safe staging pose.  The
+  # physical bridge still validates pose/sweep safety; deployments that need a
+  # temporal visual vote can explicitly raise this to two or more.
+  container_pre_action_confirmation_count: 1
+  container_pre_action_require_direct_front: true
+  # A frontal M1 image may be captured with up to 30 degrees of residual base
+  # yaw; manipulation keeps its separate, stricter pose/sweep validation.
+  container_m1_capture_yaw_tolerance_rad: 0.5235987756
+  # A cancelled capture must be terminal on the move_base server, not merely in
+  # SimpleActionClient's local state, before a successor calls make_plan.
+  container_m1_capture_successor_quiescence_timeout_s: 1.0
+  # The same server-status fence now protects every navigation successor.  The
+  # capture key above remains a compatibility fallback for older overlays.
+  move_base_successor_quiescence_timeout_s: 1.0
+  verification_timeout_s: 30.0
+  explore_prepare_timeout_s: 3.0
+  explore_finalize_timeout_s: 10.0
+  explore_reservation_retry_sec: 0.25
+  # ExplorePy can report a failed frontier preflight.  The executor consumes
+  # this request and alone owns the costmap-gated safe reverse/replan action.
+  external_recovery_request_enabled: true
+  external_recovery_request_max_age_s: 20.0
+  # Recover a single active goal that reaches ABORTED or stagnates before the
+  # legacy multi-subgoal watchdog can trigger. The executor owns the only
+  # direct cmd_vel lease and admits the reverse only against a fresh costmap.
+  navigation_failure_recovery_enabled: true
+  navigation_failure_recovery_max_attempts: 1
+  graph_poll_rate_hz: 5.0
+  rear_goal_prerotate_enabled: true
+  # A path heading at or beyond 90 degrees is treated as rear navigation and
+  # never handed straight to an unmodified DWA turn cycle.
+  rear_goal_enter_angle_rad: 1.5707963267948966
+  rear_goal_exit_angle_rad: 0.20
+  rear_goal_rotate_speed_rad_s: 1.25
+  rear_goal_prerotate_timeout_s: 12.0
+  rear_goal_prerotate_step_sync_enabled: true
+  rear_goal_prerotate_control_dt_s: 0.2
+  # The controller always follows the normalized shortest-angle arc.  If its
+  # costmap sweep is blocked, fail closed instead of taking a long opposite arc.
+  rear_goal_prerotate_max_control_steps: 28
+  # Pose/TF publication may trail the final applied yaw action.  Observe this
+  # bounded number of later simulator steps before rejecting the turn, without
+  # emitting any additional rotation command.
+  rear_goal_prerotate_post_budget_settle_steps: 3
+  rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
+  # Pair the already-published RGB with the bridge's later fresh-cmd window;
+  # one acknowledged cmd_vel becomes one fixed 0.2 s simulator action.
+  rear_goal_prerotate_gate_max_pending_steps: 32
+  rear_goal_prerotate_gate_pair_max_age_s: 0.75
+  # Bounded delivery retries only for a bridge timeout noop, never an
+  # unbounded yaw-only DWA fallback.
+  rear_goal_prerotate_delivery_retry_steps: 2
+  rear_goal_lookahead_m: 0.75
+  rear_goal_pi_tie_tolerance_rad: 0.20
+  rear_goal_pi_turn_sign: -1
+  # Direct turns/backoffs require a fresh local costmap and the public
+  # robot_radius footprint.  Unknown/out-of-map cells are blocked.
+  rear_goal_local_costmap_max_age_s: 0.75
+  rear_goal_robot_radius_m: 0.25
+  rear_goal_safety_margin_m: 0.05
+  # Match costmap_2d collision semantics: values below INSCRIBED_INFLATED_
+  # OBSTACLE (253) are soft inflation costs for DWA scoring, not physical
+  # collision cells.  The explicit radius+margin sweep below still protects
+  # the base from inscribed/lethal cells.
+  rear_goal_costmap_occupied_threshold: 253
+  rear_goal_unknown_is_blocked: true
+  rear_goal_rotation_sweep_step_rad: 0.10
+  rear_goal_cmd_vel_cancel_wait_s: 0.50
+  # A DWA window is considered oscillatory only after four applied cmd_vel
+  # steps contain two sign flips and no measurable translation/goal progress.
+  rear_goal_oscillation_window_steps: 4
+  rear_goal_oscillation_min_sign_flips: 2
+  rear_goal_oscillation_max_displacement_m: 0.05
+  rear_goal_oscillation_min_goal_reduction_m: 0.02
+  rear_goal_cmd_vel_max_age_s: 0.50
+  # If both turn sweeps are occupied, a short reverse is attempted only when
+  # the same fresh-grid circular-footprint test proves its full distance.
+  rear_goal_reverse_enabled: true
+  rear_goal_reverse_distance_m: 0.15
+  rear_goal_reverse_min_distance_m: 0.05
+  rear_goal_reverse_speed_mps: 0.10
+  rear_goal_reverse_max_control_steps: 10
+  final_align_enabled: false
+  # Interaction-only final yaw correction is opt-in per task lane.  It never
+  # enables generic NAVIGATE/EXPLORE final alignment.
+  interaction_final_align_enabled: false
+  interaction_final_align_max_distance_m: 0.35
+  interaction_final_align_yaw_tolerance_rad: 0.15
+  interaction_final_align_rotate_speed_rad_s: 0.30
+  interaction_final_align_trigger_delay_s: 2.0
+  interaction_final_align_timeout_s: 15.0
+  # If move_base is still ACTIVE after entering the interaction XY envelope,
+  # keep DWA as the single terminal-yaw controller for this many evaluator
+  # steps (75 steps = 15 simulated seconds at the default dt=.2).
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  # When interaction final-align is enabled by a task override, emit each
+  # rotation only inside a same-step RGB/fresh-command window.
+  interaction_final_align_step_sync_enabled: true
+  interaction_final_align_control_dt_s: 0.2
+  # 56 = ceil(pi / (0.30 * 0.20)) + 3 tracking-margin windows; the runtime
+  # still budgets only the steps required by the current yaw error.
+  interaction_final_align_max_control_steps: 56
+  # Bounded tracking allowance for applied yaw being slightly smaller than the
+  # nominal speed × fixed control dt estimate.
+  interaction_final_align_control_step_margin_steps: 4
+  # Same causal pose-settle tail as rear pre-rotation; command count remains
+  # strictly bounded by the derived interaction yaw budget.
+  interaction_final_align_post_budget_settle_steps: 3
+  interaction_final_align_step_sync_stall_timeout_s: 2.0
+  interaction_final_align_gate_max_pending_steps: 32
+  interaction_final_align_gate_pair_max_age_s: 0.75
+  interaction_final_align_delivery_retry_steps: 2
+  final_align_cancel_wait_s: 1.0
+  make_plan_preflight_enabled: true
+  make_plan_service: "/move_base/make_plan"
+  make_plan_service_wait_sec: 2.0
+  make_plan_tolerance_m: 0.20
+  make_plan_endpoint_tolerance_m: 0.60
+  make_plan_fail_open: true
+  make_plan_empty_retry_count: 2
+  make_plan_empty_retry_delay_s: 0.15
+  # A move_base ABORT can briefly lag a just-successful outer container M1-staging
+  # preflight.  Wait for one newer global-costmap receipt before a single same-pose
+  # replan; no M1, physical action, or direct motion is permitted in this wait.
+  container_outer_staging_abort_replan_global_costmap_wait_s: 1.00
+  container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
+  # A receipt is not itself a healthy global planner.  Keep checking the exact
+  # same safe staging goal for a bounded window, and resend only after two
+  # endpoint-valid `reachable` replies separated by a quiet interval.
+  container_outer_staging_abort_replan_plan_retry_window_s: 6.0
+  container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
+  container_outer_staging_abort_replan_plan_health_confirmations: 2
+  container_outer_staging_abort_replan_plan_health_interval_s: 0.30
+  # A successful portal open must causally propagate from raw SLAM occupancy
+  # through planning_occ_map to the global costmap before make_plan runs.
+  # This is one total bounded wait, rather than a per-stage retry loop.
+  post_interaction_costmap_fresh_timeout_s: 2.0
+  post_interaction_costmap_fresh_poll_interval_s: 0.05
+  # Once that fresh map is observed, keep any same-waypoint retry short.
+  post_interaction_traversal_make_plan_retry_window_s: 0.35
+  post_interaction_traversal_make_plan_retry_interval_s: 0.10
+  explore_make_plan_fail_open_after_retries: true
+  navigation_stagnation_timeout_s: 12.0
+  # Public evaluator-step budgets.  At the nominal 0.2 s action cadence,
+  # 60 steps correspond to the legacy 12 s translation watchdog.
+  navigation_stagnation_timeout_task_steps: 60
+  # Persist across private move_base/corridor workers.  One semantic anchor is
+  # abandoned after k steps without progress; the mission exits after 3*k.
+  semantic_progress_supervisor_enabled: true
+  semantic_subgoal_no_progress_task_steps: 60
+  semantic_mission_no_progress_task_steps: 180
+  navigation_max_task_steps: 360
+  interaction_navigation_max_task_steps: 240
+  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_stagnation_distance_m: 0.10
+  navigation_stagnation_yaw_rad: 0.15
+  # Do not cancel a deliberately slow DWA trajectory when it has published a
+  # fresh plan and has made a material net reduction toward its goal.
+  navigation_stagnation_goal_distance_reduction_m: 0.02
+  navigation_stagnation_local_plan_max_age_s: 1.0
+  navigation_stagnation_local_plan_min_poses: 2
+  # An INTERACT command remains committed across a small set of approach
+  # poses; switch only after the current approach hits the stagnation guard.
+  interaction_approach_fallback_max_attempts: 4
+  # Two-stage container interaction advertises up to three rings x four faces.
+  # Keep the broader sequence bounded, but do not truncate it to the portal
+  # fallback budget before a different M1 observation can be tried.
+  container_two_stage_fallback_max_attempts: 12
+  # For a fresh M1-authorized container face, walk at most this many short
+  # make-plan-backed segments before the existing final physical bridge pose.
+  # These executor-private points never trigger M1 or an interaction command.
+  container_inner_corridor_enabled: true
+  container_inner_corridor_segment_m: 0.30
+  container_inner_corridor_arrival_tolerance_m: 0.10
+  container_inner_corridor_max_segments: 4
+  interaction_approach_fallback_cancel_wait_s: 0.5
+  # Once move_base reports arrival, validate the simulator pose on this many
+  # fresh evaluator steps.  This is intentionally count-bounded, not
+  # wall-clock bounded, so slow ROS/rendering cannot manufacture a failure.
+  interaction_approach_pose_poll_max_attempts: 5
+  stuck_recovery_enabled: true
+  stuck_recovery_subgoal_failures: 3
+  stuck_recovery_min_displacement_m: 0.10
+  stuck_recovery_backoff_distance_m: 0.20
+  stuck_recovery_speed_mps: 0.12
+  stuck_recovery_timeout_s: 8.0
+  stuck_recovery_obstacle_escape_distance_m: 0.35
+  stuck_recovery_robot_radius_m: 0.25
+  stuck_recovery_safety_margin_m: 0.05
+  stuck_recovery_unknown_is_blocked: true

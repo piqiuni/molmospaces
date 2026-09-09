@@ -1,7 +1,7 @@
 """Task configuration classes for MolmoSpaces experiments."""
 
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -173,6 +173,8 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     pickup_obj_candidates: list[str] | None = (
         None  # List of all candidate object instances of this type
     )
+    # Legacy benchmarks navigate to any candidate; v3 container episodes set this explicitly.
+    selection_mode: Literal["specific_instance", "any_candidate"] = "any_candidate"
     pickup_obj_category: str | None = None  # Semantic category (e.g., "apple")
     pickup_obj_synset: str | None = None  # WordNet synset (e.g., "apple.n.01")
     robot_base_pose: list[float] | None = None

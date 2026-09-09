@@ -1,0 +1,78 @@
+TebLocalPlannerROS:
+  odom_topic: /odom
+  map_frame: tf_frame_odom
+
+  teb_autosize: true
+  dt_ref: 0.20
+  dt_hysteresis: 0.05
+  global_plan_overwrite_orientation: true
+  allow_init_with_backwards_motion: false
+  max_global_plan_lookahead_dist: 1.50
+  force_reinit_new_goal_dist: 0.50
+  force_reinit_new_goal_angular: 0.78
+  feasibility_check_no_poses: -1
+  feasibility_check_lookahead_distance: 1.0
+  exact_arc_length: true
+  publish_feedback: true
+  control_look_ahead_poses: 1
+  global_plan_viapoint_sep: 0.30
+  via_points_ordered: true
+
+  max_vel_x: 0.35
+  max_vel_x_backwards: 0.05
+  max_vel_theta: 0.80
+  acc_lim_x: 0.50
+  acc_lim_theta: 1.00
+  max_vel_y: 0.0
+  max_vel_trans: 0.35
+  min_turning_radius: 0.0
+  use_proportional_saturation: true
+  transform_tolerance: 0.50
+
+  footprint_model:
+    type: circular
+    radius: 0.30
+
+  xy_goal_tolerance: 0.30
+  yaw_goal_tolerance: 3.14
+  free_goal_vel: true
+  trans_stopped_vel: 0.05
+  theta_stopped_vel: 0.10
+
+  min_obstacle_dist: 0.05
+  inflation_dist: 0.25
+  dynamic_obstacle_inflation_dist: 0.25
+  include_dynamic_obstacles: false
+  include_costmap_obstacles: true
+  legacy_obstacle_association: false
+  obstacle_association_force_inclusion_factor: 2.0
+  obstacle_association_cutoff_factor: 6.0
+  costmap_obstacles_behind_robot_dist: 1.0
+  obstacle_poses_affected: 15
+  costmap_converter_plugin: ""
+
+  no_inner_iterations: 5
+  no_outer_iterations: 3
+  optimization_activate: true
+  optimization_verbose: false
+  penalty_epsilon: 0.05
+  weight_max_vel_x: 2.0
+  weight_max_vel_theta: 1.0
+  weight_acc_lim_x: 5.0
+  weight_acc_lim_theta: 5.0
+  weight_kinematics_nh: 1000.0
+  weight_kinematics_forward_drive: 20.0
+  weight_kinematics_turning_radius: 1.0
+  weight_optimaltime: 1.0
+  weight_shortest_path: 0.0
+  weight_obstacle: 50.0
+  weight_inflation: 0.2
+  weight_viapoint: 5.0
+  weight_adapt_factor: 2.0
+
+  enable_homotopy_class_planning: false
+  enable_multithreading: false
+  max_number_classes: 1
+
+  shrink_horizon_backup: true
+  oscillation_recovery: true

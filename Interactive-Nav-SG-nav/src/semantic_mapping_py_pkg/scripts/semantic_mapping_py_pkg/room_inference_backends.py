@@ -8,6 +8,74 @@ class RoomInferenceBackend:
         raise NotImplementedError
 
 
+class WeightedRoomAttributeInferencer(RoomInferenceBackend):
+    def __init__(self, object_room_priors, min_confidence=0.2):
+        self.min_confidence = float(min_confidence)
+        self.object_to_room_scores = defaultdict(dict)
+        for room, priors in (object_room_priors or {}).items():
+            for obj_name, score in (priors or {}).items():
+                self.object_to_room_scores[normalize_label(obj_name)][
+                    normalize_label(room)
+                ] = float(score)
+
+    def infer(self, detections):
+        strongest_evidence = {}
+        for detection in detections or []:
+            label = normalize_label(
+                detection.get("semantic_name")
+                or detection.get("semantic_class")
+                or detection.get("class")
+                or detection.get("category")
+            )
+            confidence = float(
+                detection.get("confidence", detection.get("conf", 1.0)) or 0.0
+            )
+            for room, prior in self.object_to_room_scores.get(label, {}).items():
+                vote = confidence * prior
+                evidence_key = (room, label)
+                evidence_record = {
+                    "node_id": str(detection.get("node_id") or ""),
+                    "object_label": label,
+                    "object_confidence": confidence,
+                    "prior_weight": prior,
+                    "vote": vote,
+                }
+                previous = strongest_evidence.get(evidence_key)
+                if previous is None or vote > float(previous["vote"]):
+                    strongest_evidence[evidence_key] = evidence_record
+
+        room_scores = defaultdict(float)
+        evidence = defaultdict(list)
+        for (room, _label), evidence_record in strongest_evidence.items():
+            room_scores[room] += float(evidence_record["vote"])
+            evidence[room].append(evidence_record)
+
+        if not room_scores:
+            return {
+                "room_attribute": "unknown",
+                "confidence": 0.0,
+                "scores": {},
+                "evidence": [],
+            }
+
+        room, score = max(room_scores.items(), key=lambda item: (item[1], item[0]))
+        total_score = sum(max(value, 0.0) for value in room_scores.values())
+        confidence = min(1.0, max(score, 0.0)) * (
+            max(score, 0.0) / total_score if total_score > 1e-8 else 0.0
+        )
+        inferred_room = room if confidence >= self.min_confidence else "unknown"
+        ranked_evidence = sorted(
+            evidence[room],
+            key=lambda item: (-float(item["vote"]), item["object_label"], item["node_id"]),
+        )
+        return {
+            "room_attribute": inferred_room,
+            "confidence": confidence,
+            "scores": dict(sorted(room_scores.items())),
+            "evidence": ranked_evidence,
+        }
+
+
 class ObjectRulesRoomInference(RoomInferenceBackend):
     def __init__(self, object_room_priors, min_confidence=0.2):
         self.object_room_priors = object_room_priors or {}

@@ -1,0 +1,31 @@
+# Compose with semantic_decision_py_pkg/config/default.yaml through
+# semantic_decision.launch's override_config_file argument.  This is kept
+# separate from object_goal_runtime.yaml so normal ROS object-goal runs retain
+# graph-verified interaction behavior.
+mission:
+  mode: "semantic_interaction_object_goal"
+
+target:
+  enabled: false
+  object_labels: []
+  require_interaction: true
+  completion_requires_visibility: true
+
+candidate:
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: true
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
+
+policy:
+  target_relevance_weight: 3.0
+  # The trusted evaluator returns only command success/failure.  A successful
+  # open establishes an episode-local belief; it is not a simulator state read.
+  direct_atomic_outcome_belief_enabled: true
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "direct_atomic"

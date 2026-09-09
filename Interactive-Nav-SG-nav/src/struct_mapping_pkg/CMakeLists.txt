@@ -5,7 +5,12 @@ find_package(catkin REQUIRED nav_msgs nodelet openslam_gmapping roscpp tf rosbag
 
 find_package(Boost REQUIRED)
 
-include_directories(${Boost_INCLUDE_DIRS} ${catkin_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+include_directories(
+  ${CMAKE_SOURCE_DIR}/openslam_gmapping/include
+  ${Boost_INCLUDE_DIRS}
+  ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+)
 
 include_directories(include)
 

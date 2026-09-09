@@ -1,0 +1,32 @@
+# Only the original Module-1 object detector reads this override.  The bridge
+# publishes the three public Habitat sensor streams with matching ROS stamps.
+frames:
+  world_frame: habitat_v2_camera
+  camera_frame: habitat_v2_camera
+
+topics:
+  rgb_image: /habitat_v2/module1/rgb
+  depth_image: /habitat_v2/module1/depth
+  camera_info: /habitat_v2/module1/camera_info
+  object_detections: /habitat_v2/module1/object_detections
+
+object_detection:
+  # external_http here means the original ObjectDetectorBackend wrapper around
+  # the in-process yoloe_local RawDetectionProvider.  It deliberately returns
+  # only 2-D detector evidence rather than a TF/world/3-D projection.
+  backend: external_http
+  provider: yoloe_local
+  include_depth: true
+  confidence_threshold: 0.35
+  publish_rate: 2.0
+  max_sync_slop_sec: 0.2
+  skip_if_busy: true
+  projection_frame_id: habitat_v2_camera
+  publish_debug_markers: false
+  publish_debug_segmented_cloud: false
+  publish_debug_detection_image: false
+  publish_debug_world_markers: false
+  publish_debug_world_segmented_cloud: false
+
+room_mllm:
+  enabled: false

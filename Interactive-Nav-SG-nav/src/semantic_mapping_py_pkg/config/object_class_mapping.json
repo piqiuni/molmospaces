@@ -36,6 +36,7 @@
   "couch": "sofa",
   "armchair": "sofa",
   "stool": "chair",
+  "doorframe": "doorframe",
   "door": "door",
   "doorway": "door",
   "gate": "door",

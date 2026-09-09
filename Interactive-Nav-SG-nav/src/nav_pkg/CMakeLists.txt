@@ -2,14 +2,19 @@ cmake_minimum_required(VERSION 3.0.2)
 project(nav_pkg)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
-# add_compile_options(-std=c++11)
+add_compile_options(-std=c++17)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   actionlib
+  costmap_2d
   geometry_msgs
+  global_planner
+  nav_core
+  nav_msgs
+  pluginlib
   roscpp
   rospy
 )
@@ -104,9 +109,9 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-#  INCLUDE_DIRS include
-#  LIBRARIES nav_pkg
-#  CATKIN_DEPENDS actionlib move_base_msgs roscpp rospy
+  INCLUDE_DIRS include
+  LIBRARIES oriented_global_planner
+  CATKIN_DEPENDS actionlib costmap_2d geometry_msgs global_planner nav_core nav_msgs pluginlib roscpp rospy
 #  DEPENDS system_lib
 )
 
@@ -117,7 +122,7 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
 )
 
@@ -135,6 +140,7 @@ include_directories(
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
 add_executable(relay_node src/relay_node.cpp)
+add_library(oriented_global_planner src/oriented_global_planner.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -148,6 +154,9 @@ add_dependencies(relay_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTE
 
 ## Specify libraries to link a library or executable target against
 target_link_libraries(relay_node
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(oriented_global_planner
   ${catkin_LIBRARIES}
 )
 
@@ -168,9 +177,11 @@ catkin_install_python(PROGRAMS
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
-# install(TARGETS ${PROJECT_NAME}_node
-#   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-# )
+install(TARGETS relay_node oriented_global_planner
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 ## Mark libraries for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_libraries.html
@@ -181,18 +192,15 @@ catkin_install_python(PROGRAMS
 # )
 
 ## Mark cpp header files for installation
-# install(DIRECTORY include/${PROJECT_NAME}/
-#   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
-#   FILES_MATCHING PATTERN "*.h"
-#   PATTERN ".svn" EXCLUDE
-# )
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+  FILES_MATCHING PATTERN "*.h"
+)
 
 ## Mark other files for installation (e.g. launch and bag files, etc.)
-# install(FILES
-#   # myfile1
-#   # myfile2
-#   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-# )
+install(FILES oriented_global_planner_plugin.xml
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
 
 #############
 ## Testing ##

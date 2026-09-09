@@ -214,6 +214,7 @@ def prepare_episode_for_saving(
     episode_idx: int = 0,
     save_file_suffix: str = "",
     remove_sensors_if_save_dir: bool = True,
+    remove_camera_sensors: bool | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """
     Transform raw episode history into batched format ready for save_trajectories().
@@ -234,6 +235,8 @@ def prepare_episode_for_saving(
         episode_idx: Episode index for video filenames
         save_file_suffix: Optional suffix for video filenames
         remove_sensors_if_save_dir: remove camera-related sensors if video saved
+        remove_camera_sensors: Explicitly remove camera sensors even when videos are not saved.
+            When omitted, preserves the historical remove_sensors_if_save_dir behavior.
 
     Returns:
         Dict[str, Tensor] with all data batched along time dimension, or None if no data
@@ -289,34 +292,30 @@ def prepare_episode_for_saving(
             sensor_suite=sensor_suite,
         )
 
-        if remove_sensors_if_save_dir:
-            # CRITICAL: Delete camera data (RGB and depth) from observations to avoid batching it
-            # This is where the massive memory savings come from
-            removed_sensors = set()
-            for obs in flattened_obs:
-                sensors_to_remove = []
-                for sensor_name in obs:
-                    # Check if this is a camera sensor (RGB or depth)
-                    # Skip segmentation sensors as they're not videos
-                    if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith(
-                        "_seg"
-                    ):
-                        sensors_to_remove.append(sensor_name)
+    if remove_camera_sensors is None:
+        remove_camera_sensors = save_dir is not None and remove_sensors_if_save_dir
 
-                # Remove camera data
-                for sensor_name in sensors_to_remove:
-                    obs.pop(sensor_name, None)
-                    removed_sensors.add(sensor_name)
+    if remove_camera_sensors:
+        # CRITICAL: Delete camera data (RGB and depth) from observations to avoid batching it.
+        removed_sensors = set()
+        for obs in flattened_obs:
+            sensors_to_remove = []
+            for sensor_name in obs:
+                # Skip segmentation sensors because they are not encoded as videos.
+                if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith("_seg"):
+                    sensors_to_remove.append(sensor_name)
 
-            if removed_sensors:
-                log.debug(
-                    f"Removed camera sensors from observations before batching: {removed_sensors}"
-                )
+            for sensor_name in sensors_to_remove:
+                obs.pop(sensor_name, None)
+                removed_sensors.add(sensor_name)
 
-        gc.collect()
+        if removed_sensors:
+            log.debug(f"Removed camera sensors from observations before batching: {removed_sensors}")
+
+    gc.collect()
 
     # Batch observations: List[Dict] -> Dict[str, Tensor(T, ...)]
-    # Note: Camera images already removed if save_dir was provided, so this is much smaller
+    # Note: Camera images are removed when requested, so this is much smaller.
     batched_data = batch_observations(flattened_obs, sensor_suite)
 
     # Delete flattened_obs after batching to free memory

@@ -1,22 +1,58 @@
+from __future__ import annotations
+
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nltk.corpus.reader import Synset
 
 
 def _ensure_nltk():
     import nltk
 
     for corpus in ["wordnet", "wordnet2022"]:
-        nltk.download(corpus)
+        candidates = (f"corpora/{corpus}", f"corpora/{corpus}.zip")
+        if any(_nltk_resource_exists(nltk, candidate) for candidate in candidates):
+            continue
+        nltk.download(corpus, quiet=True, raise_on_error=True)
 
 
-_ensure_nltk()
+def _nltk_resource_exists(nltk, resource: str) -> bool:
+    try:
+        nltk.data.find(resource)
+        return True
+    except LookupError:
+        return False
 
-from nltk.corpus import wordnet2022 as wn
 
-wn.abspaths()
+@cache
+def _get_wordnet():
+    """Load and validate the WordNet corpus only when semantic lookup is used."""
 
-from nltk.corpus.reader import Synset
+    _ensure_nltk()
+    from nltk.corpus import wordnet2022
+
+    wordnet2022.abspaths()
+    return wordnet2022
+
+
+@cache
+def _get_synset_type() -> type:
+    from nltk.corpus.reader import Synset
+
+    return Synset
+
+
+class _LazyWordNet:
+    """Compatibility proxy for callers importing ``synset_utils.wn``."""
+
+    def __getattr__(self, name: str):
+        return getattr(_get_wordnet(), name)
+
+
+wn = _LazyWordNet()
 
 from molmo_spaces.utils.constants.object_constants import AI2THOR_OBJECT_TYPE_TO_WORDNET_SYNSET
 from molmo_spaces.utils.object_metadata import ObjectMeta
@@ -975,7 +1011,7 @@ def filter_synsets_to_remove_hyponyms(synsets: Sequence[str] | Sequence[Synset])
 
     hyper_to_descs = generate_hypernym_to_descendants(synsets=synsets)
 
-    if isinstance(synsets[0], Synset):
+    if isinstance(synsets[0], _get_synset_type()):
         synsets = [s.name() for s in synsets]
 
     to_remove = set()
@@ -1154,7 +1190,7 @@ def is_valid_receptacle_synset(synset: str | Synset) -> bool:
     if synset is None:
         return False
 
-    if isinstance(synset, Synset):
+    if isinstance(synset, _get_synset_type()):
         synset = synset.name()
 
     return synset in _get_all_valid_receptacle_synsets()

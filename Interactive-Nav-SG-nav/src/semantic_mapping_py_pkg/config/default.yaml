@@ -12,6 +12,16 @@ topics:
   pointcloud: "/registered_scan"
   occupancy_grid: "/struct_mapping/occ_map"
   room_context: "/semantic_mapping/room_context"
+  gt_observations: "/semantic_mapping/gt_observations"
+  interaction_command: "/semantic_decision/interaction_command"
+  interaction_result: "/semantic_mapping/interaction_result"
+  attribute_updates: "/semantic_mapping/attribute_updates"
+  attribute_refresh_requests: "/semantic_mapping/attribute_refresh_requests"
+  room_attribute_requests: "/semantic_mapping/room_attribute_requests"
+  room_attribute_updates: "/semantic_mapping/room_attribute_updates"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
+  door_clear_mask: "/semantic_mapping/door_clear_mask"
 
   object_detections: "/semantic_mapping/object_detections"
   scene_attribute: "/semantic_mapping/scene_attribute"
@@ -20,12 +30,18 @@ topics:
   object_markers: "/semantic_mapping/object_semantic_map_markers"
   scene_id_grid: "/semantic_mapping/scene_id_grid"
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  room_segment_grid: "/semantic_mapping/room_segment_grid"
   unified_graph: "/semantic_mapping/unified_graph"
   unified_graph_markers: "/semantic_mapping/unified_graph_markers"
   unified_graph_markers_lifted: "/semantic_mapping/unified_graph_markers_lifted"
   navigation_hints: "/semantic_mapping/navigation_hints"
   scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
   scene_legend: "/semantic_mapping/scene_semantic_map/legend"
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "rule_verified"
 
 object_detection:
   backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d | yoloe_pf_box3d
@@ -106,10 +122,52 @@ room_inference:
   min_confidence: 0.2
   evidence_window_sec: 5.0
 
+# Module-1's room lane is intentionally text-only: it receives a room ID and
+# the graph's in-room object labels, never RGB or a visual crop.  The existing
+# weighted object rules remain active while this asynchronous lane is pending
+# or low confidence.
+room_mllm:
+  enabled: true
+  min_evidence_objects: 1
+  min_confidence: 0.55
+  worker_count: 1
+  max_queue_size: 4
+  min_interval_s: 2.0
+  success_refresh_interval_s: 120.0
+  max_output_tokens: 96
+
+# Module-1 visual evidence and decision-layer targeted refresh controls.
+# The refresh topic carries only object/episode/capture metadata; the node
+# waits for a later RGB + detection pair before submitting the high-priority
+# image-only request.
+attribute_inference:
+  visual_evidence_max_side_px: 1024
+  targeted_refresh_priority: 1000.0
+  # One M1 call may use earlier target views, but only when they are separated
+  # in evaluator steps and robot pose. The latest image remains authoritative.
+  targeted_multiview_max_images: 3
+  targeted_multiview_min_step_gap: 8
+  targeted_multiview_min_position_gap_m: 0.25
+  targeted_multiview_min_yaw_gap_rad: 0.25
+  target_bbox_mask_containment_required: true
+
 semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: true
-  publish_rate: 2.0
+  # The legacy scene-attribute lane consumes the registered cloud.  Keep it
+  # enabled by default for detector/offline deployments; realtime_gt receives
+  # no scene-attribute stream and disables this subscription in the parent
+  # navigation launch to avoid an unused PointCloud2 deserialization path.
+  subscribe_pointcloud: true
+  # A 5 Hz map/ready cadence matches the 0.2 s policy step without flooding
+  # downstream full-map consumers.
+  publish_rate: 5.0
+  # Emit component timing once per second at the normal 5 Hz cadence.
+  timing_log_every: 5
+  # Default fast path: readiness means a raw OCC arrived.  Set true in the
+  # strict causal smoke override to wait for the same-source room grid and
+  # unified graph publication before the simulator may advance.
+  step_ready_require_room_graph: false
   object_match_distance: 0.5
   object_min_confirmations: 2
   graph_min_observations: 1
@@ -126,12 +184,35 @@ semantic_map:
   room_small_obstacle_max_cells: 0
   room_remove_enclosed_occupied: true
   room_enclosed_occupied_max_cells: 700
-  room_enclosed_occupied_max_aspect: 2.5
+  # Only compact, furniture-like islands may be ignored for room topology.
+  # Preserve elongated occupied components as possible wall dividers.
+  room_enclosed_occupied_max_aspect: 1.8
   room_enclosed_occupied_known_ring_ratio: 0.95
   room_enclosed_occupied_free_ring_ratio: 0.45
+  room_portal_cut_enabled: true
+  room_portal_cut_margin_m: 0.15
+  room_portal_cut_thickness_cells: 2
+  room_portal_detector_min_confirmations: 3
+  room_portal_detector_max_center_jump_m: 0.4
+  room_portal_hint_merge_distance_m: 0.6
+  room_portal_min_width_m: 0.5
+  room_portal_max_width_m: 2.5
+  room_id_overlap_ratio: 0.25
+  room_merge_confirmations: 3
+  room_grid_stability_frames: 3
+  # Room topology uses confirmed semantic door clears, never an in-flight
+  # interaction command.  A successful open forces one immediate stable split.
+  room_segment_use_semantic_overlay: true
+  # Reuse a settled room topology only when the effective ternary OCC map and
+  # confirmed portal topology are exactly unchanged.  Each raw source still
+  # receives its own room/graph commit and strict readiness watermark.
+  room_topology_cache_enabled: true
+  room_post_open_force_refresh: true
+  room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""
+  graph_save_dir: ""
   graph_save_pretty: true
   scene_max_range: 3.0
   scene_min_range: 0.1
@@ -140,11 +221,23 @@ semantic_map:
 interaction_graph:
   scene_id: "semantic_mapping_scene"
   match_distance: 0.5
+  portal_room_max_radius_m: 1.0
+  object_room_search_margin_m: 0.75
+  geometry_overrides: {}
   gt_replay:
     enable: false
     shuffle: false
     batch_count: 1
     seed: 0
+
+semantic_occ_overlay:
+  enabled: true
+  # Signed aperture inset: negative contracts the closed-door reference so a
+  # rotating door leaf cannot clear adjacent wall cells in the planning map.
+  clear_padding_m: -0.05
+  max_aperture_thickness_m: 0.25
+  raw_free_confirmations: 3
+  open_states: ["ajar", "open"]
 
 scene_types:
   unknown_id: -1
@@ -186,10 +279,14 @@ object_room_priors:
     stove: 1.0
     oven: 0.9
     microwave: 0.8
-    refrigerator: 0.9
-    fridge: 0.9
+    refrigerator: 2.0
+    fridge: 2.0
     sink: 0.4
     cabinet: 0.3
+    dishwasher: 0.8
+    counter: 0.5
+    countertop: 0.5
+    table: 0.3
   bedroom:
     bed: 1.0
     pillow: 0.8
@@ -210,6 +307,10 @@ object_room_priors:
     coffee_table: 0.6
     chair: 0.3
     table: 0.2
+  diningroom:
+    dining_table: 1.0
+    table: 0.7
+    chair: 0.4
   storage:
     box: 0.5
     shelf: 0.4

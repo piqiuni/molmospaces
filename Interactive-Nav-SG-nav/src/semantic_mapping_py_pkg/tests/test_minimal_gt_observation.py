@@ -1,0 +1,560 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "scripts"
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+
+from semantic_mapping_py_pkg.graph_rules import (
+    normalize_observation,
+    opaque_portal_instance_id,
+    rle_foreground_pixel_count,
+)
+from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+
+
+def minimal_observation(
+    instance_id: str,
+    name: str,
+    center: list[float],
+    size: list[float],
+    pixels: int = 100,
+) -> dict:
+    side = max(1, int(pixels**0.5))
+    rows = [index // side for index in range(pixels)]
+    cols = [index % side for index in range(pixels)]
+    return {
+        "id": instance_id,
+        "name": name,
+        "bbox_2d": [0, 0, side - 1, side - 1],
+        "segmentation": {"rows": rows, "cols": cols},
+        "box_3d": {"center": center, "size": size, "frame_id": "world"},
+    }
+
+
+def compact_rle_observation(
+    instance_id: str = "obj_000001",
+    name: str = "Door",
+    *,
+    rle_field: str = "mask_rle",
+    counts: list[int] | None = None,
+    size: list[int] | None = None,
+) -> dict:
+    image_size = list(size or [4, 5])
+    return {
+        "id": instance_id,
+        "name": name,
+        "bbox_2d": [0, 0, image_size[1] - 1, image_size[0] - 1],
+        rle_field: {
+            "size": image_size,
+            # Foreground occupies the second and fourth alternating runs.
+            "counts": list(counts or [1, 2, 3, 4, 10]),
+        },
+        "box_3d": {
+            "center": [2.0, 1.0, 1.0],
+            "size": [0.2, 1.0, 2.0],
+            "frame_id": "world",
+        },
+    }
+
+
+def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
+    normalized = normalize_observation(
+        minimal_observation("double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0])
+    )
+
+    assert normalized["instance_id"] == opaque_portal_instance_id("double_door_root")
+    assert normalized["private_instance_id"] == "double_door_root"
+    assert normalized["semantic_name"] == "portal"
+    assert normalized["name"] == normalized["instance_id"]
+    assert normalized["aabb_center"] == [2.0, 1.0, 1.0]
+    assert normalized["aabb_size"] == [0.2, 1.0, 2.0]
+    assert normalized["visible_pixels"] == 100
+    assert normalized["visible_fraction"] == 1.0
+    assert normalized["minimal_gt_observation"] is True
+
+
+def test_compact_mask_rle_is_counted_without_expanding_the_mask() -> None:
+    raw = compact_rle_observation()
+    normalized = normalize_observation(raw)
+
+    assert rle_foreground_pixel_count(raw["mask_rle"]) == 6
+    assert normalized["visible_pixels"] == 6
+    assert normalized["visible_fraction"] == 0.3
+    assert normalized["confidence"] == 1.0
+    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["private_source_object_name"] == "obj_000001"
+
+
+def test_compact_segmentation_rle_alias_is_supported() -> None:
+    raw = compact_rle_observation(
+        rle_field="segmentation_rle",
+        counts=[0, 5, 15],
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["visible_pixels"] == 5
+    assert normalized["visible_fraction"] == 0.25
+
+
+def test_large_rle_visibility_count_does_not_materialize_a_dense_mask() -> None:
+    raw = compact_rle_observation(
+        counts=[0, 100_000_000],
+        size=[10_000, 10_000],
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["visible_pixels"] == 100_000_000
+    assert normalized["visible_fraction"] == 1.0
+
+
+def test_compact_minimal_gt_discards_private_routing_aliases() -> None:
+    raw = compact_rle_observation()
+    raw.update(
+        {
+            "source_object_name": "private_mujoco_door_body",
+            "visible_pixels": 1,
+            "confidence": 0.01,
+            "joint_infos": [{"joint_name": "private_hinge"}],
+        }
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["private_source_object_name"] == "obj_000001"
+    assert normalized["visible_pixels"] == 6
+    assert normalized["confidence"] == 1.0
+    assert normalized["joint_infos"] == []
+
+
+def test_minimal_gt_preserves_joint_axis_only_for_explicit_rule_oracle_mode() -> None:
+    raw = minimal_observation(
+        "fridge_1", "Fridge", [3.0, 2.0, 1.0], [1.0, 1.0, 2.0]
+    )
+    raw["interaction_approach_axis_xy"] = [3.0, 4.0]
+
+    assert normalize_observation(raw)["interaction_approach_axis_xy"] == []
+
+    raw["oracle_rule_gt_interaction_axis"] = True
+    raw["interaction_approach_axis_source"] = "rule_oracle_gt_joint_geometry"
+    normalized = normalize_observation(raw)
+
+    assert normalized["interaction_approach_axis_xy"] == [0.6, 0.8]
+    assert (
+        normalized["interaction_approach_axis_source"]
+        == "rule_oracle_gt_joint_geometry"
+    )
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations([raw], source_mode="realtime_gt_observation")
+    node = next(item for item in store.as_graph_dict()["nodes"] if item["type"] == "container")
+    assert node["attributes"]["interaction_approach_axis_xy"] == [0.6, 0.8]
+
+
+def test_minimal_gt_doorframe_doorway_and_leaf_share_one_generic_identity() -> None:
+    aliases = [
+        minimal_observation("doorframe_static_17", "Doorframe", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]),
+        minimal_observation("doorway_static_17", "Doorway", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]),
+        minimal_observation("door_leaf_static_17", "Door Leaf", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]),
+    ]
+
+    normalized = [normalize_observation(observation) for observation in aliases]
+
+    assert {item["instance_id"] for item in normalized} == {
+        normalized[0]["instance_id"]
+    }
+    assert normalized[0]["instance_id"].startswith("door_")
+    assert all(item["semantic_name"] == "portal" for item in normalized)
+    assert all(item["name"] == item["instance_id"] for item in normalized)
+
+
+def test_minimal_gt_uses_only_mapper_attached_capture_step_for_versioning() -> None:
+    raw = compact_rle_observation()
+    # A public caller-provided frame_index remains ignored by the minimal-GT
+    # normalizer, while the validated envelope can be attached privately by
+    # semantic_mapping_node before graph ingestion.
+    raw["frame_index"] = 999
+    raw["_capture_step"] = 23
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["frame_index"] == 23
+
+
+def test_compact_minimal_gt_uses_explicit_visible_pixel_count() -> None:
+    observation = minimal_observation(
+        "apple_1", "Apple", [1.0, 2.0, 0.5], [0.1, 0.1, 0.1], pixels=1
+    )
+    observation.pop("segmentation")
+    observation["bbox_2d"] = [0, 0, 9, 9]
+    observation["visible_pixels"] = 64
+
+    normalized = normalize_observation(observation)
+
+    assert normalized["visible_pixels"] == 64
+    assert normalized["visible_fraction"] == 0.64
+    assert normalized["segmentation"] is None
+
+
+def test_compact_minimal_gt_uses_explicit_visibility_summary() -> None:
+    observation = minimal_observation(
+        "apple_1", "Apple", [1.0, 2.0, 0.8], [0.1, 0.1, 0.1]
+    )
+    observation.pop("segmentation")
+    observation["visible_pixels"] = 37
+    observation["visible_fraction"] = 0.74
+
+    normalized = normalize_observation(observation)
+
+    assert normalized["visible_pixels"] == 37
+    assert normalized["visible_fraction"] == 0.74
+
+
+def test_minimal_gt_adapter_discards_legacy_graph_metadata() -> None:
+    raw = minimal_observation(
+        "chair_1", "Chair", [1.0, 2.0, 0.5], [0.5, 0.5, 1.0]
+    )
+    raw.update(
+        {
+            "semantic_name": "door",
+            "category": "Door",
+            "instance_id": "wrong_instance",
+            "position": [99.0, 99.0, 99.0],
+            "aabb_center": [99.0, 99.0, 99.0],
+            "aabb_size": [9.0, 9.0, 9.0],
+            "confidence": 0.01,
+            "visible_pixels": 1,
+            "parent": "cabinet_root",
+            "children": ["chair_child"],
+            "is_receptacle": True,
+            "is_pickup_candidate": True,
+            "is_articulable": True,
+            "is_door": True,
+            "is_movable_door": True,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+            "joint_infos": [{"joint_name": "forbidden_hinge"}],
+            "room_id": 7,
+            "connected_room_ids": [7, 8],
+        }
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["instance_id"] == "chair_1"
+    assert normalized["semantic_name"] == "chair"
+    assert normalized["category"] == "chair"
+    assert normalized["position"] == [1.0, 2.0, 0.5]
+    assert normalized["aabb_center"] == [1.0, 2.0, 0.5]
+    assert normalized["aabb_size"] == [0.5, 0.5, 1.0]
+    assert normalized["viz_aabb_center"] == [1.0, 2.0, 0.5]
+    assert normalized["viz_aabb_size"] == [0.5, 0.5, 1.0]
+    assert normalized["confidence"] == 1.0
+    assert normalized["visible_pixels"] == 100
+    assert normalized["parent"] is None
+    assert normalized["children"] == []
+    assert normalized["is_receptacle"] is False
+    assert normalized["is_pickup_candidate"] is False
+    assert normalized["is_articulable"] is False
+    assert normalized["is_door"] is False
+    assert normalized["is_movable_door"] is False
+    assert normalized["joint_type"] == "none"
+    assert normalized["joint_range"] == [0.0, 0.0]
+    assert normalized["joint_value"] is None
+    assert normalized["joint_infos"] == []
+    assert normalized["room_id"] is None
+    assert normalized["connected_room_ids"] == []
+
+
+def test_graph_ignores_legacy_flags_parent_and_joint_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    chair = minimal_observation(
+        "chair_1", "Chair", [1.0, 2.0, 0.5], [0.5, 0.5, 1.0]
+    )
+    chair.update(
+        {
+            "parent": "cabinet_root",
+            "is_articulable": True,
+            "is_door": True,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+        }
+    )
+    door = minimal_observation(
+        "door_1", "Door", [2.0, 2.0, 1.0], [0.2, 1.0, 2.0]
+    )
+    door.update(
+        {
+            "parent": "wall_root",
+            "is_door": False,
+            "is_articulable": False,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+        }
+    )
+
+    store.update_observations(
+        [chair, door], stamp=1.0, source_mode="realtime_gt_observation"
+    )
+    graph = store.as_graph_dict(stamp=1.0)
+    chair_node = next(node for node in graph["nodes"] if node["id"] == "object_chair_1")
+    door_node = next(node for node in graph["nodes"] if node["type"] == "portal")
+
+    assert chair_node["type"] == "object"
+    assert chair_node["interaction"]["is_interactable"] is False
+    assert door_node["type"] == "portal"
+    assert door_node["interaction"]["state"] == "unknown"
+    assert door_node["interaction"]["state_source"] == "unobserved"
+    # Geometry-only GT does not prove an articulation, but a rule policy must
+    # still be able to attempt an unknown portal and learn from feedback.
+    assert door_node["interaction"]["is_interactable"] is True
+    assert door_node["interaction"]["requires_interaction"] is True
+    assert door_node["interaction"]["traversable"] is None
+    forbidden = {"parent", "is_door", "is_articulable", "joint_infos"}
+    assert forbidden.isdisjoint(chair_node["attributes"])
+    assert forbidden.isdisjoint(door_node["attributes"])
+
+
+def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    observation = compact_rle_observation("double_door_root", "Door")
+    store.update_observations(
+        [observation], stamp=1.0, source_mode="realtime_gt_observation"
+    )
+    store.update_observations(
+        [observation], stamp=2.0, source_mode="realtime_gt_observation"
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict(stamp=2.0)["nodes"] if node["type"] == "portal"
+    )
+    assert portal["id"] == opaque_portal_instance_id("double_door_root")
+    assert portal["name"] == portal["attributes"]["instance_id"]
+    assert portal["label"] == portal["attributes"]["instance_id"]
+    assert portal["name"].startswith("door_")
+    assert portal["confidence"] == 1.0
+    assert portal["interaction"]["is_interactable"] is True
+    assert portal["interaction"]["interaction_mode"] == "open_close"
+    assert portal["interaction"]["capability"] == "unknown"
+    assert portal["interaction"]["capability_source"] == "unobserved"
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["confidence"] == 1.0
+    assert portal["interaction"]["state_confidence"] == 0.0
+    assert portal["interaction"]["requires_interaction"] is True
+    assert portal["attributes"]["consecutive_observations"] == 2
+    forbidden = {
+        "joint_infos",
+        "observation_evidence",
+        "asset_id",
+        "object_id",
+        "parent",
+        "children",
+        "is_articulable",
+        "is_movable_door",
+        "orientation",
+        "interaction_approach_axis_xy",
+    }
+    assert forbidden.isdisjoint(portal["attributes"])
+
+
+def test_public_graph_redacts_portal_source_name_but_keeps_private_feedback_routing() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    raw_id = "doorframe_static_17"
+    store.update_observations(
+        [
+            minimal_observation(
+                raw_id,
+                "Doorway",
+                [2.0, 1.0, 1.0],
+                [0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["type"] == "portal")
+    assert portal["label"] == portal["name"] == portal["attributes"]["instance_id"]
+    assert portal["attributes"]["instance_id"].startswith("door_")
+    assert "source_object_name" not in portal["attributes"]
+    serialized = str(graph).casefold()
+    assert raw_id not in serialized
+    assert "doorframe" not in serialized
+    assert "doorway" not in serialized
+    assert "gt_" not in serialized
+
+    assert store.update_interaction_result(
+        {"object_id": raw_id, "action": "open", "success": True, "step": 7}
+    )
+    updated = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert updated["interaction"]["state"] == "open"
+    assert updated["interaction"]["state_source"] == "successful_action_postcondition"
+    assert updated["interaction"]["state_observed_step"] == 7
+    assert updated["interaction"]["capability_source"] == "executor_feedback"
+
+
+def test_minimal_gt_visibility_streak_is_computed_in_graph_store() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    observation = minimal_observation("fridge_1", "Fridge", [1.0, 1.0, 1.0], [1.0, 1.0, 2.0])
+    store.update_observations([observation], source_mode="realtime_gt_observation")
+    store.update_observations([], source_mode="realtime_gt_observation")
+    store.update_observations([observation], source_mode="realtime_gt_observation")
+
+    container = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "container"
+    )
+    assert container["attributes"]["consecutive_observations"] == 1
+    assert container["attributes"]["max_consecutive_observations"] == 1
+
+
+def test_minimal_gt_container_relation_is_inferred_from_3d_boxes() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    fridge = minimal_observation("fridge_1", "Fridge", [1.0, 1.0, 1.0], [1.0, 1.0, 2.0])
+    can = minimal_observation("can_1", "Soda Can", [1.0, 1.0, 1.0], [0.05, 0.05, 0.1])
+    store.update_observations(
+        [fridge, can], source_mode="realtime_gt_observation"
+    )
+
+    graph = store.as_graph_dict()
+    assert any(
+        edge["src_id"] == "container_fridge_1"
+        and edge["relation"] == "contains"
+        and edge["dst_id"] == "object_can_1"
+        for edge in graph["edges"]
+    )
+
+
+def test_executor_semantic_result_updates_graph_by_object_id() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    observation = minimal_observation(
+        "double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]
+    )
+    store.update_observations([observation], source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "object_id": "double_door_root",
+            "state": "open",
+            "success": True,
+            "source": "executor_state_verification",
+        }
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["completed_interaction_groups"] == []
+    assert "joint_infos" not in portal["attributes"]
+    assert "joint_interaction_states" not in portal["interaction"]
+    assert "joint_open_fractions" not in portal["interaction"]
+
+
+def test_joint_only_executor_result_cannot_infer_graph_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            minimal_observation(
+                "door_1", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    assert store.update_interaction_result(
+        {
+            "object_id": "door_1",
+            "success": True,
+            "joint_infos": [
+                {
+                    "joint_name": "hinge_1",
+                    "joint_type": "hinge",
+                    "joint_range": [0.0, 1.0],
+                    "joint_value": 1.0,
+                }
+            ],
+            "verification_source": "mujoco_joint_readback",
+        }
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["state_source"] == "unobserved"
+    assert portal["interaction"]["traversable"] is None
+    assert "joint_infos" not in portal["attributes"]
+
+
+def test_minimal_gt_id_routes_mllm_attribute_patch() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            minimal_observation(
+                "double_door_root",
+                "Door",
+                [2.0, 1.0, 1.0],
+                [0.2, 1.0, 2.0],
+            )
+        ],
+        stamp=1.0,
+        source_mode="realtime_gt_observation",
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "double_door_root",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "expected_effect": "unlock_connectivity",
+            "confidence": 0.9,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "closed"
+    assert portal["interaction"]["state_source"] == "mllm_attribute_inference"
+    assert portal["interaction"]["state_evidence"] == "mllm_visual_observation"
+    assert portal["interaction"]["capability_source"] == "mllm_attribute_inference"
+    assert portal["attributes"]["attribute_status"] == "ready"
+
+
+def test_non_mllm_attribute_patch_cannot_write_realtime_gt_portal_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    raw_id = "doorway_opaque_1"
+    store.update_observations(
+        [minimal_observation(raw_id, "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0])],
+        source_mode="realtime_gt_observation",
+    )
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": raw_id,
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "source": "semantic_label_prior",
+        },
+        stamp=2.0,
+    )
+    portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["state_source"] == "unobserved"
+    assert portal["interaction"]["is_interactable"] is True

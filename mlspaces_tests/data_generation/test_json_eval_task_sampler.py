@@ -12,8 +12,10 @@ USAGE:
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import mujoco
 import pytest
 
 from molmo_spaces.configs.camera_configs import (
@@ -21,8 +23,10 @@ from molmo_spaces.configs.camera_configs import (
     RobotMountedCameraConfig,
 )
 from molmo_spaces.evaluation.benchmark_schema import (
+    ArticulationJointStateSpec,
     EpisodeSpec,
     ExocentricCameraSpec,
+    InteractiveNavSpec,
     RobotMountedCameraSpec,
     load_all_episodes,
 )
@@ -231,6 +235,49 @@ class TestBenchmarkLoading:
                 config = camera_spec_to_config(cam)
                 assert config is not None
 
+    def test_interactive_nav_schema_round_trip(self, first_episode):
+        interactive_nav = InteractiveNavSpec.model_validate(
+            {
+                "interaction_domain": "container",
+                "case_id": "test_container_case",
+                "target": {
+                    "object_name": "test_object",
+                    "container_name": "test_container",
+                    "controlling_joint_index": 0,
+                },
+                "initial_state": {"all_doors_open": True},
+                "oracle_plan": {
+                    "steps": [
+                        {
+                            "type": "navigate",
+                            "goal_point": [1.0, 2.0, 0.0],
+                            "goal_yaw": 0.5,
+                            "reason": "approach_target_container",
+                        },
+                        {
+                            "type": "open_joint",
+                            "object_name": "test_container",
+                            "joint_name": "drawer_joint",
+                            "joint_index": 0,
+                            "control_mode": "force",
+                            "reason": "reveal_target_object",
+                        },
+                        {
+                            "type": "observe_target",
+                            "object_name": "test_object",
+                            "reason": "verify_target_visible",
+                        },
+                    ]
+                },
+            }
+        )
+        episode = first_episode.model_copy(update={"interactive_nav": interactive_nav})
+        restored = EpisodeSpec.model_validate(episode.model_dump())
+        assert restored.interactive_nav is not None
+        assert restored.interactive_nav.oracle_plan.steps[0].type == "navigate"
+        assert restored.interactive_nav.oracle_plan.steps[1].type == "open_joint"
+        assert restored.interactive_nav.oracle_plan.steps[1].control_mode == "force"
+
 
 class TestJsonEvalTaskSamplerConfiguration:
     """Tests for JsonEvalTaskSampler configuration building."""
@@ -258,6 +305,44 @@ class TestJsonEvalTaskSamplerConfiguration:
             task_cls = sampler._get_task_class()
             assert task_cls is not None
             print(f"Loaded task class: {task_cls.__name__}")
+
+    def test_apply_articulation_states(self, first_episode):
+        model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="test_container">
+                  <joint name="drawer_joint" type="slide" axis="1 0 0" range="0 1"/>
+                  <geom type="box" size="0.1 0.1 0.1"/>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+        data = mujoco.MjData(model)
+        scene_modifications = first_episode.scene_modifications.model_copy(
+            update={
+                "articulation_states": [
+                    ArticulationJointStateSpec(
+                        object_name="test_container",
+                        joint_name="drawer_joint",
+                        joint_index=0,
+                        position=0.6,
+                        open_fraction=0.6,
+                    )
+                ]
+            }
+        )
+        sampler = JsonEvalTaskSampler.__new__(JsonEvalTaskSampler)
+        sampler.episode_spec = first_episode.model_copy(
+            update={"scene_modifications": scene_modifications}
+        )
+        sampler.apply_articulation_states(
+            SimpleNamespace(current_model=model, current_data=data)
+        )
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "drawer_joint")
+        qpos_addr = int(model.jnt_qposadr[joint_id])
+        assert data.qpos[qpos_addr] == pytest.approx(0.6)
 
 
 class TestPrintEpisodeDetails:

@@ -1,0 +1,15 @@
+target:
+  enabled: true
+  target_name: "fridge"
+  object_labels: ["fridge", "refrigerator"]
+  standoff_m: 1.0
+  require_interaction: true
+
+candidate:
+  target_require_current_visibility: false
+  target_require_same_room: true
+  target_allow_connected_room: true
+  target_min_visible_pixels: 128
+
+policy:
+  target_relevance_weight: 3.0

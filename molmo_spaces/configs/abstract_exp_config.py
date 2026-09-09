@@ -176,7 +176,11 @@ class MlSpacesExpConfig(Config, ABC):
                     reference_body_names=list(cam.reference_body_names),
                     camera_offset=list(cam.camera_offset),
                     lookat_offset=list(cam.lookat_offset),
-                    camera_quaternion=list(cam.camera_quaternion),
+                    camera_quaternion=(
+                        None
+                        if cam.camera_quaternion is None
+                        else list(cam.camera_quaternion)
+                    ),
                     fov=cam.fov,
                 )
                 sc.camera_config.cameras[i] = new_camera

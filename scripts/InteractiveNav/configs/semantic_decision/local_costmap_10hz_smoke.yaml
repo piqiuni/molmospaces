@@ -1,0 +1,28 @@
+# Isolated navigation-stack performance A/B.  This mirrors
+# semantic_interaction_nav.yaml, with only the local costmap update loop
+# raised from 5 to 10 Hz.  DWA control and local-costmap publication retain
+# their base 5 Hz values.
+GlobalPlanner:
+  allow_unknown: false
+  orientation_mode: 3
+  orientation_window_size: 8
+
+DWAPlannerROS:
+  xy_goal_tolerance: 0.30
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: true
+  path_distance_bias: 18.0
+  goal_distance_bias: 20.0
+  occdist_scale: 0.10
+  max_scaling_factor: 0.20
+
+global_costmap:
+  transform_tolerance: 3.0
+  update_frequency: 10.0
+  publish_frequency: 10.0
+
+local_costmap:
+  transform_tolerance: 3.0
+  width: 6.0
+  height: 6.0
+  update_frequency: 10.0

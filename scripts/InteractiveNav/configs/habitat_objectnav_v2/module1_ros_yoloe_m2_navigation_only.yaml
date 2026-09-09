@@ -1,0 +1,68 @@
+# Official Habitat Challenge 2023 ObjectNav-v2 / HM3D-Sem v0.2 profile.
+#
+# The original ROS object_detection_node runs detector-only with the YOLOE PF
+# checkpoint.  Habitat remains a separate Python process and can receive only
+# strict 2-D RGB-D detector evidence through the loopback HTTP relay.
+schema_version: 1
+profile: habitat-objectnav-v2-m1-ros-yoloe-m2-navigation-only
+
+official_task_assertions:
+  habitat_config: benchmark/nav/objectnav/objectnav_v2_hm3d_stretch.yaml
+  distance_to: VIEW_POINTS
+  success_distance_m: 0.1
+  requires_explicit_stop: true
+
+modules:
+  module1:
+    enabled: true
+    # The strict adapter schema names the cross-process contract, while the
+    # upstream implementation is the original ROS object_detection_node+YOLOE.
+    mode: detector_only_sidecar
+    sidecar:
+      # HTTP is only the cross-environment transport.  Upstream is the original
+      # ROS object_detection_node with external_http + yoloe_local.
+      transport: http_sidecar
+      endpoint: http://127.0.0.1:12188
+      timeout_s: 12.0
+      interval_steps: 5
+      min_confidence: 0.35
+      include_depth: true
+      original_module1_scripts: /home/ldl/molmospaces-exp-setting/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts
+      require_healthy: true
+
+  module2:
+    enabled: true
+    mode: original_model_policy
+    endpoint: http://127.0.0.1:8000/v1
+    model: qwen3.6-35b-a3b-fp8
+    timeout_s: 30.0
+    vision_localization_enabled: false
+
+  module3:
+    enabled: false
+    mode: disabled
+    fail_closed: true
+    allowed_behavior_types: [EXPLORE, NAVIGATE]
+    forbidden_behavior_types: [INTERACT]
+    forbidden_habitat_actions: [INTERACT, OPEN, CLOSE]
+
+approach:
+  min_depth_m: 0.20
+  max_target_depth_m: 4.0
+  waypoint_standoff_m: 0.60
+  waypoint_reached_distance_m: 0.08
+  max_contiguous_steps: 120
+  target_track_standoff_m: 1.00
+  route_goal_reached_distance_m: 0.10
+
+stop_proxy:
+  # A 2-D/RGB-D detector cannot prove the v2 VIEW_POINT<=0.1m condition.  The
+  # detector can seed a Module-2-ranked standoff only; it is never allowed to STOP.
+  enabled: false
+  habitat_action: velocity_stop
+  depth_m: 0.60
+  center_tolerance: 0.18
+  confirmations: 2
+
+logging:
+  public_trace: true

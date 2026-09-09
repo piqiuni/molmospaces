@@ -78,6 +78,7 @@ class BaseMujocoTask(ABC):
         self.terminal_cache: list[list[bool]] = []
         self.truncated_cache: list[list[bool]] = []
         self.success_cache: list[list[bool]] = []
+        self.retain_history = True
 
         # Policy completion tracking
         self._policy_done = False
@@ -87,8 +88,10 @@ class BaseMujocoTask(ABC):
         # Optional profiler for granular timing (set via set_datagen_profiler)
         self._datagen_profiler = None
         self.last_step_timing_ms: dict[str, float] = {
+            "control_update": 0.0,
             "physics_step": 0.0,
             "sensor_polling": 0.0,
+            "bookkeeping": 0.0,
             "total": 0.0,
         }
 
@@ -208,11 +211,11 @@ class BaseMujocoTask(ABC):
         success = np.full(terminated.shape, fill_value=self.judge_success())
 
         # cache the inputs and outputs
-        self.observation_cache.append(observation)
-        self.reward_cache.append(reward)
-        self.terminal_cache.append(terminated)
-        self.truncated_cache.append(truncated)
-        self.success_cache.append(success)
+        self._cache_latest_or_append(self.observation_cache, observation)
+        self._cache_latest_or_append(self.reward_cache, reward)
+        self._cache_latest_or_append(self.terminal_cache, terminated)
+        self._cache_latest_or_append(self.truncated_cache, truncated)
+        self._cache_latest_or_append(self.success_cache, success)
 
         return observation, reward, terminated, truncated, info
 
@@ -337,8 +340,10 @@ class BaseMujocoTask(ABC):
         # Update episode step count
         self.episode_step_count += 1
 
+        control_t0 = time.perf_counter()
         for robot, action in zip(self._env.robots, actions, strict=True):
             robot.update_control(action)
+        control_ms = (time.perf_counter() - control_t0) * 1000.0
 
         # Physics step (MuJoCo simulation)
         if self._datagen_profiler is not None:
@@ -364,20 +369,44 @@ class BaseMujocoTask(ABC):
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("sensor_polling")
 
-        self.last_step_timing_ms = {
-            "physics_step": physics_ms,
-            "sensor_polling": sensor_ms,
-            "total": (time.perf_counter() - step_t0) * 1000.0,
-        }
-
+        bookkeeping_t0 = time.perf_counter()
         done = np.logical_or(terminated, truncated)
         self._cumulative_reward += np.where(done, 0, reward)
         self._num_steps_taken += np.where(done, 0, 1)
 
         # Cache the action for history tracking
-        self.action_cache.append(self.last_action)
+        self._cache_latest_or_append(self.action_cache, self.last_action)
+        bookkeeping_ms = (time.perf_counter() - bookkeeping_t0) * 1000.0
+        self.last_step_timing_ms = {
+            "control_update": control_ms,
+            "physics_step": physics_ms,
+            "sensor_polling": sensor_ms,
+            "bookkeeping": bookkeeping_ms,
+            "total": (time.perf_counter() - step_t0) * 1000.0,
+        }
 
         return observation, reward, terminated, truncated, info
+
+    def set_history_retention(self, retain_history: bool) -> None:
+        self.retain_history = bool(retain_history)
+        if self.retain_history:
+            return
+        for cache in (
+            self.action_cache,
+            self.observation_cache,
+            self.reward_cache,
+            self.terminal_cache,
+            self.truncated_cache,
+            self.success_cache,
+        ):
+            if len(cache) > 1:
+                cache[:] = cache[-1:]
+
+    def _cache_latest_or_append(self, cache: list, value: Any) -> None:
+        if self.retain_history or not cache:
+            cache.append(value)
+        else:
+            cache[0] = value
 
     def is_done(self) -> NDArray[bool]:
         return np.logical_or(self.is_terminal(), self.is_timed_out())
@@ -486,9 +515,12 @@ class BaseMujocoTask(ABC):
 
     def close(self):
         # Clear any MlSpacesObject references
+        mlspaces_object_type = (
+            MlSpacesObjectAbstract if isinstance(MlSpacesObjectAbstract, type) else None
+        )
         for attr in list(vars(self).keys()):
             obj = getattr(self, attr, None)
-            if isinstance(obj, MlSpacesObjectAbstract):
+            if mlspaces_object_type is not None and isinstance(obj, mlspaces_object_type):
                 setattr(self, attr, None)
 
         # Clear sensor suite
@@ -505,4 +537,5 @@ class BaseMujocoTask(ABC):
     def __del__(self) -> None:
         """Clean up resources when the task is destroyed."""
         # TODO(all): cleanup?
-        self.close()
+        with contextlib.suppress(Exception):
+            self.close()

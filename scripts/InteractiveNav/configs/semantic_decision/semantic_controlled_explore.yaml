@@ -1,0 +1,8 @@
+exploration:
+  external_behavior_control: true
+  # Startup observation is now an explicit semantic SCAN behavior executed by
+  # semantic_behavior_executor.  Keep ExplorePy passive in external-control
+  # mode so it never bypasses decision/execution with raw cmd_vel.
+  initial_spin_enabled: false
+  local_plan_watchdog_enabled: true
+  local_plan_watchdog_sec: 12.0

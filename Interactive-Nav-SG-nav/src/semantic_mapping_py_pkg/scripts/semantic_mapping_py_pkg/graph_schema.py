@@ -1,7 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
+
+
+_PUBLIC_SOURCE_MODE = {
+    # The mapper retains this internal token for source-specific logic, but it
+    # is not an observation a semantic policy or recorder needs to see.  A
+    # neutral public label prevents an accidental GT implementation leak.
+    "realtime_gt_observation": "geometry_observation",
+    "gt_replay": "geometry_replay",
+}
+_PUBLIC_DOOR_ID_RE = re.compile(r"^door_(?:[0-9]{1,8}|x)$")
+
+
+def _public_source(value: Any) -> Any:
+    text = str(value or "")
+    return _PUBLIC_SOURCE_MODE.get(text, value)
+
+
+def _public_portal_display_name(node_id: Any, attributes: dict[str, Any]) -> str:
+    """Return the generic restricted-GT door label, if this node has one."""
+
+    for value in (attributes.get("instance_id"), node_id):
+        candidate = str(value or "").strip().casefold()
+        if _PUBLIC_DOOR_ID_RE.fullmatch(candidate):
+            return candidate
+    return "portal"
 
 
 def _as_float_list(values, size=3):
@@ -26,24 +52,43 @@ class SceneGraphNode:
     interaction: dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     observation_count: int = 0
+    first_seen: float | None = None
     last_seen: float | None = None
+    is_currently_visible: bool = False
+    state_age_sec: float = 0.0
+    graph_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        public_portal_name = _public_portal_display_name(self.id, self.attributes)
+        public_label = public_portal_name if self.type == "portal" else self.label
+        public_name = public_portal_name if self.type == "portal" else self.name
+        public_attributes = {
+            key: _public_source(value) if key in {"source", "source_mode"} else value
+            for key, value in dict(self.attributes).items()
+            if not str(key).startswith("_private_")
+            # A restricted-GT portal has no public source-name field at all;
+            # its opaque instance_id is sufficient for action/result routing.
+            and not (self.type == "portal" and key == "source_object_name")
+        }
         return {
             "id": self.id,
             "type": self.type,
-            "label": self.label,
-            "name": self.name,
+            "label": public_label,
+            "name": public_name,
             "centroid": _as_float_list(self.centroid),
             "aabb_center": _as_float_list(self.aabb_center),
             "aabb_size": _as_float_list(self.aabb_size),
             "parent_id": self.parent_id,
             "room_id": None if self.room_id is None else int(self.room_id),
-            "attributes": dict(self.attributes),
+            "attributes": public_attributes,
             "interaction": dict(self.interaction),
             "confidence": float(self.confidence),
             "observation_count": int(self.observation_count),
+            "first_seen": None if self.first_seen is None else float(self.first_seen),
             "last_seen": None if self.last_seen is None else float(self.last_seen),
+            "is_currently_visible": bool(self.is_currently_visible),
+            "state_age_sec": float(self.state_age_sec),
+            "graph_revision": int(self.graph_revision),
         }
 
 
@@ -104,8 +149,11 @@ class NavigationHint:
 @dataclass
 class SceneGraphBundle:
     scene_id: str
+    episode_id: str
     source_mode: str
+    graph_revision: int
     timestamp: float
+    capture_step: int | None
     nodes: list[SceneGraphNode]
     edges: list[SceneGraphEdge]
     semantic_node_ids: list[str]
@@ -119,8 +167,11 @@ class SceneGraphBundle:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scene_id": self.scene_id,
-            "source_mode": self.source_mode,
+            "episode_id": self.episode_id,
+            "source_mode": _public_source(self.source_mode),
+            "graph_revision": int(self.graph_revision),
             "timestamp": float(self.timestamp),
+            "capture_step": self.capture_step,
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.edges],
             "views": {

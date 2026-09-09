@@ -15,17 +15,19 @@ Key design principle: The EpisodeSpec is authoritative. All fields needed to
 recreate the episode are in the JSON, and if the field is present it strictly overrides the existing config.
 """
 
+from __future__ import annotations
+
 import importlib
 import logging
 import types
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
 from mujoco import MjSpec
 from scipy.spatial.transform import Rotation as R
 
-from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.camera_configs import (
     CameraSystemConfig,
     FixedExocentricCameraConfig,
@@ -68,6 +70,9 @@ from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
 from molmo_spaces.utils.object_metadata import ObjectMeta
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 
 log = logging.getLogger(__name__)
 
@@ -394,6 +399,39 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         pickup_obj.set_joint_position(target_joint_index, joint_start_position)
 
+    def apply_articulation_states(self, env: CPUMujocoEnv) -> None:
+        """Restore benchmark-recorded hinge/slide joint positions."""
+        states = self.episode_spec.scene_modifications.articulation_states
+        if not states:
+            return
+
+        model = env.current_model
+        data = env.current_data
+        for state in states:
+            joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, state.joint_name)
+            if joint_id < 0:
+                raise ValueError(
+                    f"Articulation joint '{state.joint_name}' for '{state.object_name}' "
+                    f"was not found in house {self.episode_spec.house_index}"
+                )
+            joint_type = int(model.jnt_type[joint_id])
+            if joint_type not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
+                raise ValueError(
+                    f"Articulation state only supports hinge/slide joints, got type={joint_type} "
+                    f"for '{state.joint_name}'"
+                )
+            if bool(model.jnt_limited[joint_id]):
+                lower, upper = [float(v) for v in model.jnt_range[joint_id]]
+                if not lower - 1e-6 <= state.position <= upper + 1e-6:
+                    raise ValueError(
+                        f"Joint position {state.position} is outside [{lower}, {upper}] "
+                        f"for '{state.joint_name}'"
+                    )
+            qpos_addr = int(model.jnt_qposadr[joint_id])
+            data.qpos[qpos_addr] = float(state.position)
+
+        mujoco.mj_forward(model, data)
+
     def _build_camera_config_from_spec(self, episode_spec: EpisodeSpec) -> CameraSystemConfig:
         """Build a CameraSystemConfig from the episode spec's camera list.
 
@@ -626,6 +664,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         mujoco.mj_forward(model, data)
         self.set_joint_values(env)
+        self.apply_articulation_states(env)
 
         # Set robot joint positions from episode spec
         for group_name, qpos in self.episode_spec.robot.init_qpos.items():

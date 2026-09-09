@@ -1,0 +1,31 @@
+GlobalPlanner:
+  allow_unknown: false
+  orientation_mode: 3
+  orientation_window_size: 8
+
+DWAPlannerROS:
+  # Interaction approaches use a 0.25 m public physical-pose gate.  Keep DWA
+  # from declaring the goal reached outside that gate; otherwise an outer M1
+  # observation can be accepted but the paired inner action is never issued.
+  xy_goal_tolerance: 0.25
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: true
+  # Stock DWA parameters only.  Loosen the path/goal tether enough for a
+  # collision-free local detour, while retaining the native doorway behavior.
+  path_distance_bias: 30.0
+  goal_distance_bias: 18.0
+  occdist_scale: 0.10
+  max_scaling_factor: 0.20
+
+global_costmap:
+  transform_tolerance: 3.0
+  # The semantic OCC overlay publishes immediately after an interaction
+  # result; bound propagation to make_plan to one 100 ms costmap cycle.
+  update_frequency: 10.0
+  publish_frequency: 10.0
+
+local_costmap:
+  transform_tolerance: 3.0
+  # Keep the full nearby continuation visible after a door traversal.
+  width: 6.0
+  height: 6.0

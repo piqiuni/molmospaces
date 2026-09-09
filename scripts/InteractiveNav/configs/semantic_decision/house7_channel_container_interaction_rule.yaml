@@ -1,0 +1,57 @@
+# House7 integration lane: exercise both navigation-channel portals and
+# openable containers while keeping ordinary frontier exploration disabled.
+# The existing house7_door_interaction_rule.yaml remains a deterministic
+# portal-only regression configuration.
+
+mission:
+  mode: "semantic_interaction_exploration"
+
+# Opt-in, rule-only oracle geometry: the simulator derives a container-facing
+# axis from the live articulation joint.  No scene ID, world pose, or cached
+# AABB is stored here.  The runner rejects this setting for MLLM/detector lanes.
+runtime:
+  rule_oracle_gt_interaction_axis: true
+
+target:
+  enabled: false
+
+candidate:
+  max_frontier_candidates: 0
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  max_state_age_sec: 3600.0
+  min_state_confidence: 0.5
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
+  portal_unknown_default_interact: true
+  portal_standoff_m: 0.85
+  container_standoff_m: 0.50
+  interaction_safety_margin_m: 0.25
+  interaction_ready_distance_m: 0.45
+
+policy:
+  backend: "rule"
+  # Keep the two interaction classes comparable across the global graph;
+  # proximity and semantic gain decide among doors, fridges, cabinets, and
+  # drawers without requiring current visibility or same-room membership.
+  portal_bonus: 1.0
+  container_bonus: 1.0
+  interaction_priority_bonus: 5.0
+  nearby_interaction_radius_m: 2.0
+  nearby_interaction_bonus: 2.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
+  failure_retry_delay_s: 1.0
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+  # Keep global (including non-visible / cross-room) containers eligible until
+  # this concrete approach has failed three terminal navigation attempts.
+  interaction_approach_failure_limit: 3
+
+executor:
+  # The post-arrival pose gate is bounded by fresh simulator-step samples, not
+  # seconds.  A rejected option advances through the preserved alternatives.
+  interaction_approach_pose_poll_max_attempts: 5
+  interaction_approach_fallback_max_attempts: 3

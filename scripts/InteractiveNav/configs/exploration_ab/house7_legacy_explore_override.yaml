@@ -1,0 +1,4 @@
+exploration:
+  reached_point_blacklist_radius_m: 0.75
+  reached_point_blacklist_sec: 90.0
+  unreachable_frontier_radius_m: 1.0
