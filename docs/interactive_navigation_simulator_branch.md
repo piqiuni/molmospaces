@@ -1,8 +1,9 @@
 # Interactive navigation simulator branch
 
-`interactive-nav/sim` is based on the current upstream `main` and contains only
-simulator-facing interaction support. It intentionally excludes the ROS
-navigation/semantic decision implementation in `codex/exp-setting`.
+`interactive-nav/sim` is based on the current upstream `main` and contains
+simulator-facing interaction support plus a self-contained InteractiveNav V3
+benchmark evaluator. It intentionally excludes the navigation/semantic decision
+implementation maintained in `codex/exp-setting`.
 
 ## Interface policy
 
@@ -42,6 +43,54 @@ python scripts/smoke_test_interaction_interface.py \
 The command exits nonzero on a missing interface category, an invalid state
 transition, sibling-joint movement, or failure to find a collision-free pose.
 
+## Standalone benchmark evaluation
+
+The repository includes the frozen ProcTHOR validation release in
+`scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1`:
+
+- Channel: 1,000 episodes
+- Container: 976 episodes
+- Mixed: 992 episodes
+
+The archives, their SHA-256 digests, and the release-pinned robot/scene/object
+versions are tracked in Git. The wrapper applies those asset versions, restores
+all recorded object and articulation state before the first observation, and
+evaluates the three domains in deterministic round-robin order.
+
+Use the bundled stop policy for the smallest real-scene wiring check:
+
+```bash
+python scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \
+  --output-dir /home/ldl/outputs/interactive-nav/smoke \
+  --episodes-per-domain 1 --max-steps 1 \
+  --policy factory \
+  --policy-factory scripts.InteractiveNav.evaluation.example_external_policy:build_policy \
+  --no-render-topdown
+```
+
+Replace the factory path with an importable `module:callable` to evaluate a
+policy. The callable receives `PublicEpisode` and per-step `PolicyObservation`
+objects. Public observations are deep-copied and allow-listed to requested RGB
+cameras, paired depth when enabled, their `sensor_param_*` calibration,
+`robot_base_pose`, and `qpos`;
+`env_states`, target/object poses, action sensors, segmentation, live tasks,
+oracle plans, and simulator object/joint names are not exposed. Generic
+interaction actions select visible objects by image pixel, not internal name.
+
+The factory runs in-process as a cooperative plugin, not as a security sandbox.
+It should be trusted code and could read local files on its own. Use process or
+container isolation for untrusted submissions. Runtime/setup exceptions,
+missing rows, and runtime-ineligible formal episodes produce a nonzero wrapper
+exit code; ordinary policy failures remain valid scored outcomes and do not fail
+the command. Top-down rendering is a best-effort reporting artifact and does not
+change scoring or the exit code. Custom benchmark audits may explicitly use
+`--allow-runtime-ineligible`.
+
+`scripted_oracle` is evaluator diagnostics only. It follows frozen waypoints and
+uses the canonical locked-force interaction executor; its scores are not an
+external-policy baseline. The evaluator retains optional protocol adapters for
+compatibility, but this branch does not ship or start the ROS navigation stack.
+
 ## Synchronization rule
 
 Changes flow in one direction:
@@ -53,7 +102,8 @@ origin/main -> interactive-nav/sim -> codex/exp-setting
 Merge or cherry-pick simulator commits from this branch into
 `codex/exp-setting`. Do not merge `codex/exp-setting` back into this branch;
 that would reintroduce the full navigation algorithm history. The root
-`.gitignore` also prevents untracked copies of `Interactive-Nav-SG-nav/` and
-`scripts/InteractiveNav/` from being added here. Git ignore rules do not remove
-tracked files during a reverse merge, so directionality remains the actual
-isolation guarantee.
+`.gitignore` continues to exclude `Interactive-Nav-SG-nav/` and defaults to
+excluding `scripts/InteractiveNav/*`, with an explicit allow-list only for this
+branch's evaluator, schema, frozen benchmark, and their simulator-side support
+files. Git ignore rules do not remove tracked files during a reverse merge, so
+directionality remains the actual isolation guarantee.
