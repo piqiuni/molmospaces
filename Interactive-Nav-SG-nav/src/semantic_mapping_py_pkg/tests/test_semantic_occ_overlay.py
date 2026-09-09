@@ -279,8 +279,8 @@ def test_open_portal_insets_reference_and_preserves_adjacent_wall_cells():
     assert sum(value > 0 for value in mask) == 16
 
 
-def test_narrow_portal_keeps_measured_width_for_costmap_clearance():
-    """A 1 m doorway must not lose its final raster cell to the inset."""
+def test_narrow_portal_insets_length_to_preserve_open_leaf_end_cells():
+    """A 1 m doorway keeps the configured 5 cm inset at both jambs."""
     overlay = SemanticOccupancyOverlay(clear_padding_m=-0.05)
     raw = [100] * (GridInfo.width * GridInfo.height)
     narrow = portal("closed", size=(1.05, 0.17, 2.0))
@@ -291,9 +291,10 @@ def test_narrow_portal_keeps_measured_width_for_costmap_clearance():
     planning, mask, stats = overlay.apply(GridInfo(), raw)
 
     assert stats["active_portal_ids"] == ["portal_door"]
-    # Full measured width (about 1.05 m) is retained; the thin normal slab
-    # remains capped at two cells and cannot erase adjacent wall rows.
-    assert sum(value > 0 for value in mask) >= 20
+    # The 1.05 m source length becomes 0.95 m; the thin normal slab remains
+    # bounded by the configured 0.25 m cap.
+    assert abs(overlay._inset_extent(1.05, GridInfo.resolution) - 0.95) < 1e-9
+    assert sum(value > 0 for value in mask) >= 18
     assert planning[10 * GridInfo.width + 10] == 0
 
 
@@ -320,7 +321,7 @@ def test_non_grid_aligned_thin_portal_clears_both_occupied_rows():
         for index, value in enumerate(mask)
         if value > 0
     }
-    assert cleared_rows == {10, 11}
+    assert cleared_rows == {9, 10, 11}
     for row in cleared_rows:
         assert all(
             planning[row * GridInfo.width + col] == 0
@@ -329,6 +330,35 @@ def test_non_grid_aligned_thin_portal_clears_both_occupied_rows():
     # The lateral inset still protects cells immediately outside the opening.
     assert planning[10 * GridInfo.width + 5] == 100
     assert planning[10 * GridInfo.width + 14] == 100
+
+
+def test_door4_raster_phase_clears_all_observed_leaf_rows():
+    overlay = SemanticOccupancyOverlay(
+        clear_padding_m=-0.05,
+        max_aperture_thickness_m=0.25,
+    )
+    raw = [0] * (GridInfo.width * GridInfo.height)
+    # H7 door_0004 has the same fractional phase at map resolution 0.1 m:
+    # y=3.327946... becomes y=1.327946... in this compact test grid.
+    for row in (13, 14):
+        for col in range(5, 15):
+            raw[row * GridInfo.width + col] = 100
+    opened = portal(
+        "closed",
+        center=(1.0, 1.3279468143908346, 1.0),
+        size=(1.05188649892807, 0.17303954064729332, 2.0),
+    )
+    overlay.update_graph(graph(opened))
+    opened["interaction"] = {"state": "open"}
+    overlay.update_graph(graph(opened))
+
+    planning, _mask, _stats = overlay.apply(GridInfo(), raw)
+
+    for row in (13, 14):
+        assert all(
+            planning[row * GridInfo.width + col] == 0
+            for col in range(5, 15)
+        )
 
 
 def test_wide_portal_reference_is_limited_to_a_narrow_doorway_slab():

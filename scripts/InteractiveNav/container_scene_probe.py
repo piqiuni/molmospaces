@@ -45,7 +45,11 @@ DEFAULT_NAV_BENCHMARK_JSON = (
     / "assets/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/"
     "NavToObjProcthor10kBench_20260112_json_benchmark/benchmark.json"
 )
-WRITABLE_ASSET_MIRROR = Path("/tmp/container_scene_probe_assets")
+# Keep evaluator-created writable scene mirrors on the large mounted volume.
+# Callers may still override this per worker with INTERACTIVE_NAV_SCENE_MIRROR.
+WRITABLE_ASSET_MIRROR = Path(
+    os.environ.get("INTERACTIVE_NAV_DEFAULT_SCENE_MIRROR", "/home/ldl/tmp/container_scene_probe_assets")
+)
 CONTAINER_TOKENS = (
     "drawer",
     "cabinet",
@@ -618,7 +622,7 @@ def token_match(value: str, tokens: tuple[str, ...]) -> bool:
 
 def safe_body_aabb(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray]:
     try:
-        return body_aabb(model, data, body_id, visual_only=True)
+        return body_aabb(model, data, body_id, visible_only=True)
     except Exception:
         return data.xpos[body_id].copy(), np.zeros(3)
 
@@ -4001,7 +4005,7 @@ def stable_rby1_container_policy_cls(
                 self.task.env.current_model,
                 self.task.env.current_data,
                 body_id,
-                visual_only=False,
+                visible_only=False,
             )
             left_tcp = self.task.env.current_robot.robot_view.get_move_group(
                 "left_gripper"
@@ -4101,7 +4105,7 @@ def stable_rby1_container_policy_cls(
                 self.task.env.current_model,
                 self.task.env.current_data,
                 body_id,
-                visual_only=False,
+                visible_only=False,
             )
             return float(center[2])
 

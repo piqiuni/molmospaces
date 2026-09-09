@@ -597,6 +597,40 @@ def articulation_joint_infos(env, object_name: str) -> list[dict[str, Any]]:
     return _joint_infos_for_group(env.current_model, env.current_data, list(group["joints"]))
 
 
+def _body_subtree_geometry_centroid(model, data, root_body_id: int) -> np.ndarray | None:
+    """Return a size-weighted live geom centroid for one articulated leaf."""
+
+    root_body_id = int(root_body_id)
+    geom_positions: list[np.ndarray] = []
+    geom_weights: list[float] = []
+    for geom_id in range(int(getattr(model, "ngeom", 0) or 0)):
+        body_id = int(model.geom_bodyid[geom_id])
+        cursor = body_id
+        belongs = cursor == root_body_id
+        while not belongs and cursor > 0:
+            cursor = int(model.body_parentid[cursor])
+            belongs = cursor == root_body_id
+        if not belongs:
+            continue
+        position = np.asarray(data.geom_xpos[geom_id], dtype=float)
+        if position.shape[0] < 3 or not np.all(np.isfinite(position[:3])):
+            continue
+        try:
+            size = np.asarray(model.geom_size[geom_id], dtype=float)
+            weight = float(np.prod(np.maximum(np.abs(size[:3]), 1e-3)))
+        except (AttributeError, IndexError, TypeError, ValueError):
+            weight = 1.0
+        geom_positions.append(position[:3])
+        geom_weights.append(max(1e-9, weight))
+    if not geom_positions:
+        return None
+    return np.average(
+        np.asarray(geom_positions, dtype=float),
+        axis=0,
+        weights=np.asarray(geom_weights, dtype=float),
+    )
+
+
 def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     """Infer a private physical front normal from live articulation geometry.
 
@@ -615,6 +649,15 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     data = env.current_data
     axes: list[np.ndarray] = []
     sources: list[str] = []
+    # A refrigerator can expose both a hinge for the door leaf and slide joints
+    # for internal trays/rails.  Averaging those motion vectors can produce a
+    # diagonal (or even cancelling) normal that is not an operable front.  The
+    # articulated door/leaf hinge is the stronger operational-front signal;
+    # use slide travel only when no hinge geometry is available.
+    hinge_axes: list[np.ndarray] = []
+    hinge_sources: list[str] = []
+    slide_axes: list[np.ndarray] = []
+    slide_sources: list[str] = []
     for joint in list(group.get("joints") or []):
         joint_id = int(joint.get("joint_id", -1))
         if joint_id < 0:
@@ -631,19 +674,40 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
             source = "slide_open_travel"
         elif joint_type == "hinge":
             anchor = np.asarray(data.xanchor[joint_id], dtype=float)
-            radial = np.asarray(data.xpos[body_id], dtype=float) - anchor
+            panel_centroid = _body_subtree_geometry_centroid(model, data, body_id)
+            radial_source = "body_origin"
+            if panel_centroid is not None:
+                radial = np.asarray(panel_centroid, dtype=float) - anchor
+                radial_source = "panel_geometry"
+            else:
+                radial = np.asarray(data.xpos[body_id], dtype=float) - anchor
             axis_xy = direction_sign * np.cross(world_axis, radial)[:2]
-            source = "hinge_initial_open_motion"
+            source = f"hinge_{radial_source}_initial_open_motion"
         else:
             continue
         norm = float(np.linalg.norm(axis_xy))
         if math.isfinite(norm) and norm > 1e-6:
-            axes.append(np.asarray(axis_xy, dtype=float) / norm)
+            normalized_axis = np.asarray(axis_xy, dtype=float) / norm
+            axes.append(normalized_axis)
             sources.append(source)
+            if joint_type == "hinge":
+                hinge_axes.append(normalized_axis)
+                hinge_sources.append(source)
+            elif joint_type == "slide":
+                slide_axes.append(normalized_axis)
+                slide_sources.append(source)
     if not axes:
         return {"checked": False, "reason": "front_axis_geometry_unavailable"}
-    reference = axes[0]
-    aligned = [axis if float(np.dot(axis, reference)) >= 0.0 else -axis for axis in axes]
+    # Prefer hinge-derived panel motion when mixed hinge/slide articulations
+    # exist.  Slide-only appliances (or drawer-like containers) still use their
+    # direct travel axis.
+    selected_axes = hinge_axes or slide_axes or axes
+    selected_sources = hinge_sources or slide_sources or sources
+    reference = selected_axes[0]
+    aligned = [
+        axis if float(np.dot(axis, reference)) >= 0.0 else -axis
+        for axis in selected_axes
+    ]
     mean_axis = np.mean(aligned, axis=0)
     norm = float(np.linalg.norm(mean_axis))
     if not math.isfinite(norm) or norm <= 1e-6:
@@ -652,8 +716,9 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     return {
         "checked": True,
         "axis_xy": [float(value) for value in mean_axis / norm],
-        "source": "+".join(sorted(set(sources))),
-        "joint_count": len(axes),
+        "source": "+".join(sorted(set(selected_sources))),
+        "joint_count": len(selected_axes),
+        "candidate_joint_count": len(axes),
     }
 
 

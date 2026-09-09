@@ -34,6 +34,7 @@ from semantic_mapping_py_pkg.attribute_filter import (
 )
 from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
 from semantic_mapping_py_pkg.graph_rules import bbox_area, segmentation_pixel_count
+from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_nested_param
 
@@ -200,6 +201,18 @@ class InteractionAttributeInferenceNode:
         self.target_bbox_mask_containment_required = bool(
             attribute_config.get("target_bbox_mask_containment_required", True)
         )
+        self.portal_state_consensus = PortalStateConsensus(
+            confirmation_count=attribute_config.get(
+                "portal_state_confirmation_count", 3
+            ),
+            cooldown_steps=attribute_config.get("portal_state_cooldown_steps", 300),
+            min_position_gap_m=attribute_config.get(
+                "portal_state_min_position_gap_m", 0.25
+            ),
+            min_yaw_gap_rad=attribute_config.get(
+                "portal_state_min_yaw_gap_rad", 0.25
+            ),
+        )
         self.room_enabled = bool(room_mllm_config.get("enabled", True))
         self.room_worker_count = max(
             1, int(room_mllm_config.get("worker_count", 1))
@@ -262,6 +275,7 @@ class InteractionAttributeInferenceNode:
             "targeted_refresh_rejected": 0,
             "targeted_refresh_bbox_rejected": 0,
             "targeted_refresh_multiview": 0,
+            "portal_consensus_suppressed": 0,
         }
         self.room_counts = {
             "messages_received": 0,
@@ -449,6 +463,7 @@ class InteractionAttributeInferenceNode:
         episode_id = str(payload.get("episode_id") or "") if isinstance(payload, dict) else ""
         capture_step = self._capture_step(payload)
         frame_id = "" if capture_step is None else str(capture_step)
+        observation_pose_xyyaw = self._observation_pose_xyyaw(payload)
         observation_stamp = self._observation_stamp(payload, image_stamp)
         if episode_id:
             self._set_episode(episode_id)
@@ -484,6 +499,59 @@ class InteractionAttributeInferenceNode:
                 with self.lock:
                     self.filter_counts["filtered"] += 1
                 continue
+            portal_detection = self._is_portal_detection(detection)
+            if portal_detection:
+                portal_pose = (
+                    targeted_refresh.get("observation_pose_xyyaw")
+                    if targeted_refresh is not None
+                    else observation_pose_xyyaw
+                )
+                portal_request_allowed, portal_request_reason = (
+                    self.portal_state_consensus.can_request(
+                        object_id,
+                        capture_step=capture_step,
+                        observation_pose_xyyaw=portal_pose,
+                    )
+                )
+                if not portal_request_allowed:
+                    with self.lock:
+                        self.filter_counts["portal_consensus_suppressed"] = (
+                            self.filter_counts.get("portal_consensus_suppressed", 0)
+                            + 1
+                        )
+                        self.filter_counts["filtered"] += 1
+                    if targeted_refresh is not None:
+                        cached_consensus = (
+                            self.portal_state_consensus.cached_stable_result(
+                                object_id,
+                                capture_step=capture_step,
+                            )
+                            if portal_request_reason == "stable_state_cooldown"
+                            else None
+                        )
+                        if cached_consensus is not None:
+                            self._publish_cached_portal_targeted_refresh(
+                                object_id=object_id,
+                                episode_id=episode_id,
+                                observation_stamp=observation_stamp,
+                                frame_id=frame_id,
+                                image_sequence=image_sequence,
+                                signature=self._state_signature(detection),
+                                targeted_refresh=targeted_refresh,
+                                consensus=cached_consensus,
+                            )
+                        else:
+                            self._reject_targeted_refresh_evidence(
+                                object_id=object_id,
+                                episode_id=episode_id,
+                                observation_stamp=observation_stamp,
+                                frame_id=frame_id,
+                                image_sequence=image_sequence,
+                                signature=self._state_signature(detection),
+                                targeted_refresh=targeted_refresh,
+                                error=f"portal_state_consensus:{portal_request_reason}",
+                            )
+                    continue
             with self.lock:
                 self.filter_counts["eligible"] += 1
             signature = self._state_signature(detection)
@@ -491,7 +559,7 @@ class InteractionAttributeInferenceNode:
                 image,
                 detection,
                 margin_ratio=self.crop_margin_ratio,
-                include_crop_inset=not self._is_portal_detection(detection),
+                include_crop_inset=not portal_detection,
             )
             if visual_evidence is None:
                 continue
@@ -500,8 +568,24 @@ class InteractionAttributeInferenceNode:
             evidence_capture_steps = (
                 [int(capture_step)] if capture_step is not None else []
             )
-            evidence_observation_poses: list[list[float]] = []
-            evidence_view_metadata: list[dict] = []
+            evidence_observation_poses: list[list[float]] = (
+                [list(observation_pose_xyyaw)] if observation_pose_xyyaw else []
+            )
+            evidence_view_metadata: list[dict] = (
+                [
+                    {
+                        "view_id": "view_1",
+                        "frame_id": frame_id,
+                        "capture_step": capture_step,
+                        "observation_pose_xyyaw": list(observation_pose_xyyaw),
+                        "anchor_face_id": "",
+                        "anchor_face_index": None,
+                        "anchor_face_axis_xy": [],
+                    }
+                ]
+                if observation_pose_xyyaw
+                else []
+            )
             bbox_containment = self._target_bbox_containment(
                 image, detection
             )
@@ -583,7 +667,13 @@ class InteractionAttributeInferenceNode:
                         with self.lock:
                             self.filter_counts["targeted_refresh_multiview"] += 1
             if targeted_refresh is None:
-                self._invalidate_if_state_changed(object_id, signature, episode_id)
+                # Portal consensus needs each accepted model response to count
+                # before another view can replace it. Containers still prefer
+                # the newest material view, but a moving door observation must
+                # not invalidate an in-flight vote and enqueue an avoidable
+                # fourth request before the third response starts cooldown.
+                if not portal_detection:
+                    self._invalidate_if_state_changed(object_id, signature, episode_id)
                 reservation = self._try_reserve(object_id, signature)
             else:
                 reservation = self._force_reserve_targeted_refresh(
@@ -1027,6 +1117,7 @@ class InteractionAttributeInferenceNode:
             self.room_generations.clear()
             self.targeted_refresh_requests.clear()
             self.target_visual_history.clear()
+        self.portal_state_consensus.reset()
         for object_id, request_sequence in stale_request_ids:
             self.request_queue.discard(object_id, request_sequence)
         for room_key, request_sequence in stale_room_request_ids:
@@ -1072,6 +1163,32 @@ class InteractionAttributeInferenceNode:
                 getattr(self, "target_visual_history", {}).pop(object_id, None)
         for object_id in object_ids:
             self.request_queue.discard(object_id)
+            consensus = getattr(self, "portal_state_consensus", None)
+            if consensus is not None:
+                is_portal_result = bool(
+                    str(payload.get("node_type") or "").casefold() == "portal"
+                    or str(payload.get("expected_node_type") or "").casefold()
+                    == "portal"
+                    or str(object_id).casefold().startswith("door_")
+                    or "door_" in str(payload.get("candidate_id") or "").casefold()
+                )
+                result_step = payload.get("result_published_step")
+                if result_step is None:
+                    result_step = payload.get("step")
+                result_state = payload.get("post_state") or payload.get("state")
+                if is_portal_result:
+                    # Capability=unavailable is orthogonal to visual aperture
+                    # state. If the backend cannot provide open/closed, retain
+                    # the existing proposal/stable state and its cooldown;
+                    # never erase visual consensus merely because the asset is
+                    # non-articulated.
+                    consensus.record_authoritative(
+                        object_id,
+                        result_state,
+                        capture_step=result_step,
+                    )
+                else:
+                    consensus.clear(object_id)
 
     @staticmethod
     def _parse_targeted_refresh_payload(payload: object) -> dict | None:
@@ -1668,6 +1785,47 @@ class InteractionAttributeInferenceNode:
             ],
         )
 
+    def _publish_cached_portal_targeted_refresh(
+        self,
+        *,
+        object_id: str,
+        episode_id: str,
+        observation_stamp: float,
+        frame_id: str,
+        image_sequence: int,
+        signature: str,
+        targeted_refresh: dict,
+        consensus: dict,
+    ) -> None:
+        """Satisfy a stale unknown-state refresh from stable consensus."""
+
+        self._consume_targeted_refresh(targeted_refresh)
+        stable_state = str(consensus.get("stable_state") or "unknown")
+        patch = self._attribute_status_patch(
+            {
+                "object_id": object_id,
+                "frame_id": frame_id,
+                "image_sequence": image_sequence,
+                "signature": signature,
+                "targeted_refresh": targeted_refresh,
+            },
+            "ready",
+        )
+        patch.update(
+            {
+                "coarse_state": stable_state,
+                "portal_state_consensus": dict(consensus),
+                "portal_state_consensus_accepted": True,
+                "is_currently_visible": True,
+                "attribute_resolution_source": "cached_portal_state_consensus",
+            }
+        )
+        self._publish_updates(
+            episode_id,
+            observation_stamp,
+            [patch],
+        )
+
     @classmethod
     def _attribute_status_patch(
         cls, request_payload: dict, status: str, error: str = ""
@@ -1750,6 +1908,19 @@ class InteractionAttributeInferenceNode:
         except (TypeError, ValueError):
             return None
         return capture_step if capture_step >= 0 else None
+
+    @staticmethod
+    def _observation_pose_xyyaw(payload: object) -> list[float]:
+        if not isinstance(payload, dict):
+            return []
+        value = payload.get("observation_pose_xyyaw")
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return []
+        try:
+            pose = [float(item) for item in value[:3]]
+        except (TypeError, ValueError):
+            return []
+        return pose if all(math.isfinite(item) for item in pose) else []
 
     def _invalidate_if_state_changed(
         self, object_id: str, signature: str, episode_id: str
@@ -2556,7 +2727,32 @@ class InteractionAttributeInferenceNode:
                     "ready",
                 )
             )
-            self._publish_updates(episode_id, stamp, [patch])
+            # Re-check under the request-state lock and publish the consensus
+            # vote atomically with respect to detection-driven invalidation.
+            # Otherwise a superseded response can consume the third vote and
+            # start cooldown even though graph freshness rejects its patch.
+            with self.lock:
+                if not self._is_current_request_locked(
+                    object_id, episode_id, generation, request_sequence
+                ):
+                    outcome_status = "stale"
+                    return
+                if self._is_portal_detection(detection):
+                    consensus = self.portal_state_consensus.observe(
+                        object_id,
+                        patch.get("coarse_state"),
+                        capture_step=selected_view.get("capture_step"),
+                        observation_pose_xyyaw=selected_view.get(
+                            "observation_pose_xyyaw"
+                        ),
+                    )
+                    patch["portal_state_consensus"] = consensus
+                    patch["portal_state_consensus_accepted"] = bool(
+                        consensus.get("accepted")
+                    )
+                    if consensus.get("accepted") and consensus.get("stable_state"):
+                        patch["coarse_state"] = str(consensus["stable_state"])
+                self._publish_updates(episode_id, stamp, [patch])
             succeeded = True
         except Exception as exc:
             outcome_error = str(exc)

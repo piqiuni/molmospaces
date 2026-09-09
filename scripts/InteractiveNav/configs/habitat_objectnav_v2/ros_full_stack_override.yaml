@@ -1,7 +1,7 @@
 frames:
-  world_frame: habitat_v2_map
-  base_frame: habitat_v2_base
-  camera_frame: habitat_v2_camera
+  world_frame: tf_frame_map
+  base_frame: tf_frame_base_link
+  camera_frame: tf_frame_camera
 
 topics:
   rgb_image: /habitat_v2/full/rgb
@@ -12,6 +12,7 @@ topics:
   # evidence is still published separately for recorder/audit comparison; the
   # Habitat-specific footprint values below reduce the extra safety projection.
   occupancy_grid: /struct_mapping/occ_map
+  pointcloud: /filtered_pointcloud
   odom: /odom
 
 object_detection:
@@ -19,13 +20,13 @@ object_detection:
   provider: external_http
   external_url: http://127.0.0.1:12219/detect
   timeout: 20.0
-  include_depth: false
+  include_depth: true
   confidence_threshold: 0.35
   publish_rate: 20.0
   max_sync_slop_sec: 0.2
   skip_if_busy: true
   process_each_stamp_once: true
-  projection_frame_id: habitat_v2_camera
+  projection_frame_id: tf_frame_camera
   class_mapping: /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/configs/habitat_objectnav_v2/objectnav_v2_yoloe_class_mapping.json
 
 room_inference:
@@ -39,7 +40,7 @@ room_mllm:
 semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: false
-  subscribe_pointcloud: false
+  subscribe_pointcloud: true
   step_ready_require_room_graph: false
   graph_min_observations: 1
   room_min_component_cells: 12
@@ -52,6 +53,9 @@ interaction_graph:
 candidate:
   interaction_types: []
   max_frontier_candidates: 12
+  # The original generic interaction-navigation default is 1.0 m. Habitat-v2
+  # needs a closer detector-backed target pose before handing control to M3.
+  target_standoff_m: 0.55
   # The bridge already synchronizes the detector result to the exact Habitat
   # RGB stamp.  A single current high-confidence observation may therefore be
   # offered as a NAVIGATE candidate; M2 and M3 remain separate gates.

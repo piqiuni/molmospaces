@@ -74,6 +74,18 @@ RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-10}
 RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-600}
 RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
 FAST_EVAL=${FAST_EVAL:-false}
+# Load the complete ProcTHOR scene by default, then project the final ROS map
+# onto its GT navigable area.  TOPDOWN_ROS_ONLY=true is an explicit lightweight
+# fallback; it cannot report whole-scene GT coverage because it lacks the GT
+# denominator.
+TOPDOWN_ROS_ONLY=${TOPDOWN_ROS_ONLY:-false}
+if [[ -z "${TOPDOWN_REQUIRE_FULL_SCENE+x}" ]]; then
+  if [[ "${TOPDOWN_ROS_ONLY}" == true ]]; then
+    TOPDOWN_REQUIRE_FULL_SCENE=false
+  else
+    TOPDOWN_REQUIRE_FULL_SCENE=true
+  fi
+fi
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 # This entry point is a Bash script (despite its historical .zsh suffix), so
@@ -252,13 +264,32 @@ cleanup_process() {
   wait "${pid}" 2>/dev/null || true
 }
 
+cleanup_process_group() {
+  local pid="${1:-}"
+  local grace_s="${2:-20}"
+  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+    return
+  fi
+  local pgid
+  pgid=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)
+  if [[ "${pgid}" =~ ^[0-9]+$ ]] && [[ "${pgid}" -gt 1 ]] && [[ "${pgid}" != "${BASHPID}" ]]; then
+    kill -INT -- "-${pgid}" 2>/dev/null || true
+  fi
+  cleanup_process "${pid}" "${grace_s}"
+  if [[ "${pgid}" =~ ^[0-9]+$ ]] && [[ "${pgid}" -gt 1 ]] && [[ "${pgid}" != "${BASHPID}" ]]; then
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-${pgid}" 2>/dev/null || true
+  fi
+}
+
 ROSCORE_PID=""
 ROSLAUNCH_PID=""
 RECORDER_PID=""
 cleanup() {
   cleanup_process "${RECORDER_PID:-}" 30
-  cleanup_process "${ROSLAUNCH_PID:-}" 20
-  cleanup_process "${ROSCORE_PID:-}" 10
+  cleanup_process_group "${ROSLAUNCH_PID:-}" 20
+  cleanup_process_group "${ROSCORE_PID:-}" 10
 }
 trap cleanup EXIT INT TERM
 
@@ -415,9 +446,9 @@ EVAL_EXIT=$?
 set -e
 
 if [[ "${FAST_EVAL}" == true ]]; then
-  cleanup_process "${ROSLAUNCH_PID}" 20
+  cleanup_process_group "${ROSLAUNCH_PID}" 20
   ROSLAUNCH_PID=""
-  cleanup_process "${ROSCORE_PID}" 10
+  cleanup_process_group "${ROSCORE_PID}" 10
   ROSCORE_PID=""
 fi
 EPISODE_RESULTS=()
@@ -473,9 +504,9 @@ RECORDER_DRAIN_STATUS=0
 
 cleanup_process "${RECORDER_PID}" "${RECORDER_SHUTDOWN_GRACE_S}"
 RECORDER_PID=""
-cleanup_process "${ROSLAUNCH_PID}" 20
+cleanup_process_group "${ROSLAUNCH_PID}" 20
 ROSLAUNCH_PID=""
-cleanup_process "${ROSCORE_PID}" 10
+cleanup_process_group "${ROSCORE_PID}" 10
 ROSCORE_PID=""
 # Re-check after recorder shutdown because its final join may complete the last
 # raw receipt even if the live drain reached its timeout boundary.
@@ -533,12 +564,21 @@ if not video_path.is_file() or video_path.stat().st_size <= 0:
 PY
 
 TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
+TOPDOWN_ARGS=(
+  --episode-result "${EPISODE_RESULT}"
+  --benchmark "${BENCHMARK}"
+  --debug-dir "${RUN_DIR}/debug"
+  --private-context "${EPISODE_DIR}/episode_visualization.json"
+  --output "${TOPDOWN_PATH}"
+)
+if [[ "${TOPDOWN_ROS_ONLY}" == true ]]; then
+  TOPDOWN_ARGS+=(--ros-only)
+fi
+if [[ "${TOPDOWN_REQUIRE_FULL_SCENE}" == true ]]; then
+  TOPDOWN_ARGS+=(--require-full-scene)
+fi
 MUJOCO_GL=egl "${PYTHON_BIN}" "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
-  --episode-result "${EPISODE_RESULT}" \
-  --benchmark "${BENCHMARK}" \
-  --debug-dir "${RUN_DIR}/debug" \
-  --private-context "${EPISODE_DIR}/episode_visualization.json" \
-  --output "${TOPDOWN_PATH}" \
+  "${TOPDOWN_ARGS[@]}" \
   >"${RUN_DIR}/topdown.log" 2>&1
 
 for required_artifact in "${RUN_DIR}/debug/final_occ_map.yaml" "${RUN_DIR}/debug/trajectory.csv" \

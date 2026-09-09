@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 
 from semantic_decision_py_pkg.behavior_candidates import (
@@ -20,7 +21,7 @@ from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
 patch_roslogging_findcaller_for_py311()
 
 import rospy
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from std_msgs.msg import String
 
 
@@ -131,6 +132,12 @@ class SemanticCandidateNode:
                     config.get("remembered_portal_reobservation_enabled", False)
                 ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
+                portal_allow_opposite_side_interaction=bool(
+                    config.get("portal_allow_opposite_side_interaction", False)
+                ),
+                portal_interaction_front_angle_tolerance_rad=float(
+                    config.get("portal_interaction_front_angle_tolerance_rad", 0.15)
+                ),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.8)
                 ),
@@ -379,6 +386,7 @@ class SemanticCandidateNode:
         self.graph: dict = {}
         self.target_context: dict = dict(rospy.get_param("~target", {}) or {})
         self.robot_xy: tuple[float, float] | None = None
+        self.room_segment_grid: dict | None = None
         self.sequence = 0
         self.publisher = rospy.Publisher(
             topics.get("candidates", "/semantic_decision/candidates"),
@@ -412,6 +420,12 @@ class SemanticCandidateNode:
         )
         rospy.Subscriber(
             topics.get("odom", "/odom"), Odometry, self._odom_callback, queue_size=1
+        )
+        rospy.Subscriber(
+            topics.get("room_segment_grid", "/semantic_mapping/room_segment_grid"),
+            OccupancyGrid,
+            self._room_segment_grid_callback,
+            queue_size=1,
         )
         if self.startup_scan_enabled:
             rospy.Subscriber(
@@ -504,6 +518,34 @@ class SemanticCandidateNode:
             float(message.pose.pose.position.y),
         )
 
+    def _room_segment_grid_callback(self, message: OccupancyGrid) -> None:
+        origin = message.info.origin
+        quaternion = origin.orientation
+        origin_yaw = math.atan2(
+            2.0
+            * (
+                float(quaternion.w) * float(quaternion.z)
+                + float(quaternion.x) * float(quaternion.y)
+            ),
+            1.0
+            - 2.0
+            * (
+                float(quaternion.y) * float(quaternion.y)
+                + float(quaternion.z) * float(quaternion.z)
+            ),
+        )
+        self.room_segment_grid = {
+            "width": int(message.info.width),
+            "height": int(message.info.height),
+            "resolution": float(message.info.resolution),
+            "origin_x": float(origin.position.x),
+            "origin_y": float(origin.position.y),
+            "origin_yaw": float(origin_yaw),
+            "frame_id": str(message.header.frame_id or ""),
+            "stamp_sec": float(message.header.stamp.to_sec()),
+            "data": [int(value) for value in message.data],
+        }
+
     def _publish(self, _event) -> None:
         explorer_input = (
             self.explorer_proposal_stream
@@ -512,7 +554,11 @@ class SemanticCandidateNode:
         )
         ready = bool(explorer_input.get("ready", False))
         candidates = self.generator.generate(
-            explorer_input, self.graph, self.robot_xy, self.target_context
+            explorer_input,
+            self.graph,
+            self.robot_xy,
+            self.target_context,
+            self.room_segment_grid,
         )
         episode_id = str(
             self.graph.get("episode_id")
@@ -555,6 +601,32 @@ class SemanticCandidateNode:
         )
         frontier_filtering = summarize_frontier_filtering(
             explorer_input.get("frontier_debug")
+        )
+        raw_frontier_proposals = list(
+            explorer_input.get("proposals")
+            or explorer_input.get("exploration_proposals")
+            or []
+        )
+        if isinstance(raw_frontier_proposals, dict):
+            raw_frontier_proposals = list(
+                raw_frontier_proposals.get("proposals") or []
+            )
+        source_frontier_candidate_ids = sorted(
+            {
+                "frontier:"
+                + str(
+                    proposal.get("proposal_id")
+                    or proposal.get("cluster_id")
+                    or ""
+                )
+                for proposal in raw_frontier_proposals
+                if isinstance(proposal, dict)
+                and str(
+                    proposal.get("proposal_id")
+                    or proposal.get("cluster_id")
+                    or ""
+                )
+            }
         )
         retryable_filtered_frontier = bool(
             frontier_filtering["filtered_frontier_retryable"]
@@ -607,6 +679,7 @@ class SemanticCandidateNode:
                     unresolved_interaction_target_count
                 ),
                 "connected_unknown_area_present": connected_unknown_area_present,
+                "source_frontier_candidate_ids": source_frontier_candidate_ids,
                 "combined_frontier_count": len(navigation_frontiers)
                 + len(interaction_frontiers),
                 "source_frontier_exhausted": bool(

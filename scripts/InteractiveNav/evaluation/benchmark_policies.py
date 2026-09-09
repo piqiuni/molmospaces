@@ -394,6 +394,7 @@ class RosConfigFacade:
     """Minimal config accepted by RosBridgePolicy without task-level GT."""
 
     policy_dt_ms: float
+    policy_config: Any
 
 
 def build_ros_bridge_policy(
@@ -422,7 +423,10 @@ def build_ros_bridge_policy(
     from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 
     policy = RosBridgePolicy(
-        config=RosConfigFacade(policy_dt_ms=float(policy_dt_ms)),
+        config=RosConfigFacade(
+            policy_dt_ms=float(policy_dt_ms),
+            policy_config=type("RosPolicyConfig", (), {"force_enable_depth": False})(),
+        ),
         task=None,
         observation_topic=observation_topic,
         action_topic=action_topic,

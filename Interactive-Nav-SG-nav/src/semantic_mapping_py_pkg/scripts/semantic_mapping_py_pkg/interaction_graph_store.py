@@ -1182,6 +1182,9 @@ class InteractionGraphStore:
         interaction_class = normalize_label(patch.get("interaction_class"))
         patch_source = str(patch.get("source") or "mllm_attribute_inference")
         is_visual_mllm_patch = "mllm" in patch_source.casefold()
+        portal_state_consensus_accepted = bool(
+            patch.get("portal_state_consensus_accepted", True)
+        )
         requested_patch_state = str(
             patch.get("coarse_state") or "unknown"
         ).strip().casefold()
@@ -1244,6 +1247,10 @@ class InteractionGraphStore:
                 "affordances": list(patch.get("affordances") or []),
                 "interaction_parts": parts,
                 "mllm_interaction_parts": parts,
+                "portal_state_consensus": dict(
+                    patch.get("portal_state_consensus") or {}
+                ),
+                "portal_state_consensus_accepted": portal_state_consensus_accepted,
             }
         )
         if is_visual_mllm_patch and (
@@ -1355,6 +1362,7 @@ class InteractionGraphStore:
             has_verified_interaction_state
             and is_visual_mllm_patch
             and node.type == "portal"
+            and portal_state_consensus_accepted
             and str(verified_state_override.get("capability") or "").casefold()
             == "unavailable"
             and patch_state.casefold() in {"open", "ajar", "static_open"}
@@ -1367,9 +1375,21 @@ class InteractionGraphStore:
             not has_verified_interaction_state
             and latest_operation_stamp <= patch_stamp
             and is_visual_mllm_patch
+            and (node.type != "portal" or portal_state_consensus_accepted)
             and not container_state_rejected
             and not portal_type_locked
         ) or unavailable_open_reconciliation
+        if (
+            is_visual_mllm_patch
+            and node.type == "portal"
+            and not portal_state_consensus_accepted
+        ):
+            node.attributes["portal_state_gate"] = {
+                "accepted": False,
+                "requested_state": str(patch_state).casefold(),
+                "reason": "portal_state_consensus_pending",
+                "observation_capture_step": patch_frame_index,
+            }
         if state_was_updated:
             if unavailable_open_reconciliation:
                 patch_state = "static_open"
@@ -1856,9 +1876,26 @@ class InteractionGraphStore:
         node.type = observed_node_type
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
-        node.centroid = self._ground_non_room_centroid(observation["position"], observation["aabb_size"])
-        node.aabb_center = self._ground_non_room_centroid(observation["aabb_center"], observation["aabb_size"])
-        node.aabb_size = list(observation["aabb_size"])
+        observed_aabb_center = list(observation["aabb_center"])
+        observed_aabb_size = list(observation["aabb_size"])
+        aabb_reused_previous = False
+        if (
+            not self._valid_aabb_size(observed_aabb_size)
+            and self._valid_aabb_size(node.aabb_size)
+        ):
+            # A transient publisher/geometry failure must not erase a valid
+            # portal or container footprint and force candidate generation to
+            # fall back to a robot-bearing direction.
+            observed_aabb_center = list(node.aabb_center)
+            observed_aabb_size = list(node.aabb_size)
+            aabb_reused_previous = True
+        node.centroid = self._ground_non_room_centroid(
+            observation["position"], observed_aabb_size
+        )
+        node.aabb_center = self._ground_non_room_centroid(
+            observed_aabb_center, observed_aabb_size
+        )
+        node.aabb_size = observed_aabb_size
         node.room_id = observation.get("room_id") if observation.get("room_id") is not None else node.room_id
         node.confidence = max(float(node.confidence), float(observation.get("confidence", 0.0)))
         node.observation_count += 1
@@ -1925,8 +1962,14 @@ class InteractionGraphStore:
                 ),
                 "episode_id": observation.get("episode_id"),
                 "box_3d_frame_id": observation.get("box_3d_frame_id"),
-                "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
-                "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
+                "viz_aabb_center": list(
+                    observation.get("viz_aabb_center") or observed_aabb_center
+                ),
+                "viz_aabb_size": list(
+                    observation.get("viz_aabb_size") or observed_aabb_size
+                ),
+                "aabb_valid": bool(self._valid_aabb_size(observed_aabb_size)),
+                "aabb_reused_previous": bool(aabb_reused_previous),
             }
         if not (minimal_gt and node.type == "portal"):
             observation_attributes["source_object_name"] = observation.get(
@@ -2042,12 +2085,14 @@ class InteractionGraphStore:
         }
         node.interaction = default_interaction_payload(node.type, observation)
         if node.type == "portal":
-            if "interaction_reference_aabb_center" not in node.attributes:
+            if not self._valid_aabb_size(
+                node.attributes.get("interaction_reference_aabb_size")
+            ):
                 node.attributes["interaction_reference_aabb_center"] = list(
-                    observation["aabb_center"]
+                    observed_aabb_center
                 )
                 node.attributes["interaction_reference_aabb_size"] = list(
-                    observation["aabb_size"]
+                    observed_aabb_size
                 )
         if interaction_state_override:
             for key in (
@@ -2648,6 +2693,16 @@ class InteractionGraphStore:
         half_height = max(float(size[2]) * 0.5, 0.01)
         grounded[2] = max(grounded[2], half_height)
         return grounded
+
+    @staticmethod
+    def _valid_aabb_size(size) -> bool:
+        try:
+            values = [float(value) for value in list(size or [])[:3]]
+        except (TypeError, ValueError):
+            return False
+        return len(values) == 3 and all(
+            math.isfinite(value) and value > 1e-6 for value in values
+        )
 
     def _grounded_center(self, center):
         grounded = list(center)

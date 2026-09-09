@@ -19,7 +19,9 @@ modules:
       transport: http_sidecar
       endpoint: http://127.0.0.1:12230
       timeout_s: 25.0
-      interval_steps: 5
+      # The original ROS mapper and move_base controller require every Habitat
+      # sensor/control tick; this is no longer a sparse telemetry sidecar.
+      interval_steps: 1
       min_confidence: 0.35
       include_depth: true
       original_module1_scripts: /home/ldl/molmospaces-exp-setting/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts
@@ -32,15 +34,40 @@ modules:
     model: qwen3.6-35b-a3b-fp8
     timeout_s: 30.0
     vision_localization_enabled: false
+    # A promoted public RGB-D/ROS target stays inside the original Module-2
+    # candidate pool. ModelPolicyClient is always called, then its built-in
+    # TARGET_GOAL pre-score guard prevents an exploration frontier from taking
+    # over a reliable target approach.
+    target_goal_lock_enabled: true
+    target_goal_pre_score: 1.0
 
   module3:
     enabled: true
     mode: objectgoal_stop_verified
     fail_closed: true
     allowed_outputs: [STOP, CONTINUE, RESCAN]
+    # M3 owns control only after the selected target standoff is reached. It
+    # sends a same-frame detector box directly to M3; persistent invisibility,
+    # excessive range, or rejection invalidates this standoff and exposes a retry.
+    # This is the public ROS subgoal-arrival tolerance, not Habitat's hidden
+    # success metric.  The latter remains VIEW_POINTS geodesic distance <=0.1m
+    # and is never exposed to M3 or the policy.
     stop_trigger_distance_m: 0.25
-    detector_confirmations: 2
+    # Invoke M3 on the first current target box. Detector confidence and
+    # horizontal box position are model context, not adapter-side call gates.
+    detector_confirmations: 1
+    # This threshold applies to M3's own structured response confidence, not to
+    # the detector score used to decide whether M3 is called.
     min_confidence: 0.80
+    # Public RGB-D planar range to the current box-centre ray. Every navigation
+    # terminal is sent to M3; this value is included in its structured judgment
+    # and prevents only the final STOP outcome, not the M3 call itself.
+    max_bbox_center_distance_m: 0.85
+    # At 0.045 rad per v2 step, 80 steps can cover a 180-degree initial
+    # misalignment plus the bounded search around the tracked target bearing.
+    missing_target_max_steps: 80
+    max_verification_steps: 120
+    semantic_rejection_limit: 3
     allowed_behavior_types: [EXPLORE, NAVIGATE]
     forbidden_behavior_types: [INTERACT]
     forbidden_habitat_actions: [INTERACT, OPEN, CLOSE]
@@ -51,8 +78,18 @@ approach:
   waypoint_standoff_m: 0.60
   waypoint_reached_distance_m: 0.08
   max_contiguous_steps: 120
-  target_track_standoff_m: 1.00
-  route_goal_reached_distance_m: 0.10
+  target_track_standoff_m: 0.55
+  target_track_standoff_tolerance_m: 0.10
+  # Keep the adapter's ROS-subgoal completion check aligned with move_base's
+  # DWAPlannerROS.xy_goal_tolerance. This does not relax Habitat's STOP metric.
+  route_goal_reached_distance_m: 0.20
+  # move_base ABORTED is not target completion. Suppress the failed standoff
+  # and offer front-side alternatives around the same public RGB-D target track
+  # to the unchanged Module-2 selector.
+  ros_goal_terminal_grace_steps: 3
+  target_standoff_failure_radius_m: 0.35
+  target_standoff_failure_cooldown_steps: 500
+  target_standoff_retry_angles_deg: [35.0, -35.0, 70.0, -70.0]
 
 stop_proxy:
   # Disable the legacy direct RGB-D proxy. STOP is owned by the fail-closed M3

@@ -924,6 +924,18 @@ def _build_replay_config(
     from molmo_spaces.configs.task_configs import NavToObjTaskConfig
     from molmo_spaces.configs.task_sampler_configs import NavToObjTaskSamplerConfig
     from molmo_spaces.robots.rby1 import RBY1
+    from molmo_spaces.robots.robot_views.rby1_view import RBY1RobotView
+    from molmo_spaces.molmo_spaces_constants import get_robot_path
+
+    class ReplayRBY1(RBY1):
+        """RBY1 scene insertion without legacy post-insertion XML lookup."""
+
+        @classmethod
+        def apply_control_overrides(cls, spec, robot_config):
+            # add_robot_to_scene already creates the holonomic actuators with
+            # the intended ranges.  The legacy override re-queries attached
+            # joints through an API that no longer exposes them on MjSpec.
+            return None
 
     init_qpos = {
         "base": np.array([0.0, 0.0, 0.0]),
@@ -939,9 +951,8 @@ def _build_replay_config(
         for group_name, values in init_qpos.items()
     }
     robot_config = SimpleNamespace(
-        robot_cls=RBY1,
-        robot_factory=RBY1,
-        robot_view_factory=None,
+        robot_cls=ReplayRBY1,
+        robot_factory=ReplayRBY1,
         robot_namespace="robot_0/",
         init_qpos=init_qpos,
         init_qpos_noise_range=init_qpos_noise_range,
@@ -959,6 +970,12 @@ def _build_replay_config(
         K_stiffness=None,
         K_damping=None,
         action_noise_config=SimpleNamespace(enabled=False),
+        robot_view_factory=lambda mj_data, namespace: RBY1RobotView(
+            mj_data, namespace, holo_base=True
+        ),
+        # BaseRobotConfig exposes this method; keep the lightweight replay
+        # namespace compatible without invoking Pydantic model copying.
+        get_robot_xml_path=lambda: get_robot_path("rby1") / "rby1_site_control.xml",
     )
     replay = SimpleNamespace(
         num_envs=1,
@@ -978,11 +995,16 @@ def _build_replay_config(
         data_split="val",
         camera_config=None,
         robot_config=robot_config,
-        task_sampler_config=NavToObjTaskSamplerConfig(task_sampler_class=None),
+        task_sampler_config=NavToObjTaskSamplerConfig(
+            task_sampler_class=None, house_variant="base"
+        ),
         task_config=NavToObjTaskConfig(task_cls=None),
         task_config_preset_exp=None,
         task_config_preset_scn=None,
-        policy_config=None,
+        # JsonEvalTaskSampler reads this flag even for the evaluator-only
+        # adapter; provide the minimal policy contract without constructing a
+        # planner policy (which would pull in optional manipulation deps).
+        policy_config=SimpleNamespace(force_enable_depth=False),
         benchmark_path=None,
         eval_runtime_params=None,
         output_dir=output_dir,
@@ -3616,6 +3638,14 @@ def evaluate_episode(
     paper_metric_config_payload = paper_metric_config.to_dict()
     try:
         phase_started = time.perf_counter()
+        # Older frozen V3 benchmark releases omitted the empty articulation
+        # state list from ``scene_modifications``.  The current schema keeps
+        # the field required so downstream replay can rely on a stable shape;
+        # normalize the legacy payload in memory without changing the frozen
+        # benchmark artifact.
+        episode.setdefault("scene_modifications", {}).setdefault(
+            "articulation_states", []
+        )
         interactive_nav_v3.validate_interactive_nav_v3_episode(episode, expected_domains=list(nav["interaction_domains"]))
         phase_timings.record("episode_validation", phase_started)
         spec = EpisodeSpec.model_validate(episode)
@@ -3663,7 +3693,9 @@ def evaluate_episode(
         variants["base"] = probe.prepare_writable_scene_path(Path(source_scene_path))
         try:
             phase_started = time.perf_counter()
-            task = sampler.sample_task(house_index=spec.house_index, variant="base")
+            # Current BaseMujocoTaskSampler selects the base scene variant
+            # internally; older releases exposed a variant keyword here.
+            task = sampler.sample_task(house_index=spec.house_index)
             phase_timings.record("task_sample", phase_started)
         finally:
             variants["base"] = source_scene_path
@@ -3672,6 +3704,46 @@ def evaluate_episode(
         phase_started = time.perf_counter()
         observation, _info = task.reset()
         phase_timings.record("task_reset", phase_started)
+        # JsonEvalTaskSampler's nav-to-object path intentionally skips its
+        # manipulation-only joint initializer. Reapply the frozen object and
+        # articulation state explicitly before runtime consistency checks. A
+        # released benchmark can contain decorative object poses from an older
+        # asset revision; the sampler already validated that task-critical
+        # bodies exist, so drop only non-critical poses absent from this runtime
+        # scene instead of turning an otherwise scoreable episode into a setup
+        # exception. The frozen JSON is never modified on disk.
+        runtime_body_names = {
+            mujoco.mj_id2name(task.env.current_model, mujoco.mjtObj.mjOBJ_BODY, index)
+            for index in range(task.env.current_model.nbody)
+        }
+        runtime_body_names.discard(None)
+        critical_pose_names = set(target_candidate_names(episode))
+        critical_pose_names.update(
+            str(row["object_name"])
+            for row in nav.get("interactions", [])
+            if isinstance(row, Mapping) and row.get("object_name")
+        )
+        modifications = episode.get("scene_modifications") or {}
+        recorded_poses = modifications.get("object_poses") or {}
+        dropped_pose_names = sorted(
+            str(name)
+            for name in recorded_poses
+            if str(name) not in runtime_body_names
+        )
+        missing_critical = sorted(set(dropped_pose_names) & critical_pose_names)
+        if missing_critical:
+            raise RuntimeError(
+                "Runtime scene is missing task-critical object pose bodies: "
+                + ", ".join(missing_critical)
+            )
+        if dropped_pose_names:
+            episode["scene_modifications"] = dict(modifications)
+            episode["scene_modifications"]["object_poses"] = {
+                name: pose
+                for name, pose in recorded_poses.items()
+                if str(name) not in set(dropped_pose_names)
+            }
+        probe.apply_episode_scene_state(task.env, episode)
         catalog = InteractionCatalog(task.env)
         private_visualization = _private_episode_visualization_context(
             task=task,
@@ -4667,12 +4739,65 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
             "elapsed_seconds": elapsed,
             "eta_seconds": eta_seconds,
         }
+        # Keep the live progress artifact useful to an outer scheduler as well
+        # as to humans watching the terminal. ``success`` is the historical
+        # formal V3 score; only complete, scoring-eligible rows contribute to
+        # the interim SR so runtime exceptions and consistency exclusions do not
+        # silently dilute the metric.
+        eligible_rows = [
+            row
+            for row in rows
+            if row.get("status") == "complete" and bool(row.get("scoring_eligible"))
+        ]
+        payload.update(
+            {
+                "scored": len(eligible_rows),
+                "success_count": sum(bool(row.get("success")) for row in eligible_rows),
+                "task_success_count": sum(bool(row.get("task_success")) for row in eligible_rows),
+                "nav_success_count": sum(bool(row.get("nav_success")) for row in eligible_rows),
+                "interaction_success_count": sum(
+                    bool(row.get("required_interaction_success")) for row in eligible_rows
+                ),
+                "success_rate": (
+                    sum(bool(row.get("success")) for row in eligible_rows) / len(eligible_rows)
+                    if eligible_rows
+                    else None
+                ),
+            }
+        )
         _atomic_json(config.output_dir / "progress.json", payload)
+        progress_sr = "NA" if payload["success_rate"] is None else format(payload["success_rate"], ".4f")
+        progress_task_sr = (
+            "NA"
+            if not eligible_rows
+            else format(payload["task_success_count"] / len(eligible_rows), ".4f")
+        )
+        progress_nav_sr = (
+            "NA"
+            if not eligible_rows
+            else format(payload["nav_success_count"] / len(eligible_rows), ".4f")
+        )
+        try:
+            with (config.output_dir / "progress.log").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "[benchmark-progress] "
+                    f"processed={completed}/{total_payloads} "
+                    f"scored={payload['scored']} "
+                    f"success={payload['success_count']} "
+                    f"SR={progress_sr} taskSR={progress_task_sr} navSR={progress_nav_sr} "
+                    f"rate={rate:.4f}/s "
+                    f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}\n"
+                )
+        except OSError:
+            # Progress reporting must never turn an otherwise valid evaluator
+            # result into a failed episode when a log filesystem is transient.
+            pass
         print(
             "[quality-gate-progress] "
             f"time={payload['time']} processed={completed}/{total_payloads} "
             f"eligible={payload['eligible']} ineligible={payload['ineligible']} "
-            f"exceptions={payload['exceptions']} rate={rate:.3f}/s "
+            f"exceptions={payload['exceptions']} SR={'NA' if payload['success_rate'] is None else format(payload['success_rate'], '.3f')} "
+            f"rate={rate:.3f}/s "
             f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}",
             flush=True,
         )

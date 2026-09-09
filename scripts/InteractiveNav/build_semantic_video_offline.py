@@ -1093,8 +1093,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     display_id = scene_display_id(scene_dir)
     global_replay = GlobalCostmapReplay(maps_by_id)
 
-    # Per-frame known bounds made Panel 5 visibly pan/zoom whenever one new map
-    # row arrived.  Lock all map-frame panels to the episode envelope instead.
+    # Keep the margin policy from the episode, but do not use future maps to
+    # determine the initial viewport. The renderer below maintains a monotonic
+    # union of maps causally available at each step.
     episode_occ_crop_margin_m = max(
         [
             float(
@@ -1107,11 +1108,6 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         ]
         or [2.5]
     )
-    fixed_world_bounds = episode_planning_world_bounds(
-        maps_by_stage.get("planning_occ", []),
-        margin_m=episode_occ_crop_margin_m,
-    )
-
     panel_size = (480, 270)
     videos_dir = scene_dir / "videos"
     frames_dir = videos_dir / "offline_composite_frames"
@@ -1129,6 +1125,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     if not writer.isOpened():
         raise RuntimeError("Cannot open raw offline video writer")
     written = 0
+    running_world_bounds = None
     component_post_observation_receipt_count = 0
     component_causal_fallback_count = 0
     requested_future_receipt_count = 0
@@ -1221,10 +1218,20 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 semantic_xy_overview_inset = bool(
                     getattr(args, "semantic_xy_overview_inset", False)
                 )
-                world_bounds = fixed_world_bounds
+                if planning is not None:
+                    running_world_bounds = union_world_bounds(
+                        running_world_bounds,
+                        known_world_bounds(planning, margin_m=0.0),
+                    )
+                world_bounds = running_world_bounds
                 if world_bounds is None and planning is not None:
-                    world_bounds = known_world_bounds(
-                        planning, margin_m=occ_crop_margin_m
+                    world_bounds = known_world_bounds(planning, margin_m=0.0)
+                if world_bounds is not None:
+                    world_bounds = (
+                        world_bounds[0] - occ_crop_margin_m,
+                        world_bounds[1] - occ_crop_margin_m,
+                        world_bounds[2] + occ_crop_margin_m,
+                        world_bounds[3] + occ_crop_margin_m,
                     )
                 occ_world_bounds = extend_world_bounds_lower(
                     world_bounds, occ_lower_margin_m

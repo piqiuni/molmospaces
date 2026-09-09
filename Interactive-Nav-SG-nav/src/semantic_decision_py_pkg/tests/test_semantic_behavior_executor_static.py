@@ -328,6 +328,43 @@ def test_portal_aperture_observation_is_forwarded_without_private_metadata(
     assert "private_joint_name" not in published[0]["portal_aperture_observation"]
 
 
+def test_interaction_front_tolerances_survive_bridge_payload_compaction(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.evaluator_opaque_open_only = False
+    executor.interaction_command_sequence = 0
+    executor.latest_image_sequence = 0
+    executor._command_id = lambda _candidate: "container-command"
+    published = []
+    executor.interaction_command_pub = SimpleNamespace(
+        publish=lambda message: published.append(json.loads(message.data))
+    )
+    candidate = _portal_selection()
+    candidate["interaction_command"].update(
+        {
+            "interaction_front_position_tolerance_rad": 0.261799,
+            "interaction_front_yaw_tolerance_rad": 0.261799,
+            "interaction_ready_yaw_tolerance_rad": 0.20,
+        }
+    )
+
+    executor._publish_interaction_command(candidate)
+
+    assert published[0]["interaction_front_position_tolerance_rad"] == pytest.approx(
+        0.261799
+    )
+    assert published[0]["interaction_front_yaw_tolerance_rad"] == pytest.approx(
+        0.261799
+    )
+    assert published[0]["navigation_goal_tolerance_contract_explicit"] is False
+    assert published[0]["navigation_goal_position_tolerance_m"] == pytest.approx(
+        published[0]["interaction_ready_distance_m"]
+    )
+    assert published[0]["navigation_goal_yaw_tolerance_rad"] == pytest.approx(0.20)
+
+
 def test_physical_retries_publish_unique_command_ids(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.lock = threading.RLock()
@@ -2603,7 +2640,42 @@ def test_drawer_scan_wait_ignores_stale_callback_timestamp_after_step_progress(
         "max_task_steps": 120,
         "step_budget_margin": 8,
     }
-    assert executor._drawer_scan_execution_timeout_reason_locked(now=55.0) == ""
+    # Even a host delay beyond the emergency wall cap is not a failure while
+    # the public evaluator clock is advancing below its finite step budget.
+    assert executor._drawer_scan_execution_timeout_reason_locked(now=181.0) == ""
+
+
+def test_drawer_scan_wait_active_only_for_matching_sent_command(executor_module) -> None:
+    candidate = {
+        "decision_id": "decision-drawer-owner",
+        "candidate_id": "interaction:drawer-owner:scan",
+        "behavior_type": "INTERACT",
+        "metadata": {"requires_approach": False},
+        "interaction_command": {"sequence_type": "drawer_scan"},
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = candidate
+    executor.machine = executor_module.BehaviorExecutionStateMachine(
+        executor_module.ExecutionConfig(interaction_timeout_s=30.0)
+    )
+    executor.machine.start(candidate, now=0.0)
+    executor._interaction_command_sent_id = "drawer-command"
+    executor._drawer_scan_execution_wait = {
+        "command_id": "drawer-command",
+        "decision_id": "decision-drawer-owner",
+        "candidate_id": "interaction:drawer-owner:scan",
+        "sequence_type": "drawer_scan",
+    }
+    assert executor._drawer_scan_execution_wait_active_locked() is True
+
+    executor._interaction_command_sent_id = "different-command"
+    assert executor._drawer_scan_execution_wait_active_locked() is False
+    executor._interaction_command_sent_id = "drawer-command"
+    executor._drawer_scan_execution_wait["candidate_id"] = "other-candidate"
+    assert executor._drawer_scan_execution_wait_active_locked() is False
+    executor._drawer_scan_execution_wait["candidate_id"] = "interaction:drawer-owner:scan"
+    executor._drawer_scan_execution_wait["sequence_type"] = "ordinary"
+    assert executor._drawer_scan_execution_wait_active_locked() is False
 
 
 def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
@@ -3174,6 +3246,68 @@ def test_fresh_m1_drawer_plan_uses_sequential_scan_contract(executor_module) -> 
     assert command["action"] == "scan"
     assert command["sequence_type"] == "drawer_scan"
     assert command["visual_operation_plan"]["drawer_sequence_type"] == "drawer_scan"
+
+
+def test_low_view_drawer_scan_contract_allows_empty_regions_but_not_drawer_open(
+    executor_module,
+) -> None:
+    """A valid front/bbox M1 frame may request the scan-all fallback only."""
+    executor_cls = executor_module.SemanticBehaviorExecutor
+    scan = {
+        "sequence_type": "drawer_scan",
+        "open_regions": [],
+        "drawer_scan_fallback_to_all": True,
+        "drawer_container_bbox_2d": [10, 20, 110, 220],
+        "drawer_container_capture_step": 22,
+    }
+    assert executor_cls._has_valid_drawer_visual_contract(scan) is True
+
+    open_command = {
+        **scan,
+        "sequence_type": "drawer_open",
+    }
+    assert executor_cls._has_valid_drawer_visual_contract(open_command) is False
+
+
+def test_low_view_drawer_m1_without_regions_builds_scan_all_candidate(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.container_pre_action_require_direct_front = True
+    candidate = {
+        "metadata": {"drawer_pre_action_observation": True},
+        "interaction_command": {
+            "node_id": "container_drawers",
+            "object_id": "drawer_unit",
+            "node_type": "container",
+            "action": "open",
+        },
+    }
+    planned, reason = executor._drawer_candidate_from_m1_update_locked(
+        candidate,
+        {
+            "attribute_status": "ready",
+            "is_currently_visible": True,
+            "observation_capture_step": 22,
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "needs_reobserve": False,
+            "observed_bbox_2d": [10, 20, 110, 220],
+            # Low camera view: M1 identifies the drawer unit but cannot provide
+            # a reliable crop-relative region. The sealed scan must still be
+            # allowed to enumerate every simulator slide joint.
+            "action_regions": [],
+            "source": "mllm_attribute_inference",
+        },
+        {"minimum_capture_step": 21},
+    )
+    assert reason == "ready"
+    assert planned is not None
+    command = planned["interaction_command"]
+    assert command["sequence_type"] == "drawer_scan"
+    assert command["open_regions"] == []
+    assert command["drawer_scan_fallback_to_all"] is True
 
 
 def test_drawer_contact_allows_vertical_crop_but_rejects_lateral_crop(

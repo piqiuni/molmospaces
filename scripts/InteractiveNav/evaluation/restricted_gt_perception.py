@@ -832,7 +832,7 @@ def _runtime_aabb(spec: PrivateObjectSpec, model: Any, data: Any) -> tuple[tuple
         try:
             from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 
-            center, size = body_aabb(model, data, int(spec.body_id), visual_only=True)
+            center, size = body_aabb(model, data, int(spec.body_id), visible_only=True)
             return _triplet(center, path="private_runtime.aabb_center"), _triplet(size, path="private_runtime.aabb_size")
         except Exception:
             try:

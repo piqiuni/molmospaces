@@ -9,6 +9,7 @@ pytest.importorskip("rospy")
 
 import interaction_attribute_inference_node as attribute_module
 from interaction_attribute_inference_node import InteractionAttributeInferenceNode
+from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
 
 
 class RecordingQueue:
@@ -74,6 +75,7 @@ def test_interaction_result_object_id_invalidates_cached_attribute() -> None:
     node.last_request = {"canonical_object": 1.0}
     node.pending = {"canonical_object": {"request_sequence": 4}}
     node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
 
     node._interaction_result_callback(
         SimpleNamespace(data=json.dumps({"object_id": "canonical_object", "success": True}))
@@ -84,6 +86,121 @@ def test_interaction_result_object_id_invalidates_cached_attribute() -> None:
     assert "canonical_object" not in node.last_request
     assert "canonical_object" not in node.pending
     assert node.request_queue.discarded == [("canonical_object", None)]
+
+
+def test_portal_interaction_result_latches_state_and_cooldown() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.aliases = {"door_0001": "door_0001"}
+    node.generations = {"door_0001": 0}
+    node.completed = {}
+    node.last_request = {}
+    node.pending = {}
+    node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
+
+    node._interaction_result_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "object_id": "door_0001",
+                    "candidate_id": "interaction:door_0001:open",
+                    "post_state": "open",
+                    "result_published_step": 120,
+                    "success": True,
+                }
+            )
+        )
+    )
+
+    assert node.portal_state_consensus.can_request(
+        "door_0001",
+        capture_step=419,
+        observation_pose_xyyaw=[0.0, 0.0, 0.0],
+    ) == (False, "stable_state_cooldown")
+
+
+def test_unavailable_portal_result_preserves_visual_state_cooldown() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.aliases = {"door_0002": "door_0002"}
+    node.generations = {"door_0002": 0}
+    node.completed = {}
+    node.last_request = {}
+    node.pending = {}
+    node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(
+        confirmation_count=1, cooldown_steps=300
+    )
+    node.portal_state_consensus.observe(
+        "door_0002",
+        "closed",
+        capture_step=100,
+        observation_pose_xyyaw=[0.0, 0.0, 0.0],
+    )
+
+    node._interaction_result_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "object_id": "door_0002",
+                    "candidate_id": "interaction:door_0002:open",
+                    "post_state": "unavailable",
+                    "result_published_step": 150,
+                    "success": False,
+                }
+            )
+        )
+    )
+
+    assert node.portal_state_consensus.can_request(
+        "door_0002",
+        capture_step=399,
+        observation_pose_xyyaw=[1.0, 0.0, 0.0],
+    ) == (False, "stable_state_cooldown")
+
+
+def test_targeted_portal_refresh_uses_cached_consensus_instead_of_failing() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.targeted_refresh_requests = {
+        "door_0003": {"refresh_sequence": 7}
+    }
+    published = []
+    node._publish_updates = (
+        lambda episode_id, stamp, patches: published.append(
+            (episode_id, stamp, patches)
+        )
+    )
+    targeted = {
+        "request_key": "door_0003",
+        "refresh_sequence": 7,
+        "request_id": "refresh-7",
+        "minimum_capture_step": 300,
+        "reason": "portal_unknown_refresh",
+    }
+
+    node._publish_cached_portal_targeted_refresh(
+        object_id="door_0003",
+        episode_id="episode_1",
+        observation_stamp=123.0,
+        frame_id="331",
+        image_sequence=44,
+        signature="door|closed",
+        targeted_refresh=targeted,
+        consensus={
+            "accepted": True,
+            "stable_state": "closed",
+            "reason": "cached_stable_state_cooldown",
+        },
+    )
+
+    assert "door_0003" not in node.targeted_refresh_requests
+    patch = published[0][2][0]
+    assert patch["attribute_status"] == "ready"
+    assert patch["coarse_state"] == "closed"
+    assert patch["portal_state_consensus_accepted"] is True
+    assert patch["error"] == ""
 
 
 def test_rle_only_minimal_gt_detection_passes_attribute_visibility_filter() -> None:
@@ -620,6 +737,86 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     ]
     assert published[0][0]["object_id"] == "object_1"
     assert published[0][0]["approach_ready"] is True
+
+
+def test_superseded_portal_response_does_not_advance_consensus() -> None:
+    class ConsensusSpy:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def observe(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {"accepted": False, "reason": "confirmation_pending"}
+
+    class SupersedingPortalClient(RecordingClient):
+        def __init__(self, owner) -> None:
+            super().__init__()
+            self.owner = owner
+
+        def request_json(self, **kwargs):
+            response = super().request_json(**kwargs)
+            response.payload.update(
+                {
+                    "interaction_class": "portal",
+                    "coarse_state": "closed",
+                    "portal_morphology": {
+                        "door_leaf": "present",
+                        "confidence": 0.9,
+                    },
+                    "portal_aperture_evidence": {
+                        "open_aperture": "not_visible",
+                        "confidence": 0.9,
+                    },
+                }
+            )
+            self.owner.generations["door_1"] = 1
+            return response
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "door_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"door_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.uncertain_portal_refresh_interval_s = 5.0
+    node.uncertain_portal_confidence = 0.6
+    node.portal_state_consensus = ConsensusSpy()
+    node.client = SupersedingPortalClient(node)
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="door_1",
+        detection={"name": "door"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1",
+        frame_id="20",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={},
+        evidence_capture_steps=[20],
+        evidence_observation_pose_xyyaw=[[1.0, 2.0, 0.1]],
+    )
+
+    assert node.portal_state_consensus.calls == []
+    assert published == []
 
 
 def test_m1_multiview_sends_one_montage_and_binds_authoritative_latest_view() -> None:

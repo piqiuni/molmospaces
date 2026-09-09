@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import threading
 
@@ -118,6 +119,9 @@ class ObjectDetectionNode:
         self.projection_frame_id = str(config.get("projection_frame_id", self.default_frame_id) or self.default_frame_id)
         self.world_frame = frames.get("world_frame", "tf_frame_map")
         self.backend = make_detector_backend(config.get("backend", "mock_empty"), config, frames=frames)
+        self.debug_dump_rgb_dir = os.environ.get("HABITAT_OBJECT_DETECTOR_DUMP_RGB_DIR", "")
+        if self.debug_dump_rgb_dir:
+            os.makedirs(self.debug_dump_rgb_dir, exist_ok=True)
         self.publish_debug_markers = bool(config.get("publish_debug_markers", False))
         self.publish_debug_segmented_cloud = bool(config.get("publish_debug_segmented_cloud", False))
         self.publish_debug_detection_image = bool(config.get("publish_debug_detection_image", False))
@@ -275,6 +279,16 @@ class ObjectDetectionNode:
                 except Exception as exc:
                     rospy.logwarn_throttle(2.0, "[object_detection_node] TF snapshot unavailable: %s", exc)
 
+            if self.debug_dump_rgb_dir:
+                try:
+                    import cv2
+
+                    cv2.imwrite(
+                        os.path.join(self.debug_dump_rgb_dir, f"rgb_step_{int(getattr(stamp, 'nsecs', 0)):09d}.png"),
+                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                    )
+                except Exception as exc:
+                    rospy.logwarn_throttle(5.0, "[object_detection_node] debug RGB dump failed: %s", exc)
             detections = self.backend.detect(rgb, depth, camera_info, stamp, frame_id, tf_snapshot=tf_snapshot)
             detections = [
                 det for det in detections

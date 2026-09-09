@@ -221,17 +221,20 @@ def test_model_drawer_plan_cannot_inherit_a_direct_scan_box() -> None:
     assert "drawer_container_bbox_2d" not in planned["interaction_command"]
 
 
-def test_fresh_visual_drawer_scan_requires_visible_regions_and_pairs_them_with_box() -> None:
+def test_fresh_visual_drawer_scan_allows_low_view_without_regions() -> None:
     candidate = {"interaction_command": {"action": "open"}}
-    assert (
-        candidate_with_visual_drawer_scan(
-            candidate,
-            drawer_bbox_2d=[10, 20, 110, 160],
-            capture_step=42,
-            action_regions=[],
-        )
-        is None
+    fallback = candidate_with_visual_drawer_scan(
+        candidate,
+        drawer_bbox_2d=[10, 20, 110, 160],
+        capture_step=42,
+        action_regions=[],
     )
+    assert fallback is not None
+    fallback_command = fallback["interaction_command"]
+    assert fallback_command["sequence_type"] == "drawer_scan"
+    assert fallback_command["open_regions"] == []
+    assert fallback_command["drawer_scan_fallback_to_all"] is True
+    assert fallback_command["drawer_container_bbox_2d"] == [10.0, 20.0, 110.0, 160.0]
 
     planned = candidate_with_visual_drawer_scan(
         candidate,
@@ -251,6 +254,19 @@ def test_fresh_visual_drawer_scan_requires_visible_regions_and_pairs_them_with_b
         {"center": [0.5, 0.23], "confidence": 0.9},
         {"center": [0.5, 0.72], "confidence": 0.7},
     ]
+    assert command["drawer_scan_fallback_to_all"] is False
+
+    # The persistent drawer_open contract still requires explicit visible
+    # regions; only the sealed scan macro may fall back to all slide joints.
+    assert (
+        candidate_with_visual_drawer_open(
+            candidate,
+            drawer_bbox_2d=[10, 20, 110, 160],
+            capture_step=42,
+            action_regions=[],
+        )
+        is None
+    )
 
 
 def test_fresh_visual_drawer_open_has_persistent_open_contract() -> None:

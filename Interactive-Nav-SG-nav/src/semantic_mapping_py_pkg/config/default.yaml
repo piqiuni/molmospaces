@@ -177,6 +177,13 @@ attribute_inference:
   targeted_multiview_min_position_gap_m: 0.25
   targeted_multiview_min_yaw_gap_rad: 0.25
   target_bbox_mask_containment_required: true
+  # Door state is committed only after three consecutive equal M1 answers
+  # from materially separated camera poses. A committed result suppresses M1
+  # for this many evaluator steps; changing it requires the same evidence.
+  portal_state_confirmation_count: 3
+  portal_state_cooldown_steps: 300
+  portal_state_min_position_gap_m: 0.25
+  portal_state_min_yaw_gap_rad: 0.25
 
 semantic_map:
   enable_object_mapping: true
@@ -262,7 +269,9 @@ semantic_occ_overlay:
   # Signed aperture inset: negative contracts the closed-door reference so a
   # rotating door leaf cannot clear adjacent wall cells in the planning map.
   clear_padding_m: -0.05
-  max_aperture_thickness_m: 0.25
+  # Widen only the wall-normal doorway clearing slab. This covers off-grid
+  # adjacent occupied rows without extending the long axis into an opened leaf.
+  max_aperture_thickness_m: 0.35
   raw_free_confirmations: 3
   open_states: ["ajar", "open"]
 

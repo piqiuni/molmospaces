@@ -8,7 +8,11 @@ import os
 import threading
 import time
 
-from semantic_decision_py_pkg.behavior_candidates import BEHAVIOR_SCAN, BehaviorCandidate
+from semantic_decision_py_pkg.behavior_candidates import (
+    BEHAVIOR_SCAN,
+    BehaviorCandidate,
+    execution_candidates_with_reobserve_fallback,
+)
 from semantic_decision_py_pkg.candidate_curator import (
     CandidateCurator,
     CandidateCuratorConfig,
@@ -18,6 +22,7 @@ from semantic_decision_py_pkg.candidate_curator import (
     validate_candidate_update,
 )
 from semantic_decision_py_pkg.behavior_execution import (
+    SemanticNavigationProgressSupervisor,
     is_interaction_pose_precondition_failure,
 )
 from semantic_decision_py_pkg.env_config import apply_model_env_overrides, load_env_file
@@ -542,6 +547,25 @@ class SemanticRuleDecisionNode:
                 ),
             )
         )
+        self.global_navigation_progress = SemanticNavigationProgressSupervisor(
+            subgoal_timeout_task_steps=max(
+                1,
+                int(completion_config.get("global_subgoal_no_progress_task_steps", 60)),
+            ),
+            mission_timeout_task_steps=max(
+                1,
+                int(completion_config.get("global_mission_no_progress_task_steps", 180)),
+            ),
+            min_displacement_m=max(
+                0.0,
+                float(completion_config.get("global_no_progress_min_displacement_m", 0.10)),
+            ),
+        )
+        self.active_frontier_missing_confirmations = max(
+            1,
+            int(completion_config.get("active_frontier_missing_confirmations", 2)),
+        )
+        self.active_frontier_missing_count = 0
         self.terminal_no_plan_exit_tracker = TerminalInteractionNoPlanExitTracker(
             TerminalInteractionNoPlanExitConfig(
                 enabled=bool(
@@ -735,6 +759,8 @@ class SemanticRuleDecisionNode:
                 )
                 self.completion_tracker.reset()
                 self.terminal_no_plan_exit_tracker.reset()
+                self.global_navigation_progress.reset()
+                self.active_frontier_missing_count = 0
             target_context = payload.get("target_context") or {}
             target_key = json.dumps(target_context, ensure_ascii=False, sort_keys=True)
             previous_target_key = json.dumps(
@@ -752,6 +778,8 @@ class SemanticRuleDecisionNode:
                 )
             self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
+            self._observe_global_navigation_progress(payload)
+            self._preempt_resolved_active_frontier(payload)
             priority_target = self.target_mission.priority_target_candidate(
                 payload.get("candidates") or []
             )
@@ -815,6 +843,13 @@ class SemanticRuleDecisionNode:
                 self.active_interaction_candidate
             )
         detail = dict(payload.get("detail") or {})
+        if status == "SUCCEEDED":
+            robot_xy = list(self.latest_candidates_payload.get("robot_xy") or [])
+            if len(robot_xy) >= 2:
+                self.global_navigation_progress.note_success(
+                    (float(robot_xy[0]), float(robot_xy[1])),
+                    self._observation_step(self.latest_candidates_payload),
+                )
         semantic_mission_no_progress = bool(
             detail.get("semantic_mission_no_progress", False)
         )
@@ -1287,6 +1322,103 @@ class SemanticRuleDecisionNode:
                     "decision_id": decision_id,
                 },
             )
+
+    def _observe_global_navigation_progress(self, payload: dict) -> None:
+        """Count evaluator-step stagnation across active and IDLE intervals."""
+
+        if self.goal_complete:
+            return
+        step = self._observation_step(payload)
+        robot_xy = list(payload.get("robot_xy") or [])
+        if step < 0 or len(robot_xy) < 2:
+            return
+        # Drawer/container physical macros intentionally hold the base.  Their
+        # own finite evaluator-step lease is authoritative, so pause rather
+        # than reset the global navigation clock while INTERACT owns execution.
+        if self.active_behavior_type == "INTERACT":
+            self.global_navigation_progress.pause(step)
+            return
+        detail = self.global_navigation_progress.observe(
+            subgoal_key=self.active_candidate_id or "__idle__",
+            pose=(float(robot_xy[0]), float(robot_xy[1])),
+            task_step_index=step,
+        )
+        if not bool(detail.get("mission_stalled")):
+            return
+        if self.active_decision_id and (
+            self.preempt_requested_for_decision_id != self.active_decision_id
+        ):
+            self.preempt_requested_for_decision_id = self.active_decision_id
+            self.preempt_pub.publish(
+                String(
+                    data=json.dumps(
+                        {
+                            "decision_id": self.active_decision_id,
+                            "candidate_id": self.active_candidate_id,
+                            "reason": "semantic_mission_no_progress",
+                            "timestamp": time.time(),
+                            **detail,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            )
+        self.goal_complete = True
+        self._publish_goal_status(
+            "EXPLORATION_STALLED",
+            detail={
+                "reason": "semantic_mission_no_progress",
+                "candidate_id": self.active_candidate_id,
+                "decision_id": self.active_decision_id,
+                "global_no_progress_includes_idle": True,
+                **detail,
+            },
+        )
+
+    def _preempt_resolved_active_frontier(self, payload: dict) -> None:
+        """Release an EXPLORE goal once its source frontier is truly absent."""
+
+        if self.active_behavior_type != "EXPLORE" or not self.active_candidate_id:
+            self.active_frontier_missing_count = 0
+            return
+        source_ids = {
+            str(value)
+            for value in (
+                (payload.get("exploration_context") or {}).get(
+                    "source_frontier_candidate_ids", []
+                )
+                or []
+            )
+            if str(value)
+        }
+        if not source_ids or self.active_candidate_id in source_ids:
+            self.active_frontier_missing_count = 0
+            return
+        self.active_frontier_missing_count += 1
+        if (
+            self.active_frontier_missing_count
+            < self.active_frontier_missing_confirmations
+            or not self.active_decision_id
+            or self.preempt_requested_for_decision_id == self.active_decision_id
+        ):
+            return
+        self.preempt_requested_for_decision_id = self.active_decision_id
+        self.preempt_pub.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "decision_id": self.active_decision_id,
+                        "candidate_id": self.active_candidate_id,
+                        "reason": "frontier_resolved_by_observation",
+                        "missing_confirmations": self.active_frontier_missing_count,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        )
 
     def _candidate_fingerprint_for_id(self, candidate_id: str) -> str:
         """Return the current pose-sensitive fingerprint for an active candidate."""
@@ -2418,7 +2550,12 @@ class SemanticRuleDecisionNode:
         for candidate in candidates:
             if candidate.candidate_id not in mission_ids:
                 rejected[candidate.candidate_id] = "pending_target_interaction_filter"
-        return mission_filtered, rejected
+        execution_candidates, deferred_reobserve_ids = (
+            execution_candidates_with_reobserve_fallback(mission_filtered)
+        )
+        for candidate_id in deferred_reobserve_ids:
+            rejected[candidate_id] = "remembered_portal_reobserve_fallback_only"
+        return execution_candidates, rejected
 
     def _history_context(self, candidate_snapshot: dict) -> tuple[list[dict], list[dict]]:
         self._refresh_history_metrics(candidate_snapshot)

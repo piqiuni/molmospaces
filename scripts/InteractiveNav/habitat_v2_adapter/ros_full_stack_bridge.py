@@ -9,18 +9,23 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
+from pathlib import Path as FilePath
 import threading
 import time
 import traceback
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
 import rospy
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from actionlib_msgs.msg import GoalID, GoalStatusArray
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
-from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from std_msgs.msg import Empty, String
 import tf2_ros
 
 
@@ -75,6 +80,11 @@ class _State:
     def __init__(self, args: argparse.Namespace) -> None:
         rospy.init_node("habitat_v2_full_stack_bridge", anonymous=True, disable_signals=True)
         self.args = args
+        dump_dir = os.environ.get("HABITAT_BRIDGE_DUMP_RGB_DIR", "")
+        self._dump_rgb_dir = FilePath(dump_dir) if dump_dir else None
+        self._direct_detector_url = os.environ.get("HABITAT_DIRECT_DETECTOR_URL", "").rstrip("/")
+        if self._dump_rgb_dir is not None:
+            self._dump_rgb_dir.mkdir(parents=True, exist_ok=True)
         self._request_lock = threading.Lock()
         self._condition = threading.Condition()
         self._latest_graph: dict[str, Any] = {}
@@ -82,28 +92,77 @@ class _State:
         self._latest_detections: dict[str, Any] = {}
         self._latest_detection_stamp = 0.0
         self._candidate_sequence = -1
+        self._last_target_context: tuple[str, tuple[str, ...], bool] | None = None
+        self._candidate_context_waits = 0
+        self._candidate_context_skips = 0
         self._requests = 0
+        self._detector_ticks = 0
+        self._detector_step_interval = max(1, int(args.detector_step_interval))
         self._failures = 0
         self._selection_requests = 0
         self._selection_failures = 0
-        self._pending_step_sync: tuple[rospy.Time, dict[str, Any]] | None = None
+        self._pending_step_sync: tuple[rospy.Time, dict[str, Any], dict[str, Any]] | None = None
+        self._latest_cmd_vel = {"linear_x": 0.0, "angular_z": 0.0}
+        self._latest_cmd_vel_monotonic = 0.0
+        self._latest_measured_twist = {"linear_x": 0.0, "linear_y": 0.0, "angular_z": 0.0}
+        self._last_measurement_pose_ros: tuple[float, float, float] | None = None
+        self._latest_move_base_status = 0
+        self._latest_global_plan: list[list[float]] = []
+        self._latest_local_plan: list[list[float]] = []
+        self._last_goal_key: tuple[str, float, float, float] | None = None
+        self._latest_pose: tuple[np.ndarray, float] | None = None
 
         self.rgb_pub = rospy.Publisher(args.rgb_topic, Image, queue_size=1)
         self.depth_pub = rospy.Publisher(args.depth_topic, Image, queue_size=1)
         self.info_pub = rospy.Publisher(args.camera_info_topic, CameraInfo, queue_size=1)
+        self.mapping_cloud_pub = rospy.Publisher(args.mapping_scan_topic, PointCloud2, queue_size=1)
+        self.local_cloud_pub = rospy.Publisher(args.registered_scan_topic, PointCloud2, queue_size=1)
         self.odom_pub = rospy.Publisher(args.odom_topic, Odometry, queue_size=1)
-        self.map_pub = rospy.Publisher(args.occupancy_topic, OccupancyGrid, queue_size=1, latch=True)
-        self.raw_map_pub = rospy.Publisher(args.raw_occupancy_topic, OccupancyGrid, queue_size=1, latch=True)
-        self.global_plan_pub = rospy.Publisher(args.global_plan_topic, Path, queue_size=1, latch=True)
-        self.local_plan_pub = rospy.Publisher(args.local_plan_topic, Path, queue_size=1, latch=True)
+        self.map_pub = (
+            None
+            if args.original_ros_navigation
+            else rospy.Publisher(args.occupancy_topic, OccupancyGrid, queue_size=1, latch=True)
+        )
+        self.raw_map_pub = (
+            None
+            if args.original_ros_navigation
+            else rospy.Publisher(args.raw_occupancy_topic, OccupancyGrid, queue_size=1, latch=True)
+        )
+        self.global_plan_pub = (
+            None
+            if args.original_ros_navigation
+            else rospy.Publisher(args.global_plan_topic, Path, queue_size=1, latch=True)
+        )
+        self.local_plan_pub = (
+            None
+            if args.original_ros_navigation
+            else rospy.Publisher(args.local_plan_topic, Path, queue_size=1, latch=True)
+        )
         self.diagnostic_panel_pub = rospy.Publisher(args.diagnostic_panel_topic, Image, queue_size=1, latch=True)
         self.target_pub = rospy.Publisher(args.target_topic, String, queue_size=1, latch=True)
         self.selection_pub = rospy.Publisher(args.selected_behavior_topic, String, queue_size=8)
+        self.simple_goal_pub = rospy.Publisher(args.simple_goal_topic, PoseStamped, queue_size=2)
+        self.mapping_reset_pub = rospy.Publisher(args.mapping_reset_topic, Empty, queue_size=1)
+        self.move_base_cancel_pub = rospy.Publisher(args.move_base_cancel_topic, GoalID, queue_size=1)
         self.step_sync_pub = rospy.Publisher(args.step_sync_topic, String, queue_size=8)
+        # Direct detector fallback results must enter the same ROS semantic-map
+        # stream as the timer-driven detector.  Without this relay the policy
+        # could track a target while the original graph/recorder had no object
+        # node to draw.
+        self.detection_relay_pub = rospy.Publisher(args.detections_topic, String, queue_size=4)
         self.tf_pub = tf2_ros.TransformBroadcaster()
         rospy.Subscriber(args.graph_topic, String, self._graph_callback, queue_size=1)
         rospy.Subscriber(args.candidates_topic, String, self._candidate_callback, queue_size=1)
         rospy.Subscriber(args.detections_topic, String, self._detection_callback, queue_size=1)
+        rospy.Subscriber(args.cmd_vel_topic, Twist, self._cmd_vel_callback, queue_size=1)
+        rospy.Subscriber(args.move_base_status_topic, GoalStatusArray, self._status_callback, queue_size=1)
+        rospy.Subscriber(args.move_base_global_plan_topic, Path, self._global_plan_callback, queue_size=1)
+        rospy.Subscriber(args.move_base_local_plan_topic, Path, self._local_plan_callback, queue_size=1)
+        # Habitat advances synchronously and detector/M2 requests can take
+        # seconds.  ROS costmaps still require a fresh transform at their own
+        # controller rate, so republish the last measured pose without
+        # extrapolating motion between simulator steps.
+        self._pose_timer = rospy.Timer(rospy.Duration(0.05), self._pose_heartbeat)
 
     @staticmethod
     def _parse(message: String) -> dict[str, Any]:
@@ -139,19 +198,100 @@ class _State:
             self._latest_detection_stamp = stamp
             self._condition.notify_all()
 
+    def _cmd_vel_callback(self, message: Twist) -> None:
+        with self._condition:
+            self._latest_cmd_vel = {
+                "linear_x": float(message.linear.x),
+                "angular_z": float(message.angular.z),
+            }
+            self._latest_cmd_vel_monotonic = time.monotonic()
+            self._condition.notify_all()
+
+    def _status_callback(self, message: GoalStatusArray) -> None:
+        if not message.status_list:
+            return
+        with self._condition:
+            self._latest_move_base_status = int(message.status_list[-1].status)
+            self._condition.notify_all()
+
+    @staticmethod
+    def _path_rows(message: Path) -> list[list[float]]:
+        rows: list[list[float]] = []
+        for pose in message.poses:
+            q = pose.pose.orientation
+            yaw = math.atan2(
+                2.0 * (float(q.w) * float(q.z) + float(q.x) * float(q.y)),
+                1.0 - 2.0 * (float(q.y) ** 2 + float(q.z) ** 2),
+            )
+            rows.append([float(pose.pose.position.x), float(pose.pose.position.y), yaw])
+        return rows
+
+    def _global_plan_callback(self, message: Path) -> None:
+        with self._condition:
+            self._latest_global_plan = self._path_rows(message)
+            self._condition.notify_all()
+
+    def _local_plan_callback(self, message: Path) -> None:
+        with self._condition:
+            self._latest_local_plan = self._path_rows(message)
+            self._condition.notify_all()
+
     @staticmethod
     def _quaternion(yaw: float) -> tuple[float, float, float, float]:
         return (0.0, 0.0, math.sin(0.5 * yaw), math.cos(0.5 * yaw))
 
-    def _publish_pose(self, stamp: rospy.Time, gps_xy: np.ndarray, compass: float) -> None:
+    def _pose_heartbeat(self, _event: rospy.TimerEvent) -> None:
+        pose = self._latest_pose
+        if pose is None:
+            return
+        self._publish_pose(rospy.Time.now(), pose[0], pose[1], remember=False)
+
+    def _publish_pose(
+        self,
+        stamp: rospy.Time,
+        gps_xy: np.ndarray,
+        compass: float,
+        *,
+        remember: bool = True,
+    ) -> None:
         # Habitat GPS uses [x, y] with forward=[cos(h), -sin(h)].  Reflect its
         # second axis so ROS receives the standard forward=[cos(yaw), sin(yaw)].
         ros_x = float(gps_xy[0])
         ros_y = -float(gps_xy[1])
-        qx, qy, qz, qw = self._quaternion(float(compass))
+        yaw = float(compass)
+        if remember:
+            self._latest_pose = (np.asarray(gps_xy, dtype=np.float32).copy(), yaw)
+            previous = self._last_measurement_pose_ros
+            if previous is None:
+                measured = {"linear_x": 0.0, "linear_y": 0.0, "angular_z": 0.0}
+            else:
+                dt = max(float(self.args.sim_dt_s), 1e-6)
+                delta_yaw = math.atan2(
+                    math.sin(yaw - previous[2]),
+                    math.cos(yaw - previous[2]),
+                )
+                world_vx = (ros_x - previous[0]) / dt
+                world_vy = (ros_y - previous[1]) / dt
+                # nav_msgs/Odometry twist is expressed in child_frame_id.  Use
+                # the midpoint heading for an arc executed during one Habitat
+                # control step, rather than reporting map-frame displacement.
+                midpoint_yaw = previous[2] + 0.5 * delta_yaw
+                measured = {
+                    "linear_x": math.cos(midpoint_yaw) * world_vx
+                    + math.sin(midpoint_yaw) * world_vy,
+                    "linear_y": -math.sin(midpoint_yaw) * world_vx
+                    + math.cos(midpoint_yaw) * world_vy,
+                    "angular_z": delta_yaw / dt,
+                }
+                for key, value in measured.items():
+                    if abs(value) < 1e-5:
+                        measured[key] = 0.0
+            self._latest_measured_twist = measured
+            self._last_measurement_pose_ros = (ros_x, ros_y, yaw)
+        qx, qy, qz, qw = self._quaternion(yaw)
         odom = Odometry()
         odom.header.stamp = stamp
-        odom.header.frame_id = self.args.map_frame
+        odom.header.frame_id = self.args.odom_frame
         odom.child_frame_id = self.args.base_frame
         odom.pose.pose.position.x = ros_x
         odom.pose.pose.position.y = ros_y
@@ -159,20 +299,80 @@ class _State:
         odom.pose.pose.orientation.y = qy
         odom.pose.pose.orientation.z = qz
         odom.pose.pose.orientation.w = qw
+        odom.twist.twist.linear.x = float(self._latest_measured_twist["linear_x"])
+        odom.twist.twist.linear.y = float(self._latest_measured_twist["linear_y"])
+        odom.twist.twist.angular.z = float(self._latest_measured_twist["angular_z"])
         self.odom_pub.publish(odom)
 
         transform = TransformStamped()
         transform.header.stamp = stamp
-        transform.header.frame_id = self.args.map_frame
-        transform.child_frame_id = self.args.camera_frame
+        transform.header.frame_id = self.args.odom_frame
+        transform.child_frame_id = self.args.base_frame
         transform.transform.translation.x = ros_x
         transform.transform.translation.y = ros_y
-        transform.transform.translation.z = float(self.args.camera_height_m)
+        transform.transform.translation.z = 0.0
         transform.transform.rotation.x = qx
         transform.transform.rotation.y = qy
         transform.transform.rotation.z = qz
         transform.transform.rotation.w = qw
         self.tf_pub.sendTransform(transform)
+
+        lidar = TransformStamped()
+        lidar.header.stamp = stamp
+        lidar.header.frame_id = self.args.base_frame
+        lidar.child_frame_id = self.args.lidar_frame
+        lidar.transform.translation.z = float(self.args.camera_height_m)
+        lidar.transform.rotation.w = 1.0
+        self.tf_pub.sendTransform(lidar)
+
+        optical = TransformStamped()
+        optical.header.stamp = stamp
+        optical.header.frame_id = self.args.base_frame
+        optical.child_frame_id = self.args.camera_frame
+        optical.transform.translation.z = float(self.args.camera_height_m)
+        # REP-103 optical frame: z forward, x right, y down.
+        optical.transform.rotation.x = -0.5
+        optical.transform.rotation.y = 0.5
+        optical.transform.rotation.z = -0.5
+        optical.transform.rotation.w = 0.5
+        self.tf_pub.sendTransform(optical)
+
+    def _publish_pointcloud(
+        self,
+        stamp: rospy.Time,
+        depth: np.ndarray,
+        camera_k: list[float],
+    ) -> None:
+        stride = max(1, int(self.args.pointcloud_stride))
+        z = np.asarray(depth[::stride, ::stride], dtype=np.float32)
+        rows = np.arange(0, depth.shape[0], stride, dtype=np.float32)[:, None]
+        cols = np.arange(0, depth.shape[1], stride, dtype=np.float32)[None, :]
+        fx, fy = max(float(camera_k[0]), 1e-6), max(float(camera_k[4]), 1e-6)
+        cx, cy = float(camera_k[2]), float(camera_k[5])
+        # Convert camera optical coordinates to ROS base axes at the lidar origin.
+        x = z
+        y = -(cols - cx) * z / fx
+        zz = -(rows - cy) * z / fy
+        valid = np.isfinite(z) & (z > 0.05) & (z <= float(self.args.pointcloud_max_depth_m))
+        xyz = np.stack([x, y, zz], axis=-1).astype(np.float32)
+        xyz[~valid] = np.nan
+        cloud = PointCloud2()
+        cloud.header.stamp = stamp
+        cloud.header.frame_id = self.args.lidar_frame
+        cloud.height = int(xyz.shape[0])
+        cloud.width = int(xyz.shape[1])
+        cloud.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        cloud.is_bigendian = False
+        cloud.point_step = 12
+        cloud.row_step = int(cloud.point_step * cloud.width)
+        cloud.is_dense = False
+        cloud.data = np.ascontiguousarray(xyz).tobytes(order="C")
+        self.mapping_cloud_pub.publish(cloud)
+        self.local_cloud_pub.publish(cloud)
 
     def _publish_map(self, stamp: rospy.Time, payload: dict[str, Any], *, raw: bool = False) -> None:
         key = "raw_occupancy" if raw else "occupancy"
@@ -193,7 +393,9 @@ class _State:
         message.info.origin.position.y = float(origin[1])
         message.info.origin.orientation.w = 1.0
         message.data = grid.reshape(-1).astype(np.int8).tolist()
-        (self.raw_map_pub if raw else self.map_pub).publish(message)
+        publisher = self.raw_map_pub if raw else self.map_pub
+        if publisher is not None:
+            publisher.publish(message)
 
     def _publish_path(self, stamp: rospy.Time, rows: Any, publisher: rospy.Publisher) -> None:
         path = Path()
@@ -232,6 +434,11 @@ class _State:
         info.header.frame_id = self.args.camera_frame
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         sequence = max(0, int(context.get("step", 0) or 0))
+        if self._dump_rgb_dir is not None and sequence > 0:
+            cv2.imwrite(
+                str(self._dump_rgb_dir / f"rgb_step_{sequence:06d}.png"),
+                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            )
         info.header.seq = sequence
         info.width = int(rgb.shape[1])
         info.height = int(rgb.shape[0])
@@ -243,14 +450,28 @@ class _State:
         self.rgb_pub.publish(
             _image_message(rgb.astype(np.uint8), "rgb8", stamp, self.args.camera_frame, sequence=sequence)
         )
+        self._publish_pointcloud(stamp, depth, info.K)
 
-    def _publish_step_sync(self, stamp: rospy.Time, payload: dict[str, Any]) -> None:
+    def _publish_step_sync(
+        self,
+        stamp: rospy.Time,
+        payload: dict[str, Any],
+        detections: dict[str, Any],
+    ) -> None:
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         sequence = max(0, int(context.get("step", 0) or 0))
         self.step_sync_pub.publish(
             String(
                 data=json.dumps(
-                    {"step_index": sequence, "stamp_sec": float(stamp.to_sec())},
+                    {
+                        "step_index": sequence,
+                        "stamp_sec": float(stamp.to_sec()),
+                        # Carry the exact detector snapshot in the same message
+                        # that freezes the recorder frame.  Cross-topic callback
+                        # ordering is otherwise nondeterministic and produced
+                        # videos whose RGB frame preceded its detection boxes.
+                        "external_detections": detections,
+                    },
                     separators=(",", ":"),
                 )
             )
@@ -270,6 +491,85 @@ class _State:
                 )
             )
         )
+
+    def _lift_direct_detections(
+        self,
+        detections: dict[str, Any],
+        payload: dict[str, Any],
+        gps: np.ndarray,
+        compass: float,
+        stamp: rospy.Time,
+    ) -> dict[str, Any]:
+        """Attach public RGB-D world geometry to direct 2-D fallback boxes."""
+
+        depth = _decode_array(payload.get("depth"), dtype=np.float32, name="depth")
+        if depth.ndim == 3:
+            depth = depth[..., 0]
+        camera = payload.get("camera_info") if isinstance(payload.get("camera_info"), dict) else {}
+        intrinsics = [float(value) for value in camera.get("K", [])]
+        if len(intrinsics) != 9:
+            return detections
+        fx, fy = max(intrinsics[0], 1e-6), max(intrinsics[4], 1e-6)
+        cx, cy = intrinsics[2], intrinsics[5]
+        height, width = depth.shape
+        cos_h, sin_h = math.cos(compass), math.sin(compass)
+        lifted: list[dict[str, Any]] = []
+        for source in detections.get("detections") or []:
+            if not isinstance(source, dict):
+                continue
+            row = dict(source)
+            bbox = list(row.get("bbox") or row.get("bbox_xyxy") or [])
+            if len(bbox) == 4:
+                values = [float(value) for value in bbox]
+                if max(abs(value) for value in values) <= 1.5:
+                    x0, y0, x1, y1 = (
+                        values[0] * width,
+                        values[1] * height,
+                        values[2] * width,
+                        values[3] * height,
+                    )
+                else:
+                    x0, y0, x1, y1 = values
+                ix0 = max(0, min(width - 1, int(math.floor(x0))))
+                iy0 = max(0, min(height - 1, int(math.floor(y0))))
+                ix1 = max(ix0 + 1, min(width, int(math.ceil(x1))))
+                iy1 = max(iy0 + 1, min(height, int(math.ceil(y1))))
+                crop = depth[iy0:iy1, ix0:ix1]
+                valid = crop[np.isfinite(crop) & (crop > 0.05)]
+                if valid.size:
+                    z = float(np.median(valid))
+                    u = 0.5 * (x0 + x1)
+                    v = 0.5 * (y0 + y1)
+                    lateral = (u - cx) * z / fx
+                    vertical = (v - cy) * z / fy
+                    world_x = float(gps[0] + cos_h * z + sin_h * lateral)
+                    # ROS map coordinates reflect Habitat GPS axis 1.  Positive
+                    # image lateral points to camera-right, hence -cos(yaw) in
+                    # the ROS map y component.
+                    world_y = float(-gps[1] + sin_h * z - cos_h * lateral)
+                    world_z = float(self.args.camera_height_m - vertical)
+                    width_m = max(0.10, abs(x1 - x0) * z / fx)
+                    height_m = max(0.10, abs(y1 - y0) * z / fy)
+                    center = {"x": world_x, "y": world_y, "z": world_z}
+                    size = {"x": width_m, "y": 0.30, "z": height_m}
+                    row.update(
+                        {
+                            "world_position": center,
+                            "world_box3d_center": center,
+                            "world_box3d_size": size,
+                            "position": center,
+                            "box3d_center": center,
+                            "box3d_size": size,
+                        }
+                    )
+            lifted.append(row)
+        return {
+            **detections,
+            "stamp_sec": int(stamp.secs),
+            "stamp_nsec": int(stamp.nsecs),
+            "detections": lifted,
+            "bridge_rgbd_lift": True,
+        }
 
     def _publish_diagnostic_panel(
         self,
@@ -320,45 +620,105 @@ class _State:
         with self._request_lock:
             self._requests += 1
             try:
+                detector_tick = ((self._requests - 1) % self._detector_step_interval) == 0
+                if detector_tick:
+                    self._detector_ticks += 1
                 gps = np.asarray(payload.get("gps"), dtype=np.float32).reshape(2)
                 compass = float(payload.get("compass"))
                 target = str(payload.get("object_category") or "")
                 if not target:
                     raise ValueError("object_category is required")
                 stamp = rospy.Time.now()
-                before = self._candidate_sequence
                 self._publish_pose(stamp, gps, compass)
-                self._publish_map(stamp, payload)
-                self._publish_map(stamp, payload, raw=True)
-                self._publish_path(stamp, payload.get("global_plan_xyyaw"), self.global_plan_pub)
-                self._publish_path(stamp, payload.get("local_plan_xyyaw"), self.local_plan_pub)
+                if not self.args.original_ros_navigation:
+                    self._publish_map(stamp, payload)
+                    self._publish_map(stamp, payload, raw=True)
+                    self._publish_path(stamp, payload.get("global_plan_xyyaw"), self.global_plan_pub)
+                    self._publish_path(stamp, payload.get("local_plan_xyyaw"), self.local_plan_pub)
                 labels = list(payload.get("object_labels") or [target])
-                # Seed the graph with the public task target.  Visibility is
-                # updated after this frame's detector result is available.
-                self._publish_target_context(target, labels, visible=False)
                 self._publish_sensor_frame(stamp, payload)
                 deadline = time.monotonic() + float(self.args.update_wait_s)
                 expected_stamp = float(stamp.to_sec())
-                with self._condition:
-                    while (
-                        (
-                            self._candidate_sequence <= before
-                            or self._latest_detection_stamp + 1e-6 < expected_stamp
+                if detector_tick:
+                    with self._condition:
+                        while (
+                            self._latest_detection_stamp + 1e-6 < expected_stamp
+                            and time.monotonic() < deadline
+                        ):
+                            self._condition.wait(timeout=max(0.0, deadline - time.monotonic()))
+                        detections = (
+                            dict(self._latest_detections)
+                            if self._latest_detection_stamp + 1e-6 >= expected_stamp
+                            else {
+                                "stamp_sec": int(stamp.secs),
+                                "stamp_nsec": int(stamp.nsecs),
+                                "detections": [],
+                                "stale_result_discarded": True,
+                            }
                         )
-                        and time.monotonic() < deadline
-                    ):
-                        self._condition.wait(timeout=max(0.0, deadline - time.monotonic()))
-                    detections = (
-                        dict(self._latest_detections)
-                        if self._latest_detection_stamp + 1e-6 >= expected_stamp
-                        else {
-                            "stamp_sec": int(stamp.secs),
-                            "stamp_nsec": int(stamp.nsecs),
-                            "detections": [],
-                            "stale_result_discarded": True,
-                        }
+                else:
+                    with self._condition:
+                        detections = dict(self._latest_detections)
+                    detections["stale_result_reused"] = True
+                    detections["source_step_interval"] = self._detector_step_interval
+                # Fail-safe for the timer-driven ROS detector: if no stamped
+                # topic result arrived, query the same dedicated YOLO worker
+                # with this exact RGB frame.  ROS semantic mapping remains
+                # active; this only restores public detector evidence for the
+                # Habitat/M2 bridge and keeps the frame-step association exact.
+                direct_fallback = False
+                if detector_tick and self._direct_detector_url and not (detections.get("detections") or []):
+                    try:
+                        request = Request(
+                            self._direct_detector_url + "/detect",
+                            data=json.dumps(
+                                {"image_b64": payload["image_b64"]},
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urlopen(request, timeout=2.0) as handle:
+                            direct = json.loads(handle.read().decode("utf-8"))
+                        if isinstance(direct, dict) and isinstance(direct.get("detections"), list):
+                            detections = {**detections, "detections": direct["detections"], "direct_fallback": True}
+                            direct_fallback = True
+                    except (OSError, URLError, ValueError):
+                        pass
+                if direct_fallback:
+                    # The timer-driven ROS detector missed this exact frame, so
+                    # publish the same direct 2-D result, lifted only with public
+                    # RGB-D/GPS/Compass, into the original semantic-mapping topic.
+                    # This keeps the policy, graph, and recorder on one evidence
+                    # stream without exposing Habitat goal geometry.
+                    detections = self._lift_direct_detections(
+                        detections,
+                        payload,
+                        gps,
+                        compass,
+                        stamp,
                     )
-                normalized_labels = {str(value).replace("_", " ").casefold() for value in labels}
+                    self.detection_relay_pub.publish(
+                        String(data=json.dumps(detections, separators=(",", ":")))
+                    )
+                # The Habitat task vocabulary and YOLOE/Module-1 vocabulary
+                # differ for several ObjectNav classes (couch/sofa,
+                # television/tv, plant/potted plant).  Use the shared alias
+                # expansion here so a valid detector result actually reaches
+                # the target-context and M3 gates.
+                normalized_labels = {
+                    str(value).replace("_", " ").casefold()
+                    for value in labels
+                }
+                try:
+                    from habitat_v2_adapter.policy import goal_label_aliases
+
+                    normalized_labels.update(
+                        str(value).replace("_", " ").casefold()
+                        for value in goal_label_aliases(target)
+                    )
+                except Exception:
+                    pass
                 visible = any(
                     isinstance(row, dict)
                     and normalized_labels.intersection(
@@ -369,21 +729,36 @@ class _State:
                     )
                     for row in (detections.get("detections") or [])
                 )
-                # Candidate generation is asynchronous.  Wait for one revision
-                # after publishing this frame's visibility so the response cannot
-                # contain the previous target-context state.
+                # Candidate generation is asynchronous and timer-driven.  A
+                # stable target/visibility state cannot produce new semantic
+                # information, so never wait for another 1 Hz publication in
+                # that case.  Only a real context transition is published and
+                # synchronized once; graph/frontier updates otherwise remain
+                # opportunistic snapshots.
+                context_key = (
+                    target.strip().casefold(),
+                    tuple(sorted(str(value).strip().casefold() for value in labels)),
+                    bool(visible),
+                )
+                context_changed = context_key != self._last_target_context
+                if context_changed:
+                    with self._condition:
+                        before_target_context = self._candidate_sequence
+                    self._publish_target_context(target, labels, visible=visible)
+                    self._last_target_context = context_key
+                    self._candidate_context_waits += 1
+                    target_deadline = time.monotonic() + min(2.0, float(self.args.update_wait_s))
+                    with self._condition:
+                        while (
+                            self._candidate_sequence <= before_target_context
+                            and time.monotonic() < target_deadline
+                        ):
+                            self._condition.wait(
+                                timeout=max(0.0, target_deadline - time.monotonic())
+                            )
+                else:
+                    self._candidate_context_skips += 1
                 with self._condition:
-                    before_target_context = self._candidate_sequence
-                self._publish_target_context(target, labels, visible=visible)
-                target_deadline = time.monotonic() + min(2.0, float(self.args.update_wait_s))
-                with self._condition:
-                    while (
-                        self._candidate_sequence <= before_target_context
-                        and time.monotonic() < target_deadline
-                    ):
-                        self._condition.wait(
-                            timeout=max(0.0, target_deadline - time.monotonic())
-                        )
                     graph = dict(self._latest_graph)
                     candidates = dict(self._latest_candidates)
                 # The recorder freezes its six-panel frame on step_sync.  Emit
@@ -391,9 +766,9 @@ class _State:
                 # returned the corresponding detector/graph snapshot, preventing
                 # the common one-frame-late detection overlay.
                 if self.args.defer_step_sync_to_diagnostic:
-                    self._pending_step_sync = (stamp, dict(payload))
+                    self._pending_step_sync = (stamp, dict(payload), dict(detections))
                 else:
-                    self._publish_step_sync(stamp, payload)
+                    self._publish_step_sync(stamp, payload, detections)
                     self._publish_diagnostic_panel(stamp, payload, gps, graph)
                 return {
                     "ready": True,
@@ -401,6 +776,19 @@ class _State:
                     "candidate_payload": candidates,
                     "detections": detections,
                     "candidate_sequence": self._candidate_sequence,
+                    "candidate_context_changed": context_changed,
+                    "cmd_vel": dict(self._latest_cmd_vel),
+                    "cmd_vel_age_s": (
+                        time.monotonic() - self._latest_cmd_vel_monotonic
+                        if self._latest_cmd_vel_monotonic > 0.0
+                        else None
+                    ),
+                    "odom_twist": dict(self._latest_measured_twist),
+                    "detector_tick": detector_tick,
+                    "detector_step_interval": self._detector_step_interval,
+                    "move_base_status": self._latest_move_base_status,
+                    "global_plan_xyyaw": list(self._latest_global_plan),
+                    "local_plan_xyyaw": list(self._latest_local_plan),
                 }
             except Exception:
                 self._failures += 1
@@ -421,17 +809,40 @@ class _State:
                 raise ValueError("interaction_command is forbidden in Habitat navigation-only mode")
             mirrored = dict(payload)
             mirrored["behavior_type"] = behavior_type
+            # M2 selects in Habitat's public GPS frame, whose second axis is the
+            # reflection of ROS map y.  Odom and Path are already reflected in
+            # this bridge; reflect the recorder-only selected goal as well so
+            # the original recorder's endpoint consistency check does not hide
+            # an otherwise valid global/local plan.
             mirrored["goal_xyyaw"] = [
                 float(goal[0]),
-                float(goal[1]),
+                -float(goal[1]),
                 float(goal[2]) if len(goal) > 2 else 0.0,
             ]
             mirrored["module3_enabled"] = False
-            mirrored["execution_owner"] = "habitat_adapter"
-            mirrored["telemetry_only"] = True
+            mirrored["execution_owner"] = (
+                "move_base" if self.args.original_ros_navigation else "habitat_adapter"
+            )
+            mirrored["telemetry_only"] = not self.args.original_ros_navigation
             self.selection_pub.publish(
                 String(data=json.dumps(mirrored, separators=(",", ":")))
             )
+            if self.args.original_ros_navigation:
+                goal_yaw = float(goal[2]) if len(goal) > 2 else 0.0
+                key = (str(payload.get("candidate_id") or ""), float(goal[0]), -float(goal[1]), goal_yaw)
+                if key != self._last_goal_key:
+                    message = PoseStamped()
+                    message.header.stamp = rospy.Time.now()
+                    message.header.frame_id = self.args.map_frame
+                    message.pose.position.x = key[1]
+                    message.pose.position.y = key[2]
+                    qx, qy, qz, qw = self._quaternion(goal_yaw)
+                    message.pose.orientation.x = qx
+                    message.pose.orientation.y = qy
+                    message.pose.orientation.z = qz
+                    message.pose.orientation.w = qw
+                    self.simple_goal_pub.publish(message)
+                    self._last_goal_key = key
             return {"ready": True, "published": True}
         except Exception:
             self._selection_failures += 1
@@ -449,7 +860,7 @@ class _State:
                 _image_message(image, "rgb8", stamp, self.args.map_frame)
             )
             if pending is not None:
-                self._publish_step_sync(pending[0], pending[1])
+                self._publish_step_sync(pending[0], pending[1], pending[2])
         return {"ready": True, "published": True}
 
     def health(self) -> dict[str, Any]:
@@ -462,9 +873,36 @@ class _State:
             "selection_requests": self._selection_requests,
             "selection_failures": self._selection_failures,
             "candidate_sequence": self._candidate_sequence,
+            "candidate_context_waits": self._candidate_context_waits,
+            "candidate_context_skips": self._candidate_context_skips,
             "graph_nodes": len(self._latest_graph.get("nodes") or []),
             "graph_edges": len(self._latest_graph.get("edges") or []),
+            "original_ros_navigation": bool(self.args.original_ros_navigation),
+            "move_base_status": self._latest_move_base_status,
+            "odom_twist": dict(self._latest_measured_twist),
+            "detector_ticks": self._detector_ticks,
+            "detector_step_interval": self._detector_step_interval,
         }
+
+    def reset(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        with self._request_lock:
+            self.move_base_cancel_pub.publish(GoalID(stamp=rospy.Time.now(), id=""))
+            self.mapping_reset_pub.publish(Empty())
+            self._last_goal_key = None
+            self._last_target_context = None
+            self._latest_global_plan = []
+            self._latest_local_plan = []
+            self._latest_move_base_status = 0
+            self._latest_cmd_vel = {"linear_x": 0.0, "angular_z": 0.0}
+            self._latest_cmd_vel_monotonic = 0.0
+            self._latest_measured_twist = {
+                "linear_x": 0.0,
+                "linear_y": 0.0,
+                "angular_z": 0.0,
+            }
+            self._last_measurement_pose_ros = None
+            self._latest_pose = None
+        return {"ready": True, "reset": True}
 
 
 def _handler(state: _State):
@@ -489,7 +927,7 @@ def _handler(state: _State):
             self._send(HTTPStatus.OK, state.health())
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path not in {"/step", "/selection", "/diagnostic"}:
+            if self.path not in {"/step", "/selection", "/diagnostic", "/reset"}:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
@@ -503,6 +941,8 @@ def _handler(state: _State):
                     result = state.step(payload)
                 elif self.path == "/diagnostic":
                     result = state.publish_diagnostic(payload)
+                elif self.path == "/reset":
+                    result = state.reset(payload)
                 else:
                     result = state.publish_selection(payload)
                 self._send(HTTPStatus.OK, result)
@@ -521,13 +961,32 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=12230)
     parser.add_argument("--update-wait-s", type=float, default=1.5)
     parser.add_argument("--camera-height-m", type=float, default=1.31)
-    parser.add_argument("--map-frame", default="habitat_v2_map")
-    parser.add_argument("--base-frame", default="habitat_v2_base")
-    parser.add_argument("--camera-frame", default="habitat_v2_camera")
+    parser.add_argument(
+        "--sim-dt-s",
+        type=float,
+        default=0.1,
+        help="Habitat control-step duration used to derive measured odometry twist",
+    )
+    parser.add_argument(
+        "--detector-step-interval",
+        type=int,
+        default=2,
+        help="Run Module-1 detection every N Habitat steps (2 at dt=0.1s gives 5 Hz)",
+    )
+    parser.add_argument("--map-frame", default="tf_frame_map")
+    parser.add_argument("--odom-frame", default="tf_frame_odom")
+    parser.add_argument("--base-frame", default="tf_frame_base_link")
+    parser.add_argument("--lidar-frame", default="tf_frame_lidar")
+    parser.add_argument("--camera-frame", default="tf_frame_camera")
+    parser.add_argument("--original-ros-navigation", action="store_true")
+    parser.add_argument("--pointcloud-stride", type=int, default=2)
+    parser.add_argument("--pointcloud-max-depth-m", type=float, default=5.0)
     parser.add_argument("--rgb-topic", default="/habitat_v2/full/rgb")
     parser.add_argument("--depth-topic", default="/habitat_v2/full/depth")
     parser.add_argument("--camera-info-topic", default="/habitat_v2/full/camera_info")
     parser.add_argument("--odom-topic", default="/odom")
+    parser.add_argument("--mapping-scan-topic", default="/molmo_spaces/organized_depth_scan")
+    parser.add_argument("--registered-scan-topic", default="/registered_scan")
     parser.add_argument("--occupancy-topic", default="/struct_mapping/occ_map")
     parser.add_argument("--raw-occupancy-topic", default="/struct_mapping/raw_occ_map")
     parser.add_argument("--global-plan-topic", default="/habitat_v2/policy/global_plan")
@@ -540,6 +999,13 @@ def main() -> int:
     parser.add_argument("--graph-topic", default="/semantic_mapping/unified_graph")
     parser.add_argument("--candidates-topic", default="/semantic_decision/candidates")
     parser.add_argument("--detections-topic", default="/semantic_mapping/object_detections")
+    parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
+    parser.add_argument("--simple-goal-topic", default="/move_base_simple/goal")
+    parser.add_argument("--move-base-cancel-topic", default="/move_base/cancel")
+    parser.add_argument("--move-base-status-topic", default="/move_base/status")
+    parser.add_argument("--move-base-global-plan-topic", default="/move_base/OrientedGlobalPlanner/plan")
+    parser.add_argument("--move-base-local-plan-topic", default="/move_base/DWAPlannerROS/local_plan")
+    parser.add_argument("--mapping-reset-topic", default="/nav_system/reset")
     args = parser.parse_args()
     state = _State(args)
     server = ThreadingHTTPServer((args.host, args.port), _handler(state))

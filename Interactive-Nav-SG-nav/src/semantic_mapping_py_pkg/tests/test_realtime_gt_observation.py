@@ -417,8 +417,8 @@ def test_publisher_applies_min_visible_fraction_to_projected_object_extent():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([1.0, 1.0, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -451,8 +451,8 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -531,8 +531,8 @@ def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -603,8 +603,8 @@ def test_realtime_gt_reuses_private_snapshot_but_force_always_renders_fresh():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb

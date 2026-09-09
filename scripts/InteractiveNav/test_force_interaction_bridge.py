@@ -1,9 +1,11 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import force_interaction_bridge as bridge
+import force_interaction_runtime as runtime
 from force_interaction_bridge import AtomicForceInteractionController
 
 
@@ -82,6 +84,49 @@ def test_drawer_scan_defaults_to_every_slide_joint(monkeypatch) -> None:
     )
 
 
+def test_hinge_front_axis_uses_leaf_geometry_when_body_origin_is_at_hinge(
+    monkeypatch,
+) -> None:
+    model = SimpleNamespace(
+        ngeom=1,
+        geom_bodyid=np.asarray([1], dtype=int),
+        body_parentid=np.asarray([0, 0], dtype=int),
+        geom_size=np.asarray([[0.5, 0.05, 1.0]], dtype=float),
+        jnt_bodyid=np.asarray([1], dtype=int),
+        jnt_axis=np.asarray([[0.0, 0.0, 1.0]], dtype=float),
+    )
+    data = SimpleNamespace(
+        xmat=np.asarray([np.eye(3), np.eye(3)], dtype=float),
+        xanchor=np.asarray([[0.0, 0.0, 1.0]], dtype=float),
+        # The historical implementation used this body origin, producing a
+        # zero hinge radius and front_axis_geometry_unavailable.
+        xpos=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=float),
+        geom_xpos=np.asarray([[1.0, 0.0, 1.0]], dtype=float),
+    )
+    env = SimpleNamespace(current_model=model, current_data=data)
+    monkeypatch.setattr(
+        runtime,
+        "collect_articulation_groups",
+        lambda _env: {
+            "fridge": {
+                "joints": [
+                    {
+                        "joint_id": 0,
+                        "joint_type": "hinge",
+                        "joint_range": [0.0, 1.2],
+                    }
+                ]
+            }
+        },
+    )
+
+    result = runtime.infer_articulation_front_axis_xy(env, "fridge")
+
+    assert result["checked"] is True
+    assert np.allclose(result["axis_xy"], [0.0, 1.0])
+    assert result["source"] == "hinge_panel_geometry_initial_open_motion"
+
+
 def test_interaction_pose_validation_accepts_front_pose() -> None:
     _set_pose(8.20, 1.10, math.pi - 0.05)
     result = AtomicForceInteractionController._validate_interaction_pose(
@@ -93,6 +138,20 @@ def test_interaction_pose_validation_accepts_front_pose() -> None:
         },
     )
     assert result["valid"] is True
+
+
+def test_interaction_pose_validation_accepts_submillimetre_numeric_boundary() -> None:
+    _set_pose(0.1501, 0.0, 0.0)
+    result = AtomicForceInteractionController._validate_interaction_pose(
+        _Task(),
+        {
+            "interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+            "navigation_goal_position_tolerance_m": 0.15,
+            "navigation_goal_yaw_tolerance_rad": 0.2,
+        },
+    )
+    assert result["valid"] is True
+    assert result["comparison_epsilon"] == pytest.approx(1e-3)
 
 
 def test_interaction_pose_validation_rejects_side_pose_with_feedback_detail() -> None:
@@ -144,6 +203,42 @@ def test_interaction_pose_validation_accepts_m1_confirmed_face() -> None:
     )
     assert result["face_checked"] is True
     assert result["face_valid"] is True
+
+
+def test_portal_face_contract_does_not_require_missing_articulation_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Door AABB-front validation remains usable for assets without joint geometry."""
+    _set_pose(1.0, 1.35, -math.pi / 2.0)
+    monkeypatch.setattr(
+        bridge,
+        "infer_articulation_front_axis_xy",
+        lambda _env, _object_id: {
+            "checked": False,
+            "reason": "front_axis_geometry_unavailable",
+        },
+    )
+    result = AtomicForceInteractionController._validate_interaction_pose(
+        _Task(),
+        {
+            "node_type": "portal",
+            "object_id": "door_1",
+            "interaction_approach_pose_xyyaw": [1.0, 1.35, -math.pi / 2.0],
+            "interaction_ready_distance_m": 0.45,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+            "navigation_goal_position_tolerance_m": 0.15,
+            "navigation_goal_yaw_tolerance_rad": 0.15,
+            "interaction_approach_axis_xy": [0.0, 1.0],
+            "interaction_target_center_xy": [1.0, 1.0],
+            "interaction_front_axis_validation_required": True,
+            "interaction_front_position_tolerance_rad": 0.15,
+            "interaction_front_yaw_tolerance_rad": 0.15,
+        },
+    )
+    assert result["valid"] is True
+    assert result["face_valid"] is True
+    assert result["physical_front_required"] is False
+    assert result["physical_front_checked"] is False
 
 
 def test_interaction_pose_validation_rejects_m1_face_that_is_not_physical_front(
@@ -280,3 +375,63 @@ def test_unsafe_open_sweep_still_rejects_when_bypass_disabled(
     assert result["failure_reason"] == "unsafe_open_sweep"
     assert result["physics_substeps"] == 0
     assert controller._pending is None
+
+
+def test_already_open_refrigerator_finishes_without_force(monkeypatch) -> None:
+    controller = AtomicForceInteractionController()
+    _enqueue_fridge_open(controller)
+    monkeypatch.setattr(
+        bridge,
+        "articulation_joint_infos",
+        lambda _env, _object_id: [
+            {"joint_name": "door_hinge", "joint_type": "hinge", "open_fraction": 0.9},
+            {"joint_name": "door_slide", "joint_type": "slide", "open_fraction": 0.8},
+        ],
+    )
+    monkeypatch.setattr(
+        controller,
+        "_validate_interaction_pose",
+        lambda *_args, **_kwargs: pytest.fail("already-open check must precede pose validation"),
+    )
+    result = controller.before_step(_Task(), step=42)
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["status"] == "SUCCEEDED"
+    assert result["already_open"] is True
+    assert result["action_executed"] is False
+    assert result["observation_outcome"] == "finish_without_action"
+    assert result["execution_cost"] == 0.0
+    assert controller._pending is None
+
+
+def test_refrigerator_not_already_open_when_any_leaf_is_closed(monkeypatch) -> None:
+    controller = AtomicForceInteractionController()
+    _enqueue_fridge_open(controller)
+    monkeypatch.setattr(
+        bridge,
+        "articulation_joint_infos",
+        lambda _env, _object_id: [
+            {"joint_name": "door_hinge", "joint_type": "hinge", "open_fraction": 0.2},
+            # An internal slide may remain closed while the refrigerator door
+            # is open; it must not be part of the already-open decision.
+            {"joint_name": "door_slide", "joint_type": "slide", "open_fraction": 0.9},
+        ],
+    )
+    monkeypatch.setattr(
+        controller,
+        "_validate_interaction_pose",
+        lambda _task, _command: {"valid": True},
+    )
+    monkeypatch.setattr(
+        controller._head_view_controller,
+        "command",
+        lambda *_args, **_kwargs: {"applied": False},
+    )
+    monkeypatch.setattr(
+        bridge,
+        "prepare_articulation_force",
+        lambda *_args, **_kwargs: {"supported": True, "pre_joint_infos": [], "targets": {}},
+    )
+
+    assert controller._already_open_refrigerator(_Task(), controller._commands.queue[0]) is None

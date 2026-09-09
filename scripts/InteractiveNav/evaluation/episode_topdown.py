@@ -23,9 +23,41 @@ import numpy as np
 import yaml
 
 
-TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v2"
+TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v3"
 _UNKNOWN_MIN = 50
 _UNKNOWN_MAX = 250
+
+
+class _RosOccupancyScene:
+    """Minimal scene-map adapter used when the frozen static scene is absent.
+
+    A completed ROS run already contains a world-frame occupancy raster.  It is
+    sufficient for a truthful trajectory report even when the optional ProcTHOR
+    LMDB mirror is unavailable (for example on a clean evaluation machine).
+    """
+
+    def __init__(self, image: np.ndarray, resolution: float, origin_xy: np.ndarray, origin_yaw: float) -> None:
+        self._image = np.asarray(image)
+        self._resolution = float(resolution)
+        self._origin_xy = np.asarray(origin_xy, dtype=float)
+        self._origin_yaw = float(origin_yaw)
+        self.px_per_m = int(round(1.0 / self._resolution))
+        # Keep the plotted extent to observed cells.  Unknown ROS cells are
+        # normally encoded as 205; including the whole unknown canvas makes a
+        # small explored room unreadable in the report.
+        observed = self._image != 205
+        self.occupancy = observed if np.any(observed) else (self._image > _UNKNOWN_MIN)
+        self.room_map = None
+        self.room_ids_to_name: dict[int, str] = {}
+
+    def pos_px_to_m(self, row_col: np.ndarray) -> np.ndarray:
+        values = np.asarray(row_col, dtype=float).reshape((-1, 2))
+        local_x = values[:, 1] * self._resolution
+        local_y = (self._image.shape[0] - 1.0 - values[:, 0]) * self._resolution
+        cosine, sine = math.cos(self._origin_yaw), math.sin(self._origin_yaw)
+        world_x = self._origin_xy[0] + cosine * local_x - sine * local_y
+        world_y = self._origin_xy[1] + sine * local_x + cosine * local_y
+        return np.column_stack((world_x, world_y, np.zeros(len(values), dtype=float)))
 
 
 def _load_json(path: Path) -> Any:
@@ -131,9 +163,17 @@ def load_trace_trajectory(trace: list[dict[str, Any]]) -> tuple[np.ndarray, np.n
     points: list[tuple[float, float]] = []
     yaws: list[float] = []
     for row in trace:
-        base = row.get("base", {})
-        base = base if isinstance(base, dict) else {}
-        pose = base.get("base_pose_xyyaw")
+        # New traces keep the pose in the public ``base`` block; older/basic
+        # policy traces put it under the navigation detail block.  Accept all
+        # of these shapes so a non-ROS evaluator still gets a driven path.
+        pose = None
+        for block_name in ("base", "oracle_navigation", "python_navigation", "navigation"):
+            block = row.get(block_name, {})
+            if isinstance(block, dict) and block.get("base_pose_xyyaw") is not None:
+                pose = block.get("base_pose_xyyaw")
+                break
+        if pose is None:
+            pose = row.get("base_pose_xyyaw")
         xy = _as_xy(pose)
         if xy is None:
             continue
@@ -295,6 +335,11 @@ def _reconstruct_gt_oracle_path(scene_map: Any, episode: dict[str, Any]) -> dict
         return None
     from scripts.InteractiveNav import explore_molmo_interactions as emi
 
+    # ``explore_molmo_interactions`` keeps its heavyweight numerical imports
+    # lazy.  The live-scene loader initializes them as a side effect, but the
+    # precomputed-map fast path below does not, so initialize them explicitly
+    # before calling its planner helper.
+    emi.ensure_runtime_dependencies()
     terminal = np.asarray(stages[-1]["xy"], dtype=float)
     path_xy = emi.compute_path_from_map(
         scene_map,
@@ -573,14 +618,52 @@ def _load_coverage_payload(debug_dir: Path, coverage_path: Path | None) -> dict[
     return {}
 
 
-def _coverage_summary(debug_dir: Path, *, observed_scene_ratio: float, coverage_path: Path | None) -> tuple[str, dict[str, Any]]:
+def _coverage_summary(
+    debug_dir: Path,
+    *,
+    recomputed_metrics: dict[str, Any] | None,
+    coverage_path: Path | None,
+) -> tuple[str, dict[str, Any]]:
+    """Return whole-scene coverage text and auditable numeric metadata.
+
+    Coverage is meaningful only when the ROS raster is projected onto the full
+    GT navigable map.  A ROS-only raster has no GT denominator, so it must not be
+    reported as 100% merely because all pixels in its cropped canvas are known.
+    """
+
     payload = _load_coverage_payload(debug_dir, coverage_path)
-    if isinstance(payload.get("exploration_coverage_ratio"), (int, float)):
-        return f"GT navigable coverage: {float(payload['exploration_coverage_ratio']):.1%}", payload
-    return f"GT navigable coverage: {observed_scene_ratio:.1%}", {
-        "source": "static_scene_map_recomputed",
-        "exploration_coverage_ratio": observed_scene_ratio,
-    }
+    if recomputed_metrics is not None:
+        coverage_metadata = {
+            "source": "static_scene_map_recomputed",
+            **recomputed_metrics,
+        }
+        if payload:
+            # Keep an older standalone coverage result for comparison, but use
+            # the exact map/radius represented by this image for its title and
+            # primary metrics.
+            coverage_metadata["reported_artifact"] = payload
+    elif isinstance(payload.get("exploration_coverage_ratio"), (int, float)):
+        coverage_metadata = dict(payload)
+    else:
+        coverage_metadata = {
+            "source": "ros_occupancy_without_gt_denominator",
+            "exploration_coverage_ratio": None,
+            "mapped_free_coverage_ratio": None,
+            "mapped_occupied_on_gt_free_ratio": None,
+        }
+
+    observed_ratio = coverage_metadata.get("exploration_coverage_ratio")
+    mapped_free_ratio = coverage_metadata.get("mapped_free_coverage_ratio")
+    false_occupied_ratio = coverage_metadata.get("mapped_occupied_on_gt_free_ratio")
+    if not isinstance(observed_ratio, (int, float)):
+        return "Whole-scene GT coverage: unavailable (full GT scene not loaded)", coverage_metadata
+
+    segments = [f"observed {float(observed_ratio):.1%}"]
+    if isinstance(mapped_free_ratio, (int, float)):
+        segments.append(f"mapped free {float(mapped_free_ratio):.1%}")
+    if isinstance(false_occupied_ratio, (int, float)):
+        segments.append(f"false occupied {float(false_occupied_ratio):.1%}")
+    return f"Whole-scene GT coverage: {' | '.join(segments)}", coverage_metadata
 
 
 def _resolve_scene_model_path(
@@ -640,14 +723,67 @@ def _resolve_scene_model_path(
     )
 
 
+def _resolve_precomputed_scene_map_path(
+    *,
+    episode: dict[str, Any],
+    source_model_path: Path | None,
+    allow_registry_lookup: bool,
+) -> Path | None:
+    """Resolve and, when cached, link the complete precomputed scene map."""
+
+    candidates: list[Path] = []
+    if source_model_path is not None:
+        stem = source_model_path.stem.removesuffix("_ceiling")
+        sibling_map = source_model_path.with_name(f"{stem}_map.png")
+        if sibling_map.is_file():
+            # Resolve the global assets symlink to the persistent resource-cache
+            # target.  Concurrent scene installs may refresh the symlink tree,
+            # while the cache target itself remains stable for this render.
+            return sibling_map.resolve()
+        candidates.append(sibling_map)
+
+    # A resource map can exist in the local cache without having been linked
+    # into assets/scenes yet.  Query the authoritative scene registry so all
+    # benchmark houses get the fast path, not only houses used earlier in this
+    # process.  An explicit XML override deliberately skips this lookup because
+    # its sibling map is the only map guaranteed to describe that exact model.
+    if allow_registry_lookup:
+        try:
+            from molmo_spaces.molmo_spaces_constants import get_scenes
+
+            dataset = str(episode.get("scene_dataset", "procthor-10k"))
+            split = str(episode.get("data_split", "val"))
+            house_index = int(episode["house_index"])
+            scene_entry = get_scenes(dataset, split)[split][house_index]
+            if isinstance(scene_entry, dict) and scene_entry.get("map"):
+                candidates.append(Path(str(scene_entry["map"])))
+        except Exception:
+            # Registry access is an optimization only; rendering can still use
+            # the resolved XML and the live-scene fallback below.
+            pass
+
+    for candidate in dict.fromkeys(candidates):
+        if not candidate.is_file() and allow_registry_lookup:
+            try:
+                from molmo_spaces.utils.lazy_loading_utils import install_scene_from_path
+
+                install_scene_from_path(candidate)
+            except Exception:
+                # The live XML path below remains the authoritative fallback.
+                continue
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def _load_static_scene_map(
     *,
     episode: dict[str, Any],
     context: dict[str, Any] | None,
     coverage_metadata: dict[str, Any],
     scene_model_path: Path | None,
-) -> tuple[Any, Path, float, int]:
-    """Load the reference-style full-room navigability map from the scene XML."""
+) -> tuple[Any, Path, float, int, str, Path | None]:
+    """Load the complete scene map, preferring its precomputed occupancy PNG."""
 
     from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
     from scripts.InteractiveNav.read_scene_room_properties import build_scene_config
@@ -689,12 +825,43 @@ def _load_static_scene_map(
         if isinstance(configured_radius, (int, float)) and float(configured_radius) > 0.0
         else coverage_agent_radius_m
     )
+    precomputed_map_path = _resolve_precomputed_scene_map_path(
+        episode=episode,
+        source_model_path=source_model_path,
+        allow_registry_lookup=scene_model_path is None,
+    )
+    if precomputed_map_path is not None:
+        scene_map = map_cls.load(path=str(precomputed_map_path), agent_radius=agent_radius_m)
+        # The V3 benchmark source map is defined at approximately 200 px/m.
+        # Saved maps preserve the exact fitted scale (for example 200.014), while
+        # ``ProcTHORMap.load`` historically rounds it upward to 201.  Accept that
+        # one-pixel metadata rounding but reject genuinely different resolutions.
+        if abs(float(scene_map.px_per_m) - px_per_m) <= 1.0:
+            reported_model_path = source_model_path
+            if reported_model_path is None:
+                split = str(episode.get("data_split", "val"))
+                house_index = int(episode["house_index"])
+                inferred_model_path = precomputed_map_path.with_name(f"{split}_{house_index}.xml")
+                reported_model_path = inferred_model_path if inferred_model_path.is_file() else Path(
+                    "<precomputed-scene-map>"
+                )
+            return (
+                scene_map,
+                reported_model_path,
+                agent_radius_m,
+                int(scene_map.px_per_m),
+                "precomputed_complete_scene_map",
+                precomputed_map_path,
+            )
     sampler = cfg.task_sampler_config.task_sampler_class(cfg)
     try:
+        # Current BaseMujocoTaskSampler.update_scene accepts only scene_path;
+        # older versions also accepted a redundant ``variant`` keyword.
+        # Passing only the stable argument avoids a post-config API mismatch.
         if source_model_path is None:
-            sampler.update_scene(variant="base")
+            sampler.update_scene()
         else:
-            sampler.update_scene(scene_path=str(source_model_path), variant="base")
+            sampler.update_scene(scene_path=str(source_model_path))
         runtime_model_path = str(sampler.env.current_model_path)
         if is_ithor:
             scene_map = map_cls.from_mj_model_path(
@@ -721,7 +888,14 @@ def _load_static_scene_map(
             )
     finally:
         sampler.close()
-    return scene_map, Path(runtime_model_path) if source_model_path is None else source_model_path, agent_radius_m, px_per_m
+    return (
+        scene_map,
+        Path(runtime_model_path) if source_model_path is None else source_model_path,
+        agent_radius_m,
+        px_per_m,
+        "live_all_open_scene_map",
+        None,
+    )
 
 
 def _sample_ros_map(
@@ -752,7 +926,7 @@ def _scene_coverage_classes(
     ros_resolution: float,
     ros_origin_xy: np.ndarray,
     ros_origin_yaw: float,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Classify static scene pixels by their final recorder observation state."""
 
     free_mask = np.asarray(scene_map.occupancy, dtype=bool)
@@ -767,8 +941,20 @@ def _scene_coverage_classes(
     classes[free_rc[observed, 0], free_rc[observed, 1]] = 2
     classes[free_rc[mapped_free, 0], free_rc[mapped_free, 1]] = 3
     classes[free_rc[mapped_occupied, 0], free_rc[mapped_occupied, 1]] = 4
-    coverage = float(np.count_nonzero(observed) / len(free_rc)) if len(free_rc) else 0.0
-    return classes, coverage
+    gt_count = int(len(free_rc))
+    observed_count = int(np.count_nonzero(observed))
+    mapped_free_count = int(np.count_nonzero(mapped_free))
+    mapped_occupied_count = int(np.count_nonzero(mapped_occupied))
+    denominator = float(gt_count) if gt_count else 1.0
+    return classes, {
+        "gt_navigable_cells": gt_count,
+        "observed_gt_cells": observed_count,
+        "mapped_free_gt_cells": mapped_free_count,
+        "mapped_occupied_on_gt_free_cells": mapped_occupied_count,
+        "exploration_coverage_ratio": observed_count / denominator if gt_count else 0.0,
+        "mapped_free_coverage_ratio": mapped_free_count / denominator if gt_count else 0.0,
+        "mapped_occupied_on_gt_free_ratio": mapped_occupied_count / denominator if gt_count else 0.0,
+    }
 
 
 def _unobserved_scene_classes(scene_map: Any) -> np.ndarray:
@@ -865,6 +1051,8 @@ def render_episode_topdown(
     private_context_path: Path | None = None,
     coverage_path: Path | None = None,
     scene_model_path: Path | None = None,
+    ros_only: bool = False,
+    require_full_scene: bool = False,
 ) -> dict[str, Any]:
     """Render one completed V3 evaluation episode as a top-down PNG.
 
@@ -895,26 +1083,67 @@ def render_episode_topdown(
     if context is not None and not isinstance(context, dict):
         raise ValueError(f"Private visualization context must be an object: {private_context_path}")
 
-    coverage_hint = _load_coverage_payload(debug_dir, coverage_path)
-    scene_map, resolved_scene_model, scene_agent_radius_m, scene_px_per_m = _load_static_scene_map(
-        episode=episode,
-        context=context,
-        coverage_metadata=coverage_hint,
-        scene_model_path=scene_model_path,
-    )
     ros_map_available = (debug_dir / "final_occ_map.yaml").is_file()
+    ros_fallback_error: str | None = None
+    ros_image: np.ndarray | None = None
+    ros_resolution: float | None = None
+    ros_origin_xy: np.ndarray | None = None
+    ros_origin_yaw: float | None = None
     if ros_map_available:
         ros_image, ros_resolution, ros_origin_xy, ros_origin_yaw = load_ros_map(debug_dir)
-        scene_classes, observed_scene_ratio = _scene_coverage_classes(
+    coverage_hint = _load_coverage_payload(debug_dir, coverage_path)
+    static_scene_loaded = False
+    try:
+        if ros_only:
+            raise RuntimeError("ros_only requested")
+        (
+            scene_map,
+            resolved_scene_model,
+            scene_agent_radius_m,
+            scene_px_per_m,
+            static_scene_map_source,
+            precomputed_scene_map_path,
+        ) = _load_static_scene_map(
+            episode=episode,
+            context=context,
+            coverage_metadata=coverage_hint,
+            scene_model_path=scene_model_path,
+        )
+        static_scene_loaded = True
+    except Exception as exc:
+        if require_full_scene:
+            raise RuntimeError(
+                "The complete GT scene was required for this top-down report, "
+                f"but it could not be loaded: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not ros_map_available or ros_image is None or ros_resolution is None or ros_origin_xy is None or ros_origin_yaw is None:
+            raise
+        # Keep the report useful when the optional static scene/LMDB is missing.
+        # GT and actual markers remain in the benchmark world frame, so the ROS
+        # occupancy raster is a valid coordinate-aligned background.
+        ros_fallback_error = f"{type(exc).__name__}: {exc}"
+        scene_map = _RosOccupancyScene(ros_image, ros_resolution, ros_origin_xy, ros_origin_yaw)
+        resolved_scene_model = Path("<ros-occupancy-fallback>")
+        scene_agent_radius_m = float(coverage_hint.get("gt_agent_radius_m", 0.1))
+        scene_px_per_m = int(round(1.0 / ros_resolution))
+        static_scene_map_source = "ros_recorder_occupancy_fallback"
+        precomputed_scene_map_path = None
+    if ros_map_available:
+        assert ros_image is not None and ros_resolution is not None and ros_origin_xy is not None and ros_origin_yaw is not None
+        scene_classes, candidate_coverage_metrics = _scene_coverage_classes(
             scene_map,
             ros_image,
             ros_resolution,
             ros_origin_xy,
             ros_origin_yaw,
         )
+        # A ROS-only canvas can colour its known cells, but it cannot provide the
+        # denominator for whole-scene GT coverage.  Only retain these metrics when
+        # the full static scene was successfully loaded.
+        recomputed_coverage_metrics = candidate_coverage_metrics if static_scene_loaded else None
     else:
         scene_classes = _unobserved_scene_classes(scene_map)
-        observed_scene_ratio = 0.0
+        recomputed_coverage_metrics = None
     trajectory_xy, trajectory_yaw = load_trajectory(debug_dir)
     trajectory_source = "ros_recorder"
     if not len(trajectory_xy):
@@ -933,14 +1162,14 @@ def render_episode_topdown(
     gt_oracle_path_error: str | None = None
     try:
         gt_oracle_path = _reconstruct_gt_oracle_path(scene_map, episode)
-    except (ValueError, IndexError, TypeError) as error:
+    except Exception as error:
         # The rest of the post-eval report remains useful if a historic episode
         # has incomplete frozen oracle metadata.
         gt_oracle_path_error = f"{type(error).__name__}: {error}"
     if ros_map_available:
         coverage_label, coverage_metadata = _coverage_summary(
             debug_dir,
-            observed_scene_ratio=observed_scene_ratio,
+            recomputed_metrics=recomputed_coverage_metrics,
             coverage_path=coverage_path,
         )
     else:
@@ -949,6 +1178,25 @@ def render_episode_topdown(
             "source": "evaluator_trace_fallback",
             "exploration_coverage_ratio": None,
         }
+    if gt_oracle_path is None:
+        # A lightweight ROS-only report may not have enough map resolution for
+        # the source planner.  The frozen oracle navigate stages still provide
+        # an honest GT polyline for visual comparison.
+        stage_points = []
+        if benchmark_start is not None:
+            stage_points.append(np.asarray(benchmark_start["xy"], dtype=float))
+        stage_points.extend(np.asarray(stage["xy"], dtype=float) for stage in _oracle_navigation_stages(episode))
+        if len(stage_points) >= 2:
+            stage_xy = np.asarray(stage_points, dtype=float)
+            gt_oracle_path = {
+                "source": "frozen_oracle_plan_stages",
+                "complete": False,
+                "xy": stage_xy,
+                "start": benchmark_start,
+                "stages": _oracle_navigation_stages(episode),
+                "length_m": _polyline_length_m(stage_xy),
+                "planner": None,
+            }
 
     fig, ax = plt.subplots(figsize=(13.0, 10.0), dpi=160)
     world_min, world_max = _draw_scene_background(ax, scene_map, scene_classes)
@@ -1050,7 +1298,32 @@ def render_episode_topdown(
     for index, marker in enumerate(gt_markers, start=1):
         suffix = "" if marker["source"] == "evaluator_private_geometry" else " (plan point)"
         draw_marker(marker, color="#d946ef", marker_style="D", size=68, text=f"GT interaction {index}{suffix}")
+    actual_interaction_paths: list[dict[str, Any]] = []
     for index, marker in enumerate(actual_markers, start=1):
+        # Make the physical interaction approach visible as a path, not only a
+        # point.  The nearest recorded base pose is the last executed walking
+        # pose before the evaluator's interaction marker.
+        if len(trajectory_xy):
+            marker_xy = np.asarray(marker["xy"], dtype=float)
+            nearest_index = int(np.argmin(np.linalg.norm(trajectory_xy - marker_xy[None, :], axis=1)))
+            approach_xy = trajectory_xy[nearest_index]
+            if np.linalg.norm(approach_xy - marker_xy) > 1e-4:
+                ax.plot(
+                    [approach_xy[0], marker_xy[0]],
+                    [approach_xy[1], marker_xy[1]],
+                    color="#f97316",
+                    linewidth=1.8,
+                    linestyle=(0, (3, 2)),
+                    alpha=0.9,
+                    zorder=11,
+                )
+                actual_interaction_paths.append(
+                    {
+                        "from_xy": approach_xy.astype(float).tolist(),
+                        "to_xy": marker_xy.astype(float).tolist(),
+                        "request_id": marker.get("request_id"),
+                    }
+                )
         color = "#22c55e" if marker.get("success") else "#ef4444"
         draw_marker(marker, color=color, marker_style="X", size=88, text=f"Actual interaction {index}")
 
@@ -1079,6 +1352,7 @@ def render_episode_topdown(
         Line2D([], [], marker="*", color="w", markerfacecolor="#fbbf24", markeredgecolor="white", markersize=11, label="GT target"),
         Line2D([], [], marker="D", color="w", markerfacecolor="#d946ef", markeredgecolor="white", markersize=7, label="GT required interaction"),
         Line2D([], [], marker="X", color="w", markerfacecolor="#ef4444", markeredgecolor="white", markersize=7, label="actual interaction (red=failed)"),
+        Line2D([], [], color="#f97316", lw=1.8, linestyle=(0, (3, 2)), label="actual interaction approach path"),
     ]
     ax.legend(
         handles=legend_handles,
@@ -1105,12 +1379,32 @@ def render_episode_topdown(
         "episode_index": episode_index,
         "coverage": coverage_metadata,
         "scene_background": {
-            "mode": "live_all_open_all_rooms_occupancy",
+            "mode": (
+                "ros_recorder_occupancy_fallback"
+                if not static_scene_loaded
+                else (
+                    "full_gt_scene_with_ros_coverage_overlay"
+                    if ros_map_available
+                    else "full_gt_scene_without_ros_overlay"
+                )
+            ),
             "model_path": str(resolved_scene_model),
+            "map_source": static_scene_map_source,
+            "precomputed_map_path": (
+                str(precomputed_scene_map_path) if precomputed_scene_map_path is not None else None
+            ),
             "agent_radius_m": scene_agent_radius_m,
             "px_per_m": scene_px_per_m,
-            "recomputed_exploration_coverage_ratio": observed_scene_ratio,
+            "complete_gt_scene_loaded": static_scene_loaded,
+            "complete_gt_scene_required": require_full_scene,
+            "coverage_overlay": (
+                "ros_observed_mapped_free_false_occupied"
+                if ros_map_available
+                else "unavailable"
+            ),
+            "recomputed_coverage": recomputed_coverage_metrics,
             "ros_map_available": ros_map_available,
+            "ros_fallback_error": ros_fallback_error,
         },
         "trajectory_samples": int(len(trajectory_xy)),
         "trajectory_source": trajectory_source,
@@ -1138,6 +1432,7 @@ def render_episode_topdown(
         "gt_target": None if target is None else {**target, "xy": np.asarray(target["xy"], dtype=float).tolist()},
         "gt_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in gt_markers],
         "actual_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in actual_markers],
+        "actual_interaction_paths": actual_interaction_paths,
         "fallbacks_used": {
             "target": target is not None and target["source"] != "evaluator_private_geometry",
             "gt_interaction_count": sum(row["source"] != "evaluator_private_geometry" for row in gt_markers),
@@ -1161,6 +1456,16 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional static scene XML override; otherwise resolve it from the frozen benchmark episode.",
     )
+    parser.add_argument(
+        "--ros-only",
+        action="store_true",
+        help="Use the recorded ROS occupancy raster without loading the ProcTHOR/LMDB scene.",
+    )
+    parser.add_argument(
+        "--require-full-scene",
+        action="store_true",
+        help="Fail instead of emitting a ROS-only fallback when the complete GT scene cannot be loaded.",
+    )
     return parser.parse_args()
 
 
@@ -1174,6 +1479,8 @@ def main() -> int:
         private_context_path=args.private_context,
         coverage_path=args.coverage_json,
         scene_model_path=args.scene_model_path,
+        ros_only=args.ros_only,
+        require_full_scene=args.require_full_scene,
     )
     print(json.dumps(metadata, indent=2, ensure_ascii=False))
     return 0

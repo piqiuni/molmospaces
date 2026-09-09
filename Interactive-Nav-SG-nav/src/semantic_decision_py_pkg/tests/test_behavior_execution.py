@@ -309,6 +309,27 @@ def test_semantic_progress_supervisor_accepts_shortest_yaw_and_translation_progr
     )["mission_stalled"]
 
 
+def test_semantic_progress_supervisor_pause_excludes_stationary_interaction_macro() -> None:
+    supervisor = SemanticNavigationProgressSupervisor(
+        subgoal_timeout_task_steps=6,
+        mission_timeout_task_steps=18,
+        min_displacement_m=0.10,
+    )
+    supervisor.observe(
+        subgoal_key="drawer|approach",
+        pose=(0.0, 0.0, 0.0),
+        task_step_index=10,
+    )
+    supervisor.pause(40)
+    resumed = supervisor.observe(
+        subgoal_key="__idle__",
+        pose=(0.0, 0.0, 0.0),
+        task_step_index=41,
+    )
+    assert not resumed["mission_stalled"]
+    assert resumed["mission_elapsed_task_steps"] == 1
+
+
 def test_stuck_recovery_accepts_repeated_no_progress_plan_failures() -> None:
     assert is_stuck_recovery_failure({"reason": "navigation_stagnation"})
     assert is_stuck_recovery_failure({"status": "Robot appears to be oscillating"})
@@ -422,6 +443,17 @@ def test_effective_interaction_approach_replaces_bridge_pose_not_primary_goal() 
         distance_tolerance_m=0.45,
         yaw_tolerance_rad=0.55,
     )["valid"]
+
+
+def test_interaction_pose_validation_tolerates_submillimetre_numeric_boundary() -> None:
+    validation = interaction_pose_validation(
+        [0.0, 0.0, 0.0],
+        [0.1501, 0.0, 0.0],
+        distance_tolerance_m=0.15,
+        yaw_tolerance_rad=0.2,
+    )
+    assert validation["valid"] is True
+    assert validation["comparison_epsilon"] == 1e-3
 
 
 def test_effective_container_anchor_binds_actual_staging_index() -> None:
@@ -1071,6 +1103,7 @@ def test_unknown_portal_open_observation_finishes_without_action() -> None:
             "attribute_source": "mllm_attribute_inference",
             "is_currently_visible": True,
             "state": "static_open",
+            "portal_state_consensus_accepted": True,
             "attribute_capture_step": 1,
         },
         now=1.0,
@@ -1080,6 +1113,29 @@ def test_unknown_portal_open_observation_finishes_without_action() -> None:
     assert terminal[0]["success"] is True
     assert terminal[0]["detail"]["action_executed"] is False
     assert terminal[0]["detail"]["observation_outcome"] == "finish_without_action"
+
+
+def test_unknown_portal_open_observation_waits_for_consensus() -> None:
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(
+        observation_required_interaction_candidate(requires_approach=False), now=0.0
+    )
+    assert commands[0]["kind"] == "request_interaction_observation"
+
+    commands = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "static_open",
+            "portal_state_consensus_accepted": False,
+            "attribute_capture_step": 1,
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert commands[0]["kind"] == "request_interaction_observation"
 
 
 def test_unknown_portal_observation_retries_then_terminates_unresolved() -> None:

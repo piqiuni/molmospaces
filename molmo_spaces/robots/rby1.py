@@ -374,11 +374,22 @@ class RBY1(Robot):
 
         namespace = str(getattr(robot_config, "robot_namespace", "robot_0/"))
         planar_range = np.array([-limit_m, limit_m], dtype=np.float64)
+
+        # Site-transmission actuators are not returned by MjSpec.actuator(name)
+        # in some MuJoCo versions.  Resolve by iterating the authoritative
+        # actuator collection so both joint- and site-driven RBY1 models work.
+        def named_actuator(name: str):
+            actuator = next(
+                (candidate for candidate in spec.actuators if candidate.name == name),
+                None,
+            )
+            return actuator
+
         for axis in ("x", "y"):
             joint_name = f"{namespace}base_{axis}"
             actuator_name = f"{namespace}base_{axis}_act"
             joint = spec.joint(joint_name)
-            actuator = spec.actuator(actuator_name)
+            actuator = named_actuator(actuator_name)
             if joint is None or actuator is None:
                 raise ValueError(
                     f"holonomic base requires {joint_name!r} and {actuator_name!r}"

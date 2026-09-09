@@ -195,7 +195,12 @@ def interaction_observation_disposition(
     if state in {"closed", "ajar"}:
         return "execute"
     if state in {"open", "opened", "static_open", "static"}:
-        return "finish_without_action"
+        # Portal state is stabilized by the multi-view consensus module.  A
+        # single open-looking image must not finish the interaction while the
+        # graph still keeps the door unresolved/requires_interaction.
+        if merged.get("portal_state_consensus_accepted") is True:
+            return "finish_without_action"
+        return "retry"
     if state in {"blocked", "unavailable", "static_closed", "locked"}:
         # See the container branch above: M1 must not one-shot terminalize a
         # portal or container merely from a semantic label in one image.
@@ -228,11 +233,12 @@ def interaction_pose_validation(
     yaw_error_rad = abs(normalize_angle(actual[2] - expected[2]))
     distance_tolerance_m = max(0.05, float(distance_tolerance_m))
     yaw_tolerance_rad = max(0.05, float(yaw_tolerance_rad))
+    comparison_epsilon = 1e-3
     return {
         "checked": True,
         "valid": bool(
-            position_error_m <= distance_tolerance_m
-            and yaw_error_rad <= yaw_tolerance_rad
+            position_error_m <= distance_tolerance_m + comparison_epsilon
+            and yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
         ),
         "expected_pose_xyyaw": expected,
         "actual_pose_xyyaw": actual,
@@ -240,6 +246,7 @@ def interaction_pose_validation(
         "yaw_error_rad": yaw_error_rad,
         "distance_tolerance_m": distance_tolerance_m,
         "yaw_tolerance_rad": yaw_tolerance_rad,
+        "comparison_epsilon": comparison_epsilon,
     }
 
 
@@ -1489,6 +1496,17 @@ class SemanticNavigationProgressSupervisor:
         self.mission_reference_xy = xy
         self.mission_reference_step_index = step
 
+    def pause(self, task_step_index: int | None) -> None:
+        """Exclude a legitimate stationary macro from no-progress time."""
+
+        if task_step_index is None:
+            return
+        step = int(task_step_index)
+        if self.subgoal_reference_step_index is not None:
+            self.subgoal_reference_step_index = step
+        if self.mission_reference_step_index is not None:
+            self.mission_reference_step_index = step
+
     def observe(
         self,
         *,
@@ -1875,10 +1893,20 @@ class BehaviorExecutionStateMachine:
                     },
                 )
         if disposition == "finish_without_action":
+            already_open_payload = {
+                "action": "open",
+                "state": "open",
+                "post_state": "open",
+                "interaction_capability": "unavailable",
+                "interactable": False,
+                "requires_interaction": False,
+                "traversable": True,
+            }
             return self._finish(
                 True,
                 {
                     **observation,
+                    **already_open_payload,
                     "action_executed": False,
                     "observation_outcome": "finish_without_action",
                     "reason": "interaction_not_required_after_observation",

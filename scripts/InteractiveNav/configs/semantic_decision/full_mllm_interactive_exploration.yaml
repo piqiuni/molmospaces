@@ -3,6 +3,12 @@ ablation:
   module2: "mllm_score"
   module3: "mllm_skill_verified"
 
+runtime:
+  # Simulator-only navigation precondition: publish the live articulation
+  # normal so refrigerator anchors can be restricted to the operable face.
+  # M1 still confirms the reached RGB view before any physical action.
+  rule_oracle_gt_interaction_axis: true
+
 target:
   enabled: false
 
@@ -28,6 +34,10 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   portal_standoff_m: 0.85
+  # Opposite-side poses are reserved for traversal; interaction stays on the
+  # currently observed doorway side.
+  portal_allow_opposite_side_interaction: false
+  portal_interaction_front_angle_tolerance_rad: 0.15
   # Direct AABB-surface clearances for the shared container anchor.  The
   # selected point is used for navigation, M1, and the physical bridge in this
   # model lane; the bridge still performs its independent collision/sweep gate.
@@ -63,7 +73,9 @@ candidate:
   # fan is narrower and remains farther away to preserve leaf/interior space.
   fridge_navigation_anchor_aabb_fan_enabled: true
   fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
-  fridge_navigation_anchor_fan_angles_deg: [-15.0, 0.0, 15.0]
+  # Keep enough angular diversity for local obstacles without consuming the
+  # 15-degree physical-front budget before move_base arrival error is added.
+  fridge_navigation_anchor_fan_angles_deg: [-5.0, 0.0, 5.0]
   # The finite anchor list bounds navigation recovery.  M1 sample/view budgets
   # are tracked separately by the executor, so a single negative M1 result
   # cannot consume an anchor merely by being a model flip.

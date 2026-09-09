@@ -526,6 +526,20 @@ class AtomicForceInteractionController:
         except queue.Empty:
             return None
         try:
+            # A refrigerator may already be open when the interaction command
+            # reaches the bridge (for example after a previous action or a
+            # simulator reset).  Treat the authoritative articulation state as
+            # a terminal success before validating the robot pose or applying
+            # any force.  This also prevents repeated "open" commands from
+            # trying to drive an already-open hinge/slide assembly.
+            already_open = self._already_open_refrigerator(task, command)
+            if already_open is not None:
+                return self._publish_already_open(
+                    task,
+                    command,
+                    step,
+                    already_open,
+                )
             command["interaction_pose_validation"] = self._validate_interaction_pose(
                 task, command
             )
@@ -661,6 +675,159 @@ class AtomicForceInteractionController:
         except Exception:
             self._commands.task_done()
             raise
+
+    def _already_open_refrigerator(
+        self, task, command: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return live joint evidence when a refrigerator is already open.
+
+        This check intentionally runs only for a normal refrigerator ``open``
+        command.  Drawer scans and other containers have their own state
+        machines.  ``articulation_joint_infos`` is simulator-owned and reports
+        door hinge leaves (or slide leaves for slide-door-only models) in the
+        articulation; internal refrigerator trays are not required to be open.
+        Every selected door leaf must satisfy the same open-fraction threshold
+        used by the force backend before the command can be completed without
+        action.
+        """
+
+        if str(command.get("node_type") or "").strip().casefold() != "container":
+            return None
+        if str(command.get("container_kind") or "").strip().casefold() not in {
+            "fridge",
+            "refrigerator",
+        }:
+            return None
+        if str(command.get("action") or "open").strip().casefold() != "open":
+            return None
+        if str(command.get("sequence_type") or "").strip().casefold() in {
+            "drawer_scan",
+            "drawer_open",
+        }:
+            return None
+        object_id = self._execution_object_id(command)
+        if not object_id:
+            return None
+        try:
+            infos = articulation_joint_infos(task.env, object_id)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        articulated = [
+            dict(info)
+            for info in infos
+            if str(info.get("joint_type") or "").strip().casefold()
+            in {"hinge", "slide"}
+        ]
+        if not articulated:
+            return None
+        # Refrigerator roots often include internal slide-out drawers in
+        # addition to the door hinge(s).  A visually/physically open appliance
+        # is determined by its door leaf: prefer hinge joints when present and
+        # use slide travel only for slide-door-only models.  Requiring every
+        # internal tray to be open would make an already-open fridge issue a
+        # redundant force command.
+        hinge_infos = [
+            info
+            for info in articulated
+            if str(info.get("joint_type") or "").strip().casefold() == "hinge"
+        ]
+        relevant = hinge_infos or [
+            info
+            for info in articulated
+            if str(info.get("joint_type") or "").strip().casefold() == "slide"
+        ]
+        threshold = float(self.force_config.open_fraction_threshold)
+        if not all(float(info.get("open_fraction", 0.0)) >= threshold for info in relevant):
+            return None
+        return {
+            "checked": True,
+            "state": "open",
+            "threshold": threshold,
+            # Keep the public result free of simulator joint/body names while
+            # retaining enough evidence to audit the all-door-leaf check.
+            "door_leaf_count": len(relevant),
+            "door_leaf_joint_types": [
+                str(info.get("joint_type") or "").casefold() for info in relevant
+            ],
+            "door_leaf_open_fractions": [
+                float(info.get("open_fraction", 0.0)) for info in relevant
+            ],
+            "source": "simulator_articulation_open_fraction",
+        }
+
+    def _publish_already_open(
+        self,
+        task,
+        command: dict[str, Any],
+        step: int,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish a terminal no-op success for an already-open refrigerator."""
+
+        event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
+        self._event_index += 1
+        stamp_sec = time.time()
+        result = {
+            "event_id": event_id,
+            "command_id": str(command["command_id"]),
+            "candidate_id": str(command.get("candidate_id") or ""),
+            "decision_id": str(command.get("decision_id") or ""),
+            "node_id": str(command.get("node_id") or ""),
+            "object_id": str(command.get("object_id") or ""),
+            "node_type": "container",
+            "container_kind": str(command.get("container_kind") or "refrigerator"),
+            "action": "open",
+            "interaction_mode": str(command.get("interaction_mode") or "open_close"),
+            "interaction_capability": "articulated",
+            "interactable": True,
+            "retryable": False,
+            "already_open": True,
+            "action_executed": False,
+            "observation_outcome": "finish_without_action",
+            "state": "open",
+            "pre_state": "open",
+            "post_state": "open",
+            "success": True,
+            "status": "SUCCEEDED",
+            "confidence": 1.0,
+            "execution_cost": 0.0,
+            "sim_steps_consumed": 0,
+            "physics_substeps": 0,
+            "task_steps_consumed": 0,
+            "result_published_step": int(step),
+            "source": "executor_already_open_precondition",
+            "verification_source": str(evidence.get("source") or "simulator_articulation_state"),
+            "already_open_evidence": evidence,
+            "interaction_pose_validation": {
+                "checked": False,
+                "valid": True,
+                "reason": "already_open_no_pose_required",
+            },
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        feedback = {
+            "command_id": result["command_id"],
+            "candidate_id": result["candidate_id"],
+            "decision_id": result["decision_id"],
+            "event_id": event_id,
+            "behavior_type": "INTERACT",
+            "status": "SUCCEEDED",
+            "success": True,
+            "interaction_result": result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        self._events.append({"result": result, "feedback": feedback})
+        self._pending = None
+        self._restore_view_pending = False
+        self._pause_navigation = False
+        self._force_observation_requested = True
+        self._publish(self._result_publisher, result)
+        self._publish(self._feedback_publisher, feedback)
+        self._write_snapshot()
+        self._commands.task_done()
+        return result
 
     def _publish_unsupported_interaction(
         self,
@@ -1682,18 +1849,35 @@ class AtomicForceInteractionController:
                 math.cos(actual[2] - float(expected[2])),
             )
         )
+        # The executor carries an explicit per-goal contract because
+        # MoveBaseGoal itself has no tolerance fields.  Prefer that contract
+        # here so the final physical precondition cannot silently use the
+        # broader legacy interaction-ready envelope after navigation used a
+        # stricter AABB/front constraint.
         distance_tolerance_m = max(
-            0.05, float(command.get("interaction_ready_distance_m", 0.45) or 0.45)
+            0.05,
+            float(
+                command.get(
+                    "navigation_goal_position_tolerance_m",
+                    command.get("interaction_ready_distance_m", 0.45),
+                )
+                or 0.45
+            ),
         )
         yaw_tolerance_rad = max(
             0.05,
             float(
-                command.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+                command.get(
+                    "navigation_goal_yaw_tolerance_rad",
+                    command.get("interaction_ready_yaw_tolerance_rad", 0.55),
+                )
+                or 0.55
             ),
         )
+        comparison_epsilon = 1e-3
         pose_valid = (
-            position_error_m <= distance_tolerance_m
-            and yaw_error_rad <= yaw_tolerance_rad
+            position_error_m <= distance_tolerance_m + comparison_epsilon
+            and yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
         )
         face_required = bool(
             command.get("interaction_front_axis_validation_required", False)
@@ -1751,9 +1935,17 @@ class AtomicForceInteractionController:
                     face_position_error_rad <= face_position_tolerance_rad
                     and face_yaw_error_rad <= face_yaw_tolerance_rad
                 )
+        # Both containers and portals require an independent geometric front
+        # check.  A portal's arrival yaw alone is not a front-side guarantee.
+        # A portal's AABB face check above is the authoritative physical front
+        # contract.  Articulation geometry is often unavailable for static or
+        # hinge-less door assets, so requiring an inferred hinge/slide axis for
+        # portals would reject a valid AABB-front arrival for the wrong reason.
+        # Containers still require the independent articulation-front check.
         physical_front_required = bool(
             face_required
-            and str(command.get("node_type") or "").strip().casefold() == "container"
+            and str(command.get("node_type") or "").strip().casefold()
+            == "container"
         )
         physical_front_checked = False
         physical_front_valid = not physical_front_required
@@ -1769,6 +1961,11 @@ class AtomicForceInteractionController:
                 physical_front.get("source") or physical_front.get("reason") or ""
             )
             physical_axis = list(physical_front.get("axis_xy") or [])
+            # Do not substitute the M1-selected axis when simulator geometry is
+            # unavailable.  M1 is an image classifier, not an independent
+            # physical-front oracle; accepting its axis here would allow a
+            # side/rear view to authorize an action.  Fail closed and let the
+            # executor advance to the next bounded anchor instead.
             if physical_front_checked and len(physical_axis) >= 2 and len(center_values) >= 2:
                 offset_x = actual[0] - float(center_values[0])
                 offset_y = actual[1] - float(center_values[1])
@@ -1809,6 +2006,7 @@ class AtomicForceInteractionController:
             "yaw_error_rad": yaw_error_rad,
             "distance_tolerance_m": distance_tolerance_m,
             "yaw_tolerance_rad": yaw_tolerance_rad,
+            "comparison_epsilon": comparison_epsilon,
             "approach_axis_xy": normalized_axis or axis_values,
             "face_validation_required": face_required,
             "face_checked": face_checked,

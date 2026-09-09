@@ -55,6 +55,7 @@ from explore_py_pkg.debug_semantic_viz import (
     portal_room_node_ids,
     topology_order_rooms,
 )
+from explore_py_pkg.subgoal_overlay import SubgoalOverlay
 from step_sync_image_cache import CachedStepImage, ExactStepImageCache
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -3314,6 +3315,7 @@ class ExploreDebugRecorder:
             return
         source_stamp_ns = int(round(stamp * 1_000_000_000.0))
         source_key = (source_seq, source_stamp_ns)
+        synchronized_detections = payload.get("external_detections")
         skipped_capture = False
         with self.lock:
             if self.shutting_down or self.last_step_sync_key == source_key:
@@ -3323,6 +3325,16 @@ class ExploreDebugRecorder:
             callback_index = self.step_sync_count
             self.debug_step = source_seq
             self.latest_image_step = source_seq
+            if isinstance(synchronized_detections, dict):
+                # This payload is embedded by the Habitat bridge in the exact
+                # step boundary.  Prefer it over asynchronous ROS callback
+                # ordering so camera RGB and detector boxes cannot differ by a
+                # frame while leaving the ordinary GT recorder flow untouched.
+                self.latest_external_detections = synchronized_detections
+                if self._retain_video_state_history:
+                    self.external_detection_history.append(
+                        (stamp, synchronized_detections)
+                    )
             if (callback_index - 1) % self.step_sync_capture_every:
                 self.step_sync_skipped_count += 1
                 skipped_capture = True
@@ -4077,6 +4089,7 @@ class ExploreDebugRecorder:
         observed_instance_ids: set[str] | None,
         target_id: str,
         task_target: dict | None = None,
+        semantic_candidates: dict | None = None,
     ) -> list[dict]:
         """Keep video panels legible and bounded as the persistent graph grows."""
         observed_nodes = [
@@ -4121,6 +4134,7 @@ class ExploreDebugRecorder:
         image_step: int | None = None,
         world_bounds: tuple[float, float, float, float] | None = None,
         task_target: dict | None = None,
+        semantic_candidates: dict | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -4138,6 +4152,10 @@ class ExploreDebugRecorder:
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
             self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+            sidebar_width = max(150, int(panel_width * 0.34))
+            panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
+                (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+            )
             return panel
         if world_bounds is None:
             min_x = min(position[0] for position in positions)
@@ -4263,6 +4281,10 @@ class ExploreDebugRecorder:
             center = to_px(float(pose[0]), float(pose[1]))
             self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
         self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+        sidebar_width = max(150, int(panel_width * 0.34))
+        panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
+            (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+        )
         return panel
 
     def _render_room_segment_panel_locked(
@@ -5663,6 +5685,7 @@ class ExploreDebugRecorder:
                     image_step=image_step,
                     world_bounds=occupancy_world_bounds,
                     task_target=task_target,
+                    semantic_candidates=semantic_candidates,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -5683,9 +5706,10 @@ class ExploreDebugRecorder:
                     external_panel = np.frombuffer(panel6_rgb, dtype=np.uint8).reshape(
                         (panel6_height, panel6_width, 3)
                     )
-                    semantic_topology_panel = cv2.resize(
+                    semantic_topology_panel = self._fit_panel_image_preserving_aspect(
                         external_panel[:, :, ::-1],
-                        (frame_width, frame_height),
+                        frame_width,
+                        frame_height,
                         interpolation=cv2.INTER_NEAREST,
                     )
                     self._draw_panel_title(
@@ -6501,37 +6525,10 @@ class ExploreDebugRecorder:
         if panel is None or cv2 is None:
             return
         target_context = semantic_candidates.get("target_context") or {}
-        target_name = str(
-            target_context.get("target_name")
-            or target_context.get("target_source_object_name")
-            or "-"
-        )
-        behavior_type = str(semantic_selection.get("behavior_type") or "-")
-        subgoal_name = str(
-            semantic_selection.get("target_name")
-            or semantic_selection.get("target_id")
-            or semantic_selection.get("candidate_id")
-            or "-"
-        )
-        max_chars = max(24, int(panel.shape[1] / 10))
-        if len(subgoal_name) > max_chars:
-            subgoal_name = subgoal_name[: max_chars - 3] + "..."
-        lines = [
-            f"TASK TARGET: {target_name}",
-            f"MODULE2 SUBGOAL: {behavior_type} {subgoal_name}",
-        ]
-        cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
-        for index, line in enumerate(lines):
-            cv2.putText(
-                panel,
-                line,
-                (9, 20 + index * 21),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                (30, 30, 30),
-                1,
-                cv2.LINE_AA,
-            )
+        target_name = target_context.get("target_name") or target_context.get("target_source_object_name")
+        behavior_type = semantic_selection.get("behavior_type")
+        subgoal_name = semantic_selection.get("target_name") or semantic_selection.get("target_id") or semantic_selection.get("candidate_id")
+        SubgoalOverlay.draw_header(panel, target_name, behavior_type, subgoal_name)
 
     @staticmethod
     def _draw_panel_title(panel, title: str, step: int | None = None) -> None:
@@ -6897,6 +6894,7 @@ class ExploreDebugRecorder:
                         interaction_goal_grid[2],
                         max(11, int(10 * scale)),
                         color=(0, 140, 255),
+                        selected=True,
                     )
                     cv2.putText(
                         panel,
@@ -6941,6 +6939,7 @@ class ExploreDebugRecorder:
                     max(9, int(9 * scale)) if selected else max(5, int(5 * scale)),
                     color=color,
                     thickness=4 if selected else 2,
+                    selected=selected,
                 )
         if goal_in_grid is not None:
             goal_px = to_panel(world_to_px(goal_in_grid[0], goal_in_grid[1]))
@@ -6955,6 +6954,7 @@ class ExploreDebugRecorder:
                     goal_in_grid[2],
                     max(9, int(9 * scale)),
                     color=goal_color,
+                    selected=True,
                 )
         self._draw_panel_title(panel, title, image_step)
         if "COSTMAP" in title.upper():
@@ -7008,6 +7008,37 @@ class ExploreDebugRecorder:
         return enlarged[offset_y : offset_y + height, offset_x : offset_x + width].copy()
 
     @staticmethod
+    def _fit_panel_image_preserving_aspect(
+        image,
+        target_width: int,
+        target_height: int,
+        *,
+        interpolation,
+    ):
+        """Fit an external diagnostic image without changing its aspect ratio."""
+        if image is None or cv2 is None or np is None:
+            return image
+        source_height, source_width = image.shape[:2]
+        if source_width <= 0 or source_height <= 0:
+            return np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        scale = min(
+            float(target_width) / float(source_width),
+            float(target_height) / float(source_height),
+        )
+        fitted_width = max(1, min(target_width, int(round(source_width * scale))))
+        fitted_height = max(1, min(target_height, int(round(source_height * scale))))
+        fitted = cv2.resize(
+            image,
+            (fitted_width, fitted_height),
+            interpolation=interpolation,
+        )
+        panel = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        offset_x = (target_width - fitted_width) // 2
+        offset_y = (target_height - fitted_height) // 2
+        panel[offset_y : offset_y + fitted_height, offset_x : offset_x + fitted_width] = fitted
+        return panel
+
+    @staticmethod
     def _draw_cv_polyline(image, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
         if len(points) < 2 or cv2 is None or np is None:
             return
@@ -7041,28 +7072,20 @@ class ExploreDebugRecorder:
         length: int,
         color: tuple[int, int, int] = (230, 30, 45),
         thickness: int = 4,
+        selected: bool = False,
     ) -> None:
         if cv2 is None or np is None:
             return
-        cx, cy = center
-        heading = np.asarray([math.cos(yaw), -math.sin(yaw)], dtype=np.float32)
-        norm = float(np.linalg.norm(heading))
-        if norm <= 1e-6:
-            heading = np.asarray([1.0, 0.0], dtype=np.float32)
-        else:
-            heading = heading / norm
-        start = np.asarray([cx, cy], dtype=np.float32) - heading * float(length * 0.45)
-        end = np.asarray([cx, cy], dtype=np.float32) + heading * float(length)
-        cv2.arrowedLine(
+        # Keep the historical call site, but route all subgoal drawing through
+        # the canonical offline-style marker implementation.
+        SubgoalOverlay.draw_marker(
             image,
-            tuple(start.astype(np.int32)),
-            tuple(end.astype(np.int32)),
+            center,
             color,
-            max(1, int(thickness)),
-            cv2.LINE_AA,
-            tipLength=0.45,
+            radius=max(3, int(length) // 4),
+            selected=selected,
+            yaw=yaw,
         )
-        cv2.circle(image, (cx, cy), max(2, length // 4), color, -1, cv2.LINE_AA)
 
     def odom_callback(self, msg: Odometry) -> None:
         if self.shutting_down:

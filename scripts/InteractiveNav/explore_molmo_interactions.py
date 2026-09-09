@@ -1119,7 +1119,7 @@ def safe_body_aabb(
     body_id: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     try:
-        return body_aabb(model, data, body_id, visual_only=True)
+        return body_aabb(model, data, body_id, visible_only=True)
     except Exception as exc:
         log.debug("Failed to compute visual AABB for body %s: %s", body_id, exc)
         return np.asarray(data.xpos[body_id]).copy(), np.zeros(3, dtype=float)
@@ -2168,7 +2168,7 @@ def save_global_object_inflation_overlay_figure(
     removable_mask = None
     try:
         body_id = int(rec["body_id"])
-        geom_ids = descendant_geoms(rec["_model"], body_id, visual_only=False)
+        geom_ids = descendant_geoms(rec["_model"], body_id, visible_only=False)
         rendered_mask, effective_px = render_topdown_geom_mask(
             rec["_model"],
             rec["_data"],

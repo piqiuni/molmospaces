@@ -15,9 +15,16 @@ REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 ROUTE_CONFIG=${ROUTE_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_routes.yaml}
 VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
 RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
+RAW_TOPDOWN_RENDERER=${RAW_TOPDOWN_RENDERER:-${SCRIPT_DIR}/render_raw_interactive_nav_topdown.py}
 ROUTE_ID=${2:-${ROUTE_ID:-house7_force_route_01}}
 HOUSE_IND=${HOUSE_IND:-7}
+export HOUSE_IND
 USE_FIXED_ROUTE=${USE_FIXED_ROUTE:-true}
+# Keep the scene, coverage evaluator, and post-run GT sidecar on one split.
+# Direct legacy runs remain train by default; the batch wrapper may override to
+# val when its benchmark episodes come from the validation split.
+RAW_DATA_SPLIT=${RAW_DATA_SPLIT:-train}
+export RAW_DATA_SPLIT
 SCENE_SEED=${SCENE_SEED:-${HOUSE_IND}}
 METHOD=${METHOD:-interactive_rule}
 OUTPUT_DIR=${1:-${REPO_ROOT}/outputs/house7_${METHOD}_${ROUTE_ID}_$(date +%Y%m%d_%H%M%S)}
@@ -116,6 +123,7 @@ INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
+INTERACTIVE_NAV_RENDER_TOPDOWN=${INTERACTIVE_NAV_RENDER_TOPDOWN:-true}
 ENABLE_EXTERNAL_VIDEO=${ENABLE_EXTERNAL_VIDEO:-false}
 EXTERNAL_IMAGE_TOPIC=${EXTERNAL_IMAGE_TOPIC:-/molmo_spaces/debug_front_camera/image}
 DEBUG_FOLLOW_CAMERA_OFFSET=${DEBUG_FOLLOW_CAMERA_OFFSET:--1.45,1.30,1.90}
@@ -585,7 +593,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \
   robot:=rby1 \
   scene_dataset:=procthor-10k \
-  data_split:=train \
+  data_split:="${RAW_DATA_SPLIT}" \
   house_ind:="${HOUSE_IND}" \
   house_inds:="${HOUSE_IND}" \
   task_horizon:="${TASK_HORIZON}" \
@@ -711,7 +719,7 @@ if [[ "${SKIP_COVERAGE}" != true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; t
     --run-dir "${OUTPUT_DIR}/debug" \
     --robot rby1 \
     --scene-dataset procthor-10k \
-    --data-split train \
+    --data-split "${RAW_DATA_SPLIT}" \
     --house-ind "${HOUSE_IND}" \
     --gt-agent-radius-m 0.10 \
     >"${OUTPUT_DIR}/coverage.log" 2>&1 || true
@@ -726,8 +734,45 @@ else
 fi
 print -r -- "${ANALYSIS_ELAPSED_SEC}" >"${OUTPUT_DIR}/analysis_elapsed_sec.txt"
 
-python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" "${POINTCLOUD_STRIDE}" "${MAPPING_SCAN_SOURCE}" <<'PY'
+# The legacy/raw runner has no formal V3 episode visualisation sidecar.  Build
+# the report from the recorder's final map, trajectory and force interaction
+# log after all ROS processes have stopped.  Rendering is post-run only: GT
+# route geometry is never made available to the policy.  Keep failures visible
+# in a dedicated log while preserving the semantic result/SR summary.
+RAW_TOPDOWN_STATUS=0
+RAW_TOPDOWN_OUTPUT="${OUTPUT_DIR}/topdown.png"
+RAW_TOPDOWN_METADATA="${OUTPUT_DIR}/topdown.json"
+if [[ "${INTERACTIVE_NAV_RENDER_TOPDOWN}" == true ]]; then
+  RAW_TOPDOWN_ARGS=(
+    --run-dir "${OUTPUT_DIR}"
+    --output "${RAW_TOPDOWN_OUTPUT}"
+    --metadata "${RAW_TOPDOWN_METADATA}"
+  )
+  # Route YAML coordinates are valid GT only for the fixed-route simulator
+  # mode.  In random/runtime-target mode, passing a coincident route_id would
+  # draw a plausible but unrelated train-scene path.
+  if [[ "${USE_FIXED_ROUTE}" == true ]]; then
+    RAW_TOPDOWN_ARGS+=(--route-config "${ROUTE_CONFIG}" --route-id "${ROUTE_ID}")
+  else
+    RAW_TOPDOWN_ARGS+=(--disable-route-config)
+  fi
+  if [[ -n "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK:-}" && -f "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK}" ]]; then
+    RAW_TOPDOWN_ARGS+=(--benchmark "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK}")
+  fi
+  if [[ -n "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION:-}" && -f "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION}" ]]; then
+    RAW_TOPDOWN_ARGS+=(--target-selection "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION}")
+  elif [[ -f "${OUTPUT_DIR}/target_selection.json" ]]; then
+    RAW_TOPDOWN_ARGS+=(--target-selection "${OUTPUT_DIR}/target_selection.json")
+  fi
+  "${PYTHON_BIN}" "${RAW_TOPDOWN_RENDERER}" "${RAW_TOPDOWN_ARGS[@]}" \
+    >"${OUTPUT_DIR}/topdown.log" 2>&1 || RAW_TOPDOWN_STATUS=$?
+else
+  printf '%s\n' "disabled" >"${OUTPUT_DIR}/topdown.log"
+fi
+
+python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" "${POINTCLOUD_STRIDE}" "${MAPPING_SCAN_SOURCE}" "${RAW_TOPDOWN_OUTPUT}" "${RAW_TOPDOWN_METADATA}" "${RAW_TOPDOWN_STATUS}" <<'PY'
 import json
+import os
 import re
 from pathlib import Path
 import statistics
@@ -740,6 +785,9 @@ task_horizon = int(sys.argv[4])
 house_ind = int(sys.argv[5])
 pointcloud_stride = int(sys.argv[6])
 mapping_scan_source = sys.argv[7]
+topdown_path = Path(sys.argv[8])
+topdown_metadata_path = Path(sys.argv[9])
+topdown_status = int(sys.argv[10])
 def read_json(path):
     try:
         return json.loads(path.read_text())
@@ -909,6 +957,7 @@ result = {
     "recording_enabled": bool(video_path.exists()),
     "route_id": route_id,
     "house_ind": house_ind,
+    "raw_data_split": os.environ.get("RAW_DATA_SPLIT", "train"),
     "task_horizon": task_horizon,
     "pointcloud_stride": pointcloud_stride,
     "mapping_scan_source": mapping_scan_source,
@@ -999,6 +1048,11 @@ result = {
     "mllm_metrics_path": str(mllm_path) if mllm_path.exists() else "",
     "mllm_request_count": len(mllm_rows),
     "mllm_by_role": mllm_by_role,
+    "topdown_path": str(topdown_path) if topdown_path.is_file() else "",
+    "topdown_metadata_path": str(topdown_metadata_path) if topdown_metadata_path.is_file() else "",
+    "topdown_exists": topdown_path.is_file() and topdown_path.stat().st_size > 0,
+    "topdown_artifact_valid": topdown_path.is_file() and topdown_path.stat().st_size > 0 and topdown_metadata_path.is_file(),
+    "topdown_status": topdown_status,
 }
 (output_dir / "semantic_exploration_result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
 print(json.dumps(result, ensure_ascii=False))

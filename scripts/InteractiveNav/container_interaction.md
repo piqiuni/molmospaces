@@ -260,7 +260,7 @@ body_id = model.jnt_bodyid[joint_id]
 再用该 body 的 visual AABB 作为 joint box proxy：
 
 ```python
-body_aabb(model, data, body_id, visual_only=True)
+body_aabb(model, data, body_id, visible_only=True)
 ```
 
 `collect_joint_box_state_records(...)` 会记录每个 joint：

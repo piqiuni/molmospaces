@@ -3505,6 +3505,27 @@ class SemanticBehaviorExecutor:
         # Every other interaction retains the existing wall-clock behavior.
         return self._drawer_scan_execution_timeout_reason_locked(now=now)
 
+    def _drawer_scan_execution_wait_active_locked(self) -> bool:
+        """Return whether the sent command still owns a drawer-scan wait."""
+
+        context = dict(getattr(self, "_drawer_scan_execution_wait", {}) or {})
+        candidate = self.machine.candidate or self.selection or {}
+        interaction = dict(candidate.get("interaction_command") or {})
+        sent_id = str(getattr(self, "_interaction_command_sent_id", "") or "")
+        context_id = str(context.get("command_id") or "")
+        decision_id = str(candidate.get("decision_id") or "")
+        return bool(
+            self.machine.state == STATE_INTERACTING
+            and str(context.get("sequence_type") or "").casefold() == "drawer_scan"
+            and str(interaction.get("sequence_type") or "").casefold() == "drawer_scan"
+            and sent_id
+            and context_id == sent_id
+            and decision_id
+            and str(context.get("decision_id") or "") == decision_id
+            and str(context.get("candidate_id") or "")
+            == str(candidate.get("candidate_id") or "")
+        )
+
     def _fresh_command_gate_callback(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -4374,6 +4395,7 @@ class SemanticBehaviorExecutor:
             reason = self._effective_timeout_reason_locked()
             if (
                 not reason
+                and not self._drawer_scan_execution_wait_active_locked()
                 and self.machine.state == STATE_INTERACTING
                 and self._interaction_command_sent_at > 0.0
                 and time.monotonic() - self._interaction_command_sent_at

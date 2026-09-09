@@ -238,7 +238,7 @@ class SemanticMappingNode:
             clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
             max_aperture_thickness_m=overlay_config.get(
-                "max_aperture_thickness_m", 0.25
+                "max_aperture_thickness_m", 0.35
             ),
             raw_free_confirmations=overlay_config.get(
                 "raw_free_confirmations", 3
@@ -253,7 +253,7 @@ class SemanticMappingNode:
             clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
             max_aperture_thickness_m=overlay_config.get(
-                "max_aperture_thickness_m", 0.25
+                "max_aperture_thickness_m", 0.35
             ),
             raw_free_confirmations=overlay_config.get(
                 "raw_free_confirmations", 3
@@ -1646,8 +1646,10 @@ class SemanticMappingNode:
         graph_store = getattr(self, "graph_store", None)
         overlay = getattr(self, "semantic_occ_overlay", None)
         if graph_store is not None and overlay is not None:
+            ablation = getattr(self, "ablation", None)
+            module1 = getattr(ablation, "module1", "dynamic_rule")
             graph_payload = apply_module1_ablation(
-                graph_store.as_graph_dict(), self.ablation.module1
+                graph_store.as_graph_dict(), module1
             )
             (
                 effective_grid,
