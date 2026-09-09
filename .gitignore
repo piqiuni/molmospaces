@@ -54,8 +54,17 @@ mlspaces_tests/**/test_data
 .pytest_cache/
 __pycache__/
 
-# This branch contains simulator interfaces only. Keep full navigation stacks
-# and experiment scripts untracked so simulator changes can flow one-way into
-# codex/exp-setting without accidentally importing its algorithms here.
+# Keep the external ROS/navigation implementation out of this branch. Track the
+# standalone evaluator closure (including its optional protocol adapters), its
+# frozen benchmark, and simulator-side episode replay/reporting helpers.
 /Interactive-Nav-SG-nav/
-/scripts/InteractiveNav/
+/scripts/InteractiveNav/*
+!/scripts/InteractiveNav/benchmarks/
+!/scripts/InteractiveNav/dataset_definition/
+!/scripts/InteractiveNav/evaluation/
+!/scripts/InteractiveNav/container_scene_probe.py
+!/scripts/InteractiveNav/evaluate_interactive_nav_v3.py
+!/scripts/InteractiveNav/force_interaction_bridge.py
+!/scripts/InteractiveNav/force_interaction_runtime.py
+!/scripts/InteractiveNav/interactive_nav_v3.py
+!/scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py
