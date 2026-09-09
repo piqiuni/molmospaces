@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -107,6 +108,24 @@ from .trusted_interaction_skill import (
     OpenPostconditionSpec,
     TrustedInteractionSkill,
 )
+
+# ``semantic_mapping_py_pkg`` is a catkin source package rather than an
+# installed Python dependency.  The canonical non-ROS evaluator still shares
+# its stable public-door ID helper, so make that one package importable for all
+# evaluator entry points (not only the mixed-domain wrapper).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SEMANTIC_MAPPING_SCRIPTS = (
+    _REPO_ROOT
+    / "Interactive-Nav-SG-nav"
+    / "src"
+    / "semantic_mapping_py_pkg"
+    / "scripts"
+)
+if (
+    _SEMANTIC_MAPPING_SCRIPTS.is_dir()
+    and str(_SEMANTIC_MAPPING_SCRIPTS) not in sys.path
+):
+    sys.path.insert(0, str(_SEMANTIC_MAPPING_SCRIPTS))
 
 from semantic_mapping_py_pkg.graph_rules import opaque_door_instance_id
 

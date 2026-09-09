@@ -234,7 +234,14 @@ processes; this is required because MuJoCo renderers and episode state are not
 thread safe.  `--resume` only skips episode directories whose completed trace
 has the identical run signature (benchmark hash, evaluation configuration, and
 evaluator protocol implementation).  A partial, failed, or differently
-configured trace is rerun.  `ros_bridge` and `ros_object_goal_rule` are kept
+configured trace is rerun. The mixed-domain `run_manifest.json` records each
+domain's unhashed signature payload—including the full evaluation configuration,
+paper metric configuration, protocol version, and implementation hash—alongside
+the signature so the resolved run configuration can be reconstructed and
+audited. External policy implementations and model artifacts remain
+caller-owned: version them separately and do not resume an old output after
+changing them without also changing the factory/kwargs identity. `ros_bridge`
+and `ros_object_goal_rule` are kept
 single-worker because they attach to a stateful ROS master.
 
 ## Required validation order

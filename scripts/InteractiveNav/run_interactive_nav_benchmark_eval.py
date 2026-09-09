@@ -59,12 +59,6 @@ except Exception:  # pragma: no cover - exercised only in minimal environments.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-# ``benchmark_runner`` uses one small, ROS-originated graph-rules module even
-# for non-ROS replay.  Add its source package directly so the basic evaluator
-# does not require sourcing a ROS workspace.
-_SEMANTIC_SCRIPTS = REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts"
-if _SEMANTIC_SCRIPTS.is_dir() and str(_SEMANTIC_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SEMANTIC_SCRIPTS))
 from scripts.InteractiveNav.evaluation.benchmark_io import load_benchmark_episodes
 
 
@@ -705,7 +699,7 @@ def _build_schedule(args: argparse.Namespace) -> tuple[list[ScheduledEpisode], d
         config_obj = benchmark_runner.BenchmarkEvaluationConfig(
             **_normalise_config_for_worker(domain_config)
         )
-        signature, _ = benchmark_runner._run_signature(
+        signature, signature_payload = benchmark_runner._run_signature(
             config_obj,
             _sha256(source),
             [item.source_index for item in domain_items],
@@ -716,6 +710,7 @@ def _build_schedule(args: argparse.Namespace) -> tuple[list[ScheduledEpisode], d
             "episode_indices": [item.source_index for item in domain_items],
             "count": len(domain_items),
             "run_signature": signature,
+            "run_signature_payload": signature_payload,
             "output_dir": str(domain_output_dirs[domain]),
         }
         for item in domain_items:

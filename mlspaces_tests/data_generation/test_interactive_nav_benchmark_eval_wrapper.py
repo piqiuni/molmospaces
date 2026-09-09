@@ -6,7 +6,9 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 from scripts.InteractiveNav.evaluation.benchmark_io import load_benchmark_episodes
@@ -20,6 +22,10 @@ SCRIPT = (
     / "scripts"
     / "InteractiveNav"
     / "run_interactive_nav_benchmark_eval.py"
+)
+REPO_ROOT = SCRIPT.parents[2]
+CANONICAL_SCRIPT = (
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluate_interactive_nav_v3.py"
 )
 SPEC = importlib.util.spec_from_file_location("interactive_nav_mixed_eval", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -112,6 +118,20 @@ def test_gzip_benchmark_loader_and_dry_run(tmp_path: Path) -> None:
                 "factory",
                 "--policy-factory",
                 "scripts.InteractiveNav.evaluation.example_external_policy:build_policy",
+                "--policy-kwargs-json",
+                '{"reason":"manifest_contract"}',
+                "--max-steps",
+                "17",
+                "--min-steps",
+                "11",
+                "--camera-names",
+                "head_camera",
+                "wrist_camera",
+                "--image-resolution",
+                "320",
+                "240",
+                "--video-fps",
+                "7.5",
                 "--dry-run",
             ]
         )
@@ -120,6 +140,46 @@ def test_gzip_benchmark_loader_and_dry_run(tmp_path: Path) -> None:
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["selected_episode_count"] == 3
     assert manifest["domain_counts"] == {"channel": 1, "container": 1, "mixed": 1}
+    for domain in MODULE.DOMAIN_NAMES:
+        payload = manifest["domains"][domain]["run_signature_payload"]
+        assert payload["protocol_version"]
+        assert payload["protocol_implementation_sha256"]
+        assert payload["paper_metric_config"]
+        config = payload["evaluation_config"]
+        assert config["policy_kwargs"] == {"reason": "manifest_contract"}
+        assert config["max_steps"] == 17
+        assert config["min_steps"] == 11
+        assert config["camera_names"] == ["head_camera", "wrist_camera"]
+        assert config["image_resolution"] == [320, 240]
+        assert config["video_fps"] == 7.5
+
+
+def test_canonical_cli_imports_without_ros_pythonpath(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.update(
+        {
+            "TMPDIR": str(runtime_root),
+            "XDG_CACHE_HOME": str(runtime_root / "xdg"),
+            "HF_HOME": str(runtime_root / "hf"),
+            "TORCH_HOME": str(runtime_root / "torch"),
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(CANONICAL_SCRIPT), "--help"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--policy-factory" in result.stdout
 
 
 def test_example_external_factory_uses_public_contract() -> None:
