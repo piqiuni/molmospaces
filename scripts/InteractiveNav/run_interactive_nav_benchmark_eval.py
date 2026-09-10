@@ -68,7 +68,7 @@ DEFAULT_BENCHMARK_ROOT = (
     / "scripts"
     / "InteractiveNav"
     / "benchmarks"
-    / "interactive_nav_v3_procthor10k_val_release_v1_1"
+    / "interactive_nav_v3_procthor10k_val_release_v1_2"
 )
 DOMAIN_NAMES = ("channel", "container", "mixed")
 SIMULATOR_PROFILE_NAMES = ("interactive_nav_v3", "upstream_main", "custom")
