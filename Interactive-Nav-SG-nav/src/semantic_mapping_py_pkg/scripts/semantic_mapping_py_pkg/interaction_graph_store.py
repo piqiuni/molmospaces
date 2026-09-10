@@ -38,12 +38,46 @@ _SEMANTIC_POSTCONDITION_BY_ACTION = {
 # hypothesis only and must never be written into the occupancy-derived room
 # grid.
 _PORTAL_CHILD_ROOM_ID_BASE = 1_000_000
+_PARENT_CACHE_MISS = object()
+_PORTAL_MATCH_LABELS = frozenset(
+    {"portal", "door", "doorway", "doorframe", "door_leaf", "gate", "entrance"}
+)
 
 # These are semantic landmarks rather than short-lived detector tracks.  Once
 # the temporal detector gate and the visual Module-1 gate have both passed,
 # their identity must survive occlusion, viewpoint changes, and detector
 # dropouts.  Visibility and geometry continue to be refreshed separately.
 _PERSISTENT_SEMANTIC_TYPES = frozenset({"room", "portal", "container"})
+
+# Label predicates are evaluated repeatedly while refreshing every graph node
+# (especially the refrigerator/content relation fallback).  Labels come from
+# a bounded open-vocabulary detector stream, so a small explicit cache avoids
+# re-normalizing the same strings without retaining an unbounded history.
+_LABEL_MARKER_CACHE_MAX = 4096
+_LABEL_MARKER_CACHE = {}
+_REFRIGERATOR_LABEL_CACHE = {}
+
+
+def _cached_label_marker_match(label, marker):
+    """Match already-normalized labels with a bounded pair cache."""
+
+    key = (label, marker)
+    cached = _LABEL_MARKER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = bool(
+        label
+        and marker
+        and (
+            label == marker
+            or label.startswith(f"{marker}_")
+            or label.endswith(f"_{marker}")
+        )
+    )
+    if len(_LABEL_MARKER_CACHE) >= _LABEL_MARKER_CACHE_MAX:
+        _LABEL_MARKER_CACHE.clear()
+    _LABEL_MARKER_CACHE[key] = result
+    return result
 
 
 def _portal_geometry_plausible(size):
@@ -75,6 +109,21 @@ def _portal_attrs_geometry_plausible(attrs):
     return True
 
 
+_SEMANTIC_CONFIRMATION_FIELDS = (
+    "attribute_status", "attribute_confidence", "mllm_interaction_class",
+    "m1_observed_object_name", "m1_refrigerator_pending_confirmation", "attribute_updated_at",
+)
+
+
+def _accepted_semantic_evidence(attrs):
+    """Transport progress is not a revocation of the last semantic result."""
+    if str(attrs.get("attribute_status") or "").casefold() in {"pending", "failed", "stale"}:
+        accepted = attrs.get("attribute_last_ready")
+        if isinstance(accepted, dict):
+            return accepted
+    return attrs
+
+
 def _has_m1_portal_confirmation(attrs):
     """Return whether M1 positively identified a detector portal as a door."""
 
@@ -82,13 +131,20 @@ def _has_m1_portal_confirmation(attrs):
     # a wall panel, cabinet face, or other flat structure while the detector
     # keeps its provisional ``portal`` label.  Such a result must never create
     # a synthetic room behind it.
-    if str(attrs.get("attribute_status") or "").casefold() != "ready":
+    evidence = _accepted_semantic_evidence(attrs)
+    if str(evidence.get("attribute_status") or "").casefold() != "ready":
         return False
-    if str(attrs.get("mllm_interaction_class") or "").casefold() != "portal":
+    try:
+        confidence = float(evidence.get("attribute_confidence", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(confidence) or not 0.5 <= confidence <= 1.0:
+        return False
+    if str(evidence.get("mllm_interaction_class") or "").casefold() != "portal":
         return False
     if not _portal_attrs_geometry_plausible(attrs):
         return False
-    observed_name = normalize_label(attrs.get("m1_observed_object_name"))
+    observed_name = normalize_label(evidence.get("m1_observed_object_name"))
     # A portal class with a contradictory concrete name (for example
     # ``thermostat``) is not a confirmed door, even if the detector proposed
     # portal and the crop contains a flat, door-like shape.  M1's concrete
@@ -115,6 +171,13 @@ def _resolved_interaction_state(result):
     semantic postcondition even when no simulator articulation is returned.
     """
 
+    # A failed action may still carry the controller's last/desired
+    # ``post_state`` (for example ``open`` after a rejected M3 request).  It is
+    # not evidence that the object reached that state.  Portal results are
+    # additionally checked by ``_portal_result_state_gate``; keep this guard
+    # here as well so containers cannot be promoted by a failed/stale result.
+    if result.get("success") is False:
+        return None, False
     explicit_state = result.get("state") or result.get("post_state")
     if explicit_state is not None:
         return str(explicit_state), False
@@ -526,6 +589,8 @@ def _portal_result_state_gate(node, result, resolved_state):
         "static_open",
     }:
         return True, "not_applicable"
+    if result.get("success") is False:
+        return False, "unsuccessful_result"
     action = str(result.get("action") or "").strip().casefold()
     capability = _interaction_result_capability(result)
     source = str(result.get("source") or "").strip().casefold()
@@ -619,6 +684,23 @@ class InteractionGraphStore:
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
+        # Detector observations normally carry a stable instance/track ID.
+        # Keep a per-update identity index so matching does not scan every
+        # historical graph node for each 10 Hz observation.  The index is
+        # rebuilt at the start of an observation batch and updated as nodes
+        # are observed/created; direct node mutations are outside the store's
+        # observation API and are reconciled on the next batch boundary.
+        self._identity_index = None
+        # Spatial buckets are the secondary index for observations that do
+        # not carry a stable detector identity.  The historical matcher
+        # scanned every object of the same label/type, which made a large
+        # first batch quadratic even when detections were far apart.
+        self._spatial_index = None
+        self._spatial_node_bucket = {}
+        self._spatial_node_order = {}
+        self._spatial_cell_size = max(self.match_distance, 0.1)
+        self._parent_relation_cache = {}
+        self._parent_relation_cache_context = None
         self.edges = {}
         self.next_node_index = 1
         self.edge_counter = 1
@@ -630,6 +712,13 @@ class InteractionGraphStore:
         # revision/relations without rescanning every cell on a cache hit.
         self._room_grid_stats_cache = None
         self.last_room_grid_cache_hit = False
+        # Portal-to-room probing is pure with respect to one accepted room
+        # grid and one portal geometry.  Detection observations arrive more
+        # frequently than room segmentation, so cache the result between
+        # those observations and invalidate it only when the grid topology
+        # (or a room merge) advances.
+        self._room_grid_epoch = 0
+        self._portal_room_ids_cache: dict[tuple, tuple[int, ...]] = {}
         self.source_mode = "detector_online"
         self.episode_id = ""
         self.graph_revision = 0
@@ -648,12 +737,20 @@ class InteractionGraphStore:
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
+        self._identity_index = None
+        self._spatial_index = None
+        self._spatial_node_bucket = {}
+        self._spatial_node_order = {}
+        self._parent_relation_cache = {}
+        self._parent_relation_cache_context = None
         self.edges = {}
         self.next_node_index = 1
         self.edge_counter = 1
         self.room_grid = None
         self._room_grid_stats_cache = None
         self.last_room_grid_cache_hit = False
+        self._room_grid_epoch = 0
+        self._portal_room_ids_cache = {}
         self.graph_revision = 0
         self.capture_step = None
         self.interaction_event_counter = 1
@@ -712,6 +809,9 @@ class InteractionGraphStore:
             )
         )
         self.last_room_grid_cache_hit = cache_hit
+        if not cache_hit or room_merges:
+            self._room_grid_epoch += 1
+            self._portal_room_ids_cache.clear()
         if cache_hit:
             # Retain the store-owned immutable copies from the previous call;
             # this avoids two more full-grid list allocations on the hot path.
@@ -728,7 +828,10 @@ class InteractionGraphStore:
         self._apply_room_merges(room_merges or {})
         redirects_before = self._room_redirect_signature()
         if cache_hit:
-            self._refresh_room_nodes_from_cached_stats()
+            # This is a new room-grid receipt (same cell content, newer
+            # source/header), so it still counts as one room observation for
+            # the temporal room admission gate.
+            self._refresh_room_nodes_from_cached_stats(count_observation=True)
         else:
             self._refresh_room_nodes_from_grid()
         # A force-stable room refresh can legitimately publish a grid where a
@@ -786,6 +889,7 @@ class InteractionGraphStore:
             self.source_mode = str(source_mode)
         if capture_step is not None:
             self.capture_step = int(capture_step)
+        self._rebuild_identity_index()
         if self.source_mode in {"realtime_gt_observation", "detector_online"}:
             for node in self.nodes.values():
                 if node.type not in {"scene", "room"}:
@@ -797,14 +901,30 @@ class InteractionGraphStore:
             observation = normalize_observation(raw_observation)
             node = self._find_or_create_node(observation)
             self._apply_observation(node, observation, now)
+            self._index_node_identity(node)
         # ObjectMapStore can legitimately hand off a physical doorway to a
         # new detector track after an occlusion or a large viewpoint change.
         # The opaque track id is not a semantic identity, so collapse portal
         # nodes again at the graph boundary before rebuilding room relations.
         self._merge_duplicate_portal_nodes()
+        # Portal deduplication can remove or move graph nodes.  No further
+        # observation association happens in this batch, so reconcile lazily
+        # at the next batch boundary instead of rebuilding O(N) here.
+        self._invalidate_spatial_index()
         for node in self.nodes.values():
             node.attributes.pop("_was_visible_previous_update", None)
-        self._refresh_room_nodes_from_grid()
+        # Room topology/statistics are produced by update_room_grid(), which
+        # already owns the expensive full-grid scan and keeps a cache for
+        # unchanged labels. Detector observations arrive at 10 Hz; rescanning
+        # a multi-million-cell room grid here would hold the mapper lock for
+        # hundreds of milliseconds on every YOLO receipt. Reapply the cached
+        # per-room statistics instead, with the helper's full-scan fallback
+        # for startup/legacy callers that have no cache yet.
+        # Detector frames reuse the last room-grid statistics.  They must not
+        # be counted as additional room observations: otherwise a 10 Hz YOLO
+        # stream can satisfy the two-room-frame gate before a second room grid
+        # has actually arrived.
+        self._refresh_room_nodes_from_cached_stats(count_observation=False)
         self._rebuild_relations(now=now)
         self._refresh_missing_room_nodes_from_observations()
         self._bump_revision()
@@ -858,10 +978,15 @@ class InteractionGraphStore:
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
         resolved_state, inferred_from_action = _resolved_interaction_state(result)
+        # The resolver intentionally discards failed postconditions; retain
+        # the rejected claim in gate diagnostics without applying it.
+        requested_state = resolved_state
+        if requested_state is None and result.get("success") is False:
+            requested_state = result.get("state") or result.get("post_state")
         result_state_allowed, result_state_gate_reason = _portal_result_state_gate(
-            node, result, resolved_state
+            node, result, requested_state
         )
-        if node.type == "portal" and str(resolved_state or "").casefold() in {
+        if node.type == "portal" and str(requested_state or "").casefold() in {
             "open",
             "opened",
             "ajar",
@@ -869,7 +994,7 @@ class InteractionGraphStore:
         }:
             node.attributes["portal_result_state_gate"] = {
                 "accepted": bool(result_state_allowed),
-                "requested_state": str(resolved_state or "").casefold(),
+                "requested_state": str(requested_state or "").casefold(),
                 "reason": result_state_gate_reason,
                 "event_id": str(result.get("event_id") or ""),
             }
@@ -900,21 +1025,6 @@ class InteractionGraphStore:
                     "drawer_scan_covered_region_count": len(grounded_regions),
                 }
             )
-            # A refrigerator with an M1-observed door is an open/close
-            # interaction even when the model omits an explicit mode field.
-            # Candidate generation rejects container modes other than
-            # open_close/slide, so leaving this as ``none`` hides the fridge
-            # from the subgoal pool despite is_interactable=true.
-            if (
-                patch_interactable
-                and _is_refrigerator_label(m1_observed_name or node.label)
-                and any(
-                    str(part.get("type") or "").casefold() in {"door", "lid", "drawer"}
-                    for part in (patch.get("interaction_parts") or [])
-                    if isinstance(part, dict)
-                )
-            ):
-                node.interaction["interaction_mode"] = "open_close"
         result_source = str(
             result.get("source")
             or result.get("verification_source")
@@ -1217,6 +1327,16 @@ class InteractionGraphStore:
         if node is None:
             return False
         attribute_status = str(patch.get("attribute_status") or "ready")
+        confidence = 0.0
+        if attribute_status not in {"pending", "failed", "stale"}:
+            try:
+                confidence = float(patch.get("confidence", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            # Rejected evidence must not change an accepted name/state or
+            # overwrite the confirmation metadata used by portal topology.
+            if not math.isfinite(confidence) or not 0.5 <= confidence <= 1.0:
+                return False
         patch_stamp = float(stamp if stamp is not None else time.time())
         request_sequence = int(patch.get("request_sequence", 0) or 0)
         latest_request_sequence = int(
@@ -1261,6 +1381,12 @@ class InteractionGraphStore:
             attribute_status == "pending" or not request_signature
         ):
             request_signature = patch_signature
+        if str(node.attributes.get("attribute_status") or "").casefold() == "ready":
+            # Also preserve ready evidence from older serialized graphs that
+            # predate attribute_last_ready before overwriting request status.
+            node.attributes["attribute_last_ready"] = {
+                key: node.attributes.get(key) for key in _SEMANTIC_CONFIRMATION_FIELDS
+            }
         node.attributes.update(
             {
                 "attribute_status": attribute_status,
@@ -1291,7 +1417,6 @@ class InteractionGraphStore:
         has_verified_interaction_state = bool(
             verified_state_override.get("event_id")
         )
-        confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
         patch_source = str(patch.get("source") or "mllm_attribute_inference")
         is_visual_mllm_patch = "mllm" in patch_source.casefold()
@@ -1762,18 +1887,6 @@ class InteractionGraphStore:
             }
             node.attributes["interaction_state_override"]["timestamp"] = patch_stamp
 
-            # A visually confirmed open/ajar portal is already traversable,
-            # but the far-side occupancy cells may still be unknown. Keep a
-            # graph-only provisional child room now so planning can target
-            # the doorway; OCC will replace it with a real room after the
-            # robot crosses and observes free space there.
-            if (
-                self.portal_child_room_enabled
-                and node.type == "portal"
-                and str(patch_state).casefold() in {"open", "ajar"}
-            ):
-                self._ensure_open_portal_child_room(node, previous_history)
-
         # Keep the interaction mode canonical even when a repeated M1 patch
         # does not change the closed/open state.  Otherwise the first patch
         # may leave mode=none and every later patch preserves that value.
@@ -1792,7 +1905,17 @@ class InteractionGraphStore:
             node.attributes["interaction_state_override"] = override
 
         node.attributes["attribute_updated_at"] = patch_stamp
+        node.attributes["attribute_last_ready"] = {
+            key: node.attributes.get(key) for key in _SEMANTIC_CONFIRMATION_FIELDS
+        }
         self._update_persistent_semantic_gate(node)
+        # This very response may complete the two-frame + M1 gate. Evaluate
+        # topology afterwards so the first confirmed open observation need
+        # not wait for another model call to create its graph-only far side.
+        if (state_was_updated and self.portal_child_room_enabled
+            and node.type == "portal"
+            and str(node.interaction.get("state") or "").casefold() in {"open", "ajar"}):
+            self._ensure_open_portal_child_room(node, previous_history)
         self._rebuild_relations(now=patch_stamp)
         self._bump_revision()
         return True
@@ -2017,6 +2140,7 @@ class InteractionGraphStore:
         stale_id_set = set(stale_ids)
         for node_id in stale_ids:
             self.nodes.pop(node_id, None)
+        self._invalidate_spatial_index()
         self.edges = {
             edge_id: edge
             for edge_id, edge in self.edges.items()
@@ -2027,20 +2151,36 @@ class InteractionGraphStore:
     def _find_or_create_node(self, observation):
         instance_id = str(observation.get("instance_id") or "")
         private_instance_id = str(observation.get("private_instance_id") or "")
-        if instance_id or private_instance_id:
-            for node in self.nodes.values():
-                if self._node_matches_identity(node, instance_id) or (
-                    private_instance_id
-                    and self._node_matches_identity(node, private_instance_id)
-                ):
+        identities = tuple(
+            identity
+            for identity in (instance_id, private_instance_id)
+            if identity
+        )
+        if identities:
+            if self._identity_index is None:
+                self._rebuild_identity_index()
+            for identity in identities:
+                node_id = self._identity_index.get(identity)
+                node = self.nodes.get(node_id) if node_id is not None else None
+                if node is not None and self._node_matches_identity(node, identity):
                     return node
+            # The index is rebuilt at every observation-batch boundary and is
+            # updated whenever a node is observed/created.  A miss is therefore
+            # definitive for normal ROS callers; avoid falling back to an
+            # O(N) scan for every newly created track in a large first batch.
 
         node_type = infer_node_type(observation)
         label = normalize_label(observation.get("semantic_name"))
         best = None
         best_dist = None
-        for node in self.nodes.values():
-            if node.type == "room":
+        candidates = self._spatial_candidates(observation, node_type, label)
+        if candidates is None:
+            # Compatibility for a minimal test double or a legacy store that
+            # bypassed ``__init__``. Production batches build the index before
+            # reaching this branch.
+            candidates = self.nodes.values()
+        for node in candidates:
+            if node.type in {"scene", "room"}:
                 continue
             if node.type != node_type:
                 continue
@@ -2048,14 +2188,10 @@ class InteractionGraphStore:
             # ``door`` and ``portal`` while retaining the same physical
             # surface. Treat portal-family labels as equivalent for spatial
             # association so a label canonicalization cannot split a track.
-            portal_labels = {
-                "portal", "door", "doorway", "doorframe", "door_leaf",
-                "gate", "entrance",
-            }
             portal_equivalent = (
                 node_type == "portal"
-                and node.label in portal_labels
-                and label in portal_labels
+                and node.label in _PORTAL_MATCH_LABELS
+                and label in _PORTAL_MATCH_LABELS
             )
             if node.label != label and not portal_equivalent:
                 continue
@@ -2074,6 +2210,10 @@ class InteractionGraphStore:
             name=str(observation.get("name") or label or node_type),
         )
         self.nodes[node_id] = node
+        # The caller indexes after ``_apply_observation`` has populated the
+        # instance ID, centroid, and final type.  Indexing this empty shell
+        # here would immediately be repeated and adds one spatial-bucket
+        # update per newly created detector track.
         return node
 
     @staticmethod
@@ -2172,6 +2312,10 @@ class InteractionGraphStore:
         ordered = sorted(
             portals,
             key=lambda node: (
+                # A detector handoff is not a new semantic doorway. Keep the
+                # confirmed public ID (including an in-flight M1 refresh), so
+                # room ownership and pending results remain attached to it.
+                -int(_has_m1_portal_confirmation(node.attributes)),
                 -int(node.observation_count or 0),
                 -(float(node.confidence or 0.0)),
                 str(node.id),
@@ -2187,27 +2331,11 @@ class InteractionGraphStore:
                     keeper, duplicate
                 ):
                     continue
-                # Preserve the strongest M1/topology decision if the current
-                # keeper is a newly handed-off track without an attribute patch.
+                # Confirmed evidence already ranks first. Do not copy a
+                # duplicate's bare "ready" status: it may lack valid evidence
+                # and must not overwrite a confirmed node's pending refresh.
                 keeper_attrs = keeper.attributes
                 duplicate_attrs = duplicate.attributes
-                if (
-                    str(keeper_attrs.get("attribute_status") or "").casefold()
-                    != "ready"
-                    and str(duplicate_attrs.get("attribute_status") or "").casefold()
-                    == "ready"
-                ):
-                    for key in (
-                        "attribute_status",
-                        "attribute_confidence",
-                        "m1_observed_object_name",
-                        "mllm_interaction_class",
-                        "mllm_portal_promotion_rejected",
-                        "m1_noninteractive_override",
-                    ):
-                        if key in duplicate_attrs:
-                            keeper_attrs[key] = duplicate_attrs[key]
-                    keeper.interaction.update(duplicate.interaction)
                 keeper.observation_count = max(
                     int(keeper.observation_count or 0),
                     int(duplicate.observation_count or 0),
@@ -2216,6 +2344,10 @@ class InteractionGraphStore:
                     float(keeper.confidence or 0.0),
                     float(duplicate.confidence or 0.0),
                 )
+                keeper.is_currently_visible = bool(
+                    keeper.is_currently_visible or duplicate.is_currently_visible
+                )
+                self._update_persistent_semantic_gate(keeper)
                 keeper.last_seen = max(
                     value
                     for value in (keeper.last_seen, duplicate.last_seen)
@@ -2256,6 +2388,193 @@ class InteractionGraphStore:
             str(attributes.get("_private_source_object_name") or ""),
         }
 
+    @staticmethod
+    def _node_identity_values(node):
+        attributes = node.attributes or {}
+        return (
+            str(node.id or ""),
+            str(attributes.get("instance_id") or ""),
+            str(attributes.get("source_object_name") or ""),
+            str(attributes.get("_private_instance_id") or ""),
+            str(attributes.get("_private_source_object_name") or ""),
+        )
+
+    @staticmethod
+    def _spatial_label_key(node_type, label):
+        """Return the label family used by the track-association index."""
+
+        label = normalize_label(label)
+        if node_type == "portal" and label in PORTAL_LABELS:
+            # Portal aliases are intentionally equivalent in the historical
+            # matcher; keep them in one bucket while retaining the exact
+            # semantic check below.
+            return "__portal__"
+        return label
+
+    def _spatial_bucket_key(self, node):
+        """Return a coarse XY bucket for one non-room graph node."""
+
+        if node is None or getattr(node, "type", None) in {"scene", "room"}:
+            return None
+        center = list(getattr(node, "centroid", None) or [])
+        if len(center) < 2:
+            return None
+        try:
+            cell_size = float(self._spatial_cell_size)
+            x = float(center[0])
+            y = float(center[1])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (cell_size, x, y)):
+            return None
+        return (
+            str(getattr(node, "type", "object") or "object"),
+            self._spatial_label_key(
+                getattr(node, "type", "object"),
+                getattr(node, "label", ""),
+            ),
+            math.floor(x / cell_size),
+            math.floor(y / cell_size),
+        )
+
+    def _observation_spatial_key(self, observation, node_type, label, dx=0, dy=0):
+        try:
+            position = observation.get("position") or []
+            x = float(position[0])
+            y = float(position[1])
+            cell_size = float(self._spatial_cell_size)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (cell_size, x, y)):
+            return None
+        return (
+            str(node_type or "object"),
+            self._spatial_label_key(node_type, label),
+            math.floor(x / cell_size) + int(dx),
+            math.floor(y / cell_size) + int(dy),
+        )
+
+    def _rebuild_spatial_index(self):
+        index = defaultdict(list)
+        buckets = {}
+        order = {}
+        for insertion_order, node in enumerate(self.nodes.values()):
+            node_id = str(getattr(node, "id", "") or "")
+            if not node_id:
+                continue
+            order[node_id] = insertion_order
+            key = self._spatial_bucket_key(node)
+            if key is None:
+                continue
+            index[key].append(node_id)
+            buckets[node_id] = key
+        self._spatial_index = dict(index)
+        self._spatial_node_bucket = buckets
+        self._spatial_node_order = order
+
+    def _invalidate_spatial_index(self):
+        """Force a rebuild after nodes are removed/merged outside a batch."""
+
+        self._spatial_index = None
+        self._spatial_node_bucket = {}
+        self._spatial_node_order = {}
+
+    def _index_node_spatial(self, node):
+        """Insert/update one node in the current batch's spatial index."""
+
+        if self._spatial_index is None or node is None:
+            return
+        node_id = str(getattr(node, "id", "") or "")
+        if not node_id or getattr(node, "type", None) in {"scene", "room"}:
+            return
+        old_key = self._spatial_node_bucket.get(node_id)
+        new_key = self._spatial_bucket_key(node)
+        if old_key == new_key:
+            if new_key is not None:
+                bucket = self._spatial_index.setdefault(new_key, [])
+                if node_id not in bucket:
+                    bucket.append(node_id)
+            self._spatial_node_order.setdefault(
+                node_id, len(self._spatial_node_order)
+            )
+            return
+        if old_key is not None:
+            old_bucket = self._spatial_index.get(old_key)
+            if old_bucket is not None:
+                try:
+                    old_bucket.remove(node_id)
+                except ValueError:
+                    pass
+                if not old_bucket:
+                    self._spatial_index.pop(old_key, None)
+            self._spatial_node_bucket.pop(node_id, None)
+        self._spatial_node_order.setdefault(node_id, len(self._spatial_node_order))
+        if new_key is not None:
+            self._spatial_index.setdefault(new_key, []).append(node_id)
+            self._spatial_node_bucket[node_id] = new_key
+
+    def _spatial_candidates(self, observation, node_type, label):
+        """Return nearby indexed nodes in historical insertion order."""
+
+        if self._spatial_index is None:
+            return None
+        try:
+            position = observation.get("position") or []
+            x = float(position[0])
+            y = float(position[1])
+            cell_size = float(self._spatial_cell_size)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return []
+        if not all(math.isfinite(value) for value in (cell_size, x, y)):
+            return []
+        base_x = math.floor(x / cell_size)
+        base_y = math.floor(y / cell_size)
+        prefix = (
+            str(node_type or "object"),
+            self._spatial_label_key(node_type, label),
+        )
+        candidate_ids = []
+        seen = set()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                bucket = self._spatial_index.get(
+                    (prefix[0], prefix[1], base_x + dx, base_y + dy), ()
+                )
+                for node_id in bucket:
+                    if node_id not in seen:
+                        seen.add(node_id)
+                        candidate_ids.append(node_id)
+        if not candidate_ids:
+            return []
+        if len(candidate_ids) > 1:
+            candidate_ids.sort(
+                key=lambda node_id: self._spatial_node_order.get(node_id, 1 << 60)
+            )
+        return [
+            self.nodes[node_id]
+            for node_id in candidate_ids
+            if node_id in self.nodes
+        ]
+
+    def _rebuild_identity_index(self):
+        index = {}
+        for node in self.nodes.values():
+            for identity in self._node_identity_values(node):
+                if identity:
+                    # Preserve the first match, which is the same insertion
+                    # order used by the historical full scan on collisions.
+                    index.setdefault(identity, node.id)
+        self._identity_index = index
+        self._rebuild_spatial_index()
+
+    def _index_node_identity(self, node):
+        if self._identity_index is None:
+            return
+        for identity in self._node_identity_values(node):
+            if identity:
+                self._identity_index.setdefault(identity, node.id)
+        self._index_node_spatial(node)
+
     def _ensure_scene_node(self):
         node_id = f"scene_{sanitize_token(self.episode_id or self.scene_id)}"
         existing = next((node for node in self.nodes.values() if node.type == "scene"), None)
@@ -2288,6 +2607,7 @@ class InteractionGraphStore:
             },
         )
         self.nodes[node_id] = node
+        self._index_node_identity(node)
         return node
 
     def _make_node_id(self, node_type, observation):
@@ -2693,19 +3013,20 @@ class InteractionGraphStore:
         # promote a one-frame RGB-D box to a persistent interaction object.
         # Use graph receipts as the admission evidence instead.
         two_frames = node.observation_count >= 2
-        m1_status = str(node.attributes.get("attribute_status") or "").casefold()
-        m1_confidence = float(node.attributes.get("attribute_confidence", 0.0) or 0.0)
-        m1_name = normalize_label(node.attributes.get("m1_observed_object_name"))
+        evidence = _accepted_semantic_evidence(node.attributes)
+        m1_status = str(evidence.get("attribute_status") or "").casefold()
+        m1_confidence = float(evidence.get("attribute_confidence", 0.0) or 0.0)
+        m1_name = normalize_label(evidence.get("m1_observed_object_name"))
         # A locker/safe refrigerator recheck is intentionally not persistent
         # after its first ambiguous answer; the graph store only latches it
         # once the existing two-independent-M1-evidence rule is satisfied.
         m1_recheck_pending = bool(
-            node.attributes.get("m1_refrigerator_pending_confirmation", False)
+            evidence.get("m1_refrigerator_pending_confirmation", False)
         )
         m1_confirmed = bool(
             m1_status == "ready"
             and m1_confidence >= 0.5
-            and (m1_name or node.attributes.get("mllm_interaction_class"))
+            and (m1_name or evidence.get("mllm_interaction_class"))
             and not m1_recheck_pending
         )
         if node.type == "portal":
@@ -2830,29 +3151,49 @@ class InteractionGraphStore:
             room_statistics,
         )
 
-    def _refresh_room_nodes_from_cached_stats(self, geometry_stability_frames=None):
+    def _refresh_room_nodes_from_cached_stats(
+        self, geometry_stability_frames=None, *, count_observation=True
+    ):
         cache = self._room_grid_stats_cache
         if cache is None:
             return self._refresh_room_nodes_from_grid(geometry_stability_frames)
         if geometry_stability_frames is None:
             geometry_stability_frames = self.room_geometry_stability_frames
         for statistic in cache.get("statistics") or []:
-            self._apply_room_grid_statistic(statistic, geometry_stability_frames)
+            self._apply_room_grid_statistic(
+                statistic,
+                geometry_stability_frames,
+                count_observation=count_observation,
+            )
 
-    def _apply_room_grid_statistic(self, statistic, geometry_stability_frames):
+    def _apply_room_grid_statistic(
+        self, statistic, geometry_stability_frames, *, count_observation=True
+    ):
         room_id = int(statistic["room_id"])
         center = list(statistic["center"])
         size = list(statistic["size"])
-        node = self._ensure_room_node(room_id)
+        # The current grid pass already computed this room's geometry.  Reuse
+        # it while creating a previously unseen node; otherwise
+        # ``_ensure_room_node`` falls back to two additional Python scans of
+        # the complete grid, only for the geometry to be overwritten below.
+        node = self._ensure_room_node(
+            room_id,
+            geometry_override={
+                "center": center,
+                "aabb_size": size,
+                "cell_count": int(statistic.get("cell_count", 0) or 0),
+            },
+        )
         # Room grids are the temporal observation stream for room identity.
         # Count accepted grid receipts independently of geometry stability so
         # a room can pass the same two-observation gate as object tracks.
-        node.attributes["room_observation_count"] = int(
-            node.attributes.get("room_observation_count", 0) or 0
-        ) + 1
-        node.attributes["room_consecutive_observations"] = int(
-            node.attributes.get("room_consecutive_observations", 0) or 0
-        ) + 1
+        if count_observation:
+            node.attributes["room_observation_count"] = int(
+                node.attributes.get("room_observation_count", 0) or 0
+            ) + 1
+            node.attributes["room_consecutive_observations"] = int(
+                node.attributes.get("room_consecutive_observations", 0) or 0
+            ) + 1
         stable_geometry = self._accept_room_geometry(
             room_id,
             center,
@@ -2893,11 +3234,23 @@ class InteractionGraphStore:
         scene_data = self.room_grid.get("scene_data")
         if scene_data is None or len(scene_data) == 0:
             return
-        active_room_ids = {
-            self._resolve_room_id(room_id)
-            for room_id in scene_data
-            if int(room_id) >= 0
-        }
+        # ``update_room_grid`` has already reduced the accepted grid to one
+        # scalar statistic per room.  Reuse that set on the common unchanged
+        # OCC heartbeat instead of iterating every cell again (a 1000² grid
+        # otherwise adds roughly 170 ms to the room callback).
+        cached_statistics = (self._room_grid_stats_cache or {}).get("statistics")
+        if isinstance(cached_statistics, list):
+            active_room_ids = {
+                self._resolve_room_id(statistic.get("room_id"))
+                for statistic in cached_statistics
+                if isinstance(statistic, dict) and statistic.get("room_id") is not None
+            }
+        else:
+            active_room_ids = {
+                self._resolve_room_id(room_id)
+                for room_id in scene_data
+                if int(room_id) >= 0
+            }
         # An all-unknown grid has no evidence that a previously observed room
         # vanished, so retain the previous lifecycle in that case.
         if not active_room_ids:
@@ -3186,11 +3539,25 @@ class InteractionGraphStore:
             primary_node.aabb_size = list(merged_size)
 
     def _refresh_missing_room_nodes_from_observations(self):
+        # Room IDs present in the latest occupancy-derived statistics already
+        # have their temporal observation count advanced by
+        # ``update_room_grid``.  Detector frames may reuse those statistics at
+        # 10 Hz; counting them here would let YOLO cadence satisfy the
+        # two-room-grid-frame admission gate.  Only genuinely provisional
+        # rooms (with no occupancy geometry yet) may use object observations
+        # as their fallback evidence.
+        grid_room_ids = {
+            int(statistic.get("room_id"))
+            for statistic in (self._room_grid_stats_cache or {}).get("statistics", [])
+            if isinstance(statistic, dict) and statistic.get("room_id") is not None
+        }
         room_to_nodes = defaultdict(list)
         for node in self.nodes.values():
             if node.type == "room" or node.room_id is None:
                 continue
             if int(node.room_id) in self.room_geometries:
+                continue
+            if self._resolve_room_id(node.room_id) in grid_room_ids:
                 continue
             room_to_nodes[int(node.room_id)].append(node)
         for room_id, child_nodes in room_to_nodes.items():
@@ -3228,13 +3595,19 @@ class InteractionGraphStore:
             room_node.attributes["estimated_from_observations"] = True
             room_node.attributes["cell_count"] = len(child_nodes)
 
-    def _ensure_room_node(self, room_id):
+    def _ensure_room_node(self, room_id, geometry_override=None):
         room_id = int(room_id)
         node_id = f"room_{room_id}"
         node = self.nodes.get(node_id)
         if node is None:
             label = room_node_label(self.room_id_to_name, room_id)
-            geometry = self.room_geometries.get(room_id, {})
+            geometry = dict(self.room_geometries.get(room_id, {}) or {})
+            if geometry_override:
+                # Existing explicit room geometry remains authoritative.  The
+                # override only fills fields needed for first construction.
+                for key, value in dict(geometry_override).items():
+                    if value is not None:
+                        geometry.setdefault(key, value)
             center = self._grounded_center(geometry.get("center") or self._default_room_center(room_id))
             aabb_center = self._grounded_center(geometry.get("aabb_center") or center)
             size = self._room_box_size(geometry.get("aabb_size") or self._default_room_size(room_id))
@@ -3267,31 +3640,13 @@ class InteractionGraphStore:
         if not _has_persistent_semantic_evidence(portal_node):
             return None
         attrs = portal_node.attributes
-        existing = [int(v) for v in (attrs.get("potential_room_ids") or []) if str(v).lstrip("-").isdigit()]
-        if existing:
-            room = self._ensure_room_node(existing[0])
-            # Keep the same provisional node alive across OCC frames.  It is
-            # intentionally absent from the room grid until the robot crosses
-            # the doorway, so the normal "absent from latest grid" retirement
-            # path must not turn it into a stale inactive room.
-            if not room.attributes.get("resolved_to_room_id"):
-                room.attributes.update(
-                    {
-                        "active": True,
-                        "is_potential_room": True,
-                        "room_lifecycle": "provisional",
-                        "room_assignment_source": "portal_prior",
-                        "confirmed": False,
-                        "observed_free_space": False,
-                        "parent_portal_id": portal_node.id,
-                    }
-                )
-                room.attributes.pop("retired_reason", None)
-                room.attributes.pop("retired_graph_revision", None)
-            return room
-        room_id = int(self.next_portal_child_room_id)
-        self.next_portal_child_room_id += 1
-        room = self._ensure_room_node(room_id)
+        room_id = self._ensure_open_portal_child_room(
+            portal_node, portal_node.interaction.get("operation_history") or [],
+            geometry_source="portal_prior",
+        )
+        if room_id is None:
+            return None
+        room = self.nodes[f"room_{room_id}"]
         room.attributes.update({
             "active": True,
             "is_potential_room": True,
@@ -3324,6 +3679,7 @@ class InteractionGraphStore:
         if not invalid_room_ids:
             return False
         invalid = set(invalid_room_ids)
+        invalid_numeric_ids = {int(self.nodes[node_id].room_id) for node_id in invalid}
         for room_id in invalid_room_ids:
             self.nodes.pop(room_id, None)
         self.edges = {
@@ -3332,12 +3688,10 @@ class InteractionGraphStore:
             if edge.src_id not in invalid and edge.dst_id not in invalid
         }
         for portal in self.nodes.values():
-            if portal.type != "portal":
-                continue
             potential_ids = [
                 int(value)
                 for value in (portal.attributes.get("potential_room_ids") or [])
-                if str(value).lstrip("-").isdigit() and int(value) not in invalid
+                if str(value).lstrip("-").isdigit() and int(value) not in invalid_numeric_ids
             ]
             if potential_ids:
                 portal.attributes["potential_room_ids"] = potential_ids
@@ -3509,7 +3863,7 @@ class InteractionGraphStore:
             return (0.0, 1.0, "door_aabb_normal")
         return (1.0, 0.0, "door_aabb_normal")
 
-    def _ensure_open_portal_child_room(self, node, history):
+    def _ensure_open_portal_child_room(self, node, history, *, geometry_source="portal_open_potential_child"):
         """Create one unobserved child room after a portal changes state.
 
         This is deliberately a graph-only room.  It provides a stable target
@@ -3537,12 +3891,24 @@ class InteractionGraphStore:
             return None
         attributes = node.attributes
         existing = attributes.get("portal_child_room_id")
+        if existing is None:
+            # Adopt the earlier forced-room representation instead of
+            # allocating a second room when its door is subsequently opened.
+            for candidate_id in attributes.get("potential_room_ids") or []:
+                candidate = self.nodes.get(f"room_{candidate_id}")
+                if candidate is not None and candidate.attributes.get("is_potential_room"):
+                    owner = candidate.attributes.get("source_portal_id") or candidate.attributes.get("parent_portal_id")
+                    if owner == node.id:
+                        existing = candidate.room_id
+                        break
         try:
             child_room_id = int(existing)
         except (TypeError, ValueError):
             child_room_id = None
         if child_room_id is not None:
             child = self.nodes.get(f"room_{child_room_id}")
+            if child is not None and child.attributes.get("resolved_to_room_id") is not None:
+                return None
             if child is not None and (
                 child.attributes.get("active", True)
                 or child.attributes.get("is_potential_room", False)
@@ -3565,9 +3931,18 @@ class InteractionGraphStore:
                 child.attributes.pop("retired_reason", None)
                 child.attributes.pop("retired_graph_revision", None)
                 attributes["portal_child_source_room_id"] = int(source_room_id)
+                attributes["portal_child_room_id"] = child_room_id
                 attributes["potential_room_ids"] = [child_room_id]
-                return child_room_id
-        child_room_id = self._allocate_portal_child_room_id()
+                existing_geometry_source = child.attributes.get("room_geometry_source")
+                if existing_geometry_source in {geometry_source, "portal_open_potential_child"}:
+                    return child_room_id
+                # Legacy forced rooms used room ID as X. Repair their
+                # geometry in place; an actual opening can also refine the
+                # prior side using its approach pose without changing IDs.
+            else:
+                child_room_id = None
+        if child_room_id is None:
+            child_room_id = self._allocate_portal_child_room_id()
         unit_x, unit_y, direction_source = self._portal_child_direction(
             node, source_room_id, history
         )
@@ -3594,7 +3969,10 @@ class InteractionGraphStore:
             0.5 * self.room_box_height,
         ]
         self.room_id_to_name.setdefault(child_room_id, "unobserved_portal_room")
-        child = self._ensure_room_node(child_room_id)
+        child = self._ensure_room_node(child_room_id, geometry_override={
+            "center": child_center, "aabb_center": child_center,
+            "aabb_size": [size_x, size_y, self.room_box_height], "cell_count": 0,
+        })
         child.name = f"unobserved_room_beyond_{node.id}"
         child.centroid = list(child_center)
         child.aabb_center = list(child_center)
@@ -3610,7 +3988,7 @@ class InteractionGraphStore:
                 "source_room_id": int(source_room_id),
                 "portal_child_direction_xy": [round(unit_x, 4), round(unit_y, 4)],
                 "portal_child_direction_source": direction_source,
-                "room_geometry_source": "portal_open_potential_child",
+                "room_geometry_source": geometry_source,
             }
         )
         attributes.update(
@@ -3691,11 +4069,16 @@ class InteractionGraphStore:
             room_node.parent_id = scene_node.id
             self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
         non_rooms = [node for node in self.nodes.values() if node.type not in {"scene", "room"}]
+        previous_parent_ids = {node.id: node.parent_id for node in non_rooms}
 
         for node in non_rooms:
             if node.type == "portal":
                 node.parent_id = scene_node.id
             room_id = node.room_id
+            # An explicit first observation may introduce a room before OCC.
+            # Missing is different from an existing, deliberately retired room.
+            if room_id is not None and f"room_{self._resolve_room_id(room_id)}" not in self.nodes:
+                self._ensure_room_node(self._resolve_room_id(room_id))
             # A node can retain a room label from a previous segmentation
             # revision even after that room has been retired.  Re-sample the
             # current room grid before building relations so candidates do not
@@ -3803,6 +4186,47 @@ class InteractionGraphStore:
         support_nodes = [node for node in non_rooms if node.type == "support"]
         container_nodes = [node for node in non_rooms if node.type == "container"]
         object_nodes = [node for node in non_rooms if node.type == "object"]
+        # Parent inference accepts a support/container from the same room or
+        # from an unknown-room candidate. Bucket known rooms while retaining
+        # the unknown bucket as the conservative historical fallback. The
+        # stable merge below preserves non_rooms insertion order for ties.
+        support_by_room = defaultdict(list)
+        container_by_room = defaultdict(list)
+        for candidate in support_nodes:
+            support_by_room[candidate.room_id].append(candidate)
+        for candidate in container_nodes:
+            container_by_room[candidate.room_id].append(candidate)
+        relation_order = {node.id: index for index, node in enumerate(non_rooms)}
+
+        def room_relation_candidates(by_room, all_candidates, room_id):
+            if room_id is None:
+                return all_candidates
+            room_candidates = by_room.get(room_id, [])
+            unknown_candidates = by_room.get(None, [])
+            if not unknown_candidates:
+                return room_candidates
+            if not room_candidates:
+                return unknown_candidates
+            merged = []
+            room_index = 0
+            unknown_index = 0
+            while room_index < len(room_candidates) or unknown_index < len(unknown_candidates):
+                if unknown_index >= len(unknown_candidates):
+                    merged.append(room_candidates[room_index])
+                    room_index += 1
+                elif room_index >= len(room_candidates):
+                    merged.append(unknown_candidates[unknown_index])
+                    unknown_index += 1
+                elif relation_order[room_candidates[room_index].id] < relation_order[
+                    unknown_candidates[unknown_index].id
+                ]:
+                    merged.append(room_candidates[room_index])
+                    room_index += 1
+                else:
+                    merged.append(unknown_candidates[unknown_index])
+                    unknown_index += 1
+            return merged
+
         # A delayed M1 response can temporarily relabel a bottle/food track as
         # ``container``.  It is still a possible refrigerator child, whereas
         # portals/support surfaces are never content.  Keep this relaxed pool
@@ -3867,20 +4291,63 @@ class InteractionGraphStore:
                 relation_object_nodes.append(candidate)
                 relation_object_ids.add(candidate.id)
 
-        for obj in relation_object_nodes:
-            previous_parent_id = obj.parent_id
-            obj.parent_id = None
-            parent = self._find_parent_node(
-                obj,
-                support_nodes,
-                container_nodes,
-                id_lookup,
-                previous_parent_id=previous_parent_id,
-                open_refrigerator_sides=open_refrigerator_sides,
+        # For the ordinary (closed-container) hierarchy, parent inference is
+        # deterministic for a fixed candidate geometry.  Keep one bounded
+        # per-context cache so a repeated detector frame does not rescan every
+        # container/support for every object.  Open-refrigerator depth
+        # inference has additional side evidence and intentionally bypasses
+        # this cache.
+        parent_context_key = None
+        if not open_refrigerator_sides:
+            parent_context_key = self._parent_candidate_context_key(
+                support_nodes, container_nodes
             )
+            if parent_context_key != self._parent_relation_cache_context:
+                self._parent_relation_cache.clear()
+                self._parent_relation_cache_context = parent_context_key
+
+        next_parent_cache = {}
+        for obj in relation_object_nodes:
+            previous_parent_id = previous_parent_ids.get(obj.id)
+            support_candidates = room_relation_candidates(
+                support_by_room, support_nodes, obj.room_id
+            )
+            container_candidates = room_relation_candidates(
+                container_by_room, container_nodes, obj.room_id
+            )
+            parent = None
+            object_cache_key = None
+            cached_parent_id = _PARENT_CACHE_MISS
+            if parent_context_key is not None:
+                object_cache_key = self._parent_object_context_key(
+                    obj, previous_parent_id
+                )
+                cached_parent_id = self._parent_relation_cache.get(
+                    (obj.id, object_cache_key), _PARENT_CACHE_MISS
+                )
+                if cached_parent_id is not _PARENT_CACHE_MISS:
+                    parent = id_lookup.get(cached_parent_id)
+                    if parent is not None and parent.type not in {
+                        "container",
+                        "support",
+                    }:
+                        parent = None
+            if object_cache_key is None or cached_parent_id is _PARENT_CACHE_MISS:
+                parent = self._find_parent_node(
+                    obj,
+                    support_candidates,
+                    container_candidates,
+                    id_lookup,
+                    previous_parent_id=previous_parent_id,
+                    open_refrigerator_sides=open_refrigerator_sides,
+                )
+            if object_cache_key is not None:
+                next_parent_cache[(obj.id, object_cache_key)] = (
+                    parent.id if parent is not None else None
+                )
             if parent is None:
-                if obj.room_id is not None:
-                    obj.parent_id = self._ensure_room_node(obj.room_id).id
+                # The first pass already selected an active room or scene.
+                # Do not resurrect a retired room from a stale room_id here.
                 continue
             obj.parent_id = parent.id
             if parent.type == "support":
@@ -3903,6 +4370,9 @@ class InteractionGraphStore:
                 )
                 parent.attributes["inferred_child_ids"].append(obj.id)
 
+        # Only the current context for each live object can be reused on the
+        # next rebuild. Historical positions otherwise grow without bound.
+        self._parent_relation_cache = next_parent_cache
         for container in container_nodes:
             child_ids = sorted(set(container.attributes["inferred_child_ids"]))
             container.attributes["inferred_child_ids"] = child_ids
@@ -3917,6 +4387,50 @@ class InteractionGraphStore:
             self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
         self._refresh_room_attributes()
 
+    @staticmethod
+    def _parent_geometry_values(values):
+        try:
+            return tuple(float(value) for value in list(values or [])[:3])
+        except (TypeError, ValueError):
+            return ()
+
+    @classmethod
+    def _parent_node_context_key(cls, node):
+        """Return geometry/semantic fields used by ordinary parent tests."""
+
+        attributes = node.attributes or {}
+        return (
+            str(node.id),
+            str(node.type),
+            normalize_label(node.label or node.name),
+            node.room_id,
+            cls._parent_geometry_values(node.aabb_center or node.centroid),
+            cls._parent_geometry_values(node.aabb_size),
+            cls._parent_geometry_values(node.centroid),
+            bool(node.is_currently_visible),
+            str(attributes.get("interaction_state") or ""),
+            str(node.interaction.get("state") or ""),
+        )
+
+    def _parent_candidate_context_key(self, support_nodes, container_nodes):
+        # Preserve insertion order because the historical matcher used that
+        # order to break equal-distance/volume ties.
+        return tuple(
+            self._parent_node_context_key(node)
+            for node in (*support_nodes, *container_nodes)
+        )
+
+    def _parent_object_context_key(self, obj, previous_parent_id):
+        return (
+            self._parent_node_context_key(obj),
+            # The fallback parent is consulted only for an invisible object;
+            # including it for visible tracks would miss the cache on the
+            # first frame after a normal parent assignment.
+            str(previous_parent_id or "")
+            if not bool(obj.is_currently_visible)
+            else "",
+        )
+
     def _find_parent_node(
         self,
         obj,
@@ -3926,6 +4440,14 @@ class InteractionGraphStore:
         previous_parent_id=None,
         open_refrigerator_sides=None,
     ):
+        # Without a fresh object observation, changing container geometry is
+        # not evidence that its contents moved. Preserve the previous parent
+        # before considering a newly overlapping neighboring container.
+        if not obj.is_currently_visible and previous_parent_id:
+            previous_parent = id_lookup.get(str(previous_parent_id))
+            if (previous_parent is not None and previous_parent.type == "container"
+                and _same_room_or_unknown(obj, previous_parent)):
+                return previous_parent
         # An opened refrigerator's measured body box is often the *closed*
         # appliance box.  Its newly visible contents therefore have to win
         # before a stale/nearby closed container or support claims the same
@@ -3952,11 +4474,6 @@ class InteractionGraphStore:
         ]
         if containing:
             return sorted(containing, key=lambda node: volume(node.aabb_size))[0]
-
-        if not obj.is_currently_visible and previous_parent_id:
-            previous_parent = id_lookup.get(str(previous_parent_id))
-            if previous_parent is not None and previous_parent.type == "container":
-                return previous_parent
 
         supporting = [node for node in support_nodes if self._is_on_support(obj, node)]
         if supporting:
@@ -4051,6 +4568,39 @@ class InteractionGraphStore:
         if grid_info is None or not scene_data:
             return [node.room_id] if node.room_id is not None else []
 
+        size = list(node.aabb_size or [])
+        center = list(node.aabb_center or node.centroid or [])
+        center.extend([0.0] * max(0, 3 - len(center)))
+        size.extend([0.0] * max(0, 3 - len(size)))
+        yaw_value = node.attributes.get("interaction_reference_yaw")
+        if yaw_value is None:
+            yaw_value = node.attributes.get("yaw")
+        try:
+            cache_yaw = float(yaw_value)
+        except (TypeError, ValueError):
+            cache_yaw = None
+        cache_key = (
+            int(self._room_grid_epoch),
+            float(center[0]),
+            float(center[1]),
+            abs(float(size[0])),
+            abs(float(size[1])),
+            cache_yaw,
+            self._resolve_room_id(node.room_id)
+            if node.room_id is not None
+            else None,
+        )
+        cached = self._portal_room_ids_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        def _finish(values):
+            result = tuple(int(value) for value in values[:2])
+            if len(self._portal_room_ids_cache) >= 512:
+                self._portal_room_ids_cache.clear()
+            self._portal_room_ids_cache[cache_key] = result
+            return list(result)
+
         # A portal connects the free-space components on its two sides.  The
         # old implementation only counted a circular ring around the box;
         # when one room occupied most of that ring, the second room was lost
@@ -4059,7 +4609,7 @@ class InteractionGraphStore:
         # short rays through both doorway sides first.  This keeps the
         # association local and avoids accidentally linking a distant room.
         counts = defaultdict(int)
-        center_x, center_y = float(node.aabb_center[0]), float(node.aabb_center[1])
+        center_x, center_y = float(center[0]), float(center[1])
         radii = sorted(
             {
                 min(self.portal_room_max_radius_m, radius)
@@ -4095,9 +4645,8 @@ class InteractionGraphStore:
         except (TypeError, ValueError):
             yaw_valid = False
         if not yaw_valid:
-            size = list(node.aabb_size or [])
-            size_x = abs(float(size[0])) if len(size) >= 1 else 0.0
-            size_y = abs(float(size[1])) if len(size) >= 2 else 0.0
+            size_x = abs(float(size[0]))
+            size_y = abs(float(size[1]))
             # The long box axis is the doorway span, therefore its
             # perpendicular is the crossing direction.
             yaw = math.pi * 0.5 if size_y >= size_x else 0.0
@@ -4106,10 +4655,9 @@ class InteractionGraphStore:
         normal_y = math.cos(yaw)
         tangent_x = math.cos(yaw)
         tangent_y = math.sin(yaw)
-        size = list(node.aabb_size or [])
         span = max(
-            abs(float(size[0])) if len(size) >= 1 else 0.0,
-            abs(float(size[1])) if len(size) >= 2 else 0.0,
+            abs(float(size[0])),
+            abs(float(size[1])),
         )
         # Keep the side probe local to the doorway.  A few tangent offsets
         # make this robust to a slightly off-centre detector box without
@@ -4157,10 +4705,10 @@ class InteractionGraphStore:
             if current_room in distinct_side_ids:
                 distinct_side_ids.remove(current_room)
                 distinct_side_ids.insert(0, current_room)
-            return distinct_side_ids[:2]
+            return _finish(distinct_side_ids)
 
         ranked = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
-        return ranked[:2]
+        return _finish(ranked)
 
     def _refresh_room_attributes(self):
         room_nodes = {
@@ -4512,10 +5060,17 @@ def _is_refrigerator_label(value):
     """Match refrigerator-family labels without treating arbitrary IDs as one."""
 
     label = normalize_label(value)
-    return any(
-        _label_matches_marker(label, marker)
+    cached = _REFRIGERATOR_LABEL_CACHE.get(label)
+    if cached is not None:
+        return cached
+    result = any(
+        _cached_label_marker_match(label, marker)
         for marker in ("fridge", "freezer", "refrigerator")
     )
+    if len(_REFRIGERATOR_LABEL_CACHE) >= _LABEL_MARKER_CACHE_MAX:
+        _REFRIGERATOR_LABEL_CACHE.clear()
+    _REFRIGERATOR_LABEL_CACHE[label] = result
+    return result
 
 
 def _is_refrigerator_content_label(label):
@@ -4726,15 +5281,7 @@ def _label_matches_marker(label, marker):
 
     label = normalize_label(label)
     marker = normalize_label(marker)
-    return bool(
-        label
-        and marker
-        and (
-            label == marker
-            or label.startswith(f"{marker}_")
-            or label.endswith(f"_{marker}")
-        )
-    )
+    return _cached_label_marker_match(label, marker)
 
 
 def _is_open_refrigerator_content_candidate(node):

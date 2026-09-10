@@ -19,6 +19,7 @@ pytest.importorskip("rospy")
 from semantic_rule_decision_node import (
     SemanticRuleDecisionNode,
     aggregate_step_ready_states,
+    candidate_snapshot_token,
     container_anchor_step_cooldown_active,
     is_completed_drawer_scan_candidate,
     successful_drawer_scan_feedback,
@@ -89,6 +90,32 @@ def test_fast_ready_keeps_legacy_minimum_contract():
     assert payload["ready"]
     assert not payload["source_alignment_required"]
     assert payload["step_index"] == 12
+
+
+def test_candidate_snapshot_token_rejects_late_sequence_revision_or_episode():
+    baseline = {
+        "episode_id": "episode_a",
+        "sequence": 12,
+        "graph_revision": 41,
+    }
+    assert candidate_snapshot_token(dict(baseline)) == (
+        "episode_a",
+        12,
+        41,
+    )
+    assert candidate_snapshot_token(dict(baseline)) == candidate_snapshot_token(
+        dict(baseline)
+    )
+    for field, value in (
+        ("sequence", 13),
+        ("graph_revision", 42),
+        ("episode_id", "episode_b"),
+    ):
+        changed = dict(baseline)
+        changed[field] = value
+        assert candidate_snapshot_token(changed) != candidate_snapshot_token(
+            baseline
+        )
 
 
 def test_explicit_exact_source_falls_back_to_seq_when_stamp_unavailable():

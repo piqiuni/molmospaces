@@ -18,6 +18,37 @@ from showcase_pages import DARK_SHOWCASE_HTML  # noqa: E402
 
 
 class PhysicalRawRecorderTests(unittest.TestCase):
+    def test_inactive_ros_map_does_not_materialize_or_enqueue_payload(self):
+        class ExplodesOnDeepcopy:
+            def __deepcopy__(self, _memo):
+                raise AssertionError("inactive map payload was deep-copied")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = PhysicalRawRecorder(temporary)
+            value = {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "data": [ExplodesOnDeepcopy()],
+            }
+
+            self.assertFalse(recorder.record_ros_state("occupancy", value))
+            self.assertEqual(recorder._receipt_counters, {})
+            self.assertIsNone(recorder._queue)
+
+    def test_inactive_common_event_does_not_deepcopy_or_enqueue_payload(self):
+        class ExplodesOnDeepcopy:
+            def __deepcopy__(self, _memo):
+                raise AssertionError("inactive event payload was deep-copied")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = PhysicalRawRecorder(temporary)
+
+            self.assertFalse(
+                recorder.record_event("large_state", ExplodesOnDeepcopy())
+            )
+            self.assertIsNone(recorder._queue)
+
     def _packet(self):
         rgb = np.zeros((24, 32, 3), dtype=np.uint8)
         ok, rgb_encoded = cv2.imencode(".jpg", rgb)
@@ -47,6 +78,12 @@ class PhysicalRawRecorderTests(unittest.TestCase):
             )
             self.assertTrue(started["active"])
             packet = self._packet()
+            packet["capture_timing"] = {
+                "version": 1,
+                "timestamp_kind": "sensor_exposure_midpoint",
+                "stamp_source": "device_clock_estimated",
+                "dequeue_age_s": 0.02,
+            }
             self.assertTrue(recorder.record_sensor_packet(packet))
             self.assertTrue(
                 recorder.record_ros_state(
@@ -83,6 +120,21 @@ class PhysicalRawRecorderTests(unittest.TestCase):
             self.assertFalse(stopped["active"])
             session = pathlib.Path(stopped["record_dir"])
             self.assertTrue((session / "raw/camera/manifest.jsonl").is_file())
+            camera_record = json.loads(
+                (session / "raw/camera/manifest.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(camera_record["stamp"], 1.2)
+            self.assertEqual(
+                camera_record["capture_timing"], packet["capture_timing"]
+            )
+            self.assertIn("session_time_s", camera_record)
+            for stream in ("rgb", "depth"):
+                self.assertEqual(
+                    (session / camera_record["files"][stream]).read_bytes(),
+                    base64.b64decode(packet[stream]["data"]),
+                )
             self.assertTrue((session / "raw/map_manifest.jsonl").is_file())
             self.assertTrue((session / "raw/panels/manifest.jsonl").is_file())
             self.assertTrue((session / "raw/phone/audio.wav").is_file())

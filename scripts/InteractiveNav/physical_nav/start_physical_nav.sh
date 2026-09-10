@@ -58,6 +58,8 @@ CAMERA_IMU="${PHYSICAL_NAV_CAMERA_IMU:-0}"
 RUNTIME_DIR="${PHYSICAL_NAV_RUNTIME_DIR:-/tmp/molmospaces-physical-nav-${UID}}"
 LOG_DIR="${PHYSICAL_NAV_LOG_DIR:-${RUNTIME_DIR}/logs}"
 GATEWAY_PID_FILE="${PHYSICAL_NAV_GATEWAY_PID_FILE:-${RUNTIME_DIR}/gateway.pid}"
+GATEWAY_FINGERPRINT_FILE="${PHYSICAL_NAV_GATEWAY_FINGERPRINT_FILE:-${RUNTIME_DIR}/gateway.fingerprint}"
+YOLO_FINGERPRINT_FILE="${PHYSICAL_NAV_YOLO_FINGERPRINT_FILE:-${RUNTIME_DIR}/yoloe.fingerprint}"
 mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
 
 # A second supervisor can otherwise start a second roslaunch tree during a
@@ -156,18 +158,64 @@ if [[ "${PHYSICAL_NAV_START_QWEN_TUNNEL:-0}" == "1" ]]; then
 fi
 
 start_or_reuse_gateway() {
-  local gateway_pid=""
+  local gateway_pid="" expected_fingerprint="" recorded_fingerprint=""
+  # The web gateway is deliberately persistent across ROS-worker restarts,
+  # but persistence must not turn source/config changes into a silent no-op.
+  # Include every module that participates in the live state/TF/render path as
+  # well as its command-line configuration.  A missing fingerprint is treated
+  # as stale, which upgrades gateways created by older versions of this script.
+  expected_fingerprint="$(
+    {
+      printf 'python=%s\n' "${GATEWAY_PYTHON}"
+      printf 'web=%s:%s ws=%s:%s qwen=%s model=%s interval=%s\n' \
+        "${WEB_HOST}" "${WEB_PORT}" "${WS_HOST}" "${WS_PORT}" \
+        "${QWEN_URL}" "${QWEN_MODEL}" "${QWEN_AUTO_INTERVAL}"
+      printf 'record=%s mode=%s queue=%s on_start=%s camera=%s,%s,%s,%s,%s,%s\n' \
+        "${RECORD_DIR}" "${RECORD_MODE}" "${RECORD_QUEUE_SIZE}" \
+        "${RECORD_ON_START}" "${CAMERA_X}" "${CAMERA_Y}" "${CAMERA_Z}" \
+        "${CAMERA_ROLL}" "${CAMERA_PITCH}" "${CAMERA_YAW}"
+      # The canonical renderer lives one directory above physical_nav;
+      # keeping it in the fingerprint is required because panel geometry
+      # and heading fixes are imported at gateway startup.
+      for source_file in \
+        "${ROOT_DIR}/physical_six_panel_server.py" \
+        "${ROOT_DIR}/runtime_state.py" \
+        "${ROOT_DIR}/physical_protocol.py" \
+        "${ROOT_DIR}/../offline_semantic_renderer.py" \
+        "${ROOT_DIR}/showcase_pages.py" \
+        "${ROOT_DIR}/physical_ros_gateway.py"; do
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum "${source_file}"
+        else
+          shasum -a 256 "${source_file}"
+        fi
+      done
+    } | if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+  )"
   if [[ -f "${GATEWAY_PID_FILE}" ]]; then gateway_pid="$(<"${GATEWAY_PID_FILE}")"; fi
   if [[ -z "${gateway_pid}" ]]; then
     gateway_pid="$(pgrep -f '[p]hysical_six_panel_server.py' | head -n1 || true)"
   fi
   if [[ "${gateway_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${gateway_pid}" 2>/dev/null &&
      [[ "$(tr '\0' ' ' <"/proc/${gateway_pid}/cmdline" 2>/dev/null || true)" == *physical_six_panel_server.py* ]]; then
-    GATEWAY_PID="${gateway_pid}"
-    log_supervisor "reusing persistent gateway pid=${GATEWAY_PID}"
-    return 0
+    [[ -f "${GATEWAY_FINGERPRINT_FILE}" ]] && recorded_fingerprint="$(<"${GATEWAY_FINGERPRINT_FILE}")"
+    if [[ -n "${recorded_fingerprint}" && "${recorded_fingerprint}" == "${expected_fingerprint}" ]]; then
+      GATEWAY_PID="${gateway_pid}"
+      log_supervisor "reusing persistent gateway pid=${GATEWAY_PID}"
+      return 0
+    fi
+    log_supervisor "restarting stale persistent gateway pid=${gateway_pid} (source/config fingerprint changed)"
+    kill -TERM "${gateway_pid}" 2>/dev/null || true
+    for _ in {1..50}; do
+      if ! kill -0 "${gateway_pid}" 2>/dev/null; then break; fi
+      sleep .1
+    done
+    if kill -0 "${gateway_pid}" 2>/dev/null; then
+      log_supervisor "forcing stop of stale gateway pid=${gateway_pid}"
+      kill -KILL "${gateway_pid}" 2>/dev/null || true
+    fi
   fi
-  rm -f "${GATEWAY_PID_FILE}"
+  rm -f "${GATEWAY_PID_FILE}" "${GATEWAY_FINGERPRINT_FILE}"
   # The gateway is deliberately not registered as a critical child. It owns
   # the persistent web/control plane and must survive navigation watchdog
   # failures and ROS stack restarts.
@@ -185,6 +233,7 @@ start_or_reuse_gateway() {
     >>"${LOG_DIR}/gateway.log" 2>&1 </dev/null 8>&- &
   GATEWAY_PID=$!
   printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
+  printf '%s\n' "${expected_fingerprint}" >"${GATEWAY_FINGERPRINT_FILE}"
   log_supervisor "started persistent gateway pid=${GATEWAY_PID}"
 }
 
@@ -227,12 +276,57 @@ if [[ "${START_YOLO}" == "1" ]]; then
       ALGORITHM_PYTHON=python3
     fi
   fi
+  YOLO_MODEL_PATH="${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}"
+  YOLO_CONFIG_PATH="${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}"
+  YOLO_DEVICE="${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}"
+  YOLO_RATE="${PHYSICAL_NAV_YOLO_RATE:-10}"
+  YOLO_EXPECTED_FINGERPRINT="$({
+    printf 'python=%s device=%s rate=%s cuda=%s camera=%s,%s,%s,%s,%s,%s\n' \
+      "${ALGORITHM_PYTHON}" "${YOLO_DEVICE}" "${YOLO_RATE}" \
+      "${PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES:-0}" "${CAMERA_X}" "${CAMERA_Y}" \
+      "${CAMERA_Z}" "${CAMERA_ROLL}" "${CAMERA_PITCH}" "${CAMERA_YAW}"
+    printf 'model=%s ' "${YOLO_MODEL_PATH}"
+    if [[ -f "${YOLO_MODEL_PATH}" ]]; then
+      stat -c '%Y:%s' "${YOLO_MODEL_PATH}" 2>/dev/null || wc -c <"${YOLO_MODEL_PATH}"
+    else
+      printf 'missing\n'
+    fi
+    printf 'config=%s\n' "${YOLO_CONFIG_PATH}"
+    if [[ -f "${YOLO_CONFIG_PATH}" ]]; then
+      if command -v sha256sum >/dev/null 2>&1; then sha256sum "${YOLO_CONFIG_PATH}"; else shasum -a 256 "${YOLO_CONFIG_PATH}"; fi
+    else
+      printf 'missing-config\n'
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/physical_yoloe_bridge.py"; else shasum -a 256 "${ROOT_DIR}/physical_yoloe_bridge.py"; fi
+  } | if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi)"
   # Reusing one detector is important: two workers would consume the same
-  # latest-only ROS image stream and publish competing detections.
+  # latest-only ROS image stream and publish competing detections.  As with
+  # the persistent web gateway, do not silently keep an old worker after a
+  # source/config change: the next explicit restart replaces it.
   EXISTING_YOLO="$(pgrep -f '[p]hysical_yoloe_bridge.py' | head -n1 || true)"
-  if [[ "${EXISTING_YOLO}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${EXISTING_YOLO}" 2>/dev/null; then
-    log_supervisor "reusing persistent yoloe pid=${EXISTING_YOLO}"
-  else
+  YOLO_REUSED=0
+  if [[ "${EXISTING_YOLO}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${EXISTING_YOLO}" 2>/dev/null &&
+     [[ "$(tr '\0' ' ' <"/proc/${EXISTING_YOLO}/cmdline" 2>/dev/null || true)" == *physical_yoloe_bridge.py* ]]; then
+    YOLO_RECORDED_FINGERPRINT=""
+    [[ -f "${YOLO_FINGERPRINT_FILE}" ]] && YOLO_RECORDED_FINGERPRINT="$(<"${YOLO_FINGERPRINT_FILE}")"
+    if [[ -n "${YOLO_RECORDED_FINGERPRINT}" && "${YOLO_RECORDED_FINGERPRINT}" == "${YOLO_EXPECTED_FINGERPRINT}" ]]; then
+      log_supervisor "reusing persistent yoloe pid=${EXISTING_YOLO}"
+      YOLO_REUSED=1
+    else
+      log_supervisor "restarting stale persistent yoloe pid=${EXISTING_YOLO} (source/config fingerprint changed)"
+      kill -TERM "${EXISTING_YOLO}" 2>/dev/null || true
+      for _ in {1..50}; do
+        if ! kill -0 "${EXISTING_YOLO}" 2>/dev/null; then break; fi
+        sleep .1
+      done
+      if kill -0 "${EXISTING_YOLO}" 2>/dev/null; then
+        log_supervisor "forcing stop of stale yoloe pid=${EXISTING_YOLO}"
+        kill -KILL "${EXISTING_YOLO}" 2>/dev/null || true
+      fi
+      rm -f "${YOLO_FINGERPRINT_FILE}"
+    fi
+  fi
+  if (( YOLO_REUSED == 0 )); then
     CUDA_VISIBLE_DEVICES="${PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES:-0}" \
     OMP_NUM_THREADS="${PHYSICAL_NAV_YOLO_OMP_NUM_THREADS:-1}" \
     OPENBLAS_NUM_THREADS="${PHYSICAL_NAV_YOLO_OPENBLAS_NUM_THREADS:-1}" \
@@ -240,13 +334,14 @@ if [[ "${START_YOLO}" == "1" ]]; then
     NUMEXPR_NUM_THREADS="${PHYSICAL_NAV_YOLO_NUMEXPR_NUM_THREADS:-1}" \
     "${ALGORITHM_PYTHON}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
     --web-url "$([[ "${START_WEB}" == "1" ]] && echo "http://127.0.0.1:${WEB_PORT}" || echo "")" \
-    --model-path "${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
-    --detector-config "${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}" \
-    --device "${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}" --rate "${PHYSICAL_NAV_YOLO_RATE:-10}" \
+    --model-path "${YOLO_MODEL_PATH}" \
+    --detector-config "${YOLO_CONFIG_PATH}" \
+    --device "${YOLO_DEVICE}" --rate "${YOLO_RATE}" \
     --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" \
     --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" \
       >>"${LOG_DIR}/yoloe.log" 2>&1 &
     register_process yoloe "$!"
+    printf '%s\n' "${YOLO_EXPECTED_FINGERPRINT}" >"${YOLO_FINGERPRINT_FILE}"
   fi
 fi
 

@@ -61,6 +61,73 @@ def _room_count(room_ids):
     return len({int(room_id) for room_id in room_ids if int(room_id) >= 0})
 
 
+@pytest.mark.parametrize("confidence", [40, 60, 70, 100])
+def test_uniform_single_seed_propagation_skips_distance_lookup(monkeypatch, confidence):
+    cv2 = pytest.importorskip("cv2")
+    mask = np.zeros((9, 13), dtype=np.uint8)
+    mask[1:8, 1:5] = 1
+    mask[1:8, 7:12] = 1
+    ids = np.full(mask.shape, -1, dtype=np.int32)
+    conf = np.full(mask.shape, -1, dtype=np.int16)
+    ids[2, 2], conf[2, 2] = 3, confidence
+    ids[5, 9], conf[5, 9] = 7, 70
+    seed_mask = ids >= 0
+
+    def unexpected_transform(*args, **kwargs):
+        raise AssertionError("uniform seeds do not need a nearest-seed transform")
+
+    monkeypatch.setattr(cv2, "distanceTransformWithLabels", unexpected_transform)
+    assert RoomSegmenter()._propagate_single_seed_components(
+        mask, ids.ravel(), conf.ravel(), 13, 9, cv2
+    )
+    assert np.all(ids[1:8, 1:5] == 3)
+    assert np.all(ids[1:8, 7:12] == 7)
+    assert conf[2, 2] == confidence and conf[5, 9] == 70
+    left_targets = (ids == 3) & ~seed_mask
+    assert np.all(conf[left_targets] == max(confidence - 5, 60))
+    assert np.all(conf[(ids == 7) & ~seed_mask] == 65)
+    assert np.all(ids[mask == 0] == -1)
+    assert np.all(conf[mask == 0] == -1)
+
+
+def test_mixed_seed_confidence_keeps_distance_lookup(monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    mask = np.ones((9, 13), dtype=np.uint8)
+    ids = np.full(mask.shape, -1, dtype=np.int32)
+    conf = np.full(mask.shape, -1, dtype=np.int16)
+    ids[2, 2], conf[2, 2] = 3, 100
+    ids[6, 10], conf[6, 10] = 3, 70
+    transform = cv2.distanceTransformWithLabels
+    calls = []
+
+    def counted_transform(*args, **kwargs):
+        calls.append(1)
+        return transform(*args, **kwargs)
+
+    monkeypatch.setattr(cv2, "distanceTransformWithLabels", counted_transform)
+    assert RoomSegmenter()._propagate_single_seed_components(
+        mask, ids.ravel(), conf.ravel(), 13, 9, cv2
+    )
+    assert calls == [1]
+    assert np.all(ids == 3)
+    assert conf[2, 2] == 100 and conf[6, 10] == 70
+
+
+def test_multi_room_seed_fast_path_does_not_modify_inputs():
+    cv2 = pytest.importorskip("cv2")
+    mask = np.ones((8, 10), dtype=np.uint8)
+    ids = np.full(mask.shape, -1, dtype=np.int32)
+    conf = np.full(mask.shape, -1, dtype=np.int16)
+    ids[2, 2], conf[2, 2] = 3, 100
+    ids[5, 7], conf[5, 7] = 8, 100
+    original_ids, original_conf = ids.copy(), conf.copy()
+    assert not RoomSegmenter()._propagate_single_seed_components(
+        mask, ids.ravel(), conf.ravel(), 10, 8, cv2
+    )
+    np.testing.assert_array_equal(ids, original_ids)
+    np.testing.assert_array_equal(conf, original_conf)
+
+
 def _segmenter(**kwargs):
     config = {
         "room_min_component_cells": 4,
@@ -161,6 +228,117 @@ def test_enclosed_obstacle_filter_removes_compact_furniture_but_keeps_wall_like_
 
     assert room_ids[3 * width + 3] >= 0
     assert room_ids[3 * width + 9] == segmenter.room_unknown_id
+
+
+def test_enclosed_obstacle_fill_path_returns_a_publishable_room_grid():
+    """The optional obstacle fill must not fail on list-valued output."""
+    pytest.importorskip("cv2")
+    width, height = 18, 12
+    values = np.zeros((height, width), dtype=np.int8)
+    values[0, :] = values[-1, :] = 100
+    values[:, 0] = values[:, -1] = 100
+    values[4:7, 7:10] = 100
+    grid = _grid(width=width, height=height)
+    grid.data = values.reshape(-1).tolist()
+    segmenter = RoomSegmenter(
+        room_min_component_cells=1,
+        room_core_min_component_cells=1,
+        room_core_clearance_cells=1,
+        room_remove_enclosed_occupied=False,
+        room_fill_enclosed_obstacles=True,
+        room_enclosed_obstacle_min_cells=1,
+        room_enclosed_obstacle_max_cells=100,
+        room_enclosed_obstacle_dominance_ratio=0.0,
+        room_portal_cut_enabled=False,
+    )
+
+    room_ids, room_conf = segmenter.segment(grid, force_stable=True)
+
+    assert len(room_ids) == width * height
+    assert len(room_conf) == width * height
+
+
+def test_physical_unknown_hole_is_filled_but_open_frontier_stays_unknown():
+    """Compact RGB-D holes must not fragment a room or open the frontier."""
+
+    width, height = 20, 12
+    values = np.full((height, width), 100, dtype=np.int8)
+    values[1:-1, 1:-1] = 0
+    # A depth dropout fully enclosed by known free cells.
+    values[5:7, 8:10] = -1
+    # An unknown strip connected to the outside envelope represents unseen
+    # space and must remain blocked by the conservative room policy.
+    values[1:4, 18] = -1
+    grid = _grid(width=width, height=height)
+    grid.data = values.reshape(-1).tolist()
+
+    kwargs = dict(
+        room_min_component_cells=4,
+        room_core_min_component_cells=4,
+        room_core_clearance_cells=1,
+        room_remove_enclosed_occupied=False,
+        room_portal_cut_enabled=False,
+        room_fill_enclosed_unknown=True,
+        room_enclosed_unknown_max_cells=16,
+        room_enclosed_unknown_known_ring_ratio=0.9,
+        room_enclosed_unknown_free_ring_ratio=0.75,
+    )
+    segmenter = RoomSegmenter(**kwargs)
+    room_ids, _room_conf = segmenter.segment(grid, force_stable=True)
+
+    hole_indices = [y * width + x for y in range(5, 7) for x in range(8, 10)]
+    assert all(room_ids[index] >= 0 for index in hole_indices)
+    frontier_indices = [y * width + 18 for y in range(1, 4)]
+    assert all(room_ids[index] == segmenter.room_unknown_id for index in frontier_indices)
+
+    no_fill = RoomSegmenter(**{**kwargs, "room_fill_enclosed_unknown": False})
+    no_fill_ids, _ = no_fill.segment(grid, force_stable=True)
+    assert all(no_fill_ids[index] == no_fill.room_unknown_id for index in hole_indices)
+
+
+def test_coreless_fallback_preserves_disconnected_narrow_rooms():
+    values = np.full((12, 20), 100, dtype=np.int8)
+    values[2:5, 2:8] = 0
+    values[7:10, 12:18] = 0
+    grid = _grid(width=20, height=12)
+    grid.data = values.ravel().tolist()
+    segmenter = RoomSegmenter(room_remove_enclosed_occupied=False,
+                              room_core_clearance_cells=7, room_min_component_cells=5)
+    ids, _ = segmenter.segment(grid, force_stable=True)
+    first, second = ids[3 * 20 + 4], ids[8 * 20 + 14]
+    assert first >= 0 and second >= 0 and first != second
+    assert ids[5 * 20 + 9] == segmenter.room_unknown_id
+    again, _ = segmenter.segment(grid, force_stable=True)
+    assert again == ids
+
+
+def test_component_local_indices_match_full_raster_for_irregular_shapes():
+    cv2 = pytest.importorskip("cv2")
+    mask = np.zeros((30, 45), dtype=np.uint8)
+    mask[3:17, 4] = 1
+    mask[16, 4:19] = 1
+    mask[5:9, 8:12] = 1  # Another component inside the L component's bounds.
+    mask[20:25, 31:39] = 1
+    count, labels, stats, _ = RoomSegmenter._connected_components_with_stats(mask, cv2)
+    for component_id in range(1, count):
+        indices = RoomSegmenter._component_flat_indices(labels, stats[component_id], component_id, cv2)
+        np.testing.assert_array_equal(indices, np.flatnonzero(labels.ravel() == component_id))
+
+
+def test_many_unknown_holes_are_filled_without_mutating_raw_occ():
+    cv2 = pytest.importorskip("cv2")
+    values = np.zeros((100, 140), dtype=np.int16)
+    values[5:-5:7, 5:-5:7] = -1
+    values[:, 0] = -1  # Open unknown frontier must remain unknown.
+    original = values.copy()
+    free = ((values >= 0) & (values <= 20)).astype(np.uint8)
+    work = free.copy()
+    segmenter = RoomSegmenter(room_fill_enclosed_unknown=True)
+    count = segmenter._fill_enclosed_unknown_cells(values, free, work, cv2)
+    assert count == int((values[:, 1:] < 0).sum())
+    assert np.all(work[:, 1:] == 1)
+    assert np.all(work[:, 0] == 0)
+    np.testing.assert_array_equal(values, original)
 
 
 def _small_portal_pocket_grid():

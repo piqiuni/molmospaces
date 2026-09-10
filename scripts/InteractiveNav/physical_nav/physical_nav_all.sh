@@ -29,6 +29,7 @@ GO2_DEPTH_HEIGHT="${PHYSICAL_NAV_GO2_DEPTH_HEIGHT:-480}"
 GO2_DEPTH_FPS="${PHYSICAL_NAV_GO2_DEPTH_FPS:-10}"
 GO2_ALIGN_TO="${PHYSICAL_NAV_GO2_ALIGN_TO:-depth}"
 GO2_CAMERA_IMU="${PHYSICAL_NAV_GO2_CAMERA_IMU:-0}"
+GO2_SENSOR_QUEUE_CAPACITY="${PHYSICAL_NAV_GO2_SENSOR_QUEUE_CAPACITY:-128}"
 GO2_TELEMETRY_PERIOD="${PHYSICAL_NAV_GO2_TELEMETRY_PERIOD:-0.05}"
 # Both machines are on the same experiment LAN. Direct WebSocket transport
 # avoids SSH channel head-of-line buffering and lets a reconnect discard an
@@ -80,21 +81,37 @@ wait_local_port() {
   return 1
 }
 
-wait_ros_command_subscriber() {
-  local topic="${PHYSICAL_NAV_MOTION_CMD_VEL_TOPIC:-/physical_nav/actuated_cmd_vel}"
-  local timeout="${PHYSICAL_NAV_MOTION_READY_TIMEOUT_S:-30}"
+wait_ros_topic_subscriber() {
+  local topic="$1"
+  local timeout="${2:-30}"
   command -v rostopic >/dev/null 2>&1 || return 0
+  # `rostopic info` always prints a Subscribers section, including when it is
+  # empty.  Checking only the section header made the old startup barrier a
+  # no-op and allowed one-shot commands to race node registration.  Require a
+  # concrete subscriber row (`* /node (...)`) instead.
   for _ in $(seq 1 $((timeout * 4))); do
-    # Do not start the remote actuator until the local mux/safety chain has a
-    # live subscriber.  Without this barrier the bridge can become ready first
-    # and the first command is lost, making startup appear randomly delayed.
-    if rostopic info "${topic}" 2>/dev/null | grep -q '^ Subscribers:'; then
+    if rostopic info "${topic}" 2>/dev/null | awk '
+      /^Subscribers:/ { in_subscribers = 1; next }
+      in_subscribers && /^[[:space:]]*\*/ { found = 1; exit }
+      in_subscribers && /^[^[:space:]]/ { exit }
+      END { exit(found ? 0 : 1) }
+    '; then
       return 0
     fi
     sleep .25
   done
-  echo "warning: no ROS subscriber on ${topic} after ${timeout}s; continuing" >&2
-  return 0
+  return 1
+}
+
+wait_ros_command_subscriber() {
+  local topic="${PHYSICAL_NAV_MOTION_CMD_VEL_TOPIC:-/physical_nav/actuated_cmd_vel}"
+  local timeout="${PHYSICAL_NAV_MOTION_READY_TIMEOUT_S:-30}"
+  # Do not start the remote actuator until the local mux/safety chain has a
+  # live subscriber.  Without this barrier the bridge can become ready first
+  # and the first command is lost, making startup appear randomly delayed.
+  if ! wait_ros_topic_subscriber "${topic}" "${timeout}"; then
+    echo "warning: no ROS subscriber on ${topic} after ${timeout}s; continuing" >&2
+  fi
 }
 
 start_qwen_tunnel() {
@@ -123,7 +140,8 @@ start_go2_components() {
     "${GO2_TUNNEL_TARGET}" "${GO2_BRIDGE_PATH}" "${GO2_BRIDGE_LOG}" \
     "${GO2_INTERFACE}" "${GO2_FPS}" "${GO2_TELEMETRY_PERIOD}" \
     "${GO2_SENSOR_URL}" "${GO2_COLOR_WIDTH}" "${GO2_COLOR_HEIGHT}" "${GO2_COLOR_FPS}" \
-    "${GO2_DEPTH_WIDTH}" "${GO2_DEPTH_HEIGHT}" "${GO2_DEPTH_FPS}" "${GO2_ALIGN_TO}" "${GO2_CAMERA_IMU}" <<'REMOTE'
+    "${GO2_DEPTH_WIDTH}" "${GO2_DEPTH_HEIGHT}" "${GO2_DEPTH_FPS}" "${GO2_ALIGN_TO}" "${GO2_CAMERA_IMU}" \
+    "${GO2_SENSOR_QUEUE_CAPACITY}" <<'REMOTE'
 set -u
 tunnel_pid="0"
 tunnel_owned=0
@@ -144,11 +162,32 @@ bridge_owned=0
 if [ -n "${bridge_pid}" ]; then
   bridge_args="$(tr '\0' ' ' <"/proc/${bridge_pid}/cmdline" 2>/dev/null || true)"
   # A stale bridge can still be connected to the legacy 12334 dashboard
-  # socket. Reuse it only when its sensor URL matches this launch request;
+  # socket, or can hold the previous RGB-D mode (resolution/align/fps). Reuse
+  # it only when every capture-critical argument matches this launch request;
   # otherwise stop that exact bridge before creating the new transport.
-  case " ${bridge_args} " in
-    *" --url ${7} "*|*" --url=${7} "*) ;;
-    *)
+  has_bridge_arg() {
+    key="$1"; value="$2"
+    case " ${bridge_args} " in
+      *" ${key} ${value} "*|*" ${key}=${value} "*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  bridge_matches=1
+  for pair in \
+    "--url|$7" "--interface|$4" "--fps|$5" \
+    "--publish-fps|$5" "--color-width|$8" "--color-height|$9" \
+    "--color-fps|${10}" "--depth-width|${11}" "--depth-height|${12}" \
+    "--depth-fps|${13}" "--align-to|${14}" "--telemetry-period|$6"; do
+    key="${pair%%|*}"; value="${pair#*|}"
+    if ! has_bridge_arg "${key}" "${value}"; then bridge_matches=0; break; fi
+  done
+  if ! has_bridge_arg "--sensor-queue-capacity" "${16}"; then bridge_matches=0; fi
+  if [ "${15}" = 1 ]; then
+    case " ${bridge_args} " in *" --enable-camera-imu "*) ;; *) bridge_matches=0 ;; esac
+  else
+    case " ${bridge_args} " in *" --enable-camera-imu "*) bridge_matches=0 ;; esac
+  fi
+  if [ "${bridge_matches}" -eq 0 ]; then
       kill -TERM "${bridge_pid}" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "${bridge_pid}" 2>/dev/null || break
@@ -156,14 +195,14 @@ if [ -n "${bridge_pid}" ]; then
       done
       kill -KILL "${bridge_pid}" 2>/dev/null || true
       bridge_pid=""
-      ;;
-  esac
+  fi
 fi
 if [ -z "${bridge_pid}" ]; then
   nohup setsid python3 "$2" \
-    --url "$7" --interface "$4" --fps "$5" \
+    --url "$7" --interface "$4" --fps "$5" --publish-fps "$5" \
     --color-width "$8" --color-height "$9" --color-fps "${10}" \
     --depth-width "${11}" --depth-height "${12}" --depth-fps "${13}" --align-to "${14}" \
+    --sensor-queue-capacity "${16}" \
     --telemetry-period "$6" \
     $(if [ "${15}" = 1 ]; then echo --enable-camera-imu; fi) \
     >>"$3" 2>&1 </dev/null &
@@ -395,13 +434,24 @@ start_all() {
 
 publish_object_goal() {
   [[ -n "${PHYSICAL_NAV_OBJECT_GOAL:-}" ]] || return 0
+  local topic="/semantic_decision/target"
+  local timeout="${PHYSICAL_NAV_TARGET_READY_TIMEOUT_S:-30}"
   local escaped
   escaped="${PHYSICAL_NAV_OBJECT_GOAL//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
   echo "publishing semantic object goal: ${PHYSICAL_NAV_OBJECT_GOAL}"
-  rostopic pub -1 /semantic_decision/target std_msgs/String \
-    "{data: '{\"enabled\":true,\"object_labels\":[\"${escaped}\"],\"target_name\":\"${escaped}\",\"mode\":\"object_goal\"}'}" \
-    >/dev/null
+  if ! wait_ros_topic_subscriber "${topic}" "${timeout}"; then
+    echo "warning: no ROS subscriber on ${topic} after ${timeout}s; publishing goal with bounded retries" >&2
+  fi
+  # A one-shot ROS publication is an execution command, not durable state. A
+  # small bounded retry window covers roslaunch registration/transport setup
+  # without creating an unbounded command queue or changing target semantics.
+  local payload
+  payload="{data: '{\"enabled\":true,\"object_labels\":[\"${escaped}\"],\"target_name\":\"${escaped}\",\"mode\":\"object_goal\"}'}"
+  for _ in 1 2 3; do
+    rostopic pub -1 "${topic}" std_msgs/String "${payload}" >/dev/null 2>&1 || true
+    sleep .20
+  done
 }
 
 stop_motion_control() {
@@ -432,10 +482,34 @@ stop_remote_owned() {
   local pid_file="$1" owned_file="$2" kind="$3" pid
   [[ -f "${owned_file}" && -f "${pid_file}" ]] || return 0
   pid="$(<"${pid_file}")"
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" \
-    "if kill -0 '${pid}' 2>/dev/null; then kill -TERM '${pid}' 2>/dev/null || true; fi" \
-    >/dev/null 2>&1 || true
-  echo "stopped Go2 ${kind} (pid=${pid})"
+  # Do not drop the ownership marker immediately after TERM.  The old
+  # implementation returned while Python/RealSense was still unwinding,
+  # leaving a live bridge that the next start silently reused.  That looked
+  # like `stop` had succeeded while stale camera frames kept arriving.  Wait
+  # for the exact owned PID, then force only that PID if it ignores TERM.
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" bash -s -- "${pid}" \
+    >/dev/null 2>&1 <<'REMOTE' || true
+set -u
+pid="$1"
+if ! [[ "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+  exit 0
+fi
+if ! kill -0 "${pid}" 2>/dev/null; then
+  exit 0
+fi
+kill -TERM "${pid}" 2>/dev/null || true
+for _ in $(seq 1 40); do
+  kill -0 "${pid}" 2>/dev/null || exit 0
+  sleep .25
+done
+kill -KILL "${pid}" 2>/dev/null || true
+REMOTE
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" \
+      "kill -0 '${pid}' 2>/dev/null" >/dev/null 2>&1; then
+    echo "warning: Go2 ${kind} pid=${pid} did not stop cleanly" >&2
+  else
+    echo "stopped Go2 ${kind} (pid=${pid})"
+  fi
   rm -f "${owned_file}"
 }
 

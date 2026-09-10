@@ -1,5 +1,8 @@
 # Physical read-only shadow lane: enable the complete M2 model policy while
 # all action topics remain remapped to unconsumed /physical_nav/shadow_* names.
+topics:
+  # Explicit base stop works even if the semantic turn/recovery lease is idle.
+  base_stop: "/physical_nav/base_stop"
 ablation:
   module1: "dynamic_mllm"
   module2: "mllm_score"
@@ -52,6 +55,24 @@ candidate:
   portal_goal_require_known_free: false
   portal_goal_known_free_radius_m: 0.30
   portal_goal_occupied_threshold: 50
+  # Cheap candidate-level OCC segment/endpoint preflight.  This physical-only
+  # guard rejects known occupied or out-of-bounds options before make_plan;
+  # unknown cells are retained and still go through the authoritative planner.
+  # Simulator/replay defaults remain disabled in the candidate node itself.
+  candidate_occupancy_preflight_enabled: true
+  candidate_occupancy_reject_occupied: true
+  candidate_occupancy_sample_step_m: 0.10
+  candidate_occupancy_start_ignore_m: 0.35
+  candidate_occupancy_endpoint_radius_m: 0.25
+  candidate_occupancy_threshold: 50
+  # Validate body clearance along every anchor route locally. The historical
+  # astar switch enables shared Dijkstra for batches (A* for single queries).
+  # The expansion cap is shared by the batch; no per-anchor make_plan RPC.
+  candidate_occupancy_use_astar: true
+  candidate_occupancy_astar_max_expansions: 12000
+  # Never apply the cheap OCC hard filter to a map/odom pair older than this;
+  # the authoritative planner remains responsible for the final check.
+  candidate_occupancy_max_pair_age_s: 0.50
   # The traversal endpoint must clear the full door AABB, Go2 footprint and
   # inflation margin rather than merely sit a fixed distance from its center.
   portal_traversal_clearance_margin_m: 0.55

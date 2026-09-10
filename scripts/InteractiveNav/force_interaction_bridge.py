@@ -395,6 +395,7 @@ class AtomicForceInteractionController:
         self._object_id_resolver = object_id_resolver
         self._commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self._seen_command_ids: set[str] = set()
+        self._command_public_metadata: dict[str, dict[str, str]] = {}
         self._event_index = 1
         self._result_publisher = None
         self._feedback_publisher = None
@@ -415,6 +416,7 @@ class AtomicForceInteractionController:
         self._ensure_ros()
         self._commands = queue.Queue()
         self._seen_command_ids.clear()
+        self._command_public_metadata.clear()
         self._event_index = 1
         self._events = []
         self._completed_steps = 0
@@ -457,6 +459,14 @@ class AtomicForceInteractionController:
             command_id = f"interaction_command_{self._event_index:06d}"
             command["command_id"] = command_id
         self._seen_command_ids.add(command_id)
+        self._command_public_metadata[command_id] = {
+            "event_id": str(command.get("event_id") or ""),
+            "episode_id": str(command.get("episode_id") or ""),
+        }
+        # Keep the replay ledger bounded for long simulator runs.
+        if len(self._command_public_metadata) > 512:
+            oldest = next(iter(self._command_public_metadata))
+            self._command_public_metadata.pop(oldest, None)
         command["action"] = action
         command["object_id"] = object_id
         execution_object_id = object_id
@@ -2062,7 +2072,9 @@ class AtomicForceInteractionController:
             self.result_topic,
             String,
             queue_size=4,
-            latch=True,
+            # Results are one-shot events.  A new semantic mapper must not
+            # consume the previous episode's terminal interaction again.
+            latch=False,
         )
         self._feedback_publisher = rospy.Publisher(
             self.feedback_topic,
@@ -2080,8 +2092,21 @@ class AtomicForceInteractionController:
     def _publish(self, publisher, payload: dict[str, Any]) -> None:
         if publisher is None or self._String is None:
             return
+        public_payload = dict(payload or {})
+        if publisher is self._result_publisher:
+            command_id = str(public_payload.get("command_id") or "")
+            metadata = self._command_public_metadata.get(command_id) or {}
+            for key in ("event_id", "episode_id"):
+                if not public_payload.get(key) and metadata.get(key):
+                    public_payload[key] = metadata[key]
         publisher.publish(
-            self._String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            self._String(
+                data=json.dumps(
+                    public_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         )
 
     def _write_snapshot(self) -> None:

@@ -107,6 +107,13 @@ pip install -e ".[curobo]"
 
 如果任务只涉及文档、配置或静态代码阅读，不应为了验证而安装大型依赖。
 
+本机常用环境补充（以当前开发机为准，路径可能因机器而异）：
+
+- 主环境：conda env `mlspaces`（Python 3.11）。激活后 `which python` 应指向该 env，例如 `/home/user/miniconda3/envs/mlspaces/bin/python`。
+- ROS：若存在 `/opt/ros/noetic`，ROS 相关节点与 pytest 需要按 `test.md` 注入 `PYTHONPATH`（含 `Interactive-Nav-SG-nav/src/...` 与 `scripts/InteractiveNav/physical_nav`），不要自行简化启动链路。
+- 语义模型：仓库根目录 `.env`（勿提交）决定本地/远程 Qwen 等服务端点；模板见 `.env.example` 与 `semantic_model_remote.env.example`。
+- 其它 conda env（如 `go2`、`qwen36-vllm`、`yolo_world`）仅在对应脚本或文档明确要求时使用；默认开发与测试仍用 `mlspaces`。
+
 ## 常见目录
 
 - `molmo_spaces/`：核心项目代码。
@@ -131,10 +138,19 @@ pip install -e ".[curobo]"
 - `molmo_spaces/evaluation/benchmark_schema.py`、`molmo_spaces/evaluation/eval_main.py`：benchmark JSON schema 与评估入口。
 - `molmo_spaces/utils/scene_maps.py`：场景地图与 door path 相关工具。
 
+补充目录（交互导航工程侧，后续使用时请以 `test.md` 为准）：
+
+- `scripts/InteractiveNav/physical_nav/`：实物 Go2 / 平台导航、传感器桥、安全速度、网页面板与性能记录。
+- `scripts/InteractiveNav/interactive_nav_v3.py`、`evaluate_interactive_nav_v3.py`、`build_*_interaction_benchmark.py`：V3 数据、评测与 benchmark 构建入口。
+- `Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/`、`semantic_decision_py_pkg/`、`semantic_mllm_py_pkg/`：ROS 语义建图、决策与 MLLM 模块。
+- `outputs/`、`output/`、`experiment_output/`：实验与批测产物；只读引用，不随意覆盖。
+- `interactive-nav-paper/`：论文写作与投稿材料。
+
 ## 搜索与阅读代码
 
 - 搜索文件优先使用 `rg --files`。
 - 搜索文本优先使用 `rg`。
+- 若当前环境没有 `rg`，可退回 `find` / `grep -RIn --include='*.py'`，不要因缺少工具而跳过检索。
 - 阅读代码前先确认相关模块已有 README、配置文件和测试文件。
 - 处理 JSON、YAML、XML、MJCF、USD 等结构化文件时，优先使用结构化解析方式，避免脆弱的字符串替换。
 
@@ -161,6 +177,8 @@ python molmo_spaces/evaluation/eval_main.py <POLICY_CONFIG> --benchmark_dir <BEN
 ```
 
 如果只修改某个模块，应优先运行相关测试文件或更小范围的测试。若因为依赖、资产、GPU、模拟器或网络限制无法运行测试，需要在最终说明中明确写出。
+
+ROS / 语义决策 / 实物相关回归通常依赖 `PYTHONPATH`、ROS master、Node 或本地编译链，命令与验收步骤一律以 `test.md` 原文为准，不要自行删减环境前置条件。
 
 ## 文档与注释
 

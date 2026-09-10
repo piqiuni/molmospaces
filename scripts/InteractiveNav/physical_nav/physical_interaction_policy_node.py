@@ -23,8 +23,15 @@ from qwen_client import QwenClient
 class PhysicalInteractionPolicyNode:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._latest_image = ""
+        self._latest_image_message = None
+        self._encoded_image_message = None
+        self._encoded_sample = None
         self._active_command = ""
+        # Commands are one-shot events.  Keep a bounded process-local replay
+        # guard in addition to using a non-latched result topic so a duplicate
+        # ROS delivery cannot execute the same physical request twice.
+        self._seen_command_ids: set[str] = set()
+        self._seen_command_order: list[str] = []
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="physical-policy")
         self._cancel = threading.Event()
         self._speech_condition = threading.Condition()
@@ -43,7 +50,7 @@ class PhysicalInteractionPolicyNode:
             str(self._param("speech_topic", "/physical_nav/speech_request")), String, queue_size=4
         )
         self._result_pub = rospy.Publisher(
-            str(self._param("result_topic", "/physical_nav/interaction_result")), String, queue_size=4, latch=True
+            str(self._param("result_topic", "/physical_nav/interaction_result")), String, queue_size=4, latch=False
         )
         self._event_pub = rospy.Publisher(
             str(self._param("mllm_events_topic", "/physical_nav/mllm_events")), String, queue_size=8
@@ -66,7 +73,36 @@ class PhysicalInteractionPolicyNode:
             return rospy.get_param(direct)
         return rospy.get_param(nested, default)
 
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        """Parse ROS/YAML booleans without treating ``"false"`` as true."""
+
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().casefold()
+        if text in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disabled", ""}:
+            return False
+        return bool(default)
+
     def _image_callback(self, message: Image) -> None:
+        # ROS owns an immutable message per callback. Keep only its reference;
+        # idle M3 must not JPEG-encode the full 10 Hz camera stream.
+        with self._lock:
+            self._latest_image_message = message
+
+    def _image_provider(self) -> dict[str, Any] | None:
+        with self._lock:
+            message = self._latest_image_message
+            if message is None:
+                return None
+            if message is self._encoded_image_message:
+                return self._encoded_sample
         try:
             encoding = str(message.encoding or "rgb8").casefold()
             mode = "L" if encoding in {"mono8", "8uc1"} else "RGB"
@@ -82,14 +118,37 @@ class PhysicalInteractionPolicyNode:
             )
             encoded = io.BytesIO()
             image.save(encoded, format="JPEG", quality=85)
+            header = getattr(message, "header", None)
+            raw_seq = getattr(header, "seq", None)
+            try:
+                frame_seq = int(raw_seq) if raw_seq is not None else None
+            except (TypeError, ValueError, OverflowError):
+                frame_seq = None
+            if frame_seq is not None and frame_seq < 0:
+                frame_seq = None
+            raw_stamp = getattr(header, "stamp", None)
+            try:
+                frame_stamp = (
+                    float(raw_stamp.to_sec())
+                    if hasattr(raw_stamp, "to_sec")
+                    else float(raw_stamp)
+                ) if raw_stamp is not None else None
+            except (TypeError, ValueError, OverflowError):
+                frame_stamp = None
+            if frame_stamp is not None and frame_stamp <= 0.0:
+                frame_stamp = None
+            sample = {
+                "image_data_url": "data:image/jpeg;base64," + base64.b64encode(encoded.getvalue()).decode("ascii"),
+                "seq": frame_seq, "stamp": frame_stamp,
+            }
             with self._lock:
-                self._latest_image = "data:image/jpeg;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
+                if self._latest_image_message is message:
+                    self._encoded_image_message = message
+                    self._encoded_sample = sample
+            return sample
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical policy image conversion failed: %s", exc)
-
-    def _image_provider(self) -> str | None:
-        with self._lock:
-            return self._latest_image or None
+            return None
 
     def _emit(self, event: dict[str, Any]) -> None:
         self._event_pub.publish(String(data=json.dumps(event, ensure_ascii=False, separators=(",", ":"))))
@@ -152,6 +211,44 @@ class PhysicalInteractionPolicyNode:
     def _cancel_callback(self, _message: String) -> None:
         self._cancel.set()
 
+    @staticmethod
+    def _result_identity(request: InteractionRequest) -> dict[str, Any]:
+        """Return public command identity carried through the M3 result.
+
+        ``InteractionRequest`` intentionally keeps platform-specific fields in
+        ``context``.  Copy only the routing identifiers here so semantic
+        consumers can reject stale/replayed results without exposing private
+        actuator details.
+        """
+
+        context = request.context if isinstance(request.context, dict) else {}
+        interaction = context.get("interaction_command") or {}
+        if not isinstance(interaction, dict):
+            interaction = {}
+        event_id = str(
+            context.get("event_id")
+            or interaction.get("event_id")
+            or f"{request.command_id}:result"
+        )
+        episode_id = str(
+            context.get("episode_id")
+            or interaction.get("episode_id")
+            or ""
+        )
+        return {
+            "command_id": str(request.command_id),
+            "event_id": event_id,
+            "episode_id": episode_id,
+            "decision_id": str(request.decision_id),
+            "candidate_id": str(request.candidate_id),
+            "node_id": str(
+                context.get("node_id")
+                or interaction.get("node_id")
+                or ""
+            ),
+            "object_id": str(request.target_id),
+        }
+
     def _command_callback(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -159,12 +256,33 @@ class PhysicalInteractionPolicyNode:
         except Exception as exc:
             rospy.logwarn("physical interaction command rejected: %s", exc)
             return
+        command_id = str(request.command_id or "")
+        if not command_id:
+            rospy.logwarn("physical interaction command rejected: missing command_id")
+            return
         with self._lock:
+            if command_id in self._seen_command_ids:
+                self._emit(
+                    {
+                        "module": "POLICY",
+                        "stage": "REJECTED_DUPLICATE",
+                        "command_id": command_id,
+                    }
+                )
+                return
             if self._active_command:
                 self._cancel.set()
-                self._emit({"module": "POLICY", "stage": "REJECTED_BUSY", "command_id": request.command_id})
+                self._emit({"module": "POLICY", "stage": "REJECTED_BUSY", "command_id": command_id})
                 return
-            self._active_command = request.command_id
+            self._active_command = command_id
+            self._seen_command_ids.add(command_id)
+            self._seen_command_order.append(command_id)
+            # Keep memory bounded across a long physical run.  IDs are
+            # monotonic per executor, so evicting the oldest cannot make a
+            # current command ambiguous.
+            if len(self._seen_command_order) > 512:
+                expired = self._seen_command_order.pop(0)
+                self._seen_command_ids.discard(expired)
             self._cancel.clear()
         self._executor.submit(self._run, request)
 
@@ -185,12 +303,21 @@ class PhysicalInteractionPolicyNode:
                     "interaction_timeout_s": float(self._param("interaction_timeout_s", 20.0)),
                     "m3_min_confidence": float(self._param("m3_min_confidence", 0.60)),
                     "temporary_skip_s": float(self._param("temporary_skip_s", 30.0)),
+                    # M3 must never treat a latched/replayed RGB image as a
+                    # new post-action observation.  The provider above carries
+                    # the ROS bridge sequence/stamp for this guard.
+                    "require_fresh_frames": self._as_bool(
+                        self._param("require_fresh_frames", True), True
+                    ),
+                    "require_post_start_frames": True,
+                    "capture_clock": lambda: rospy.Time.now().to_sec(),
                 },
             )
             result = policy.execute(request, self._cancel.is_set)
             temporary_skip_s = float(result.verification.get("temporary_skip_s", 0.0) or 0.0)
+            identity = self._result_identity(request)
             self._result_pub.publish(String(data=json.dumps({
-                "command_id": result.command_id,
+                **identity,
                 "candidate_id": request.candidate_id,
                 "object_id": request.target_id,
                 "source_object_name": request.target_name,
@@ -206,7 +333,13 @@ class PhysicalInteractionPolicyNode:
                 "stamp_sec": result.timestamp,
             }, ensure_ascii=False, separators=(",", ":"))))
         except Exception as exc:
-            self._result_pub.publish(String(data=json.dumps({"command_id": request.command_id, "success": False, "status": "FAILED", "failure_reason": str(exc)[:200], "verification_source": "physical_visual_mllm"}, ensure_ascii=False, separators=(",", ":"))))
+            self._result_pub.publish(String(data=json.dumps({
+                **self._result_identity(request),
+                "success": False,
+                "status": "FAILED",
+                "failure_reason": str(exc)[:200],
+                "verification_source": "physical_visual_mllm",
+            }, ensure_ascii=False, separators=(",", ":"))))
         finally:
             with self._lock:
                 self._active_command = ""

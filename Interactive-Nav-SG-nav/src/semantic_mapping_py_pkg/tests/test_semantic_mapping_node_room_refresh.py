@@ -34,6 +34,68 @@ class _Overlay:
         return True
 
 
+@pytest.mark.parametrize("time_fields", [
+    {"secs": 10, "nsecs": 0}, {"stamp": 10.0},
+    {"stamp_sec": 10.0}, {"capture_stamp_sec": 10.0}, {"stamp": "invalid"},
+])
+def test_replayed_detector_capture_does_not_reach_graph_or_publish(time_fields):
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.enable_object_mapping = True
+    node.object_store = ObjectMapStore()
+    det = {"semantic_class": "door", "world_position": [1, 2, 1],
+           "world_box3d_size": [1, 0.1, 2], "confidence": 0.9}
+    node.object_store.update([det], stamp=10.0)
+    node.object_store.as_tracked_detections = lambda **kwargs: pytest.fail("duplicate reached graph preparation")
+    node._process_object_message(SimpleNamespace(data=json.dumps({
+        **time_fields, "detections": [det],
+    })))
+    assert node.object_store.objects[0]["observation_count"] == 1
+
+
+@pytest.mark.parametrize("conflict", ["node_id", "object_id", "action", "episode_id", "missing_id", "unknown_id"])
+def test_physical_result_guard_protects_graph_and_pending_overlay(monkeypatch, conflict):
+    monkeypatch.setattr(semantic_mapping_module.rospy, "logwarn_throttle", lambda *args: None)
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.require_interaction_command_id = True
+    command = {"command_id": "cmd1", "episode_id": "e1", "node_id": "fridge1",
+               "object_id": "track1", "action": "close"}
+    node.pending_interaction_commands = {"cmd1": dict(command)}
+    updates, overlays, bundles = [], [], []
+    node.graph_store = SimpleNamespace(episode_id="e1", update_interaction_result=lambda result, stamp: updates.append(result) or True)
+    node._set_planning_interaction_pending = lambda *args: overlays.append(args) or True
+    node._collect_publish_bundle = lambda: {}
+    node._safe_publish_bundle = bundles.append
+    result = {**command, "success": True, "post_state": "closed", "stamp_sec": 12.0}
+    invalid = dict(result)
+    if conflict == "missing_id":
+        invalid.pop("command_id")
+    elif conflict == "unknown_id":
+        invalid["command_id"] = "other-command"
+    else:
+        invalid[conflict] = "wrong"
+    node.interaction_result_callback(SimpleNamespace(data=json.dumps(invalid)))
+    assert node.pending_interaction_commands == {"cmd1": command}
+    assert not updates and not overlays and not bundles
+    node.interaction_result_callback(SimpleNamespace(data=json.dumps(result)))
+    node.interaction_result_callback(SimpleNamespace(data=json.dumps(result)))
+    assert len(updates) == len(overlays) == len(bundles) == 1
+    assert updates[0]["node_id"] == "fridge1"
+    assert not node.pending_interaction_commands
+
+
+def test_foreign_episode_command_cannot_arm_planning_overlay():
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.graph_store = SimpleNamespace(episode_id="new")
+    node.pending_interaction_commands = {}
+    node.interaction_command_callback(SimpleNamespace(data=json.dumps({
+        "command_id": "old-command", "episode_id": "old", "action": "open", "node_id": "door1",
+    })))
+    assert not node.pending_interaction_commands
+
+
 class _RoomSegmenter:
     def __init__(self) -> None:
         self.calls = []
@@ -168,7 +230,8 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     ]
 
 
-def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
+@pytest.mark.parametrize("reset_after_snapshot", [False, True])
+def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch, reset_after_snapshot):
     """The strict M1 topic stays empty while the graph receives the item."""
 
     monkeypatch.setattr(
@@ -179,6 +242,7 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
     )
     node = object.__new__(SemanticMappingNode)
     node.enable_object_mapping = True
+    node.tracked_stream_epoch = "before-reset"
     node.lock = threading.RLock()
     node.object_store = ObjectMapStore(
         match_distance=0.5,
@@ -198,6 +262,14 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
     node._update_room_portal_hints = lambda *_args, **_kwargs: False
     node._collect_publish_bundle = lambda: {}
     node._safe_publish_bundle = lambda _bundle: None
+    timings = []
+    def record_timing(key, value):
+        timings.append((key, value))
+        if reset_after_snapshot:
+            with node.lock:
+                node.tracked_stream_epoch = "after-reset"
+
+    node._record_component_timing = record_timing
 
     SemanticMappingNode.object_callback(
         node,
@@ -229,6 +301,7 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
     )
 
     assert len(published) == 1
+    assert json.loads(published[0].data)["episode_id"] == "before-reset"
     assert json.loads(published[0].data)["detections"] == []
     assert len(node.graph_store.observations) == 1
     admitted = node.graph_store.observations[0]["observations"]
@@ -236,6 +309,18 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
     assert admitted[0]["semantic_name"] == "bottle"
     assert admitted[0]["tracking_confirmed"] is False
     assert admitted[0]["graph_admission_source"] == "open_refrigerator_exposure"
+    timing_keys = {key for key, _value in timings}
+    assert {
+        "object_store_update",
+        "object_store_as_tracked_detections",
+        "object_store_total",
+        "graph_update_observations",
+        "graph_prune_unqualified_rooms",
+        "graph_ensure_provisional_rooms",
+        "graph_prune_stale_nodes",
+        "graph_prune_ensure_total",
+    } <= timing_keys
+    assert all(value >= 0.0 for _key, value in timings)
 
 
 def test_static_portal_result_does_not_arm_post_open_transition() -> None:
@@ -284,6 +369,42 @@ class _SceneStore:
 
     def initialize_from_occupancy_grid(self, grid) -> None:
         self.grids.append(grid)
+
+
+def test_occ_receipt_time_includes_lock_wait_and_source_age_is_measured_at_entry(monkeypatch):
+    node = object.__new__(SemanticMappingNode)
+    clock = [10.0]
+
+    class DelayedLock:
+        def __enter__(self):
+            clock[0] += 0.4
+
+        def __exit__(self, *args):
+            return False
+
+    node.lock = DelayedLock()
+    node._post_open_planning_refresh_after_stamp_sec = None
+    node.scene_store = _SceneStore()
+    node._enqueue_room_refresh = lambda **kwargs: None
+    samples = {}
+    node._record_component_timing = lambda key, value: samples.update({key: value})
+    monkeypatch.setattr(semantic_mapping_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(semantic_mapping_module.rospy, "get_time", lambda: 990. + clock[0])
+    node.occupancy_callback(_raw_occupancy(999.8))
+    assert node._latest_occupancy_received_mono_s == 10.0
+    assert samples["occupancy_source_age_at_callback"] == pytest.approx(200.)
+
+
+@pytest.mark.parametrize("stamp,now,expected", [
+    (1., 1.2, 200.), (1., 1., 0.), (0., 1., None),
+    (2., 1., None), (1., float("nan"), None), (1., float("inf"), None),
+])
+def test_occ_source_age_does_not_report_invalid_clock_as_zero(stamp, now, expected):
+    actual = SemanticMappingNode._occupancy_source_age_ms(_raw_occupancy(stamp), now)
+    if expected is None:
+        assert actual is None
+    else:
+        assert actual == pytest.approx(expected)
 
 
 def test_occupancy_callback_coalesces_room_work_without_waiting_for_worker():
@@ -338,6 +459,92 @@ def test_occupancy_callback_coalesces_room_work_without_waiting_for_worker():
         release_first.set()
         SemanticMappingNode._stop_room_worker(node)
         worker.join(timeout=1.0)
+
+
+def test_room_refresh_retimes_same_ternary_map_but_rejects_changed_content():
+    """A slow room job may follow headers, never a changed OCC topology."""
+
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node._room_epoch = 0
+    node._room_topology_revision = 0
+    node._room_input_revision = 2
+    node.room_free_threshold = 20
+    node.world_frame = "world"
+
+    old_raw = _raw_occupancy(40.0)
+    # Free-cell confidence changes do not change room segmentation's ternary
+    # input.  The newer source must nevertheless own the emitted header.
+    latest_same = _raw_occupancy(40.2)
+    latest_same.data = [10, 20, 100, -1]
+    node.latest_occupancy_grid = latest_same
+    room_grid = _raw_occupancy(40.0)
+    key = SemanticMappingNode._room_occupancy_content_key(node, old_raw)
+
+    resolved_raw, resolved_grid, revision, status = (
+        SemanticMappingNode._resolve_room_refresh_commit_source(
+            node,
+            old_raw,
+            room_grid,
+            1,
+            key,
+            epoch=0,
+            topology_revision=0,
+        )
+    )
+    assert status == "retimed"
+    assert resolved_raw is latest_same
+    assert revision == 2
+    assert resolved_grid is not room_grid
+    assert resolved_grid.data is room_grid.data
+    assert resolved_grid.header.stamp.to_sec() == pytest.approx(40.2)
+
+    # A changed unknown/free/occupied category invalidates the result.  The
+    # caller must enqueue the latest source instead of publishing old labels.
+    latest_changed = _raw_occupancy(40.3)
+    latest_changed.data[0] = 100
+    node.latest_occupancy_grid = latest_changed
+    node._room_input_revision = 3
+    resolved = SemanticMappingNode._resolve_room_refresh_commit_source(
+        node,
+        old_raw,
+        room_grid,
+        1,
+        key,
+        epoch=0,
+        topology_revision=0,
+    )
+    assert resolved[3] == "content_changed"
+    assert resolved[0] is None
+
+
+def test_room_refresh_content_supersession_is_urgent_and_latest_only():
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node._room_work_condition = threading.Condition()
+    node._room_worker_thread = object()
+    node._room_worker_stopping = False
+    node._room_work_pending = None
+    node._room_epoch = 0
+    node._room_input_revision = 7
+    node._room_topology_revision = 0
+    node.latest_occupancy_grid = _raw_occupancy(41.0)
+
+    assert SemanticMappingNode._enqueue_room_refresh(
+        node,
+        reason="room_content_superseded",
+        epoch=0,
+        urgent=True,
+    )
+    assert node._room_work_pending["urgent"] is True
+
+    # A later ordinary OCC enqueue coalesces into the same request and must
+    # not clear the immediate retry flag.
+    node._room_input_revision = 8
+    node.latest_occupancy_grid = _raw_occupancy(41.1)
+    SemanticMappingNode._enqueue_room_refresh(node, reason="occupancy", epoch=0)
+    assert node._room_work_pending["urgent"] is True
+    assert node._room_work_pending["requested_source"]["stamp_sec"] == pytest.approx(41.1)
 
 
 class _EpisodeGraphStore:
@@ -505,7 +712,9 @@ def test_episode_reset_clears_pending_post_open_planning_refresh():
     node.semantic_occ_overlay = _Resettable()
     node.semantic_occ_update_tracker = _Resettable()
     node.pending_interaction_commands = {"old": {}}
-    node.object_store = SimpleNamespace(objects=[object()], next_id=7)
+    node.object_store = ObjectMapStore()
+    node.object_store.m1_canonical_labels["track_0001"] = "refrigerator"
+    node.tracked_stream_epoch = "old-stream"
     node.room_segmenter = _EpisodeRoomSegmenter()
     node._post_open_planning_refresh_after_stamp_sec = 12.0
     node._save_episode_graph_locked = lambda **_kwargs: None
@@ -528,6 +737,49 @@ def test_episode_reset_clears_pending_post_open_planning_refresh():
 
     assert node._post_open_planning_refresh_after_stamp_sec is None
     assert node.graph_store.reset_args == ("new_episode", "realtime_gt_observation")
+    assert not node.object_store.m1_canonical_labels
+    assert node.tracked_stream_epoch != "old-stream"
+
+
+def test_m1_tracker_name_changes_only_after_graph_accepts_confirmation():
+    from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.ablation = SimpleNamespace(module1="dynamic_mllm")
+    node.tracked_stream_epoch = "stream-current"
+    node.object_store = ObjectMapStore()
+    node.graph_store = InteractionGraphStore(scene_id="offline")
+    node.graph_store.episode_id = "run"
+    node._safe_publish_bundle = lambda bundle: None
+    node._collect_publish_bundle = lambda: {}
+    observation = {"instance_id": "track_0001", "semantic_name": "locker", "category": "locker",
+                   "confidence": 0.9, "position": [1.0, 2.0, 1.0],
+                   "aabb_center": [1.0, 2.0, 1.0], "aabb_size": [0.7, 0.7, 1.8]}
+    for stamp in (1.0, 2.0):
+        node.graph_store.update_observations([observation], stamp=stamp, source_mode="detector_online")
+    patch = {"object_id": "object_track_0001", "attribute_status": "ready",
+             "source": "mllm_attribute_inference", "confidence": 0.9,
+             "interaction_class": "container", "interactable": True, "coarse_state": "closed",
+             "observed_object_name": "refrigerator"}
+
+    def send(sequence, epoch="stream-current", **changes):
+        node.attribute_updates_callback(SimpleNamespace(data=json.dumps({
+            "episode_id": epoch, "stamp_sec": float(sequence + 2),
+            "updates": [{**patch, "request_sequence": sequence,
+                         "observation_signature": f"view-{sequence}",
+                         "observation_frame_index": sequence + 2, **changes}],
+        })))
+
+    send(1)
+    assert not node.object_store.m1_canonical_labels  # First fridge proposal is still pending.
+    send(2)
+    assert node.object_store.m1_canonical_labels == {"track_0001": "refrigerator"}
+    send(1, observed_object_name="water_dispenser")  # Stale sequence cannot rename the tracker.
+    send(3, epoch="stream-old", observed_object_name="water_dispenser")
+    assert node.object_store.m1_canonical_labels == {"track_0001": "refrigerator"}
+    send(3, observed_object_name="water_dispenser", interaction_class="none", interactable=False)
+    assert node.object_store.m1_canonical_labels == {"track_0001": "water_dispenser"}
 
 
 def test_room_mllm_request_contains_only_room_and_member_object_metadata():
@@ -734,6 +986,63 @@ def test_room_topology_overlay_uses_raw_grid_without_confirmed_portal():
     assert effective is raw
 
 
+def test_room_topology_overlay_reuses_unchanged_materialized_cells():
+    node = object.__new__(SemanticMappingNode)
+    node.room_segment_use_semantic_overlay = True
+    node._room_segmentation_overlay = SemanticOccupancyOverlay()
+    node._room_overlay_cache = None
+    raw = _raw_occupancy(30.0)
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_door_1",
+                "type": "portal",
+                "interaction": {"state": "open"},
+                "attributes": {
+                    "interaction_reference_aabb_center": [0.05, 0.05, 0.0],
+                    "interaction_reference_aabb_size": [0.1, 0.1, 1.0],
+                },
+            }
+        ]
+    }
+    overlay = node._room_segmentation_overlay
+    original_apply = overlay.apply
+    apply_calls = []
+
+    def counted_apply(*args, **kwargs):
+        apply_calls.append(True)
+        return original_apply(*args, **kwargs)
+
+    overlay.apply = counted_apply
+    first = SemanticMappingNode._room_segmentation_occupancy_from_snapshot(
+        node, raw, graph
+    )
+    same_content_new_source = _raw_occupancy(30.2)
+    second = SemanticMappingNode._room_segmentation_occupancy_from_snapshot(
+        node, same_content_new_source, graph
+    )
+
+    assert len(apply_calls) == 1
+    assert first.data is second.data
+    assert second.header.stamp == same_content_new_source.header.stamp
+
+    # A few in-process bridges reuse and mutate the message buffer.  The
+    # cache owns its source list, so this must invalidate rather than reuse a
+    # stale effective raster.
+    same_content_new_source.data[0] = 100
+    SemanticMappingNode._room_segmentation_occupancy_from_snapshot(
+        node, same_content_new_source, graph
+    )
+    assert len(apply_calls) == 2
+
+    changed = _raw_occupancy(30.4)
+    changed.data[0] = 100
+    SemanticMappingNode._room_segmentation_occupancy_from_snapshot(
+        node, changed, graph
+    )
+    assert len(apply_calls) == 2
+
+
 def test_exact_room_topology_cache_reuses_content_but_not_source():
     node = object.__new__(SemanticMappingNode)
     node.room_topology_cache_enabled = True
@@ -830,3 +1139,45 @@ def test_strict_room_commit_publishes_pinned_core_bundle_immediately(monkeypatch
         "room_commit_publish_ros",
         "room_commit_publish_total",
     }
+
+
+def test_collect_and_publish_keeps_concurrent_snapshots_in_causal_order():
+    node = object.__new__(SemanticMappingNode)
+    node._publish_lock = threading.RLock()
+    first_collect_started = threading.Event()
+    release_first_collect = threading.Event()
+    second_collect_started = threading.Event()
+    revision = {"value": 1}
+    published = []
+
+    def collect():
+        value = revision["value"]
+        if value == 1:
+            first_collect_started.set()
+            assert release_first_collect.wait(2.0)
+        else:
+            second_collect_started.set()
+        return {"revision": value}
+
+    node._collect_publish_bundle = collect
+    node._publish_bundle = published.append
+
+    first = threading.Thread(target=node._collect_and_publish_bundle)
+    first.start()
+    assert first_collect_started.wait(1.0)
+
+    revision["value"] = 2
+    second = threading.Thread(target=node._collect_and_publish_bundle)
+    second.start()
+    # Snapshot construction itself is behind the publication lock.  The
+    # second callback cannot collect revision 2 and publish it before the
+    # already-started revision-1 callback completes.
+    assert not second_collect_started.wait(0.05)
+
+    release_first_collect.set()
+    first.join(2.0)
+    second.join(2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert published == [{"revision": 1}, {"revision": 2}]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import html as html_lib
 import io
 import json
@@ -22,14 +23,13 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from physical_protocol import decode_wire_packet, validate_packet
-from runtime_state import RuntimeState
+from runtime_state import RuntimeState, telemetry_yaw
 from safety_gate import ReadOnlySafetyGate
 from qwen_client import QwenClient
 from physical_raw_recorder import DEFAULT_RECORD_DIR, PhysicalRawRecorder
@@ -130,6 +130,129 @@ def _ensure_phone_tls_certificate(cert_path: str, key_path: str, host_ip: str = 
 class _ReusableHTTPServer(ThreadingHTTPServer):
     # Allow an immediate service restart after a browser/MJPEG disconnect.
     allow_reuse_address = True
+    # Request threads must never keep the optional viewer alive during stack
+    # shutdown.  In particular, a browser can disappear while a JPEG body is
+    # being written and leave its handler blocked in the kernel briefly.
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Silence normal browser disconnects without hiding server faults."""
+        error = sys.exc_info()[1]
+        if isinstance(
+            error,
+            (
+                BrokenPipeError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                socket.timeout,
+                ssl.SSLEOFError,
+            ),
+        ):
+            return
+        if isinstance(error, OSError) and error.errno in {
+            errno.EPIPE,
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.ETIMEDOUT,
+        }:
+            return
+        # ThreadingMixIn calls this method from inside the active exception
+        # handler, so the base implementation can still print a traceback for
+        # programming errors and other unexpected failures.
+        super().handle_error(request, client_address)
+
+
+class _LatestRecordingWorker:
+    """Submit panel-recording batches through one replaceable pending slot."""
+
+    def __init__(self, recorder: PhysicalRawRecorder) -> None:
+        self.recorder = recorder
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._pending: tuple[Any, ...] | None = None
+        self._stopping = False
+        self.replaced = 0
+        self.last_error = ""
+        self._thread = threading.Thread(
+            target=self._run,
+            name="physical-recording-submit",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        camera_box_frame: bytes,
+        panels: dict[int, bytes],
+        topology_bytes: bytes,
+        *,
+        stamp: Any,
+        frame_seq: Any,
+        step_index: Any,
+    ) -> bool:
+        job = (
+            camera_box_frame,
+            dict(panels),
+            topology_bytes,
+            stamp,
+            frame_seq,
+            step_index,
+        )
+        with self._lock:
+            if self._stopping:
+                return False
+            if self._pending is not None:
+                self.replaced += 1
+            self._pending = job
+            self._event.set()
+        return True
+
+    def close(self, timeout: float = 2.0) -> None:
+        with self._lock:
+            self._stopping = True
+            self._event.set()
+        self._thread.join(max(0.0, float(timeout)))
+
+    def _run(self) -> None:
+        while True:
+            self._event.wait()
+            with self._lock:
+                job = self._pending
+                self._pending = None
+                self._event.clear()
+                stopping = self._stopping
+            if job is not None:
+                try:
+                    self._write(job)
+                except Exception as exc:
+                    # Match ThreadPoolExecutor's previous isolation: one bad
+                    # optional recording batch must not terminate the worker.
+                    self.last_error = str(exc)
+            if stopping:
+                return
+
+    def _write(self, job: tuple[Any, ...]) -> None:
+        camera_box_frame, panels, topology_bytes, stamp, frame_seq, step_index = job
+        self.recorder.record_panel(
+            1, camera_box_frame, stamp=stamp, frame_seq=frame_seq
+        )
+        for panel_index, panel_bytes in panels.items():
+            if panel_index != 1:
+                self.recorder.record_panel(
+                    panel_index,
+                    panel_bytes,
+                    stamp=stamp,
+                    frame_seq=frame_seq,
+                )
+        if topology_bytes:
+            self.recorder.record_panel(
+                6, topology_bytes, stamp=stamp, frame_seq=frame_seq
+            )
+        self.recorder.record_step_boundary(
+            step_index=step_index,
+            stamp=stamp,
+            frame_seq=frame_seq,
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -147,6 +270,23 @@ def _point_xy(value: Any) -> tuple[float, float] | None:
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         return _safe_float(value[0]), _safe_float(value[1])
     return None
+
+
+def _grid_origin_yaw(origin: Any) -> float:
+    """Read an OccupancyGrid origin yaw without changing the map convention."""
+    if not isinstance(origin, dict):
+        return 0.0
+    try:
+        qx = float(origin.get("qx", 0.0) or 0.0)
+        qy = float(origin.get("qy", 0.0) or 0.0)
+        qz = float(origin.get("qz", 0.0) or 0.0)
+        qw = float(origin.get("qw", 1.0) or 1.0)
+        return math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _decode(value: str, encoding: str) -> Any:
@@ -189,6 +329,11 @@ class SixPanelRenderer:
         # the first room-panel world bounds, while its center is the initial
         # robot pose, so later frontier/trajectory points cannot zoom panel 2.
         self._occ_view_bounds: tuple[float, float, float, float] | None = None
+        # The web gateway may survive a navigation-stack restart.  New ROS
+        # gateway processes attach a process-scoped map_session token to OCC
+        # receipts, allowing this locked viewport to be re-centered for the
+        # new map even when dimensions and origin happen to be identical.
+        self._occ_map_session: str | None = None
         # Decoding the same ROS grid payload repeatedly was a surprisingly
         # large part of OCC latency: each render converted a Python list into
         # a new NumPy array for up to four maps.  Payload dictionaries are
@@ -197,13 +342,68 @@ class SixPanelRenderer:
         self._grid_cache: dict[int, tuple[Any, RawGrid | None]] = {}
         self._display_costmap_cache_key: tuple[int, int] | None = None
         self._display_costmap_cache: RawGrid | None = None
-        self._spatial_cache_key: tuple[int, int, int] | None = None
+        self._spatial_cache_key: tuple[int, int, int, int] | None = None
         self._spatial_cache: Any = None
         self._topology_cache_key: tuple[int, int, int] | None = None
         self._topology_cache: Any = None
+        # YOLO reports arrive after their RGB receipt and may trail the newest
+        # camera frame by several ticks.  Retain only a short, immutable-by-
+        # convention frame history so the web overlay can use the exact RGB
+        # identified by detection_meta.seq instead of painting old boxes on a
+        # newer image.  At 10 Hz twelve references cover about 1.2 seconds;
+        # no image is copied until the selected pair is rendered.
+        self._camera_frame_lock = threading.Lock()
+        self._camera_frame_capacity = 12
+        self._camera_frames: dict[int, Any] = {}
+        self._camera_generation: tuple[str | None, int] | None = None
+        self._camera_generation_detection_floor = 0
+        self._camera_detection_revision = 0
+        self._camera_detection_metadata: dict[str, Any] = {}
+        self._camera_detections: list[dict[str, Any]] = []
 
     def set_capture_panel_streams(self, enabled: bool) -> None:
         self.capture_panel_streams = bool(enabled)
+
+    def _observe_occ_map_session(self, payload: Any) -> bool:
+        """Drop the locked OCC viewport when a new source map starts."""
+        if not isinstance(payload, dict):
+            return False
+        token = str(payload.get("map_session") or "").strip()
+        # Replay/legacy payloads have no token; retain their existing locked
+        # viewport instead of treating every compatibility update as a reset.
+        if not token:
+            return False
+        # A persistent renderer may have learned its locked bounds from a
+        # legacy payload before the first token-bearing payload arrives.  That
+        # first token is still a new map epoch; retaining those bounds would
+        # keep the old (possibly huge) viewport after a ROS restart.  Treat
+        # any token transition, including ``None -> token``, as a reset.
+        changed = token != self._occ_map_session
+        if changed:
+            self._occ_view_bounds = None
+        self._occ_map_session = token
+        return changed
+
+    @staticmethod
+    def heavy_render_key(state: RuntimeState) -> tuple[int, int, int, int]:
+        """Return revisions that can change the expensive map/graph panels.
+
+        Camera-only receipts deliberately do not participate in this key:
+        the source-resolution camera overlay has its own latest-only 10-Hz
+        renderer. Pose-bearing telemetry *does* participate because panels
+        2/3/5 draw the robot arrow and must invalidate when heading changes.
+        Keeping this small helper explicit makes it harder for a future
+        ``RuntimeState.revision`` change to reintroduce a full OCC raster/JPEG
+        pass for every RGB frame without pose data.
+        """
+
+        with state._lock:
+            return (
+                int(getattr(state, "map_revision", 0)),
+                int(getattr(state, "graph_revision", 0)),
+                int(getattr(state, "navigation_revision", 0)),
+                int(getattr(state, "telemetry_revision", 0)),
+            )
 
     @staticmethod
     def _raw_grid(payload: Any, default_frame: str = "tf_frame_map") -> RawGrid | None:
@@ -216,8 +416,10 @@ class SixPanelRenderer:
                 return None
             values = values[: width * height].reshape((height, width))
             origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
-            qz, qw = float(origin.get("qz", 0.0) or 0.0), float(origin.get("qw", 1.0) or 1.0)
-            origin_yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+            # Keep the full quaternion-to-yaw conversion in one helper.  The
+            # old planar shortcut dropped qx*qy/qy² terms and could rotate
+            # the live arrow when a map origin carried a non-zero roll/pitch.
+            origin_yaw = _grid_origin_yaw(origin)
             return RawGrid(
                 values=values,
                 width=width,
@@ -405,13 +607,238 @@ class SixPanelRenderer:
                 label = f"{det.get('semantic_class', det.get('class', '?'))} {confidence:.2f}"
                 cv2.putText(panel, label[:34], (p1[0], max(48, p1[1] - 7)), cv2.FONT_HERSHEY_SIMPLEX, .58, color, 2, cv2.LINE_AA)
 
-    def render_camera_overlay(self, *, include_masks: bool = True) -> bytes:
-        """Render detections directly at the D435i source resolution."""
+    @staticmethod
+    def _detection_capture_seq(
+        metadata: Any,
+        detections: list[dict[str, Any]],
+    ) -> int | None:
+        """Return one unambiguous capture id sequence for a YOLO report."""
+        meta_seq: int | None = None
+        if isinstance(metadata, dict) and metadata.get("seq") is not None:
+            try:
+                meta_seq = int(metadata["seq"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+        member_seqs: set[int] = set()
+        for detection in detections:
+            if detection.get("capture_seq") is None:
+                continue
+            try:
+                member_seqs.add(int(detection["capture_seq"]))
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if len(member_seqs) > 1:
+            return None
+        member_seq = next(iter(member_seqs), None)
+        if meta_seq is not None and member_seq is not None and meta_seq != member_seq:
+            return None
+        return meta_seq if meta_seq is not None else member_seq
+
+    @staticmethod
+    def _detection_transport_generation(
+        metadata: Any,
+    ) -> tuple[str, int] | None:
+        """Return a detector receipt's explicit sensor generation, if any."""
+
+        if not isinstance(metadata, dict):
+            return None
+        session = metadata.get(
+            "transport_session", metadata.get("_transport_session")
+        )
+        if session in (None, ""):
+            return None
+        connection = metadata.get(
+            "transport_connection", metadata.get("_transport_connection", 0)
+        )
+        try:
+            return str(session), int(connection or 0)
+        except (TypeError, ValueError, OverflowError):
+            # A malformed explicit identity must not fall back to seq-only
+            # matching, where it could collide with a restarted source.
+            return str(session), -1
+
+    def remember_camera_frame(
+        self,
+        frame_seq: Any,
+        rgb: Any,
+        *,
+        transport_session: Any = None,
+        transport_connection: Any = 0,
+    ) -> None:
+        """Retain a bounded, generation-scoped reference to a decoded RGB."""
+        if rgb is None:
+            return
+        try:
+            sequence = int(frame_seq)
+            connection = int(transport_connection or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        session = (
+            str(transport_session)
+            if transport_session not in (None, "")
+            else None
+        )
+        generation = (session, connection)
+        with self._camera_frame_lock:
+            if generation != self._camera_generation:
+                previous_generation = self._camera_generation
+                self._camera_frames.clear()
+                self._camera_generation = generation
+                # Detections left in RuntimeState by a retired sensor session
+                # must not match a restarted sequence that happens to reuse
+                # the same integer.
+                self._camera_generation_detection_floor = (
+                    self._camera_detection_revision
+                    if previous_generation is not None
+                    else 0
+                )
+            self._camera_frames.pop(sequence, None)
+            self._camera_frames[sequence] = rgb
+            while len(self._camera_frames) > self._camera_frame_capacity:
+                self._camera_frames.pop(next(iter(self._camera_frames)))
+
+    def remember_camera_detections(self, value: Any) -> None:
+        """Publish one compact detector receipt to the overlay-side cache."""
+        if isinstance(value, dict):
+            metadata = {
+                key: item
+                for key, item in value.items()
+                if key not in {"detections", "objects"}
+            }
+            raw_detections = value.get("detections", value.get("objects", []))
+        elif isinstance(value, list):
+            metadata = {}
+            raw_detections = value
+        else:
+            return
+        detections = [
+            dict(item) for item in raw_detections if isinstance(item, dict)
+        ] if isinstance(raw_detections, list) else []
+        with self._camera_frame_lock:
+            self._camera_detection_metadata = metadata
+            self._camera_detections = detections
+            self._camera_detection_revision += 1
+
+    def camera_overlay_candidate(
+        self,
+    ) -> tuple[tuple[Any, ...], Any, list[dict[str, Any]]] | None:
+        """Return the newest exact RGB/YOLO pair without copying the cache.
+
+        Before the first detector report (and briefly after a sensor restart),
+        a raw current RGB is returned with an empty detection list.  Once a
+        valid report exists, its capture sequence selects the RGB history;
+        the latest RGB is never combined with detections from another frame.
+        """
+        with self.state._lock:
+            current_frame_seq = int(getattr(self.state, "frame_seq", -1))
+        with self._camera_frame_lock:
+            generation = self._camera_generation
+            detection_revision = self._camera_detection_revision
+            detections = self._camera_detections
+            detection_seq = self._detection_capture_seq(
+                self._camera_detection_metadata,
+                detections,
+            )
+            detection_generation = self._detection_transport_generation(
+                self._camera_detection_metadata
+            )
+            if detection_generation is None:
+                # Compatibility path for replay/legacy detector reports that
+                # predate transport metadata.  The revision floor prevents a
+                # report retained across a frame-generation reset from being
+                # matched solely because the integer sequence was reused.
+                detection_is_current = (
+                    detection_revision > self._camera_generation_detection_floor
+                    and detection_seq is not None
+                )
+            else:
+                # Live reports carry the exact capture generation.  This also
+                # handles either arrival order: a new-generation detection may
+                # wait for its RGB, while a delayed old report can never match
+                # a restarted source that reused the same capture sequence.
+                detection_is_current = (
+                    detection_generation == generation
+                    and detection_seq is not None
+                )
+            if detection_is_current:
+                rgb = self._camera_frames.get(detection_seq)
+                if rgb is not None:
+                    return (
+                        ("exact", generation, detection_seq, detection_revision),
+                        rgb,
+                        [dict(item) for item in detections],
+                    )
+            # Never borrow the mismatched detection list.  A raw image keeps
+            # the optional viewer useful while YOLO warms up or when a report
+            # arrived after its bounded RGB history expired.
+            rgb = self._camera_frames.get(current_frame_seq)
+            if rgb is None and self._camera_frames:
+                current_frame_seq = next(reversed(self._camera_frames))
+                rgb = self._camera_frames[current_frame_seq]
+            if rgb is None:
+                return None
+            return (
+                (
+                    "raw",
+                    generation,
+                    current_frame_seq,
+                    detection_revision,
+                    detection_seq,
+                ),
+                rgb,
+                [],
+            )
+
+    def camera_overlay_key_is_current(self, pair_key: tuple[Any, ...]) -> bool:
+        """Check that a rendered pair was not superseded while encoding."""
+
+        candidate = self.camera_overlay_candidate()
+        return candidate is not None and candidate[0] == pair_key
+
+    def camera_detections_match_current_frame(
+        self,
+        frame_seq: Any,
+        metadata: Any,
+        detections: list[dict[str, Any]],
+    ) -> bool:
+        """Validate the composite panel's seq and live transport generation."""
+
+        try:
+            current_sequence = int(frame_seq)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        detection_sequence = self._detection_capture_seq(metadata, detections)
+        if detection_sequence is None or detection_sequence != current_sequence:
+            return False
+        detection_generation = self._detection_transport_generation(metadata)
+        if detection_generation is None:
+            # Old replay reports do not expose enough information to prove a
+            # generation. Preserve their historical exact-seq compatibility.
+            return True
+        with self._camera_frame_lock:
+            return detection_generation == self._camera_generation
+
+    def render_camera_overlay(
+        self,
+        *,
+        include_masks: bool = True,
+        rgb: Any = None,
+        detections: list[dict[str, Any]] | None = None,
+    ) -> bytes:
+        """Render one already-paired D435i RGB/YOLO receipt."""
         if cv2 is None:
             raise RuntimeError("physical viewer requires opencv-python and numpy")
-        with self.state._lock:
-            rgb = None if self.state.rgb is None else self.state.rgb.copy()
-            detections = [dict(item) for item in self.state.detections if isinstance(item, dict)]
+        if rgb is None or detections is None:
+            with self.state._lock:
+                if rgb is None:
+                    rgb = self.state.rgb
+                if detections is None:
+                    detections = [
+                        dict(item)
+                        for item in self.state.detections
+                        if isinstance(item, dict)
+                    ]
+        rgb = None if rgb is None else rgb.copy()
         if rgb is None:
             rgb = np.full((480, 640, 3), 25, dtype=np.uint8)
             cv2.putText(rgb, "NO RGB YET", (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2, cv2.LINE_AA)
@@ -447,9 +874,23 @@ class SixPanelRenderer:
     @staticmethod
     def _physical_step(snapshot: dict[str, Any]) -> dict[str, Any]:
         telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-        position = telemetry.get("map_position") or telemetry.get("position") or [0.0, 0.0, 0.0]
+        # Physical telemetry is the capture-time odom pose and the live
+        # renderer currently keeps map/odom coincident.  Prefer that fresh
+        # position over an optional map_position cached by an older mapper;
+        # the latter has no receipt stamp and can pin both the arrow and its
+        # apparent heading when the robot moves.
+        position = telemetry.get("position") or telemetry.get("map_position") or [0.0, 0.0, 0.0]
         try:
-            pose = [float(position[0]), float(position[1]), float(telemetry.get("map_yaw", telemetry.get("yaw", 0.0)) or 0.0)]
+            # The capture packet's ``yaw`` is the live Go2 body heading.  A
+            # ``map_yaw`` field, when present in an older mapper snapshot, can
+            # be an odom->map correction from a previous epoch and has no
+            # freshness stamp.  Prefer the live heading so a stale correction
+            # cannot pin the dashboard arrow while the robot turns; fall back
+            # to map_yaw only for legacy packets that lack yaw entirely.
+            raw_yaw = telemetry_yaw(telemetry)
+            if raw_yaw is None:
+                raw_yaw = _safe_float(telemetry.get("map_yaw", 0.0))
+            pose = [float(position[0]), float(position[1]), float(raw_yaw or 0.0)]
         except (IndexError, TypeError, ValueError):
             pose = [0.0, 0.0, 0.0]
         graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
@@ -513,7 +954,12 @@ class SixPanelRenderer:
             "step_index": int(snapshot.get("navigation_step", 0) or 0),
             "stamp_sec": float(snapshot.get("frame_stamp", 0.0) or 0.0),
             "pose": pose,
-            "pose_frame_id": "tf_frame_map",
+            # Unitree sport-state position/yaw are odometry-frame values.  The
+            # renderer applies the explicit odom->map/grid transform once;
+            # labelling this as map made panel 2/3 silently skip that step
+            # whenever a non-identity map correction was available.
+            "pose_frame_id": "tf_frame_odom",
+            "trajectory_frame_id": "tf_frame_odom",
             "active_goal": list(goal[:2]) if goal else [],
             "active_goal_yaw": _safe_float(current.get("yaw", current.get("theta", 0.0))),
             "distance_m": 0.0,
@@ -530,6 +976,29 @@ class SixPanelRenderer:
             "semantic_behavior_feedback": navigation.get("behavior_feedback") or {},
             "semantic_decision_trace": decision_trace,
         }
+
+    @staticmethod
+    def _step_for_grid_axes(step: dict[str, Any], grid: RawGrid | None) -> dict[str, Any]:
+        """Adjust only pose heading for a rotated OccupancyGrid raster.
+
+        ``RawGrid.world_to_cell`` already subtracts ``origin_yaw`` from the
+        position.  The canonical renderer receives the pose yaw separately,
+        so pass a shallow step copy with the matching local-image heading for
+        map/room/costmap panels.  Semantic-XY remains in world axes and keeps
+        the original step untouched.
+        """
+        if grid is None or abs(float(getattr(grid, "origin_yaw", 0.0))) <= 1e-12:
+            return step
+        pose = step.get("pose")
+        if not isinstance(pose, (list, tuple)) or len(pose) < 3:
+            return step
+        adjusted = dict(step)
+        adjusted["pose"] = [
+            float(pose[0]),
+            float(pose[1]),
+            float(pose[2]) - float(grid.origin_yaw),
+        ]
+        return adjusted
 
     def _placeholder(self, title: str) -> Any:
         panel = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -600,7 +1069,7 @@ class SixPanelRenderer:
             image[grid == 0] = (235, 235, 235); image[grid > 50] = (30, 30, 30)
             panel = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
         cv2.putText(panel, "4 Public RGB-D occupancy / route | no-control", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
-        pose = telemetry.get("position", [0, 0, 0]); cv2.putText(panel, f"pose={pose[:2]} yaw={telemetry.get('yaw', '?')}", (12, self.height - 15), cv2.FONT_HERSHEY_PLAIN, 1.1, (0, 100, 255), 1)
+        pose = telemetry.get("position", [0, 0, 0]); cv2.putText(panel, f"pose={pose[:2]} yaw={telemetry_yaw(telemetry, '?')}", (12, self.height - 15), cv2.FONT_HERSHEY_PLAIN, 1.1, (0, 100, 255), 1)
         return panel
 
     def _graph_panel(self, graph: dict[str, Any]) -> Any:
@@ -645,19 +1114,35 @@ class SixPanelRenderer:
         origin = occupancy.get("origin") if isinstance(occupancy.get("origin"), dict) else {}
         resolution = float(occupancy.get("resolution", 0.05) or 0.05)
         ox, oy = float(origin.get("x", 0.0) or 0.0), float(origin.get("y", 0.0) or 0.0)
+        origin_yaw = _grid_origin_yaw(origin)
 
         def world_pixel(value: Any) -> tuple[int, int] | None:
             point = _point_xy(value)
             if point is None or resolution <= 0:
                 return None
-            px = int(round((point[0] - ox) / resolution))
-            py = int(round(height - 1 - (point[1] - oy) / resolution))
+            # OccupancyGrid origin is a full 2-D pose, not merely a lower-left
+            # translation.  Convert world coordinates into the grid-local
+            # frame before applying the image-row flip; otherwise a rotated
+            # map draws the robot and every graph node at a fixed offset.
+            dx, dy = point[0] - ox, point[1] - oy
+            cos_yaw, sin_yaw = math.cos(-origin_yaw), math.sin(-origin_yaw)
+            local_x = cos_yaw * dx - sin_yaw * dy
+            local_y = sin_yaw * dx + cos_yaw * dy
+            px = int(round(local_x / resolution))
+            py = int(round(height - 1 - local_y / resolution))
             return (px, py) if 0 <= px < width and 0 <= py < height else None
 
         robot = world_pixel(telemetry.get("position"))
         if robot is not None:
             cv2.circle(canvas, robot, max(3, min(width, height) // 90), (0, 0, 255), -1)
-            yaw = _safe_float(telemetry.get("yaw"))
+            # ``world_pixel`` converts into the grid's local image axes.  A
+            # rotated OccupancyGrid origin therefore requires the same fixed
+            # origin-yaw subtraction for the arrow; otherwise its angle is
+            # offset even though the live body yaw is correct.
+            yaw = telemetry_yaw(telemetry)
+            if yaw is None:
+                yaw = _safe_float(telemetry.get("map_yaw"))
+            yaw -= _grid_origin_yaw(origin)
             tip = (int(robot[0] + 18 * math.cos(yaw)), int(robot[1] - 18 * math.sin(yaw)))
             cv2.arrowedLine(canvas, robot, tip, (255, 80, 0), 2, tipLength=0.3)
         for node in graph.get("nodes", []) if isinstance(graph, dict) else []:
@@ -709,6 +1194,24 @@ class SixPanelRenderer:
             raise RuntimeError("physical viewer requires opencv-python and numpy")
         navigation_step = self.state.advance_navigation_step()
         with self.state._lock:
+            self._observe_occ_map_session(self.state.occupancy)
+            detections = [
+                dict(item)
+                for item in self.state.detections
+                if isinstance(item, dict)
+            ]
+            # The independent source-resolution overlay uses the short RGB
+            # history for late reports.  The composite, however, represents
+            # the current navigation tick: omit boxes rather than painting a
+            # previous detector result on its newest RGB panel. Live reports
+            # must also belong to the current transport generation, because a
+            # restarted bridge can reuse the same integer sequence.
+            if detections and not self.camera_detections_match_current_frame(
+                self.state.frame_seq,
+                self.state.detection_meta,
+                detections,
+            ):
+                detections = []
             snapshot = {
                 "frame_seq": self.state.frame_seq,
                 "navigation_step": navigation_step,
@@ -717,7 +1220,7 @@ class SixPanelRenderer:
                 "graph": dict(self.state.graph),
                 "consistency": dict(self.state.consistency),
                 "navigation": dict(self.state.navigation),
-                "detections": [dict(item) for item in self.state.detections if isinstance(item, dict)],
+                "detections": detections,
             }
             rgb = None if self.state.rgb is None else self.state.rgb.copy()
             planning = self._cached_raw_grid(self.state.occupancy)
@@ -727,6 +1230,7 @@ class SixPanelRenderer:
             map_revision = int(getattr(self.state, "map_revision", 0))
             graph_revision = int(getattr(self.state, "graph_revision", 0))
             navigation_revision = int(getattr(self.state, "navigation_revision", 0))
+            telemetry_revision = int(getattr(self.state, "telemetry_revision", 0))
         step = self._physical_step(snapshot)
         if planning is None:
             global_grid = global_grid or planning
@@ -748,10 +1252,12 @@ class SixPanelRenderer:
             half_w = max(1.0, (world_bounds[2] - world_bounds[0]) * 0.5)
             half_h = max(1.0, (world_bounds[3] - world_bounds[1]) * 0.5)
             self._occ_view_bounds = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
-        # Keep the OCC viewport aligned with the current explored extent. A
-        # startup-locked viewport can leave the robot/path outside the panel
-        # after the map grows or the origin shifts.
-        occ_view_bounds = world_bounds
+        # Keep panel 2 on the startup viewport.  ``known_world_bounds`` grows
+        # as SLAM explores more cells; using it directly here makes the image
+        # suddenly zoom out and fill with unknown grey space.  The locked
+        # bounds are expressed in map coordinates, so the canonical renderer
+        # still applies the current map<-odom transform and grid origin.
+        occ_view_bounds = self._occ_view_bounds or world_bounds
         width, height = self.panel_size
         if rgb is None:
             camera = np.full((height, width, 3), 235, dtype=np.uint8)
@@ -763,16 +1269,15 @@ class SixPanelRenderer:
         # side enlargement uses the source-resolution box+seg endpoint.
         self._draw_live_detections(camera, snapshot["detections"], None if rgb is None else (rgb.shape[0], rgb.shape[1]), include_masks=False)
         occ = self._canonical.render_map_panel(
-            planning, self.panel_size, step, int(step["step_index"]),
+            planning, self.panel_size, self._step_for_grid_axes(step, planning), int(step["step_index"]),
             title="OCC", kind="occupancy", world_bounds=occ_view_bounds,
             draw_global_plan=True, draw_local_plan=False, draw_frontiers=True,
             draw_semantic_candidates=True, draw_route_plan=False,
             draw_interaction_target_links=True,
-            # Match panel 3 (room segments) so OCC and room views use the
-            # same viewport framing and can be compared directly.
-            # Panel 2 should show a slightly wider OCC context than the
-            # room/costmap panels; lower scale means less zoom and more area.
-            view_scale=1.45,
+            # Match panel 3's established framing and never let the historic
+            # trajectory enlarge the locked viewport.
+            view_scale=1.75,
+            expand_crop_for_trajectory=False,
         )
         draw_task_subgoal_header(occ, step, box_width_px=width // 2 - 10, background_alpha=.55)
         # Showcase spatial-understanding panel should show room geometry and
@@ -789,13 +1294,13 @@ class SixPanelRenderer:
         room_step["semantic_selection"] = {"active": False}
         room_step["semantic_execution_state"] = {}
         room_panel = self._canonical.render_room_panel(
-            planning, room, self.panel_size, room_step, int(step["step_index"]), world_bounds,
+            planning, room, self.panel_size, self._step_for_grid_axes(room_step, planning), int(step["step_index"]), world_bounds,
             view_scale=1.75, draw_global_plan=True,
         )
         global_grid = self._cached_global_costmap_for_display(planning, global_grid)
         global_width = width // 2
         global_panel = self._canonical.render_map_panel(
-            global_grid, (global_width, height), step, int(step["step_index"]),
+            global_grid, (global_width, height), self._step_for_grid_axes(step, global_grid), int(step["step_index"]),
             title="GLOBAL COSTMAP", kind="costmap", world_bounds=None,
             draw_global_plan=True, draw_local_plan=False, draw_frontiers=True,
             draw_semantic_candidates=True,
@@ -804,7 +1309,7 @@ class SixPanelRenderer:
             view_scale=1.75,
         )
         local_panel = self._canonical.render_map_panel(
-            local_grid, (width - global_width, height), step, int(step["step_index"]),
+            local_grid, (width - global_width, height), self._step_for_grid_axes(step, local_grid), int(step["step_index"]),
             title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
             draw_local_global_plan=True, draw_local_plan=True, draw_frontiers=False,
             draw_semantic_candidates=False,
@@ -822,7 +1327,10 @@ class SixPanelRenderer:
             cv2.line(local_panel, (bar_right, bar_y - 4), (bar_right, bar_y + 4), (20, 20, 20), 2, cv2.LINE_AA)
             cv2.putText(local_panel, "1 m", (bar_left, bar_y - 7), cv2.FONT_HERSHEY_PLAIN, .8, (20, 20, 20), 1, cv2.LINE_AA)
         costmaps = np.concatenate([global_panel, local_panel], axis=1)
-        spatial_key = (map_revision, graph_revision, navigation_revision)
+        # Panel 5 (semantic XY) includes the live robot arrow.  Its raster is
+        # cached independently from panel 2/3, so a pose-only receipt must
+        # invalidate this cache even when OCC/graph/navigation are unchanged.
+        spatial_key = (map_revision, graph_revision, navigation_revision, telemetry_revision)
         if spatial_key != self._spatial_cache_key:
             self._spatial_cache = self._canonical.render_semantic_xy(
                 planning, self.panel_size, step, int(step["step_index"]), world_bounds,
@@ -920,6 +1428,23 @@ class _WebHandler(BaseHTTPRequestHandler):
     latest_camera_box_jpeg: bytes = b""
     latest_panel3_jpeg: bytes = b""
     latest_panel6_jpeg: bytes = b""
+    # Revisions advance only when the corresponding render worker publishes a
+    # new cached JPEG.  Browser timers may run faster than a stalled sensor or
+    # an unchanged heavy-render key; explicit cursors then turn those polls
+    # into body-less responses instead of retransmitting and decoding the
+    # same image.
+    latest_snapshot_revision = 0
+    latest_camera_revision = 0
+    latest_camera_box_revision = 0
+    # Namespace validators across a gateway restart.  Render counters restart
+    # at zero, so revision alone is not a safe HTTP ETag for a long-lived
+    # browser cache.
+    image_cache_epoch = secrets.token_hex(6)
+    # Shared revision for the two native renderer panels.  Browser clients
+    # poll these panels independently from the composite snapshot; returning
+    # 204 when the revision is unchanged avoids repeatedly transferring and
+    # decoding identical JPEGs while the six-panel renderer is between ticks.
+    latest_panel_revision = 0
     phone_lock = threading.Lock()
     latest_phone_jpeg: bytes = b""
     latest_phone_at = 0.0
@@ -944,10 +1469,81 @@ class _WebHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
-    def _json(self, value: Any, status: int = 200) -> None:
+    def _json(
+        self,
+        value: Any,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         data = json.dumps(value, ensure_ascii=False, default=str).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        self.send_header("Content-Length", str(len(data)))
+        for key, header_value in (headers or {}).items():
+            self.send_header(str(key), str(header_value))
+        self.end_headers(); self.wfile.write(data)
+
+    def _not_modified(self, revisions: dict[str, Any]) -> None:
+        """Return a body-less conditional-poll response for large web data."""
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        for key, value in revisions.items():
+            self.send_header("X-Physical-" + str(key).replace("_", "-"), str(value))
+        self.end_headers()
+
+    def _revisioned_jpeg(
+        self,
+        frame: bytes,
+        revision: int,
+        *,
+        scope: str,
+        not_ready_error: str,
+    ) -> None:
+        """Serve a cached JPEG once per client-visible render revision.
+
+        ``after`` is the deterministic path used by the dashboard fetchers;
+        ETag additionally keeps direct ``<img>`` users and external viewers
+        cache-friendly.  A 204 is intentional for the explicit cursor path:
+        Fetch exposes it without synthesizing a cached 200 response, so the
+        caller can skip both ``blob()`` and image decoding.
+        """
+        if not frame:
+            self._json({"ok": False, "error": not_ready_error}, 503)
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            after = int((query.get("after") or [-1])[0])
+        except (TypeError, ValueError):
+            after = -1
+        revision = int(revision)
+        epoch = str(getattr(self, "image_cache_epoch", "legacy"))
+        etag = f'"physical-{epoch}-{scope}-{revision}"'
+        common_headers = {
+            "X-Physical-Image-Revision": str(revision),
+            "ETag": etag,
+            "Cache-Control": "private, no-cache, must-revalidate",
+        }
+        if revision > 0 and after == revision:
+            self.send_response(204)
+            for key, value in common_headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.headers.get("If-None-Match", "").strip() == etag:
+            self.send_response(304)
+            for key, value in common_headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(frame)))
+        for key, value in common_headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(frame)
 
     def _read_json_payload(self) -> dict[str, Any]:
         try:
@@ -1190,6 +1786,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "camera_position": item.get("camera_position"),
                 "camera_box3d_center": item.get("camera_box3d_center"),
                 "camera_box3d_size": item.get("camera_box3d_size"),
+                "camera_obb_center": item.get("camera_obb_center"),
+                "camera_obb_size": item.get("camera_obb_size"),
+                "camera_obb_orientation": item.get("camera_obb_orientation"),
                 "position": item.get("world_position", item.get("position")),
                 "world_position": item.get("world_position"),
                 "world_box3d_center": item.get("world_box3d_center"),
@@ -1466,11 +2065,98 @@ class _WebHandler(BaseHTTPRequestHandler):
             # Raw map/graph receipts are polled separately by showcase pages;
             # this keeps the normal state endpoint lightweight while allowing
             # independent canvas redraws from semantic data.
-            self._json(self.state.visualization_snapshot()); return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            revisions = self.state.visualization_revisions()
+            # This payload contains only the raw OCC grid (not room/global/
+            # local costmaps), so a room-grid heartbeat must not invalidate it
+            # and force browsers to download the same multi-megabyte OCC
+            # array again.  Keep the public header name for compatibility,
+            # but use the dedicated occupancy revision as its value.
+            revisions["map_revision"] = revisions.get(
+                "occupancy_revision", revisions.get("map_revision", 0)
+            )
+            # The raw OCC/graph payload is large, while pose, mapped detector
+            # overlays and navigation state are small/high-rate updates.  Keep
+            # independent cursors so a 10-Hz camera/YOLO stream can receive a
+            # tiny patch instead of re-downloading the entire map.
+            supplied = {
+                key: (query.get("after_" + key.removesuffix("_revision")) or [None])[0]
+                for key in (
+                    "map_revision", "graph_revision", "telemetry_revision",
+                    "detection_revision", "navigation_revision",
+                )
+            }
+            response_headers = {
+                "X-Physical-Map-Revision": revisions["map_revision"],
+                "X-Physical-Graph-Revision": revisions["graph_revision"],
+                "X-Physical-Telemetry-Revision": revisions["telemetry_revision"],
+                "X-Physical-Detection-Revision": revisions["detection_revision"],
+                "X-Physical-Navigation-Revision": revisions["navigation_revision"],
+            }
+            not_modified_headers = {
+                "map_revision": revisions["map_revision"],
+                "graph_revision": revisions["graph_revision"],
+                "telemetry_revision": revisions["telemetry_revision"],
+                "detection_revision": revisions["detection_revision"],
+                "navigation_revision": revisions["navigation_revision"],
+            }
+            if all(value is not None for value in supplied.values()):
+                try:
+                    changed = {
+                        key
+                        for key, value in supplied.items()
+                        if int(value) != revisions[key]
+                    }
+                    if not changed:
+                        self._not_modified(not_modified_headers)
+                        return
+                    # OCC is the only large payload that cannot be merged from
+                    # an independent patch.  Graph JSON is still copied, but
+                    # it is substantially smaller than the raw grid and can be
+                    # refreshed without re-sending OCC when the mapper emits a
+                    # visibility heartbeat.
+                    heavy_changed = changed & {"map_revision"}
+                    if not heavy_changed:
+                        fields = {
+                            key.removesuffix("_revision")
+                            for key in changed
+                            if key in {
+                                "graph_revision", "telemetry_revision",
+                                "detection_revision", "navigation_revision",
+                            }
+                        }
+                        # Revision names intentionally differ from payload
+                        # names only for mapped detections.
+                        if "detection" in fields:
+                            fields.remove("detection")
+                            fields.add("mapped_detections")
+                        self._json(
+                            self.state.visualization_delta(fields),
+                            headers=response_headers,
+                        )
+                        return
+                except (TypeError, ValueError):
+                    pass
+            self._json(
+                self.state.visualization_snapshot(),
+                headers=response_headers,
+            ); return
         if path == "/api/occupancy":
             # Dedicated latest-only map endpoint.  Do not make the browser
             # download RGB/depth/detections when it only needs OCC.
-            self._json(self.state.occupancy_snapshot()); return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            revisions = self.state.visualization_revisions()
+            after = (query.get("after") or [None])[0]
+            try:
+                if after is not None and int(after) == revisions["occupancy_revision"]:
+                    self._not_modified({"occupancy-revision": revisions["occupancy_revision"]})
+                    return
+            except (TypeError, ValueError):
+                pass
+            self._json(
+                self.state.occupancy_snapshot(),
+                headers={"X-Physical-Occupancy-Revision": revisions["occupancy_revision"]},
+            ); return
         if path == "/api/raw-frame":
             self._json(self.state.raw_frame()); return
         if path == "/api/health":
@@ -1489,27 +2175,45 @@ class _WebHandler(BaseHTTPRequestHandler):
             # multipart stream through some LAN proxies/browser setups.
             with self.frame_lock:
                 frame = self.latest_jpeg
-            if not frame:
-                self._json({"ok": False, "error": "frame not ready"}, 503); return
-            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+                revision = self.latest_snapshot_revision
+            self._revisioned_jpeg(
+                frame, revision, scope="snapshot", not_ready_error="frame not ready"
+            ); return
         if path == "/camera-overlay.jpg":
             with self.frame_lock:
                 frame = self.latest_camera_jpeg
-            if not frame:
-                self._json({"ok": False, "error": "camera overlay not ready"}, 503); return
-            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+                revision = self.latest_camera_revision
+            self._revisioned_jpeg(
+                frame, revision, scope="camera-overlay",
+                not_ready_error="camera overlay not ready",
+            ); return
         if path == "/camera-box-overlay.jpg":
             with self.frame_lock:
                 frame = self.latest_camera_box_jpeg
-            if not frame:
-                self._json({"ok": False, "error": "box-only camera overlay not ready"}, 503); return
-            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+                revision = self.latest_camera_box_revision
+            self._revisioned_jpeg(
+                frame, revision, scope="camera-box-overlay",
+                not_ready_error="box-only camera overlay not ready",
+            ); return
         if path in {"/original-panel3.jpg", "/original-panel6.jpg"}:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                after = int((query.get("after") or [0])[0])
+            except (TypeError, ValueError):
+                after = 0
             with self.frame_lock:
                 frame = self.latest_panel3_jpeg if path.endswith("panel3.jpg") else self.latest_panel6_jpeg
+                revision = int(self.latest_panel_revision)
             if not frame:
                 self._json({"ok": False, "error": "original renderer panel not ready"}, 503); return
-            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+            if after > 0 and after == revision:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.send_header("X-Physical-Panel-Revision", str(revision))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("X-Physical-Panel-Revision", str(revision)); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
         if path in {"/panel1.jpg", "/panel5.jpg"}:
             panel_index = 0 if path.startswith("/panel1") else 4
             with self.frame_lock:
@@ -1811,9 +2515,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "global_plan", "local_global_plan", "local_plan", "telemetry", "mllm_events", "explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace"}:
                 self._json({"accepted": False, "error": "unsupported ROS state"}, 400); return
             if name in {"explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace", "global_plan", "local_global_plan", "local_plan"}:
-                self.state.navigation[name] = value
+                # Keep the navigation assignment and revision update atomic.
+                # In particular, do not mutate ``navigation`` directly: the
+                # visualization delta endpoint uses ``navigation_revision``
+                # to decide whether a new plan/subgoal is available.
+                self.state.update_navigation(name, value)
             else:
                 self.state.update_topic(name, value)
+                if name == "detections":
+                    # Feed the optional viewer's exact-pair cache directly.
+                    # RuntimeState's detection_revision intentionally tracks
+                    # mapped detections for the spatial canvas, so it cannot
+                    # serve as the source-camera overlay revision.
+                    self.renderer.remember_camera_detections(value)
             recorder = getattr(self, "recorder", None)
             if recorder is not None:
                 if name == "mllm_events":
@@ -1946,23 +2660,41 @@ function renderM3(m3){
 }
 function num(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'}
 function speed(t){const v=t?.velocity||t?.linear_velocity||[];if(Array.isArray(v))return Math.hypot(...v.slice(0,3).map(Number));if(v&&typeof v==='object')return Math.hypot(Number(v.x||0),Number(v.y||0),Number(v.z||0));return Number(t?.speed||0)}
-function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},ctl=s.control||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');const controlClass=ctl.status==='enabled'?'good':(ctl.status==='blocked'?'bad':'warn');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge '+controlClass,ctl.label||'控制器状态未知'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#control-status').textContent=ctl.label||'控制器状态未知';q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
+function liveYaw(t){const raw=t?.yaw,direct=(raw===null||raw===undefined||raw==='')?NaN:Number(raw);if(Number.isFinite(direct))return direct;const r=t?.imu?.rpy;if(Array.isArray(r)&&Number.isFinite(Number(r[2])))return Number(r[2]);const q=t?.imu?.quaternion;if(Array.isArray(q)&&q.length>=4){const w=Number(q[0]),x=Number(q[1]),y=Number(q[2]),z=Number(q[3]);if([w,x,y,z].every(Number.isFinite))return Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))}return NaN}
+function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},ctl=s.control||{},grid=make('div','state-grid'),yaw=liveYaw(t);const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((yaw*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');const controlClass=ctl.status==='enabled'?'good':(ctl.status==='blocked'?'bad':'warn');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge '+controlClass,ctl.label||'控制器状态未知'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#control-status').textContent=ctl.label||'控制器状态未知';q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
 async function refresh(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'}),s=await r.json();renderEvents('#m1',s.mllm?.M1,'M1');renderEvents('#m2',m2EventsWithLiveState(s),'M2');renderM3(s.m3||{});renderGo2(s)}catch(e){q('#stamp').textContent='刷新失败';q('#go2').replaceChildren(make('div','empty',clip(e,100)))}}
-function refreshStill(id,path){
+async function refreshStill(id,path){
   if(document.hidden)return;
   const image=q(id);
-  // Do not replace an in-flight image request.  Reassigning ``src`` every
-  // 100 ms used to cancel a slower LAN response and caused a BrokenPipe /
-  // reconnect storm on the gateway.  A slow client now drops display ticks
-  // locally and immediately resumes at the newest cached frame.
+  // Poll by render revision rather than creating a fresh timestamped URL.
+  // Slow clients still drop display ticks locally, while an unchanged server
+  // frame now returns 204 before any JPEG bytes are transferred or decoded.
   if(!image||image.dataset.loading==='1')return;
   image.dataset.loading='1';
-  const done=()=>{image.dataset.loading='0'};
-  image.onload=done;image.onerror=done;
-  image.src=path+'?ts='+Date.now();
+  let nextUrl='';
+  try{
+    const revision=image.dataset.revision||'',url=revision?path+'?after='+encodeURIComponent(revision):path;
+    const response=await fetch(url,{cache:'no-store'});
+    if(response.status===204)return;
+    if(!response.ok)throw new Error('image '+response.status);
+    nextUrl=URL.createObjectURL(await response.blob());
+    await new Promise((resolve,reject)=>{
+      image.onload=resolve;image.onerror=reject;image.src=nextUrl;
+    });
+    const previousUrl=image.dataset.objectUrl||'';
+    image.dataset.objectUrl=nextUrl;nextUrl='';
+    if(previousUrl)URL.revokeObjectURL(previousUrl);
+    const nextRevision=response.headers.get('X-Physical-Image-Revision');
+    if(nextRevision!==null)image.dataset.revision=nextRevision;
+  }catch(_){
+    /* Preserve the last displayed image; retry on the next timer tick. */
+  }finally{
+    if(nextUrl)URL.revokeObjectURL(nextUrl);
+    image.dataset.loading='0';
+  }
 }
 function resumeDashboard(){if(document.hidden)return;refresh();refreshStill('#overview','/snapshot.jpg');refreshStill('#overview-camera','/camera-box-overlay.jpg')}
-setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 5 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),200);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
+setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 10 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),100);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
 </script></html>"""
 
 
@@ -1980,14 +2712,14 @@ function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.classNa
 function number(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'}
 function velocity(t){const v=t?.velocity||t?.linear_velocity||[];return Array.isArray(v)?Math.hypot(...v.slice(0,3).map(Number)):Number(t?.speed||0)}
 function resultText(event){if(!event)return '等待调用';if(event.error)return '调用异常：'+short(event.error);let raw=event.raw_text??event.response?.raw_text??event.payload?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);try{const o=JSON.parse(raw),rank=o.ranked_ids||o.candidate_id||o.label||o.state||'';return short([Array.isArray(rank)?rank.join(' → '):rank,o.reason].filter(Boolean).join(' · ')||'调用完成')}catch(_){return short(raw||'调用完成')}}
-function renderMetrics(s){const t=s.telemetry||{},b=t.battery||{},yaw=Number(t.yaw),items=[['电量',number(b.soc??t.battery_soc,0)+' %'],['移动速度',number(velocity(t),2)+' m/s'],['航向',Number.isFinite(yaw)?number(yaw*180/Math.PI,1)+'°':'--'],['机器人动作',t.mode===undefined?'--':'模式 '+t.mode]];const box=el('metrics');box.replaceChildren();items.forEach(([name,value])=>{const m=node('div','metric');m.append(node('div','name',name),node('div','value',value));box.append(m)});const line=el('statusline');line.replaceChildren(node('span','pill '+(s.link?.connected===false?'':'safe'),s.link?.connected===false?'相机离线':'D435i 在线'),node('span','pill safe','实物动作阻断'),node('span','pill','语义节点 '+(s.graph?.node_count??0)),node('span','pill','感知目标 '+(s.detections?.length??0)));el('stamp').textContent=s.link?.connected===false?'连接异常':'实时连接';el('step').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--');el('perception-meta').textContent='RGB · YOLOE Box · '+(s.detections?.length??0)+' targets'}
+function renderMetrics(s){const t=s.telemetry||{},b=t.battery||{},yaw=liveYaw(t),items=[['电量',number(b.soc??t.battery_soc,0)+' %'],['移动速度',number(velocity(t),2)+' m/s'],['航向',Number.isFinite(yaw)?number(yaw*180/Math.PI,1)+'°':'--'],['机器人动作',t.mode===undefined?'--':'模式 '+t.mode]];const box=el('metrics');box.replaceChildren();items.forEach(([name,value])=>{const m=node('div','metric');m.append(node('div','name',name),node('div','value',value));box.append(m)});const line=el('statusline');line.replaceChildren(node('span','pill '+(s.link?.connected===false?'':'safe'),s.link?.connected===false?'相机离线':'D435i 在线'),node('span','pill safe','实物动作阻断'),node('span','pill','语义节点 '+(s.graph?.node_count??0)),node('span','pill','感知目标 '+(s.detections?.length??0)));el('stamp').textContent=s.link?.connected===false?'连接异常':'实时连接';el('step').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--');el('perception-meta').textContent='RGB · YOLOE Box · '+(s.detections?.length??0)+' targets'}
 function renderCalls(s){const all=[...(s.mllm?.M1||[]),...(s.mllm?.M2||[])].sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));el('call-count').textContent=all.length+' 次近期记录';const box=el('calls');box.replaceChildren();if(!all.length){box.append(node('div','empty','等待真实 MLLM 调用'));return}all.slice(0,6).forEach(e=>{const stage=e.stage||'MLLM',row=node('div','call'),badge=node('div','stagebadge',stage),main=node('div','callmain'),purpose=stage==='M1'?'识别交互属性与状态':'选择下一语义子目标';main.append(node('b','',purpose),node('span','',resultText(e)));row.append(badge,main,node('div','latency',e.latency_s!=null?number(e.latency_s,2)+' s':'完成'));box.append(row)})}
 const dialogueLast={};
 function dialogueItem(role,title,body,kind='',stamp=''){const sig=[title,body].join('|');if(dialogueLast[role]===sig)return null;dialogueLast[role]=sig;const row=node('div','message'),avatar=node('div','avatar',role),bubble=node('div','bubble '+kind);bubble.append(node('b','',title),node('p','',body));if(stamp)bubble.append(node('time','',new Date(Number(stamp)*1000).toLocaleTimeString()));row.append(avatar,bubble);return row}
 function firstText(o,keys){for(const k of keys){const v=o?.[k];if(v!==undefined&&v!==null&&v!=='')return clean(typeof v==='object'?JSON.stringify(v):v)}return ''}
 function renderDialogue(s){const n=s.navigation||{},trace=n.decision_trace||{},exec=n.execution_state||{},feedback=n.behavior_feedback||{},interaction=n.interaction_result||{},box=el('dialogue'),rows=[];const candidate=firstText(trace,['executed_candidate_id','model_selected_candidate_id','active_candidate_id'])||firstText(exec,['candidate_id']);const reason=firstText(trace,['model_reason','selection_override_reason','model_result_source','model_error']);rows.push(dialogueItem('A','Agent 决策',candidate?'选择候选 '+candidate+(reason?'；'+short(reason,80):''):'当前没有可执行候选，继续更新感知与交互图','',trace.timestamp));const state=firstText(exec,['state'])||'IDLE',behavior=firstText(exec,['behavior_type']);rows.push(dialogueItem('→','当前行为',behavior?state+' · '+behavior+(candidate?' · '+candidate:''):state==='IDLE'?'保持待机，等待有效子目标':state,'command',exec.timestamp));if(Object.keys(feedback).length){const status=firstText(feedback,['status'])||'反馈更新',target=firstText(feedback,['target_name','target_id','candidate_id']);rows.push(dialogueItem('R','行为反馈',status+(target?' · '+target:''),/SUCCESS|COMPLETE|PASS/i.test(status)?'success':'',feedback.timestamp))}if(Object.keys(interaction).length){const status=firstText(interaction,['status','success'])||'结果已回传',target=firstText(interaction,['source_object_name','object_id','instance_id']);rows.push(dialogueItem('M3','交互结果验证',status+(target?' · '+target:''),'success',interaction.timestamp))}const previous=[...box.children];rows.filter(Boolean).forEach(row=>box.prepend(row));if(!box.children.length&&!previous.length)box.append(node('div','empty','等待 Agent 行为事件'));while(box.children.length>9)box.lastElementChild.remove()}
-let videoBusy=false;
-async function refreshVideo(){if(videoBusy)return;videoBusy=true;try{const r=await fetch('/snapshot.jpg?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);const bmp=await createImageBitmap(await r.blob());[["view1",0,0],["view3",960,0],["view6",960,270]].forEach(([id,x,y])=>el(id).getContext('2d').drawImage(bmp,x,y,480,270,0,0,480,270));bmp.close()}catch(_){el('live').textContent='画面重连中'}finally{videoBusy=false}}
+let videoBusy=false,videoRevision=null;
+async function refreshVideo(){if(videoBusy)return;videoBusy=true;try{const url=videoRevision===null?'/snapshot.jpg':'/snapshot.jpg?after='+encodeURIComponent(videoRevision),r=await fetch(url,{cache:'no-store'});if(r.status===204)return;if(!r.ok)throw Error(r.status);const bmp=await createImageBitmap(await r.blob());try{[["view1",0,0],["view3",960,0],["view6",960,270]].forEach(([id,x,y])=>el(id).getContext('2d').drawImage(bmp,x,y,480,270,0,0,480,270));const revision=r.headers.get('X-Physical-Image-Revision');if(revision!==null)videoRevision=revision}finally{bmp.close()}}catch(_){el('live').textContent='画面重连中'}finally{videoBusy=false}}
 async function refreshState(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);const s=await r.json();renderMetrics(s);renderCalls(s);renderDialogue(s);el('live').textContent='系统在线'}catch(_){el('live').textContent='状态重连中'}}
 setInterval(refreshVideo,200);setInterval(refreshState,1000);refreshVideo();refreshState();
 </script></html>"""
@@ -2128,6 +2860,16 @@ class PhysicalGateway:
         self._sensor_event = threading.Event()
         self._latest_sensor_packet: dict[str, Any] | None = None
         self._latest_sensor_stamp = float("-inf")
+        # The direct ROS bridge annotates mirrored packets with a transport
+        # session/connection and a host-local bridge sequence.  These keys
+        # survive a Go2 wall-clock rollback and source-sequence reset, while
+        # retired sessions are rejected if an old HTTP request arrives late.
+        self._active_sensor_session: str | None = None
+        self._active_sensor_connection = -1
+        self._retired_sensor_sessions: set[str] = set()
+        self._latest_sensor_bridge_seq = -1
+        self._sensor_source_seq = -1
+        self._legacy_sensor_connection = 0
         self._last_record_snapshot_mono = 0.0
         threading.Thread(target=self._sensor_decode_loop, daemon=True).start()
         if record_on_start:
@@ -2146,28 +2888,127 @@ class PhysicalGateway:
                 },
             )
 
+    def new_legacy_sensor_connection(self) -> int:
+        """Allocate a generation for the deprecated direct WebSocket path."""
+        with self._sensor_lock:
+            self._legacy_sensor_connection += 1
+            return self._legacy_sensor_connection
+
     def _process_sensor_frame(self, packet: dict[str, Any]) -> None:
         if packet.get("camera_imu") and int(packet.get("seq", 0)) % 50 == 0:
             print(f"camera_imu received seq={packet.get('seq')} keys={list(packet['camera_imu'])}", flush=True)
         rgb = _decode(packet["rgb"]["data"], "jpeg")
-        depth = _decode(packet["depth"]["data"], "png16")
-        self.state.update_frame(
-            rgb=rgb,
-            depth=depth,
-            rgb_b64=packet["rgb"]["data"],
-            depth_b64=packet["depth"]["data"],
-            depth_scale=float(packet.get("depth_scale", .001)),
-            intrinsics=packet.get("intrinsics", {}),
-            rgb_intrinsics=packet.get("rgb_intrinsics", packet.get("intrinsics", {})),
-            depth_intrinsics=packet.get("depth_intrinsics", packet.get("intrinsics", {})),
-            depth_to_color_extrinsics=packet.get("depth_to_color_extrinsics", {}),
-            camera_frame=packet.get("camera_frame", ""),
-            depth_frame=packet.get("depth_frame", packet.get("camera_frame", "")),
-            camera_imu=packet.get("camera_imu", {}),
-            frame_seq=int(packet["seq"]),
-            frame_stamp=float(packet["stamp"]),
-            sync_ms=packet.get("color_depth_sync_ms"),
+        # This process is an optional viewer: no renderer consumes the decoded
+        # depth ndarray.  Keep the original PNG16 bytes for /api/raw-frame and
+        # recording, but avoid a second full-frame depth decode beside the
+        # authoritative ROS sensor bridge on every 10-Hz receipt.
+        depth = None
+        frame_sequence = int(packet.get("_bridge_seq", packet.get("seq", -1)))
+        # Decoding can take long enough for a reconnect to supersede this
+        # receipt.  Linearize the generation check with both RuntimeState and
+        # camera-cache publication.  Without holding ``_sensor_lock`` across
+        # this small commit, a new generation could become active after the
+        # check but before an old decoded frame was written back.
+        with self._sensor_lock:
+            if not self._sensor_generation_is_current_locked(packet):
+                return
+            self.state.update_frame(
+                rgb=rgb,
+                depth=depth,
+                rgb_b64=packet["rgb"]["data"],
+                depth_b64=packet["depth"]["data"],
+                depth_scale=float(packet.get("depth_scale", .001)),
+                intrinsics=packet.get("intrinsics", {}),
+                rgb_intrinsics=packet.get("rgb_intrinsics", packet.get("intrinsics", {})),
+                depth_intrinsics=packet.get("depth_intrinsics", packet.get("intrinsics", {})),
+                depth_to_color_extrinsics=packet.get("depth_to_color_extrinsics", {}),
+                camera_frame=packet.get("camera_frame", ""),
+                depth_frame=packet.get("depth_frame", packet.get("camera_frame", "")),
+                camera_imu=packet.get("camera_imu", {}),
+                capture_timing=packet.get("capture_timing", {}),
+                frame_seq=frame_sequence,
+                frame_stamp=float(packet["stamp"]),
+                sync_ms=packet.get("color_depth_sync_ms"),
+                # ``sensor_frame`` carries a capture-time pose subset.  Feed it
+                # into RuntimeState atomically with the image so the six-panel
+                # robot arrow follows every RGB-D receipt even if the separate
+                # telemetry mirror is delayed. RuntimeState merges this patch,
+                # preserving battery/range fields from the full telemetry stream.
+                telemetry=packet.get("telemetry")
+                if isinstance(packet.get("telemetry"), dict)
+                else None,
+                # A persistent web gateway can outlive the direct sensor bridge.
+                # Carry its transport generation into RuntimeState so a reset
+                # source sequence/clock is accepted as a new pose stream.
+                telemetry_transport_session=packet.get("_transport_session"),
+                telemetry_transport_connection=packet.get("_transport_connection"),
+            )
+            self.renderer.remember_camera_frame(
+                frame_sequence,
+                rgb,
+                transport_session=packet.get("_transport_session"),
+                transport_connection=packet.get("_transport_connection", 0),
+            )
+
+    def _accept_sensor_generation(self, packet: dict[str, Any]) -> bool:
+        """Apply transport generation ordering while holding ``_sensor_lock``."""
+        session = packet.get("_transport_session")
+        session = str(session) if session not in (None, "") else None
+        try:
+            connection = int(packet.get("_transport_connection", 0) or 0)
+        except (TypeError, ValueError):
+            connection = 0
+        # Legacy packets have no generation metadata.  Preserve their
+        # sequence/stamp gate, but do not let one overwrite an annotated live
+        # stream once the direct bridge is active.
+        if session is None:
+            return self._active_sensor_session is None
+        if session in self._retired_sensor_sessions:
+            return False
+        if self._active_sensor_session is None:
+            self._active_sensor_session = session
+            self._active_sensor_connection = connection
+            self._sensor_source_seq = -1
+            self._latest_sensor_bridge_seq = -1
+            return True
+        if session != self._active_sensor_session:
+            self._retired_sensor_sessions.add(self._active_sensor_session)
+            self._active_sensor_session = session
+            self._active_sensor_connection = connection
+            self._sensor_source_seq = -1
+            self._latest_sensor_bridge_seq = -1
+            # A packet from the retired source may still be waiting for the
+            # decoder.  Drop that encoded receipt before accepting the new
+            # generation, otherwise its old source seq would block seq=1.
+            self._latest_sensor_packet = None
+            return True
+        if connection < self._active_sensor_connection:
+            return False
+        if connection > self._active_sensor_connection:
+            self._active_sensor_connection = connection
+            self._sensor_source_seq = -1
+            self._latest_sensor_bridge_seq = -1
+            self._latest_sensor_packet = None
+        return True
+
+    def _sensor_generation_is_current_locked(self, packet: dict[str, Any]) -> bool:
+        """Check a decoded receipt while the caller owns ``_sensor_lock``."""
+
+        session = packet.get("_transport_session")
+        if session in (None, ""):
+            return self._active_sensor_session is None
+        try:
+            connection = int(packet.get("_transport_connection", 0) or 0)
+        except (TypeError, ValueError):
+            connection = 0
+        return (
+            str(session) == self._active_sensor_session
+            and connection == self._active_sensor_connection
         )
+
+    def _sensor_generation_is_current(self, packet: dict[str, Any]) -> bool:
+        with self._sensor_lock:
+            return self._sensor_generation_is_current_locked(packet)
 
     def queue_sensor_frame(self, packet: dict[str, Any]) -> None:
         """Validate and retain only the newest not-yet-decoded RGB-D frame."""
@@ -2178,16 +3019,48 @@ class PhysicalGateway:
         self.recorder.record_sensor_packet(packet)
         self.state.sensor_link_active()
         stamp = float(packet.get("stamp", 0.0))
+        try:
+            source_seq = int(packet.get("seq", -1))
+        except (TypeError, ValueError):
+            source_seq = -1
+        try:
+            bridge_seq = int(packet.get("_bridge_seq", -1))
+        except (TypeError, ValueError):
+            bridge_seq = -1
         with self._sensor_lock:
+            if not self._accept_sensor_generation(packet):
+                with self.state._lock:
+                    self.state.counters["dropped"] += 1
+                return
             pending_stamp = (
                 float(self._latest_sensor_packet.get("stamp", 0.0))
                 if self._latest_sensor_packet is not None
                 else float("-inf")
             )
-            # A timed-out SSH forwarding channel can finish delivering after
-            # its replacement is live. Never let that delayed session move the
-            # shared camera receipt backwards or replace a newer queued frame.
-            if stamp <= max(self._latest_sensor_stamp, pending_stamp):
+            pending_source_seq = int(
+                self._latest_sensor_packet.get("seq", -1)
+                if self._latest_sensor_packet is not None
+                else -1
+            )
+            pending_bridge_seq = int(
+                self._latest_sensor_packet.get("_bridge_seq", -1)
+                if self._latest_sensor_packet is not None
+                else -1
+            )
+            # Prefer bridge/source sequence keys.  Raw wall-clock stamps are
+            # only a fallback for old/replay packets and must not discard a
+            # new frame after a source clock step backwards.
+            if bridge_seq >= 0:
+                if bridge_seq <= max(self._latest_sensor_bridge_seq, pending_bridge_seq):
+                    with self.state._lock:
+                        self.state.counters["dropped"] += 1
+                    return
+            elif source_seq >= 0:
+                if source_seq <= max(self._sensor_source_seq, pending_source_seq):
+                    with self.state._lock:
+                        self.state.counters["dropped"] += 1
+                    return
+            elif stamp <= max(self._latest_sensor_stamp, pending_stamp):
                 with self.state._lock:
                     self.state.counters["dropped"] += 1
                 return
@@ -2195,6 +3068,9 @@ class PhysicalGateway:
                 with self.state._lock:
                     self.state.counters["dropped"] += 1
             self._latest_sensor_packet = packet
+            if bridge_seq >= 0:
+                self._latest_sensor_bridge_seq = bridge_seq
+            self._sensor_source_seq = max(self._sensor_source_seq, source_seq)
             self._sensor_event.set()
 
     def _sensor_decode_loop(self) -> None:
@@ -2206,14 +3082,18 @@ class PhysicalGateway:
                 self._sensor_event.clear()
             if packet is None:
                 continue
+            if not self._sensor_generation_is_current(packet):
+                continue
             # Claim before decoding so a delayed packet from another socket
             # cannot enter the queue while this newer receipt is in flight.
             packet_stamp = float(packet.get("stamp", 0.0))
+            packet_bridge_seq = int(packet.get("_bridge_seq", -1) or -1)
             with self._sensor_lock:
-                self._latest_sensor_stamp = max(
-                    self._latest_sensor_stamp,
-                    packet_stamp,
-                )
+                self._latest_sensor_stamp = max(self._latest_sensor_stamp, packet_stamp)
+                if packet_bridge_seq >= 0:
+                    self._latest_sensor_bridge_seq = max(
+                        self._latest_sensor_bridge_seq, packet_bridge_seq
+                    )
             try:
                 self._process_sensor_frame(packet)
             except Exception as exc:
@@ -2247,6 +3127,7 @@ class PhysicalGateway:
         handler = type("PhysicalWebHandler", (_WebHandler,), {})
         handler.state, handler.renderer, handler.gate = self.state, self.renderer, self.gate
         handler.gateway = self
+        handler.image_cache_epoch = secrets.token_hex(6)
         # Keep the recorder on the handler class so every HTTP worker (including
         # the phone publisher and recording controls) writes into the same
         # session owned by this gateway.  Omitting this assignment silently
@@ -2274,8 +3155,7 @@ class PhysicalGateway:
         # this closure as an instance method and adds an unwanted ``self``.
         handler.qwen_submit = staticmethod(submit_qwen)
         self.http = _ReusableHTTPServer((self.host, self.port), handler)
-        camera_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="camera-overlay")
-        record_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="physical-recording")
+        record_worker = _LatestRecordingWorker(self.recorder)
         def camera_overlay_loop() -> None:
             """Publish source-resolution camera overlays independently.
 
@@ -2287,24 +3167,51 @@ class PhysicalGateway:
             control and always works from the newest RuntimeState frame.
             """
             period = 0.1  # 10 Hz perception display target
+            last_pair_key: tuple[Any, ...] | None = None
             while True:
                 started = time.monotonic()
                 try:
-                    # Generate each representation once per camera tick.  The
-                    # right-side image intentionally keeps segmentation,
-                    # while the presentation six-panel remains box-only.
-                    # One source-resolution overlay is sufficient for both
-                    # endpoints. Rendering masked and box-only JPEGs in
-                    # parallel doubled the CPU cost of the 10-Hz camera
-                    # path and starved the actual perception/ROS callbacks.
-                    box_future = camera_pool.submit(
-                        self.renderer.render_camera_overlay, include_masks=False
+                    # A detector report normally arrives after its RGB frame.
+                    # The candidate key includes detection_revision, so the
+                    # same capture is rendered again when its boxes arrive;
+                    # the bounded cache supplies that capture's exact RGB.
+                    candidate = self.renderer.camera_overlay_candidate()
+                    if candidate is None:
+                        time.sleep(min(period, 0.02))
+                        continue
+                    pair_key, pair_rgb, pair_detections = candidate
+                    if pair_key == last_pair_key:
+                        time.sleep(min(period, 0.02))
+                        continue
+                    # Generate one source-resolution box overlay per camera
+                    # tick.  The presentation path intentionally stays
+                    # box-only; segmentation remains available through the
+                    # detector/ROS products and is not painted over the RGB
+                    # image used for navigation review.
+                    # This loop already owns a dedicated thread. Submitting to
+                    # another pool and immediately blocking on ``result()``
+                    # adds a context switch without creating concurrency.
+                    camera_box = self.renderer.render_camera_overlay(
+                        include_masks=False,
+                        rgb=pair_rgb,
+                        detections=pair_detections,
                     )
-                    camera_box = box_future.result()
                     camera_seg = camera_box
+                    if not self.renderer.camera_overlay_key_is_current(pair_key):
+                        # JPEG encoding is deliberately outside the receipt
+                        # locks. If a reconnect or corrected YOLO report won
+                        # during that work, discard this obsolete product
+                        # instead of briefly publishing it after the new one.
+                        time.sleep(
+                            max(0.0, period - (time.monotonic() - started))
+                        )
+                        continue
                     with handler.frame_lock:
                         handler.latest_camera_jpeg = camera_seg
                         handler.latest_camera_box_jpeg = camera_box
+                        handler.latest_camera_revision += 1
+                        handler.latest_camera_box_revision += 1
+                    last_pair_key = pair_key
                 except Exception as exc:
                     self.state.last_error = f"camera overlay: {exc}"
                 time.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -2323,11 +3230,39 @@ class PhysicalGateway:
             except (TypeError, ValueError):
                 render_hz = 5.0
             render_period = 1.0 / max(0.5, min(10.0, render_hz))
+            last_render_key: tuple[Any, ...] | None = None
+            # Allow the first composite to render immediately.  A negative
+            # infinity sentinel would make the elapsed-time calculation
+            # infinite and the loop would sleep forever without producing a
+            # first `/snapshot.jpg`.
+            last_render_at = time.monotonic() - render_period
             while True:
                 render_started = time.monotonic()
                 try:
+                    # RGB/depth receipts are already rendered by the
+                    # independent 10-Hz camera-overlay worker.  A full
+                    # six-panel render performs OCC/room/costmap raster work
+                    # and must not be triggered by every camera frame.
+                    # The showcase page paints the current overlay over panel
+                    # 1 while this key gates only panels 2--6.
+                    render_key = self.renderer.heavy_render_key(self.state)
+                    recording_active = self.recorder.is_active()
+                    if not recording_active and render_key == last_render_key:
+                        time.sleep(min(render_period, 0.05))
+                        continue
+                    # A pose-bearing RGB-D packet advances telemetry_revision
+                    # at 10 Hz, while the composite map/graph product is
+                    # intentionally advertised at 5 Hz.  Key invalidation
+                    # keeps the arrow fresh, but must not turn every pose
+                    # receipt into another full OCC raster/JPEG pass.
+                    if not recording_active:
+                        remaining = render_period - (time.monotonic() - last_render_at)
+                        if remaining > 0.0:
+                            time.sleep(min(remaining, 0.05))
+                            continue
                     self.renderer.set_capture_panel_streams(self.recorder.is_active())
                     frame = self.renderer.render()
+                    last_render_at = time.monotonic()
                     with handler.frame_lock:
                         camera_frame = handler.latest_camera_jpeg
                         camera_box_frame = handler.latest_camera_box_jpeg
@@ -2338,6 +3273,14 @@ class PhysicalGateway:
                         handler.latest_camera_box_jpeg = camera_box_frame
                         handler.latest_panel3_jpeg = original_panels.get(3, b"")
                         handler.latest_panel6_jpeg = original_panels.get(6, b"")
+                        handler.latest_snapshot_revision += 1
+                        handler.latest_panel_revision += 1
+                    # Commit the key only after the complete render has been
+                    # published.  If rasterization or cache publication
+                    # raises, the same state key must be retried; recording
+                    # it before the try block completed could leave the web
+                    # panels frozen until the next map/pose revision.
+                    last_render_key = render_key
                     if self.recorder.is_active():
                         # The dark showcase's four durable sections are the
                         # perception image (1), OCC/costmap evidence (2–4),
@@ -2350,20 +3293,19 @@ class PhysicalGateway:
                         record_stamp = self.state.frame_stamp
                         record_seq = self.state.frame_seq
                         record_step = self.state.navigation_step
-                        # JPEG copies and recorder queue submission are kept
-                        # out of the render/navigation loop. The recorder has
-                        # its own bounded writer queue; this extra single
-                        # producer prevents panel bookkeeping from competing
-                        # with YOLO, mapping, and explore callbacks.
-                        def submit_recording() -> None:
-                            self.recorder.record_panel(1, camera_box_frame, stamp=record_stamp, frame_seq=record_seq)
-                            for panel_index, panel_bytes in record_panels.items():
-                                if panel_index != 1:
-                                    self.recorder.record_panel(panel_index, panel_bytes, stamp=record_stamp, frame_seq=record_seq)
-                            if topology_bytes:
-                                self.recorder.record_panel(6, topology_bytes, stamp=record_stamp, frame_seq=record_seq)
-                            self.recorder.record_step_boundary(step_index=record_step, stamp=record_stamp, frame_seq=record_seq)
-                        record_pool.submit(submit_recording)
+                        # Recorder submission stays outside the render loop,
+                        # but uses one replaceable pending slot instead of
+                        # ThreadPoolExecutor's unbounded work queue. If disk
+                        # or the recorder queue stalls, only the newest panel
+                        # batch is retained and memory cannot grow per frame.
+                        record_worker.submit(
+                            camera_box_frame,
+                            record_panels,
+                            topology_bytes,
+                            stamp=record_stamp,
+                            frame_seq=record_seq,
+                            step_index=record_step,
+                        )
                         now_mono = time.monotonic()
                         if now_mono - self._last_record_snapshot_mono >= 1.0:
                             self._last_record_snapshot_mono = now_mono
@@ -2429,11 +3371,15 @@ async def run_gateway(args: argparse.Namespace) -> None:
     gateway.phone_stream_url = args.phone_stream_url
     gateway.start_http()
     async def handler(websocket: Any) -> None:
+        legacy_connection = gateway.new_legacy_sensor_connection()
         try:
             async for raw in websocket:
                 try:
                     packet = decode_wire_packet(raw)
                     if packet.get("type") == "sensor_frame":
+                        packet = dict(packet)
+                        packet.setdefault("_transport_session", "legacy-gateway")
+                        packet.setdefault("_transport_connection", legacy_connection)
                         gateway.queue_sensor_frame(packet)
                         # Sensor packets are fire-and-forget. Avoid one ACK per
                         # RGB-D frame so the Go2 never has an ACK backlog to

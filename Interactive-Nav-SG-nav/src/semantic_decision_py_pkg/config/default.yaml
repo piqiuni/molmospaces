@@ -70,6 +70,13 @@ candidate:
   portal_goal_require_known_free: false
   portal_goal_known_free_radius_m: 0.30
   portal_goal_occupied_threshold: 50
+  # Do not apply hard OCC preflight filtering when the latest map and odom
+  # receipts/source stamps are farther apart than this interval.  A value <=
+  # 0 disables the pairing guard for replay data without timestamps.
+  candidate_occupancy_max_pair_age_s: 1.0
+  # Physical override enables local batch path search. Keep simulator defaults.
+  candidate_occupancy_use_astar: false
+  candidate_occupancy_astar_max_expansions: 12000
   container_standoff_m: 0.5
   # Drawer containers use the same nominal approach distance as other
   # containers.  Keep this explicit so a future task can tune drawers without

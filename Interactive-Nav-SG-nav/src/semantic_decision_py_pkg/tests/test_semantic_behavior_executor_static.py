@@ -628,6 +628,154 @@ def test_two_stage_container_staging_holds_until_its_matching_m1_request_resolve
     assert active_stops == [True, True]
 
 
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.parametrize("cancel_fails", [True, False])
+@pytest.mark.parametrize("preempt", [True, False])
+def test_terminal_navigation_feedback_cancels_goal_and_emits_immediate_zero(
+    executor_module, success, cancel_fails, preempt,
+) -> None:
+    """A terminal target result must not leave one residual DWA command."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {
+        "decision_id": "decision-stop",
+        "candidate_id": "navigate:target-stop",
+        "behavior_type": "NAVIGATE",
+        "target_id": "target-stop",
+    }
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.machine.start(dict(executor.selection))
+    command = executor.machine.on_navigation_result(
+        success, {"reason": "target_visible" if success else "navigation_failed"}
+    )[0]
+    assert executor.machine.state in {"SUCCEEDED", "FAILED"}
+    executor.model_events = []
+    executor._navigation_failure_recovery_attempts = {}
+    executor._drawer_scan_wait_records = {}
+    executor._drawer_scan_wait_contexts = {}
+    executor._clear_drawer_scan_execution_wait_locked = lambda: None
+    feedback = []
+    executor._publish_feedback = lambda selection, status, success, detail: feedback.append(
+        (selection, status, success, detail)
+    )
+    events = []
+    cancelled, rejections, holds = [], [], []
+    executor.base_stop_pub = SimpleNamespace(publish=lambda msg: holds.append(msg.data))
+
+    def cancel():
+        events.append("cancel")
+        cancelled.append(True)
+        # Inject a successor at the exact cancel/zero boundary. The old
+        # selection must remain busy until its stop is sent.
+        executor._selection_callback(executor_module.String(data=json.dumps({
+            "decision_id": "next", "candidate_id": "next-anchor", "active": True,
+        })))
+        assert executor.selection["decision_id"] == "decision-stop"
+        if cancel_fails:
+            raise RuntimeError("cancel transport failed")
+
+    executor.move_base = SimpleNamespace(
+        cancel_goal=cancel
+    )
+    stops = []
+    executor.cmd_vel_pub = SimpleNamespace(
+        publish=lambda message: (events.append("stop"), stops.append(message))
+    )
+    original_publish_feedback = executor._publish_feedback
+    def publish_feedback(*args):
+        if args[0].get("decision_id") == "next":
+            rejections.append(args)
+        else:
+            events.append("feedback")
+            original_publish_feedback(*args)
+    executor._publish_feedback = publish_feedback
+
+    if preempt:
+        executor.machine.reset()
+        executor.machine.start(dict(executor.selection))
+        request = executor_module.String(data=json.dumps({
+            "decision_id": "decision-stop", "candidate_id": "navigate:target-stop",
+            "reason": "mission_changed",
+        }))
+        executor._preempt_callback(request)
+        executor._preempt_callback(request)
+    else:
+        executor._finish_terminal(command)
+        executor._finish_terminal(command)  # Duplicate dispatch must not stop a successor.
+
+    assert cancelled == [True]
+    assert len(rejections) == 1 and rejections[0][1] == "REJECTED"
+    assert len(stops) == 1
+    assert holds == ["stop"]
+    confirmed_success = success and not cancel_fails and not preempt
+    expected_status = "CANCELED" if preempt and not cancel_fails else (
+        "SUCCEEDED" if confirmed_success else "FAILED"
+    )
+    assert feedback[0][1:3] == (
+        expected_status, confirmed_success
+    )
+    if cancel_fails:
+        assert feedback[0][3]["reason"] == "terminal_stop_send_failed"
+        assert feedback[0][3]["terminal_stop"]["zero_sent"] is True
+    assert events == ["cancel", "stop", "feedback"]
+    assert executor.selection is None
+
+
+def test_goal_preemption_does_not_abort_an_issued_interaction(executor_module):
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "active", "candidate_id": "door", "behavior_type": "INTERACT"}
+    executor.machine = SimpleNamespace(state=executor_module.STATE_VERIFYING)
+    executor._finish_terminal = lambda command: pytest.fail("external interaction has no cancel acknowledgement")
+    executor._preempt_callback(executor_module.String(data=json.dumps({
+        "decision_id": "active", "candidate_id": "door", "reason": "mission_changed",
+    })))
+    assert executor.selection["decision_id"] == "active"
+
+
+def test_goal_preemption_rechecks_interaction_state_at_cleanup_commit(executor_module):
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "active", "candidate_id": "door", "behavior_type": "INTERACT"}
+    executor.machine = SimpleNamespace(state=executor_module.STATE_APPROACH_INTERACTION)
+    finish = executor._finish_terminal
+
+    def race(command):
+        executor.machine.state = executor_module.STATE_VERIFYING
+        finish(command)
+
+    executor._finish_terminal = race
+    executor._preempt_callback(executor_module.String(data=json.dumps({
+        "decision_id": "active", "candidate_id": "door", "reason": "mission_changed",
+    })))
+    assert executor.selection["decision_id"] == "active"
+    assert not getattr(executor, "_terminal_cleanup_in_progress", False)
+
+
+def test_late_terminal_command_cannot_cancel_a_new_selection(executor_module):
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "new", "candidate_id": "same-anchor"}
+    executor._finish_terminal({"success": True, "candidate": {
+        "decision_id": "old", "candidate_id": "same-anchor"}})
+    assert executor.selection["decision_id"] == "new"
+
+
+def test_stop_send_attempts_zero_when_cancel_transport_fails(executor_module):
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    stops = []
+    def failed_cancel():
+        raise RuntimeError("transport unavailable")
+    executor.move_base = SimpleNamespace(cancel_goal=failed_cancel)
+    executor.cmd_vel_pub = SimpleNamespace(publish=stops.append)
+    result = executor._send_owned_base_stop()
+    assert result["cancel_sent"] is False
+    assert result["zero_sent"] is True
+    assert len(stops) == 1
+    assert result["errors"] == ["cancel: transport unavailable"]
+
+
 @pytest.mark.parametrize("confirmation_count", [None, 2])
 def test_container_direct_front_confirmation_count_is_configurable(
     executor_module,
@@ -2779,7 +2927,17 @@ def test_direct_m1_capture_failure_returns_to_next_outer_anchor(executor_module)
     assert [command["kind"] for command in dispatched] == ["navigate"]
     assert dispatched[0]["start_goal_option_index"] == 2
     assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == "staging"
-    assert executor.machine.candidate["goal_xyyaw"] == [1.0, 2.0, 0.0]
+    # The evidence scheduler selected outer staging index 2.  The active
+    # public goal must follow that selected pose; falling back to index 0 here
+    # would make the UI/goal consumer disagree with the dispatched command and
+    # could request M1 from the wrong face.
+    assert executor.machine.candidate["goal_xyyaw"] == [3.0, 2.0, 3.14]
+    assert executor.machine.candidate["interaction_command"][
+        "interaction_approach_pose_xyyaw"
+    ] == [3.0, 2.0, 3.14]
+    assert executor.machine.candidate["metadata"][
+        "interaction_approach_goal_option_index"
+    ] == 2
     assert executor.machine.candidate["metadata"]["m1_observation_staging_required"] is True
 
 

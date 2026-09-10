@@ -524,6 +524,8 @@ class PhysicalRawRecorder:
     def record_sensor_packet(self, packet: dict[str, Any]) -> bool:
         """Capture an incoming encoded RGB-D packet before latest-frame drop."""
 
+        if not self.is_active():
+            return False
         if not isinstance(packet, dict):
             return False
         # ``page_capture`` is an intentionally small presentation-only mode:
@@ -556,6 +558,7 @@ class PhysicalRawRecorder:
             "depth_scale": packet.get("depth_scale", 0.001),
             "intrinsics": copy.deepcopy(packet.get("intrinsics", {})),
             "color_depth_sync_ms": packet.get("color_depth_sync_ms"),
+            "capture_timing": copy.deepcopy(packet.get("capture_timing", {})),
         }
         accepted = self._enqueue(
             "sensor",
@@ -574,6 +577,8 @@ class PhysicalRawRecorder:
         return accepted
 
     def record_telemetry(self, value: Any, *, source: str = "websocket", packet: Any = None) -> bool:
+        if not self.is_active():
+            return False
         stage = "telemetry"
         payload = {"value": _compact_live_value(value), "source": str(source)}
         if packet is not None:
@@ -587,6 +592,12 @@ class PhysicalRawRecorder:
         return self.record_event(stage, payload, critical=True)
 
     def record_ros_state(self, name: str, value: Any, payload: Any = None) -> bool:
+        # The web mirror calls this for every ROS state receipt even when no
+        # recording session is active.  In particular, map values can contain
+        # millions of cells; reject them before compaction or deepcopy rather
+        # than paying that cost only for ``_enqueue`` to discard the job.
+        if not self.is_active():
+            return False
         name = str(name)
         map_stages = {
             "occupancy": "planning_occ",
@@ -615,12 +626,16 @@ class PhysicalRawRecorder:
         return self.record_event(f"ros_state:{name}", event, critical=True)
 
     def record_mllm_event(self, event: dict[str, Any], *, source: str = "mllm") -> bool:
+        if not self.is_active():
+            return False
         if not isinstance(event, dict):
             return False
         payload = {"source": str(source), "event": copy.deepcopy(event)}
         return self.record_event("mllm_event", payload, critical=True)
 
     def record_qwen_event(self, event: dict[str, Any], *, source: str = "qwen") -> bool:
+        if not self.is_active():
+            return False
         payload = {"source": str(source), "event": _compact_live_value(event)}
         return self.record_event("qwen_event", payload, critical=True)
 
@@ -632,6 +647,8 @@ class PhysicalRawRecorder:
         client_timestamp: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> bool:
+        if not self.is_active():
+            return False
         if not data:
             return False
         self._note("source_received", "phone_frame")
@@ -657,6 +674,8 @@ class PhysicalRawRecorder:
         sample_rate: int = 48_000,
         client_timestamp: Any = None,
     ) -> bool:
+        if not self.is_active():
+            return False
         if not data:
             return False
         self._note("source_received", "phone_audio")
@@ -675,6 +694,8 @@ class PhysicalRawRecorder:
         )
 
     def record_panel(self, index: int, data: bytes, *, stamp: Any = None, frame_seq: Any = None) -> bool:
+        if not self.is_active():
+            return False
         if self._mode == "raw_replay" or not data:
             return False
         index = int(index)
@@ -698,6 +719,8 @@ class PhysicalRawRecorder:
     def record_state_snapshot(self, snapshot: dict[str, Any]) -> bool:
         """Persist the right-rail state at a render boundary."""
 
+        if not self.is_active():
+            return False
         if not isinstance(snapshot, dict):
             return False
         # Keep full right-side semantics, but intentionally omit raw map cell
@@ -727,6 +750,8 @@ class PhysicalRawRecorder:
         frame_seq: Any = None,
         extra: dict[str, Any] | None = None,
     ) -> bool:
+        if not self.is_active():
+            return False
         with self._lock:
             receipts = dict(self._latest_receipts)
         record = {
@@ -740,6 +765,11 @@ class PhysicalRawRecorder:
         return self.record_event("step_boundary", record, critical=True)
 
     def record_event(self, stage: str, value: Any, *, critical: bool = True) -> bool:
+        # Keep the common JSON/event path cheap while recording is disabled.
+        # Callers may hand us a large graph or state snapshot, and function
+        # arguments are evaluated before ``_enqueue`` can observe inactivity.
+        if not self.is_active():
+            return False
         self._note("source_received", str(stage))
         return self._enqueue(
             "json",
@@ -750,6 +780,11 @@ class PhysicalRawRecorder:
         )
 
     def _enqueue_map(self, stage: str, value: dict[str, Any], source_payload: Any = None) -> bool:
+        # Recheck at the expensive private boundary in case a session stopped
+        # after the public ingress check.  This avoids the normal inactive case
+        # and narrows the stop race before the full-grid deepcopy below.
+        if not self.is_active():
+            return False
         self._note("source_received", stage)
         receipt = self._next_receipt(stage, "map")
         metadata = {

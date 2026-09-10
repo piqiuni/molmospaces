@@ -7,6 +7,16 @@
   <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
   <!-- Camera points 8 degrees forward/down; RPY values are radians. -->
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.1396263"/><arg name="camera_yaw" default="0.0"/>
+  <!-- D435i gravity correction is applied to both colour/depth TF children.
+       It is inert until Go2 sends a calibrated camera_imu sample; yaw stays
+       disabled because gyro integration has no absolute heading reference.
+       The Go2 source stream is separately opt-in via
+       PHYSICAL_NAV_GO2_CAMERA_IMU=1 (or the corresponding launcher arg). -->
+  <arg name="camera_imu_enabled" default="true"/>
+  <arg name="camera_imu_use_yaw" default="false"/>
+  <arg name="camera_imu_max_roll_rad" default="0.7"/>
+  <arg name="camera_imu_max_pitch_rad" default="0.7"/>
+  <arg name="camera_imu_max_yaw_rad" default="0.35"/>
   <arg name="sensor_ws_url" default="ws://127.0.0.1:12335"/>
   <arg name="web_url" default="http://127.0.0.1:8765"/>
   <arg name="web_state_enabled" default="true"/>
@@ -25,7 +35,6 @@
   <node name="semantic_mapping_py" pkg="semantic_mapping_py_pkg" type="semantic_mapping_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
     <rosparam file="$(arg config_file)" command="load"/>
     <rosparam file="$(arg semantic_override_config)" command="load"/>
-    <param name="semantic_map/subscribe_pointcloud" value="true" type="bool"/>
   </node>
   <!-- Module 1 was previously absent from the physical launch, so detected
        portals entered the graph but never received a visual state patch. -->
@@ -58,6 +67,11 @@
     <!-- A one-frame RGB-D box is not sufficient for an interaction object.
          Require two consecutive observations before M1 sees the track. -->
     <param name="required_consecutive_observations" value="2"/>
+    <!-- Pair the tracked detector envelope with the RGB frame carrying the
+         same capture stamp.  The bounded history absorbs normal YOLO/ROS
+         scheduling jitter without letting a stale box move to a newer image. -->
+    <param name="image_history_size" value="12"/>
+    <param name="image_sync_tolerance_s" value="0.25"/>
     <param name="worker_count" value="1"/>
     <param name="max_queue_size" value="8"/>
   </node>
@@ -88,6 +102,10 @@
            retaining supported door/furniture surfaces. -->
       <param name="maxUrange" value="7.9"/>
       <param name="pointcloud_scan_range_max" value="8.0"/>
+      <!-- Full-map inflation belongs to move_base costmaps.  Keep it
+           explicitly disabled in the physical mapper so a stale parameter
+           namespace cannot re-enable an O(map-size) pass for every frame. -->
+      <param name="enable_obstacle_inflation" value="false" type="bool"/>
       <param name="pointcloud_scan_height_min" value="0.12"/>
       <param name="pointcloud_scan_height_max" value="1.60"/>
       <param name="pointcloud_scan_min_points_per_beam" value="4"/>
@@ -115,6 +133,9 @@
     <rosparam file="$(arg config_file)" command="load"/>
     <param name="web_url" value="$(arg web_url)"/>
     <param name="legacy_http_sensor" value="false" type="bool"/>
+    <!-- The direct sensor ROS bridge is the sole RGB-D/PointCloud/odom/TF
+         owner. Keep the legacy gateway publisher explicitly disabled. -->
+    <param name="publish_sensor_ros" value="false" type="bool"/>
     <param name="legacy_http_state" value="false" type="bool"/>
     <param name="web_state_enabled" value="$(arg web_state_enabled)" type="bool"/>
     <!-- The camera source is 10 Hz. Polling faster only repeats HTTP/JPEG/
@@ -150,7 +171,13 @@
     <param name="camera_frame" value="d435i_color_optical_frame"/><param name="camera_parent" value="tf_frame_base_link"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
+    <param name="camera_imu_enabled" value="$(arg camera_imu_enabled)" type="bool"/>
+    <param name="camera_imu_use_yaw" value="$(arg camera_imu_use_yaw)" type="bool"/>
+    <param name="camera_imu_max_roll_rad" value="$(arg camera_imu_max_roll_rad)"/>
+    <param name="camera_imu_max_pitch_rad" value="$(arg camera_imu_max_pitch_rad)"/>
+    <param name="camera_imu_max_yaw_rad" value="$(arg camera_imu_max_yaw_rad)"/>
     <param name="point_stride" value="6"/><param name="max_depth_m" value="8.0"/><param name="no_return_depth_m" value="8.05"/>
+    <param name="telemetry_max_delta_sec" value="0.15"/>
   </node>
 
   <!-- This adapter only needs rospy/tf2 and must use ROS Noetic's system
@@ -176,6 +203,7 @@
   <node name="physical_velocity_command_mux" pkg="physical_nav" type="velocity_command_mux.py" launch-prefix="/usr/bin/python3" output="screen" respawn="true" respawn_delay="1.0">
     <param name="move_base_topic" value="/physical_nav/move_base_cmd_vel"/>
     <param name="semantic_topic" value="/physical_nav/semantic_cmd_vel"/>
+    <param name="stop_topic" value="/physical_nav/base_stop"/>
     <param name="output_topic" value="/physical_nav/shadow_cmd_vel"/>
     <param name="publish_rate_hz" value="20.0"/>
     <param name="move_base_timeout_s" value="0.35"/>
@@ -191,6 +219,9 @@
     <param name="profile" value="$(arg interaction_profile)"/>
     <param name="qwen_base_url" value="http://127.0.0.1:18080/v1"/>
     <param name="qwen_model" value="qwen3.6-35b-a3b-fp8"/>
+    <!-- Do not let M3 count a latched/replayed RGB image as a new visual
+         observation after the human-assist action. -->
+    <param name="require_fresh_frames" value="true" type="bool"/>
   </node>
   <!-- Publish real global/local costmaps while keeping every navigation output
        in an unconsumed shadow namespace. The local obstacle layer consumes

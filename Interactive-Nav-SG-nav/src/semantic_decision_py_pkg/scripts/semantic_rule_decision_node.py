@@ -243,6 +243,37 @@ def successful_drawer_scan_feedback(
     return is_drawer_scan_interaction(active_command)
 
 
+def candidate_snapshot_token(payload: dict | None) -> tuple[str, int, int]:
+    """Return the causal identity of a candidate snapshot.
+
+    Candidate callbacks can arrive while Module-2 is evaluating a copied
+    snapshot.  The producer sequence and graph revision are the two monotonic
+    watermarks; keeping the episode ID in the token prevents a reset from
+    accidentally matching a recycled sequence number.
+    """
+
+    payload = payload if isinstance(payload, dict) else {}
+    episode_id = str(payload.get("episode_id") or "")
+    try:
+        sequence = int(payload.get("sequence", 0) or 0)
+    except (TypeError, ValueError):
+        sequence = 0
+    try:
+        graph_revision = int(payload.get("graph_revision", 0) or 0)
+    except (TypeError, ValueError):
+        graph_revision = 0
+    return episode_id, sequence, graph_revision
+
+
+def candidate_mission_token(payload: dict) -> tuple[str, int, str]:
+    """Separate instruction identity from camera/candidate refresh sequence."""
+    return (
+        str(payload.get("episode_id") or ""),
+        int(payload.get("target_revision", 0) or 0),
+        json.dumps(payload.get("target_context") or {}, ensure_ascii=False, sort_keys=True),
+    )
+
+
 class SemanticRuleDecisionNode:
     def __init__(self) -> None:
         env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
@@ -617,7 +648,10 @@ class SemanticRuleDecisionNode:
             topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
             String,
             queue_size=1,
-            latch=True,
+            # A selection is an execution request, not durable state.  A
+            # restarted executor must wait for a fresh decision instead of
+            # replaying the last interaction/navigation action.
+            latch=False,
         )
         self.preempt_pub = rospy.Publisher(
             topics.get("preempt_request", "/semantic_decision/preempt_request"),
@@ -679,10 +713,9 @@ class SemanticRuleDecisionNode:
             episode_id = str(payload.get("episode_id") or "")
             previous_episode = str(self.latest_candidates_payload.get("episode_id") or "")
             if episode_id and previous_episode and episode_id != previous_episode:
-                self.active_candidate_id = ""
-                self.active_decision_id = ""
-                self.active_behavior_type = ""
-                self.active_interaction_candidate = {}
+                # Reset mission bookkeeping, not ownership of a still-running
+                # executor. The new episode must wait for its stop/terminal
+                # feedback just like a changed Goal in the same episode.
                 self.pending_post_interaction_traversal = {}
                 self.post_interaction_refresh_gate.clear()
                 self.terminal_post_interaction_traversal_ids.clear()
@@ -693,7 +726,8 @@ class SemanticRuleDecisionNode:
                 self.next_decision_time = 0.0
                 self.goal_complete = False
                 self.target_goal_complete = False
-                self.active_target_goal = False
+                if not self.active_decision_id:
+                    self.active_target_goal = False
                 self.priority_target_candidate_id = ""
                 self.preempt_requested_for_decision_id = ""
                 self.target_mission.reset()
@@ -721,18 +755,27 @@ class SemanticRuleDecisionNode:
             previous_target_key = json.dumps(
                 self.target_context, ensure_ascii=False, sort_keys=True
             )
-            if target_key != previous_target_key:
+            if (target_key != previous_target_key
+                or payload.get("target_revision", 0)
+                != self.latest_candidates_payload.get("target_revision", 0)):
                 self.target_context = dict(target_context)
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.priority_target_candidate_id = ""
                 self.preempt_requested_for_decision_id = ""
                 self.target_mission.reset()
+                self.pending_post_interaction_traversal = {}
+                self.post_interaction_refresh_gate.clear()
+                self.completion_tracker.reset()
+                self.terminal_no_plan_exit_tracker.reset()
+                self.minimum_candidate_sequence = 0
+                self.next_decision_time = 0.0
                 self._publish_goal_status(
                     "ACTIVE" if target_context.get("enabled") else "DISABLED"
                 )
             self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
+            self._request_mission_preempt_locked(payload)
             # A door can become open from an asynchronous M1 observation while
             # its approach subgoal is still active.  Do not leave the executor
             # driving toward an interaction that the fresh graph has already
@@ -859,6 +902,23 @@ class SemanticRuleDecisionNode:
                     )
                 )
 
+    def _request_mission_preempt_locked(self, payload: dict) -> None:
+        """Keep ownership until executor feedback; a new Goal only requests stop."""
+        active_mission = getattr(self, "_active_mission_token", None)
+        if (active_mission is None
+            or active_mission == candidate_mission_token(payload)
+            or not self.active_decision_id
+            or self.preempt_requested_for_decision_id == self.active_decision_id):
+            return
+        self.preempt_pub.publish(String(data=json.dumps({
+            "decision_id": self.active_decision_id,
+            "candidate_id": self.active_candidate_id,
+            "reason": "mission_changed",
+            "target_revision": payload.get("target_revision", 0),
+            "timestamp": time.time(),
+        }, ensure_ascii=False, separators=(",", ":"))))
+        self.preempt_requested_for_decision_id = self.active_decision_id
+
     def _feedback_callback(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -870,10 +930,75 @@ class SemanticRuleDecisionNode:
     def _handle_feedback(self, payload: dict) -> None:
         candidate_id = str(payload.get("candidate_id") or "")
         decision_id = str(payload.get("decision_id") or "")
+        # Terminal feedback has no meaning without a locally active decision;
+        # this also rejects a delayed event delivered after this node's
+        # episode/selection state was reset.
+        if not self.active_decision_id:
+            return
         if decision_id and self.active_decision_id and decision_id != self.active_decision_id:
+            return
+        # Feedback is a terminal event for the currently selected episode.  A
+        # delayed result from a previous run must not be accepted merely
+        # because its candidate id was reused.  New executor feedback carries
+        # the episode on the top level; retain the nested fallbacks for older
+        # bridge payloads.
+        active_mission = getattr(self, "_active_mission_token", None)
+        active_episode_id = str(
+            (active_mission[0] if active_mission is not None else "")
+            or (self.active_interaction_candidate or {}).get("episode_id")
+            or (self.latest_candidates_payload or {}).get("episode_id")
+            or ""
+        )
+        detail_payload = payload.get("detail") or {}
+        nested_result = payload.get("interaction_result") or detail_payload.get(
+            "interaction_result"
+        )
+        payload_episode_id = str(
+            payload.get("episode_id")
+            or (detail_payload.get("episode_id") if isinstance(detail_payload, dict) else "")
+            or (nested_result.get("episode_id") if isinstance(nested_result, dict) else "")
+            or ""
+        )
+        # ExplorePy's legacy feedback does not echo episode_id; interaction
+        # results do and are the replay-sensitive path.
+        if (active_episode_id and payload_episode_id != active_episode_id
+            and (payload_episode_id or self.active_behavior_type == "INTERACT")):
+            return
+        if candidate_id and self.active_candidate_id and candidate_id != self.active_candidate_id:
+            return
+        if (
+            self.active_behavior_type == "INTERACT"
+            and payload.get("command_id")
+            and self.active_decision_id
+            and str(payload.get("command_id"))
+            != f"{self.active_decision_id}:{self.active_candidate_id}"
+        ):
             return
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
+            return
+        if (active_mission is not None
+            and active_mission != candidate_mission_token(self.latest_candidates_payload)):
+            if decision_id != self.active_decision_id:
+                # A legacy unbound terminal event is insufficient to release
+                # an old executor across a mission/episode boundary.
+                return
+            # The old executor can finish after a new instruction arrives.
+            # Release its slot, but never credit that arrival/interaction as
+            # completion of the new task or append an old door continuation.
+            self.active_candidate_id = ""
+            self.active_decision_id = ""
+            self.active_behavior_type = ""
+            self.active_interaction_candidate = {}
+            self.active_target_goal = False
+            self._active_mission_token = None
+            self.preempt_requested_for_decision_id = ""
+            self.next_decision_time = 0.0
+            self._publish_inactive_selection({
+                **payload,
+                "detail": {**(payload.get("detail") or {}),
+                           "mission_result_ignored": "target_or_episode_changed"},
+            })
             return
         if (
             status == "SUCCEEDED"
@@ -1652,7 +1777,25 @@ class SemanticRuleDecisionNode:
         completion_snapshot["exploration_context"] = exploration_context
         return completion_snapshot, excluded_candidate_ids
 
+    def _decision_mission_is_current(self, snapshot: dict) -> bool:
+        with self.state_lock:
+            current = candidate_mission_token(self.latest_candidates_payload)
+            if candidate_mission_token(snapshot) == current:
+                return True
+            self.next_decision_time = 0.0
+        self.trace_pub.publish(String(data=json.dumps({
+            "timestamp": time.time(),
+            "phase": "stale_mission_discarded",
+            "candidate_validation_reason": "target_or_episode_changed",
+            "input_target_revision": snapshot.get("target_revision", 0),
+            "publish_target_revision": current[1],
+            "executed_candidate_id": "",
+        }, ensure_ascii=False, separators=(",", ":"))))
+        return False
+
     def _decide_from_snapshot(self, candidate_snapshot: dict) -> None:
+        if not self._decision_mission_is_current(candidate_snapshot):
+            return
         with self.state_lock:
             pending_post_interaction_traversal = copy.deepcopy(
                 self.pending_post_interaction_traversal
@@ -2071,6 +2214,11 @@ class SemanticRuleDecisionNode:
         input_selected_fingerprint = (
             candidate_fingerprint(selected) if selected is not None else ""
         )
+        # A new instruction invalidates the old model answer even if it chose
+        # a candidate with the same ID/geometry. Let the next tick prompt M2
+        # with the new task rather than adapting an answer to the old task.
+        if not self._decision_mission_is_current(candidate_snapshot):
+            return
         with self.state_lock:
             latest_snapshot = copy.deepcopy(self.latest_candidates_payload)
         inject_pending_traversal(
@@ -2079,6 +2227,8 @@ class SemanticRuleDecisionNode:
         )
         latest_sequence = int(latest_snapshot.get("sequence", 0) or 0)
         latest_revision = int(latest_snapshot.get("graph_revision", 0) or 0)
+        if candidate_mission_token(candidate_snapshot) != candidate_mission_token(latest_snapshot):
+            return
         stale_selected = False
         stale_fallback_used = False
         candidate_validation_reason = "candidate_sequence_current"
@@ -2293,6 +2443,19 @@ class SemanticRuleDecisionNode:
         if selected is None:
             return
         with self.state_lock:
+            # A candidate callback may have arrived after the revalidation
+            # above but before this commit.  Do not dispatch a decision based
+            # on that now-obsolete snapshot; the next timer tick will evaluate
+            # the newer producer state.
+            if (candidate_mission_token(candidate_snapshot)
+                != candidate_mission_token(self.latest_candidates_payload)):
+                self.next_decision_time = 0.0
+                return
+            if candidate_snapshot_token(
+                self.latest_candidates_payload
+            ) != candidate_snapshot_token(execution_snapshot):
+                self.next_decision_time = 0.0
+                return
             self.decision_index += 1
             decision_id = f"decision_{self.decision_index:06d}"
             selection = selected.to_dict()
@@ -2305,6 +2468,8 @@ class SemanticRuleDecisionNode:
                     "episode_id": execution_snapshot.get("episode_id", ""),
                     "graph_revision": execution_snapshot.get("graph_revision", 0),
                     "candidate_sequence": execution_snapshot.get("sequence", 0),
+                    "target_revision": execution_snapshot.get("target_revision", 0),
+                    "target_context": copy.deepcopy(execution_snapshot.get("target_context") or {}),
                     "model_input_graph_revision": candidate_snapshot.get(
                         "graph_revision", 0
                     ),
@@ -2334,6 +2499,7 @@ class SemanticRuleDecisionNode:
             )
             self.active_candidate_id = selected.candidate_id
             self.active_decision_id = decision_id
+            self._active_mission_token = candidate_mission_token(execution_snapshot)
             self.active_behavior_type = selected.behavior_type
             if selected.behavior_type == "INTERACT":
                 self.active_interaction_candidate = selected.to_dict()
@@ -2360,9 +2526,16 @@ class SemanticRuleDecisionNode:
                 model_selected_group_id,
                 selection_override_reason,
             )
-        self.selected_pub.publish(
-            String(data=json.dumps(selection, ensure_ascii=False, separators=(",", ":")))
-        )
+            # Keep the publish under the same lock as the token check and
+            # active-state commit.  Otherwise a candidate callback could
+            # replace the snapshot in the gap between the check and publish.
+            self.selected_pub.publish(
+                String(
+                    data=json.dumps(
+                        selection, ensure_ascii=False, separators=(",", ":")
+                    )
+                )
+            )
 
     @staticmethod
     def _observation_step(candidate_snapshot: dict) -> int:

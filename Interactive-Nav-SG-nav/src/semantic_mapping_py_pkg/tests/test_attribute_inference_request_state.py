@@ -49,6 +49,64 @@ class RecordingClient:
         )
 
 
+@pytest.mark.parametrize("confidence", [0.0, 0.49, -0.1, 1.1, float("nan"), float("inf"), "bad", None])
+def test_unreliable_reply_fails_without_consuming_success_or_recheck_cache(monkeypatch, confidence):
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {"object_1": {"request_sequence": 1, "generation": 0, "episode_id": "episode_1"}}
+    node.generations = {"object_1": 0}
+    node.last_request, node.completed = {}, {}
+    node.request_sequence = 1
+    node.min_interval_s = 2.0
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s, node.max_output_tokens = 1.0, 256
+    node.success_refresh_interval_s = 120.0
+    node.m1_recheck_refresh_interval_s = 2.0
+    node.client = RecordingClient()
+    model = node.client.request_json
+
+    def reply(**kwargs):
+        response = model(**kwargs)
+        response.payload.update({"observed_object_name": "refrigerator", "confidence": confidence})
+        return response
+
+    node.client.request_json = reply
+    published = []
+    node._publish_updates = lambda episode, stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+    now = [10.0]
+    monkeypatch.setattr(attribute_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    node._infer(
+        object_id="object_1", detection={"semantic_class": "locker"},
+        visual_evidence=np.zeros((80, 120, 3), dtype=np.uint8),
+        episode_id="episode_1", frame_id="14", image_sequence=22, stamp=10.0,
+        signature="fresh", generation=0, request_sequence=1, enqueued_at=10.0,
+        targeted_refresh={},
+    )
+    assert len(published) == 1 and published[0]["attribute_status"] == "failed"
+    assert published[0]["error"] in {"low_model_confidence", "invalid_model_confidence"}
+    assert not node.pending and not node.completed
+    assert node.filter_counts["failed"] == 1 and node.filter_counts["completed"] == 0
+    assert node._try_reserve("object_1", "next-view") is None  # No busy retry loop.
+    now[0] = 12.1
+    reservation = node._try_reserve("object_1", "next-view")
+    assert reservation is not None
+    confidence = 0.95
+    node._infer(
+        object_id="object_1", detection={"semantic_class": "locker"},
+        visual_evidence=np.zeros((80, 120, 3), dtype=np.uint8),
+        episode_id="episode_1", frame_id="15", image_sequence=23, stamp=12.1,
+        signature="next-view", generation=reservation["generation"],
+        request_sequence=reservation["request_sequence"], enqueued_at=12.1,
+        targeted_refresh={},
+    )
+    assert published[-1]["attribute_status"] == "ready"
+    assert node.completed["object_1"]["m1_recheck_attempts"] == 1
+    assert node.filter_counts["completed"] == 1
+
+
 def test_initial_generation_zero_request_is_current() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()
@@ -471,7 +529,7 @@ def test_target_multiview_history_requires_step_and_pose_separation() -> None:
             "visual_evidence": evidence,
         },
         {
-            # Enough steps, but effectively the same viewpoint: reject.
+            # Same viewpoint as step 10; prefer this newer frame, not both.
             "capture_step": 20,
             "frame_id": "20",
             "observation_pose_xyyaw": [0.04, 0.01, 0.05],
@@ -502,10 +560,26 @@ def test_target_multiview_history_requires_step_and_pose_separation() -> None:
         min_yaw_gap_rad=0.25,
     )
 
-    assert [item["capture_step"] for item in selected] == [10, 34, 50]
+    assert [item["capture_step"] for item in selected] == [20, 34, 50]
+    assert selected[-1] is history[-1]
+    assert not any(item["capture_step"] == 10 for item in selected)
+
+    # Arrival order is not capture order. Corrupt newer poses must neither
+    # throw nor pass the distinct-view test via NaN comparisons.
+    invalid = [
+        {**history[-1], "capture_step": 70, "observation_pose_xyyaw": pose}
+        for pose in ([float("nan"), 0, 0], [0, float("inf"), 0], ["bad", 0, 0], None)
+    ]
+    reordered = [history[3], history[0], history[2], history[1], *invalid]
+    selected = InteractionAttributeInferenceNode._select_diverse_target_visual_history(
+        reordered, max_images=3, min_step_gap=8,
+        min_position_gap_m=0.25, min_yaw_gap_rad=0.25,
+    )
+    assert [item["capture_step"] for item in selected] == [20, 34, 50]
 
 
-def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> None:
+@pytest.mark.parametrize("include_hypothesis", [False, True])
+def test_m1_inference_only_exposes_opted_in_detector_hypothesis(include_hypothesis) -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()
     node.current_episode_id = "episode_1"
@@ -521,10 +595,24 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     node.completed = {}
     node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
     node.visual_evidence_max_side_px = 0
+    node.include_detector_class_hypothesis = include_hypothesis
     node.request_timeout_s = 1.0
     node.max_output_tokens = 256
     node.success_refresh_interval_s = 120.0
     node.client = RecordingClient()
+    if include_hypothesis:
+        model = node.client.request_json
+
+        def corrected_name(**kwargs):
+            response = model(**kwargs)
+            response.payload.update({
+                "observed_object_name": "water_dispenser",
+                "interactable": False, "interaction_class": "none",
+                "approach_ready": False,
+            })
+            return response
+
+        node.client.request_json = corrected_name
     published = []
     node._publish_updates = lambda episode_id, stamp, updates: published.append(updates)
     node._publish_status = lambda: None
@@ -542,6 +630,7 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
             "name": "fridge",
             "category": "private_gt_category",
             "position": [9.0, 8.0, 7.0],
+            **({"semantic_class": "locker"} if include_hypothesis else {}),
         },
         visual_evidence=visual_evidence,
         episode_id="episode_1",
@@ -556,21 +645,48 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     )
 
     request = node.client.calls[0]
-    assert request["context"] == {"object_id": "target"}
+    assert request["context"] == {
+        "object_id": "target",
+        **({"detector_class": "locker"} if include_hypothesis else {}),
+    }
+    assert "private_gt_category" not in json.dumps(request["context"])
+    assert "若不是冰箱，保留 locker" not in request["instruction"]
+    if include_hypothesis:
+        assert "name-disambiguation recheck" in request["instruction"]
+        assert "MUST replace it" in request["instruction"]
+        assert published[0][0]["observed_object_name"] == "water_dispenser"
+        assert published[0][0]["interaction_class"] == "none"
+    else:
+        assert "detector_class" not in request["instruction"]
     assert len(request["images"]) == 1
     assert request["response_schema"]["schema"]["properties"]["object_id"]["enum"] == [
         "target"
     ]
     assert published[0][0]["object_id"] == "object_1"
-    assert published[0][0]["approach_ready"] is True
+    assert published[0][0]["approach_ready"] is (not include_hypothesis)
+    if include_hypothesis:
+        from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+
+        store = InteractionGraphStore(scene_id="offline")
+        observation = {
+            "instance_id": "1", "semantic_name": "locker", "category": "locker",
+            "confidence": 0.9, "position": [1.0, 0.0, 1.0],
+            "aabb_center": [1.0, 0.0, 1.0], "aabb_size": [0.5, 0.5, 1.5],
+        }
+        for stamp in (1.0, 2.0):
+            store.update_observations([observation], stamp=stamp, source_mode="detector_online")
+        assert store.apply_attribute_patch(published[0][0], stamp=14.0)
+        store.update_observations([observation], stamp=15.0, source_mode="detector_online")
+        corrected = store.nodes["object_1"]
+        assert corrected.label == "water_dispenser"
+        assert corrected.type == "object"
 
 
-def test_targeted_container_refresh_constrains_class_without_supplying_view() -> None:
+def test_targeted_container_refresh_allows_m1_to_correct_planner_class() -> None:
     class PortalFallbackClient(RecordingClient):
         def request_json(self, **kwargs):
             self.calls.append(kwargs)
-            # Deliberately violate the targeted strict schema to exercise the
-            # compatibility guard used with older OpenAI-compatible servers.
+            # The planner's container hypothesis must not force M1's answer.
             return SimpleNamespace(
                 error="",
                 payload={
@@ -650,15 +766,26 @@ def test_targeted_container_refresh_constrains_class_without_supplying_view() ->
     assert "do not require the top or bottom boundary to be fully visible" in instruction
     assert "include only action regions that are actually visible" in instruction
     properties = request["response_schema"]["schema"]["properties"]
-    assert properties["interaction_class"]["enum"] == ["container"]
-    assert properties["portal_morphology"] == {"type": "null"}
+    assert "portal" in properties["interaction_class"]["enum"]
+    assert "container" in properties["interaction_class"]["enum"]
     patch = published[0]
-    assert patch["interaction_class"] == "container"
-    assert patch["coarse_state"] == "unknown"
-    assert patch["m1_reported_interaction_class"] == "portal"
+    assert patch["interaction_class"] == "portal"
+    assert patch["coarse_state"] == "static_open"
+    assert patch["m1_expected_node_type"] == "container"
     assert patch["view_state"] == "front"
-    assert "portal_morphology" not in patch
-    assert "portal_aperture_evidence" not in patch
+    assert patch["portal_morphology"]["door_leaf"] == "absent"
+    assert patch["portal_aperture_evidence"]["open_aperture"] == "visible"
+
+
+@pytest.mark.parametrize("field", ["semantic_class", "raw_class", "semantic_name"])
+def test_physical_portal_label_uses_full_frame_evidence(field) -> None:
+    detection = {field: "door", "bbox_2d": [30, 15, 90, 70]}
+    image = np.zeros((80, 120, 3), dtype=np.uint8)
+    assert InteractionAttributeInferenceNode._is_portal_detection(detection)
+    evidence = InteractionAttributeInferenceNode._compose_attribute_visual_evidence(
+        image, detection, margin_ratio=0.08
+    )
+    assert evidence.shape == image.shape
 
 
 def test_m1_request_expired_in_local_queue_is_not_sent() -> None:

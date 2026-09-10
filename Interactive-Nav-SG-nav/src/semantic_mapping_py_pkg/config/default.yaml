@@ -159,6 +159,8 @@ room_mllm:
   worker_count: 1
   max_queue_size: 4
   min_interval_s: 2.0
+  # Optional shared room-worker dispatch spacing; physical profile sets 1 s.
+  dispatch_interval_s: 0.0
   success_refresh_interval_s: 120.0
   max_output_tokens: 96
 
@@ -167,6 +169,8 @@ room_mllm:
 # waits for a later RGB + detection pair before submitting the high-priority
 # image-only request.
 attribute_inference:
+  # Keep simulator/GT category metadata out of image-only M1 by default.
+  include_detector_class_hypothesis: false
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
   # One M1 call may use earlier target views, but only when they are separated
@@ -216,6 +220,13 @@ semantic_map:
   room_enclosed_occupied_max_aspect: 1.8
   room_enclosed_occupied_known_ring_ratio: 0.95
   room_enclosed_occupied_free_ring_ratio: 0.45
+  # Keep enclosed-unknown filling opt-in for simulator maps; physical RGB-D
+  # config enables it to bridge compact depth/OCC holes without opening the
+  # unknown frontier.
+  room_fill_enclosed_unknown: false
+  room_enclosed_unknown_max_cells: 250
+  room_enclosed_unknown_known_ring_ratio: 0.90
+  room_enclosed_unknown_free_ring_ratio: 0.75
   room_portal_cut_enabled: true
   room_portal_cut_margin_m: 0.15
   room_portal_cut_thickness_cells: 2

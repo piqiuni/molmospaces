@@ -68,6 +68,19 @@ object_detection:
       max_volume_m3: 4.00
   iou_threshold: 0.7
   max_detections: 50
+  # Keep detector recall at the configured max_detections, but cap costly
+  # RGB-D lifting to a bounded per-frame budget. Interaction classes are
+  # prioritised in the worker, so doors/fridges are lifted before ordinary
+  # scene objects; remaining boxes stay available to the 2-D overlay with
+  # ``geometry_skipped=true``.  Ordinary candidates rotate across receipts,
+  # so a crowded frame cannot permanently starve a lower-ranked object.
+  # Twelve candidates keeps the CPU postprocess below one 100 ms camera period
+  # on the physical 848x480 depth stream.
+  max_geometry_instances: 12
+  geometry_budget_ms: 75.0
+  # CPU RGB-D lifting uses a bounded persistent pool; GPU YOLO inference and
+  # ROS publication remain on their existing threads.
+  geometry_workers: 4
   # Applied to raw YOLOE labels before mask point-cloud lifting and 3D boxes.
   detection_filter:
     enabled: true
@@ -197,6 +210,9 @@ object_detection:
   max_noninteraction_box_volume_m3: 4.00
   projection_frame_id: "tf_frame_map"
   publish_debug_markers: true
+  # Optional Foxglove/RViz evidence only. The gateway additionally checks
+  # subscriber connections before decoding packed segment points, so this
+  # remains off in the real-time profile unless explicitly requested.
   publish_debug_segmented_cloud: false
   publish_debug_detection_image: true
   publish_debug_world_markers: true
@@ -221,9 +237,14 @@ object_detection:
   debug_world_segmented_cloud_topic: "/physical_nav/segmented_cloud_world"
 
 semantic_map:
+  # Physical M3 carries exact command IDs; never match a result by object alone.
+  require_interaction_command_id: true
   enable_object_mapping: true
   enable_scene_mapping: true
-  subscribe_pointcloud: true
+  # Physical scene attributes are not produced by this stack.  Object mapping
+  # consumes tracked 3-D detections directly, so deserializing a second full
+  # PointCloud2 here only burns CPU and can delay OCC/room callbacks.
+  subscribe_pointcloud: false
   # Keep an object track through occlusions. Once a door/container has two
   # detector frames plus a valid M1 result, both the semantic map and graph
   # latch its identity indefinitely; visibility is represented separately.
@@ -233,6 +254,12 @@ semantic_map:
   # these receipts at its independent 5 Hz logical step. Room topology is
   # much slower and is published independently below.
   publish_rate: 10.0
+  # Keep the timer responsive for new OCC/graph revisions, but do not
+  # rebuild and resend the full graph/map for an unchanged input bundle.
+  publish_heartbeat_period_sec: 1.0
+  # Graph JSON/markers are latched state; publish at most 5 Hz while raw
+  # planning OCC remains latest-frame driven.
+  graph_publish_period_sec: 0.2
   room_grid_publish_rate: 2.0
   room_segment_min_interval_sec: 0.5
   # Require two temporally consecutive observations before inserting an
@@ -285,15 +312,23 @@ semantic_map:
   open_refrigerator_content_min_observations: 1
   open_refrigerator_content_ignore_class_confirmations: true
   room_segment_use_semantic_overlay: true
+  # Real RGB-D OCC has compact unknown holes inside already observed free
+  # space. Fill only enclosed holes; unknown frontiers remain non-traversable.
+  room_fill_enclosed_unknown: true
+  room_enclosed_unknown_max_cells: 250
+  room_enclosed_unknown_known_ring_ratio: 0.90
+  room_enclosed_unknown_free_ring_ratio: 0.75
   room_portal_cut_enabled: true
   graph_save_path: ""
 
 room_inference:
   backend: "object_rules"
 
-# Module 1 uses image evidence only for physical interaction objects. Room
-# semantics stay on deterministic object rules to avoid unrelated VLM calls.
+# Object M1 uses image evidence. The object_rules room backend is separate
+# from the text-only M1 room worker configured under room_mllm below.
 attribute_inference:
+  # YOLO's label is a hypothesis; M1 may replace both the name and graph class.
+  include_detector_class_hypothesis: true
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
   targeted_multiview_max_images: 2
@@ -356,10 +391,12 @@ room_mllm:
   enabled: true
   worker_count: 1
   max_queue_size: 2
-  # Room-level M1 is an expensive semantic refresh.  A latest-only queue is
-  # still retained, but do not admit more than one new room analysis per
-  # second; OCC, room-grid publication and object M1 remain unaffected.
+  # Per-room retry/change interval after a completed request, not a global
+  # requests-per-second limit. Unchanged successful evidence is cached.
   min_interval_s: 5.0
+
+  # Shared by all room workers; unrelated to the object-M1 lane's rate.
+  dispatch_interval_s: 1.0
 
 semantic_occ_overlay:
   enabled: true

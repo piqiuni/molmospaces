@@ -33,12 +33,8 @@ private:
     int prune_iterations_;
     int obstacle_distance_threshold_;
     
-    // 地图缓存
-    nav_msgs::OccupancyGrid last_map_;
-    bool map_received_;
-    
 public:
-    VoronoiMappingNode() : private_nh_("~"), map_received_(false)
+    VoronoiMappingNode() : private_nh_("~")
     {
         // 读取参数
         private_nh_.param("update_rate", update_rate_, 2.0);
@@ -80,6 +76,23 @@ public:
     void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr& msg)
     {
         ROS_INFO_ONCE("Received first occupancy grid map");
+
+        // OCC arrives faster than exploration needs a new skeleton.  The
+        // previous callback recomputed Voronoi, distance and markers for
+        // every map message, so this optional worker-rate gate dropped the
+        // mapper's callback queue behind a full-grid calculation.  Always
+        // keep accepting the newest map; the next eligible callback processes
+        // it and older maps are intentionally discarded.
+        static ros::WallTime last_compute_wall;
+        const double period_sec = update_rate_ > 0.0 ? 1.0 / update_rate_ : 0.0;
+        const ros::WallTime now_wall = ros::WallTime::now();
+        if (period_sec > 0.0 &&
+            !last_compute_wall.isZero() &&
+            (now_wall - last_compute_wall).toSec() < period_sec)
+        {
+            return;
+        }
+        last_compute_wall = now_wall;
         
         int width = msg->info.width;
         int height = msg->info.height;
@@ -135,9 +148,6 @@ public:
         // initializeMap takes ownership of gridMap. It keeps the grid alive
         // for Voronoi queries and releases it on the next map or at shutdown.
         
-        // 保存地图
-        last_map_ = *msg;
-        map_received_ = true;
     }
     
     void publishVoronoiMap(const nav_msgs::OccupancyGrid::ConstPtr& original_map, 

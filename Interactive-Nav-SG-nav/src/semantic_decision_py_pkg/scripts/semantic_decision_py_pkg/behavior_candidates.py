@@ -3557,7 +3557,7 @@ class CandidateGenerator:
                     continue
                 base_label = label[: -len(suffix)]
                 candidate_index = base_indices.get(base_label)
-                if candidate_index is not None and candidate_index < index:
+                if candidate_index is not None:
                     source_index = candidate_index
                 break
             source_indices.append(source_index)
@@ -3747,7 +3747,9 @@ class CandidateGenerator:
                 and index < len(staging_source_indices)
                 else index
             )
-            if 0 <= source_index < index:
+            if not 0 <= source_index < len(staging_goals):
+                return [], [], [], []
+            if source_index < index:
                 # The outer tangent is a new M1 capture pose, not a new
                 # physical face.  Copy the already-built base face options so
                 # the eventual bridge target cannot drift with camera offset.
@@ -3760,7 +3762,10 @@ class CandidateGenerator:
                     list(action_option_labels[source_index])
                 )
                 continue
-            values = list(staging_goal or [])
+            # Sorting by robot distance can put a tangent before its base.
+            # Compute from the referenced base even if its output is not yet
+            # available for the fast copy path above.
+            values = list(staging_goals[source_index] or [])
             if len(values) < 2:
                 return [], [], [], []
             try:
@@ -3795,9 +3800,9 @@ class CandidateGenerator:
             action_goals.append(primary)
             action_goal_options.append(options)
             label = (
-                str(staging_labels[index])
-                if index < len(staging_labels)
-                else f"staging_{index}"
+                str(staging_labels[source_index])
+                if source_index < len(staging_labels)
+                else f"staging_{source_index}"
             )
             action_labels.append(f"{label}_physical_action")
             action_option_labels.append(

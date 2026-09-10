@@ -7,7 +7,13 @@ from typing import Any
 def apply_module1_ablation(graph: dict[str, Any], mode: str) -> dict[str, Any]:
     normalized = str(mode or "dynamic_rule").casefold()
     if normalized != "static_semantic":
-        result = copy.deepcopy(graph)
+        # ``InteractionGraphStore.as_graph_dict`` already materializes fresh
+        # public node/edge dictionaries.  Dynamic M1 modes only add the
+        # top-level mode tag; none of the downstream overlay, marker, or JSON
+        # builders mutates nested payloads.  Avoid a second full deepcopy on
+        # every graph heartbeat (which dominated large physical graphs), while
+        # retaining a distinct top-level mapping for callers that add fields.
+        result = dict(graph)
         result["module1_mode"] = normalized
         return result
 

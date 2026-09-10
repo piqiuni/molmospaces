@@ -9,6 +9,36 @@ from semantic_decision_py_pkg.behavior_candidates import (
 )
 
 
+def _geometry_order_after_checking_nearest(candidate, *, tangents=False):
+    """Check runtime ordering, then address geometry assertions by stable labels."""
+    metadata = candidate.metadata
+    goals = metadata["goal_xyyaw_candidates"]
+    distances = [math.hypot(goal[0], goal[1] - 2.0) for goal in goals]
+    assert distances == sorted(distances)
+    assert list(candidate.goal_xyyaw) == list(goals[0])
+    suffixes = ["safe_outer", "safe_far", "safe_farthest"]
+    if tangents:
+        suffixes = ["safe_outer", "safe_outer_tangent_left", "safe_outer_tangent_right", "safe_far", "safe_farthest"]
+    expected = [f"{face}_{suffix}" for face in
+                ("current_view", "quarter_turn_left", "quarter_turn_right", "opposite_view")
+                for suffix in suffixes]
+    labels = metadata["interaction_approach_pose_labels"]
+    assert len(labels) == len(expected) and set(labels) == set(expected)
+    order = [labels.index(label) for label in expected]
+    reverse = {original: canonical for canonical, original in enumerate(order)}
+    result = dict(metadata)
+    for key in ("goal_xyyaw_candidates", "interaction_approach_pose_labels",
+                "container_staging_pose_labels", "container_staging_goal_xyyaw_candidates",
+                "container_action_goal_xyyaw_by_staging_index",
+                "container_action_goal_xyyaw_options_by_staging_index"):
+        if key in metadata:
+            result[key] = [metadata[key][index] for index in order]
+    if "container_staging_source_index_by_index" in metadata:
+        result["container_staging_source_index_by_index"] = [
+            reverse[metadata["container_staging_source_index_by_index"][index]] for index in order]
+    return result
+
+
 def test_locker_enters_provisional_interaction_candidate_until_m1_demotes_it() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
@@ -2360,6 +2390,29 @@ def test_fridge_multiview_angular_scale_halves_only_fridge_spread() -> None:
     assert math.isclose(abs(angles[3] - angles[0]), math.pi / 2.0, abs_tol=1e-6)
 
 
+def test_tangent_mapping_can_reference_a_later_base_after_distance_sort():
+    labels = ["current_view_safe_outer_tangent_left", "current_view_safe_outer"]
+    sources = CandidateGenerator._container_staging_source_indices(labels)
+    assert sources == [1, 1]
+    node = {"aabb_center": [4.0, 2.0, 1.0], "aabb_size": [1.0, 1.0, 2.0]}
+    goals = [[2.0, 1.8, 0.0], [2.0, 2.0, 0.0]]
+    action_goals, action_labels, options, option_labels = CandidateGenerator._container_action_goals_for_staging(
+        target_xy=(4.0, 2.0), staging_goals=goals, staging_labels=labels,
+        physical_standoff_m=0.4, lateral_offset_m=0.1, node=node,
+        staging_source_indices=sources,
+    )
+    assert action_goals[0] == action_goals[1]
+    assert options[0] == options[1]
+    assert action_labels[0] == action_labels[1]
+    assert option_labels[0] == option_labels[1]
+    captures, _ = CandidateGenerator._container_m1_capture_goals_for_staging(
+        target_xy=(4.0, 2.0), staging_goals=goals, staging_labels=labels,
+        capture_standoff_m=0.8, node=node, staging_source_indices=sources,
+    )
+    assert math.isclose(captures[0][0], captures[1][0], abs_tol=1e-6)
+    assert math.isclose(captures[0][1] - captures[1][1], -0.2, abs_tol=1e-6)
+
+
 def test_m1_face_selection_enumerates_aabb_cardinal_faces() -> None:
     node = {
         "id": "container_fridge",
@@ -2387,16 +2440,15 @@ def test_m1_face_selection_enumerates_aabb_cardinal_faces() -> None:
     assert candidate.metadata["container_m1_face_selection_contract"] == (
         "aabb_four_faces_m1_authorized"
     )
-    assert candidate.metadata["interaction_approach_pose_labels"] == [
-        "aabb_face_pos_x",
-        "aabb_face_pos_y",
-        "aabb_face_neg_x",
-        "aabb_face_neg_y",
-    ]
+    labels = candidate.metadata["interaction_approach_pose_labels"]
+    assert labels[0] == "aabb_face_neg_x"  # Robot is on the negative X side.
     assert candidate.metadata["container_m1_front_axis_from_capture"] is True
     assert candidate.metadata["container_anchor_shared_pose"] is True
     axes = candidate.metadata["container_face_axis_xy_by_staging_index"]
-    assert axes == [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+    assert dict(zip(labels, axes)) == {"aabb_face_pos_x": [1.0, 0.0],
+                                     "aabb_face_pos_y": [0.0, 1.0],
+                                     "aabb_face_neg_x": [-1.0, 0.0],
+                                     "aabb_face_neg_y": [0.0, -1.0]}
 
 
 def test_oblique_mllm_container_view_uses_reobservation_ring_not_contact_axis() -> None:
@@ -2576,8 +2628,9 @@ def test_mllm_container_preaction_prioritizes_safe_staging_face_before_radius() 
     )
 
     candidate = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
-    labels = candidate.metadata["interaction_approach_pose_labels"]
-    goals = candidate.metadata["goal_xyyaw_candidates"]
+    metadata = _geometry_order_after_checking_nearest(candidate)
+    labels = metadata["interaction_approach_pose_labels"]
+    goals = metadata["goal_xyyaw_candidates"]
 
     assert labels[:3] == [
         "current_view_safe_outer",
@@ -2602,7 +2655,8 @@ def test_mllm_container_preaction_prioritizes_safe_staging_face_before_radius() 
     assert len(goals) == 12
     # The object AABB surface is at x=3.5 on the current side.  The fridge's
     # 0.80 m observation standoff plus 0.30 m outer offset therefore places
-    # the primary point at x=2.4, not in the AABB shoulder.
+    # the direct outer point at x=2.4, not in the AABB shoulder. Runtime may
+    # visit a farther-from-object ring first because it is nearer the robot.
     assert math.isclose(goals[0][0], 2.4, abs_tol=1e-6)
     assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
     # A failed outer ring must not fall back to a close shoulder pose.
@@ -2695,9 +2749,10 @@ def test_two_stage_container_tangent_observation_reuses_base_action_mapping() ->
         )
     ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
 
-    labels = candidate.metadata["container_staging_pose_labels"]
-    goals = candidate.metadata["container_staging_goal_xyyaw_candidates"]
-    sources = candidate.metadata["container_staging_source_index_by_index"]
+    metadata = _geometry_order_after_checking_nearest(candidate, tangents=True)
+    labels = metadata["container_staging_pose_labels"]
+    goals = metadata["container_staging_goal_xyyaw_candidates"]
+    sources = metadata["container_staging_source_index_by_index"]
     assert labels[:5] == [
         "current_view_safe_outer",
         "current_view_safe_outer_tangent_left",
@@ -2720,10 +2775,10 @@ def test_two_stage_container_tangent_observation_reuses_base_action_mapping() ->
         assert sources[tangent_index] == base_index
         expected_yaw = math.atan2(2.0 - goals[tangent_index][1], 4.0 - goals[tangent_index][0])
         assert math.isclose(goals[tangent_index][2], expected_yaw, abs_tol=1e-6)
-    action_goals = candidate.metadata[
+    action_goals = metadata[
         "container_action_goal_xyyaw_by_staging_index"
     ]
-    action_options = candidate.metadata[
+    action_options = metadata[
         "container_action_goal_xyyaw_options_by_staging_index"
     ]
     assert action_goals[1] == action_goals[0]
@@ -2762,9 +2817,14 @@ def test_two_stage_container_tangent_observation_budget_clamps_to_expanded_ring(
     assert len(candidate.metadata["container_staging_goal_xyyaw_candidates"]) == 20
     assert candidate.metadata["interaction_observation_max_attempts"] == 20
     assert candidate.metadata["container_two_stage_observation_max_attempts"] == 20
-    # Navigation stays face-major, while M1 gets one direct outer view from
-    # each face before it spends evidence budget on tangents/farther rings.
-    assert candidate.metadata["container_m1_viewpoint_order"][:4] == [0, 5, 10, 15]
+    # Navigation is nearest-first. M1 indices still refer to a direct outer
+    # view from each face before spending the budget on tangents/farther rings.
+    labels = candidate.metadata["container_staging_pose_labels"]
+    order = candidate.metadata["container_m1_viewpoint_order"]
+    assert {labels[index] for index in order[:4]} == {
+        f"{face}_safe_outer" for face in
+        ("current_view", "quarter_turn_left", "quarter_turn_right", "opposite_view")}
+    assert sorted(order) == list(range(len(labels)))
 
 
 def test_two_stage_container_maps_navigation_anchor_to_direct_m1_capture_then_action() -> None:
@@ -2953,8 +3013,9 @@ def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None
         )
     ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
 
-    labels = candidate.metadata["interaction_approach_pose_labels"]
-    goals = candidate.metadata["goal_xyyaw_candidates"]
+    metadata = _geometry_order_after_checking_nearest(candidate)
+    labels = metadata["interaction_approach_pose_labels"]
+    goals = metadata["goal_xyyaw_candidates"]
     assert labels[:3] == [
         "current_view_safe_outer",
         "current_view_safe_far",

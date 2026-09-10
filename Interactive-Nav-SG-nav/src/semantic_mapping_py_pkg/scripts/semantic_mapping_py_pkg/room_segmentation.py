@@ -38,6 +38,10 @@ class RoomSegmenter:
         room_enclosed_occupied_max_aspect=1.8,
         room_enclosed_occupied_known_ring_ratio=0.95,
         room_enclosed_occupied_free_ring_ratio=0.45,
+        room_fill_enclosed_unknown=False,
+        room_enclosed_unknown_max_cells=250,
+        room_enclosed_unknown_known_ring_ratio=0.90,
+        room_enclosed_unknown_free_ring_ratio=0.75,
         room_fill_enclosed_obstacles=False,
         room_enclosed_obstacle_min_cells=120,
         room_enclosed_obstacle_max_cells=700,
@@ -71,6 +75,21 @@ class RoomSegmenter:
         self.room_enclosed_occupied_max_aspect = float(room_enclosed_occupied_max_aspect)
         self.room_enclosed_occupied_known_ring_ratio = float(room_enclosed_occupied_known_ring_ratio)
         self.room_enclosed_occupied_free_ring_ratio = float(room_enclosed_occupied_free_ring_ratio)
+        # RGB-D OCC contains small, fully enclosed unknown holes when a wall
+        # edge or a depth return is missing.  Treating every unknown cell as a
+        # wall fragments an otherwise connected room.  The fill is deliberately
+        # opt-in and only accepts compact components whose one-cell ring is
+        # overwhelmingly known/free; open unknown frontiers remain blocked.
+        self.room_fill_enclosed_unknown = bool(room_fill_enclosed_unknown)
+        self.room_enclosed_unknown_max_cells = max(
+            0, int(room_enclosed_unknown_max_cells)
+        )
+        self.room_enclosed_unknown_known_ring_ratio = float(
+            room_enclosed_unknown_known_ring_ratio
+        )
+        self.room_enclosed_unknown_free_ring_ratio = float(
+            room_enclosed_unknown_free_ring_ratio
+        )
         self.room_fill_enclosed_obstacles = bool(room_fill_enclosed_obstacles)
         self.room_enclosed_obstacle_min_cells = max(0, int(room_enclosed_obstacle_min_cells))
         self.room_enclosed_obstacle_max_cells = max(
@@ -217,14 +236,28 @@ class RoomSegmenter:
         width = int(occ_grid.info.width)
         height = int(occ_grid.info.height)
         size = width * height
-        room_ids = [self.room_unknown_id] * size
-        room_conf = [-1] * size
+        room_ids = np.full(size, self.room_unknown_id, dtype=np.int32)
+        room_conf = np.full(size, -1, dtype=np.int16)
         if size <= 0 or len(occ_grid.data) != size:
-            return [self.room_unknown_id] * size, [-1] * size
+            return room_ids.tolist(), room_conf.tolist()
         values = np.asarray(occ_grid.data, dtype=np.int16).reshape(height, width)
         free_mask = ((values >= 0) & (values <= self.room_free_threshold)).astype(np.uint8)
         occupied_mask = (values > self.room_free_threshold).astype(np.uint8)
         segmentation_free = free_mask.copy()
+        occupied_components = None
+        if (cv2 is not None and np.any(occupied_mask)
+            and (self.room_remove_enclosed_occupied or self.room_small_obstacle_max_cells > 0)):
+            occupied_components = self._connected_components_with_stats(
+                occupied_mask, cv2, connectivity=8
+            )
+
+        if cv2 is not None and self.room_fill_enclosed_unknown:
+            self._fill_enclosed_unknown_cells(
+                values,
+                free_mask,
+                segmentation_free,
+                cv2,
+            )
 
         if cv2 is not None and self.room_remove_enclosed_occupied and np.any(occupied_mask):
             known_mask = (values >= 0).astype(np.uint8)
@@ -234,9 +267,7 @@ class RoomSegmenter:
                 row_max = int(np.max(known_ys)) + 1
                 col_min = int(np.min(known_xs))
                 col_max = int(np.max(known_xs)) + 1
-                component_count, labels, stats, _centroids = self._connected_components_with_stats(
-                    occupied_mask, cv2, connectivity=8
-                )
+                component_count, labels, stats, _centroids = occupied_components
                 for component_id in range(1, component_count):
                     area = int(stats[component_id, cv2.CC_STAT_AREA])
                     if area <= 0 or area > self.room_enclosed_occupied_max_cells:
@@ -276,12 +307,11 @@ class RoomSegmenter:
                         continue
                     if float(np.mean(ring_free)) < self.room_enclosed_occupied_free_ring_ratio:
                         continue
-                    segmentation_free[labels == component_id] = 1
+                    region = np.s_[top:top + comp_height, left:left + comp_width]
+                    segmentation_free[region][labels[region] == component_id] = 1
 
         if cv2 is not None and self.room_small_obstacle_max_cells > 0 and np.any(occupied_mask):
-            component_count, labels, stats, _centroids = self._connected_components_with_stats(
-                occupied_mask, cv2, connectivity=8
-            )
+            component_count, labels, stats, _centroids = occupied_components
             for component_id in range(1, component_count):
                 area = int(stats[component_id, cv2.CC_STAT_AREA])
                 if area > self.room_small_obstacle_max_cells:
@@ -303,7 +333,8 @@ class RoomSegmenter:
                 span = max(int(comp_width), int(comp_height))
                 if density < 0.55 or aspect > 1.8 or span > 18:
                     continue
-                segmentation_free[labels == component_id] = 1
+                region = np.s_[top:top + comp_height, left:left + comp_width]
+                segmentation_free[region][labels[region] == component_id] = 1
 
         portal_cut_mask = np.zeros_like(segmentation_free, dtype=np.uint8)
         pre_portal_cut_free = None
@@ -329,8 +360,13 @@ class RoomSegmenter:
                 area = int(stats[component_id, cv2.CC_STAT_AREA])
                 if area < self.room_core_min_component_cells:
                     continue
-                ys, xs = np.where(labels == component_id)
-                component_cells[next_temp_id] = [int(y) * width + int(x) for y, x in zip(ys.tolist(), xs.tolist())]
+                # Keep the native index array until raster assignment.  The
+                # previous list conversion was immediately converted back to
+                # NumPy by the propagation/remap paths and cost a full-grid
+                # Python allocation on every room refresh.
+                component_cells[next_temp_id] = self._component_flat_indices(
+                    labels, stats[component_id], component_id, cv2
+                )
                 component_confidence[next_temp_id] = 100
                 next_temp_id += 1
 
@@ -356,38 +392,66 @@ class RoomSegmenter:
             }
 
         if not component_cells:
-            fallback_component = np.flatnonzero(segmentation_free > 0).tolist()
-            if len(fallback_component) >= self.room_min_component_cells:
-                component_cells[1] = [int(index) for index in fallback_component]
-                component_confidence[1] = 100
+            # Narrow observed regions may have no distance-transform core.
+            # Preserve their connectivity instead of assigning every free
+            # cell in the entire map to one artificial room.
+            component_cells = self._fallback_component_cells(
+                segmentation_free, width, height,
+                minimum_cells=self.room_min_component_cells, cv2=cv2,
+            )
+            component_confidence = {room_id: 100 for room_id in component_cells}
 
         remapped_ids = self._remap_room_component_ids(component_cells, occ_grid.info)
         for temp_room_id, component in component_cells.items():
             stable_room_id = remapped_ids.get(temp_room_id, temp_room_id)
-            for comp_idx in component:
-                room_ids[comp_idx] = stable_room_id
-                room_conf[comp_idx] = component_confidence.get(temp_room_id, 100)
+            indices = np.asarray(component, dtype=np.int64)
+            room_ids[indices] = int(stable_room_id)
+            room_conf[indices] = int(
+                component_confidence.get(temp_room_id, 100)
+            )
 
-        queue = deque(idx for idx, room_id in enumerate(room_ids) if room_id >= 0)
-        while queue:
-            current = queue.popleft()
-            x = current % width
-            y = current // width
-            current_room_id = room_ids[current]
-            current_conf = room_conf[current]
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx = x + dx
-                ny = y + dy
-                if nx < 0 or ny < 0 or nx >= width or ny >= height:
-                    continue
-                nidx = ny * width + nx
-                if room_ids[nidx] != self.room_unknown_id:
-                    continue
-                if segmentation_free[ny, nx] <= 0:
-                    continue
-                room_ids[nidx] = current_room_id
-                room_conf[nidx] = max(current_conf - 5, 60)
-                queue.append(nidx)
+        # In the usual map each traversable connected component contains one
+        # distance-transform core. Connected-components propagation is then
+        # equivalent to the old Python deque flood-fill, but runs in OpenCV
+        # and NumPy. Keep the exact BFS for multi-seed transition frames.
+        propagated = False
+        if cv2 is not None:
+            propagated = self._propagate_single_seed_components(
+                segmentation_free, room_ids, room_conf, width, height, cv2
+            )
+        if not propagated:
+            # Door-opening frames often connect several seeded rooms.  A
+            # Python deque over a 640k-cell map made this transition take
+            # roughly a second and blocked the room worker.  OpenCV's
+            # marker watershed performs the same topology-constrained growth
+            # in C++; only its thin tie boundaries need a tiny vectorised
+            # cleanup.  Keep the deque as a dependency-free safety fallback.
+            propagated = False
+            if cv2 is not None:
+                propagated = self._propagate_watershed(
+                    segmentation_free, room_ids, room_conf, width, height, cv2
+                )
+            if not propagated:
+                queue = deque(idx for idx, room_id in enumerate(room_ids) if room_id >= 0)
+                while queue:
+                    current = queue.popleft()
+                    x = current % width
+                    y = current // width
+                    current_room_id = room_ids[current]
+                    current_conf = room_conf[current]
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx = x + dx
+                        ny = y + dy
+                        if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                            continue
+                        nidx = ny * width + nx
+                        if room_ids[nidx] != self.room_unknown_id:
+                            continue
+                        if segmentation_free[ny, nx] <= 0:
+                            continue
+                        room_ids[nidx] = current_room_id
+                        room_conf[nidx] = max(current_conf - 5, 60)
+                        queue.append(nidx)
 
         if cv2 is not None and self.room_fill_enclosed_obstacles:
             room_ids, room_conf = self._fill_enclosed_obstacles(
@@ -400,47 +464,320 @@ class RoomSegmenter:
             )
 
         signature = self._grid_signature(occ_grid.info)
+        # Most segmentation paths keep NumPy arrays, while the optional
+        # enclosed-obstacle fill returns already-flattened Python lists.  Do
+        # not call ``.tolist()`` unconditionally: enabling that cleanup path
+        # used to raise ``AttributeError`` and stop room publication.
+        room_ids_list = room_ids.tolist() if hasattr(room_ids, "tolist") else list(room_ids)
+        room_conf_list = room_conf.tolist() if hasattr(room_conf, "tolist") else list(room_conf)
         self.state.prev_room_grid_signature = signature
-        self.state.prev_room_ids = list(room_ids)
+        self.state.prev_room_ids = room_ids_list
         return self._stabilize_room_grid(
             signature,
-            room_ids,
-            room_conf,
+            room_ids_list,
+            room_conf_list,
             force=force_stable,
         )
 
+    def _fill_enclosed_unknown_cells(
+        self,
+        values,
+        free_mask,
+        segmentation_free,
+        cv2,
+    ):
+        """Fill compact unknown holes surrounded by known free OCC cells.
+
+        Unknown space at the sensor frontier is intentionally not traversable:
+        only components strictly inside the bounding box of known cells are
+        considered.  Eight-connectivity also treats a diagonal pinhole as an
+        open leak, preventing accidental room connections through a one-cell
+        corner.  The operation mutates ``segmentation_free`` in place and
+        returns the number of filled cells for diagnostics/tests.
+        """
+
+        if self.room_enclosed_unknown_max_cells <= 0:
+            return 0
+        unknown_mask = (values < 0).astype(np.uint8)
+        known_mask = (values >= 0).astype(np.uint8)
+        if not np.any(unknown_mask) or not np.any(known_mask):
+            return 0
+        known_ys, known_xs = np.where(known_mask > 0)
+        if known_ys.size == 0 or known_xs.size == 0:
+            return 0
+        row_min = int(np.min(known_ys))
+        row_max = int(np.max(known_ys)) + 1
+        col_min = int(np.min(known_xs))
+        col_max = int(np.max(known_xs)) + 1
+        component_count, labels, stats, _centroids = (
+            self._connected_components_with_stats(
+                unknown_mask,
+                cv2,
+                connectivity=8,
+            )
+        )
+        filled = 0
+        height, width = values.shape
+        for component_id in range(1, int(component_count)):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area <= 0 or area > self.room_enclosed_unknown_max_cells:
+                continue
+            left = int(stats[component_id, cv2.CC_STAT_LEFT])
+            top = int(stats[component_id, cv2.CC_STAT_TOP])
+            comp_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            # A component touching the known-data envelope is part of the
+            # unknown frontier, not a hole.  Keep it conservative even when
+            # its local ring happens to contain many free cells.
+            if (
+                left <= col_min
+                or top <= row_min
+                or (left + comp_width) >= col_max
+                or (top + comp_height) >= row_max
+            ):
+                continue
+            ring_row_min = max(top - 1, 0)
+            ring_row_max = min(top + comp_height + 1, height)
+            ring_col_min = max(left - 1, 0)
+            ring_col_max = min(left + comp_width + 1, width)
+            ring_mask = np.ones(
+                (ring_row_max - ring_row_min, ring_col_max - ring_col_min),
+                dtype=bool,
+            )
+            if ring_mask.shape[0] > 2 and ring_mask.shape[1] > 2:
+                ring_mask[1:-1, 1:-1] = False
+            ring_known = known_mask[
+                ring_row_min:ring_row_max,
+                ring_col_min:ring_col_max,
+            ][ring_mask]
+            ring_free = free_mask[
+                ring_row_min:ring_row_max,
+                ring_col_min:ring_col_max,
+            ][ring_mask]
+            if ring_known.size == 0:
+                continue
+            if float(np.mean(ring_known)) < self.room_enclosed_unknown_known_ring_ratio:
+                continue
+            if float(np.mean(ring_free)) < self.room_enclosed_unknown_free_ring_ratio:
+                continue
+            region = np.s_[top:top + comp_height, left:left + comp_width]
+            segmentation_free[region][labels[region] == component_id] = 1
+            filled += area
+        return filled
+
+    def _propagate_single_seed_components(
+        self, segmentation_free, room_ids, room_conf, width, height, cv2
+    ):
+        """Propagate seed IDs with C++ distance transforms, component-wise.
+
+        Running one transform per free connected component prevents a seed in
+        another disconnected room from winning across a wall. The result is a
+        nearest-seed partition rather than the old FIFO tie-break, which is
+        stable for the large maps used on the physical robot and avoids a
+        Python operation for every free cell.
+        """
+        mask = (segmentation_free > 0).astype(np.uint8)
+        count, component_labels, stats, _centroids = (
+            self._connected_components_with_stats(mask, cv2, connectivity=4)
+        )
+        room_array = np.asarray(room_ids, dtype=np.int32).reshape(height, width)
+        conf_array = np.asarray(room_conf, dtype=np.int16).reshape(height, width)
+
+        # A connected free component can temporarily contain multiple room
+        # seeds after a confirmed door opens.  The fast distance transform is
+        # Euclidean and would be allowed to cut across an occupied wall in
+        # that case.  Detect this before mutating the arrays and let the exact
+        # 4-neighbour BFS below preserve the topology for that transition.
+        for component_id in range(1, int(count)):
+            top = int(stats[component_id, cv2.CC_STAT_TOP])
+            left = int(stats[component_id, cv2.CC_STAT_LEFT])
+            comp_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            if comp_width <= 0 or comp_height <= 0:
+                continue
+            component = (
+                component_labels[top : top + comp_height, left : left + comp_width]
+                == component_id
+            )
+            local_rooms = room_array[
+                top : top + comp_height, left : left + comp_width
+            ]
+            seed_rooms = local_rooms[component & (local_rooms >= 0)]
+            if seed_rooms.size and np.unique(seed_rooms).size > 1:
+                return False
+
+        for component_id in range(1, int(count)):
+            top = int(stats[component_id, cv2.CC_STAT_TOP])
+            left = int(stats[component_id, cv2.CC_STAT_LEFT])
+            comp_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            if comp_width <= 0 or comp_height <= 0:
+                continue
+            component = (
+                component_labels[top : top + comp_height, left : left + comp_width]
+                == component_id
+            )
+            local_rooms = room_array[
+                top : top + comp_height, left : left + comp_width
+            ]
+            local_conf = conf_array[
+                top : top + comp_height, left : left + comp_width
+            ]
+            seed_mask = component & (local_rooms >= 0)
+            if not np.any(seed_mask):
+                continue
+            target = component & ~seed_mask
+            if not np.any(target):
+                continue
+            seed_confs = local_conf[seed_mask]
+            if np.all(seed_confs == seed_confs[0]):
+                # The validation pass established one room ID per component.
+                # Uniform seed confidence makes nearest-seed lookup redundant:
+                # every target gets exactly the same ID and confidence.
+                local_rooms[target] = local_rooms[seed_mask][0]
+                local_conf[target] = max(int(seed_confs[0]) - 5, 60)
+                continue
+            source = np.ones(component.shape, dtype=np.uint8)
+            source[seed_mask] = 0
+            _distance, nearest = cv2.distanceTransformWithLabels(
+                source, cv2.DIST_L2, 5, cv2.DIST_LABEL_PIXEL
+            )
+            seed_labels = nearest[seed_mask]
+            seed_rooms = local_rooms[seed_mask]
+            seed_confs = local_conf[seed_mask]
+            max_label = int(np.max(nearest))
+            lookup_room = np.full(max_label + 1, self.room_unknown_id, dtype=np.int32)
+            lookup_conf = np.zeros(max_label + 1, dtype=np.int16)
+            unique_labels, first_indices = np.unique(
+                seed_labels, return_index=True
+            )
+            lookup_room[unique_labels] = seed_rooms[first_indices]
+            np.maximum.at(lookup_conf, seed_labels, seed_confs)
+            mapped_rooms = lookup_room[nearest]
+            target = component & (mapped_rooms >= 0)
+            local_rooms[target] = mapped_rooms[target]
+            local_conf[target] = np.maximum(
+                lookup_conf[nearest[target]].astype(np.int16) - 5, 60
+            )
+            # Preserve explicit low-confidence scores for portal-created
+            # pocket components that were seeded before propagation.
+            local_rooms[seed_mask] = seed_rooms
+            local_conf[seed_mask] = seed_confs
+        if isinstance(room_ids, np.ndarray):
+            room_ids[:] = room_array.reshape(-1)
+            room_conf[:] = conf_array.reshape(-1)
+        else:
+            room_ids[:] = room_array.reshape(-1).tolist()
+            room_conf[:] = conf_array.reshape(-1).tolist()
+        return True
+
+    def _propagate_watershed(
+        self, segmentation_free, room_ids, room_conf, width, height, cv2
+    ):
+        """Grow multiple room seeds through free cells without crossing walls.
+
+        ``cv2.watershed`` is used only for transition maps with multiple room
+        seeds in one connected component.  Occupied/unknown cells are marked
+        as watershed boundaries, so propagation remains topological rather
+        than taking a straight-line shortcut through a wall.  Watershed can
+        leave a one-cell tie boundary; the short vectorised pass below fills
+        it from an adjacent label.
+        """
+        free = np.asarray(segmentation_free, dtype=np.uint8).reshape(height, width) > 0
+        rooms = np.asarray(room_ids, dtype=np.int32).reshape(height, width)
+        confidences = np.asarray(room_conf, dtype=np.int16).reshape(height, width)
+        seeds = free & (rooms >= 0)
+        if not np.any(seeds):
+            return True
+
+        markers = np.zeros((height, width), dtype=np.int32)
+        markers[seeds] = rooms[seeds]
+        markers[~free] = -1
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        try:
+            cv2.watershed(image, markers)
+        except Exception:
+            return False
+
+        labels = np.where(free & (markers >= 0), markers, self.room_unknown_id).astype(
+            np.int32, copy=False
+        )
+        # Assign the small watershed tie boundary from an adjacent room.  Do
+        # not iterate over all labelled cells; each pass touches only unknown
+        # free cells and normally converges in one or two rounds.
+        for _ in range(8):
+            unknown = free & (labels < 0)
+            if not np.any(unknown):
+                break
+            up = np.zeros_like(labels)
+            up[1:] = labels[:-1]
+            down = np.zeros_like(labels)
+            down[:-1] = labels[1:]
+            left = np.zeros_like(labels)
+            left[:, 1:] = labels[:, :-1]
+            right = np.zeros_like(labels)
+            right[:, :-1] = labels[:, 1:]
+            replacement = np.where(
+                up >= 0,
+                up,
+                np.where(left >= 0, left, np.where(right >= 0, right, down)),
+            )
+            take = unknown & (replacement >= 0)
+            if not np.any(take):
+                break
+            labels[take] = replacement[take]
+
+        # Preserve the explicit confidence of core/portal seeds and use the
+        # same conservative propagated confidence as the former BFS.
+        propagated_conf = np.where(labels >= 0, 60, -1).astype(np.int16)
+        propagated_conf[seeds] = confidences[seeds]
+        if isinstance(room_ids, np.ndarray):
+            room_ids[:] = labels.reshape(-1)
+            room_conf[:] = propagated_conf.reshape(-1)
+        else:
+            room_ids[:] = labels.reshape(-1).tolist()
+            room_conf[:] = propagated_conf.reshape(-1).tolist()
+        return True
     def _stabilize_room_grid(self, signature, room_ids, room_conf, *, force=False):
+        # ``segment`` has already finished mutating the current raster.  Keep
+        # that owned list as the state snapshot instead of copying the entire
+        # map once for stable IDs, once for candidates, and once for the
+        # return value.  The next segment allocates a new raster, so these
+        # aliases cannot be mutated by a later call.  On NumPy-based custom
+        # callers convert only once at this boundary.
+        current_ids = room_ids if isinstance(room_ids, list) else room_ids.tolist()
+        current_conf = room_conf if isinstance(room_conf, list) else room_conf.tolist()
         if self.state.stable_room_grid_signature != signature or self.state.stable_room_ids is None:
             self.state.stable_room_grid_signature = signature
-            self.state.stable_room_ids = list(room_ids)
-            self.state.stable_room_conf = list(room_conf)
-            self.state.candidate_room_ids = list(room_ids)
-            self.state.candidate_room_conf = list(room_conf)
+            self.state.stable_room_ids = current_ids
+            self.state.stable_room_conf = current_conf
+            self.state.candidate_room_ids = current_ids
+            self.state.candidate_room_conf = current_conf
             self.state.candidate_room_count = self.room_grid_stability_frames
-            return list(room_ids), list(room_conf)
+            return current_ids, current_conf
 
         if force:
-            self.state.stable_room_ids = list(room_ids)
-            self.state.stable_room_conf = list(room_conf)
-            self.state.candidate_room_ids = list(room_ids)
-            self.state.candidate_room_conf = list(room_conf)
+            self.state.stable_room_ids = current_ids
+            self.state.stable_room_conf = current_conf
+            self.state.candidate_room_ids = current_ids
+            self.state.candidate_room_conf = current_conf
             self.state.candidate_room_count = self.room_grid_stability_frames
-            return list(room_ids), list(room_conf)
+            return current_ids, current_conf
 
         candidate_ids = self.state.candidate_room_ids
-        if candidate_ids is not None and self._room_grids_compatible(candidate_ids, room_ids):
+        if candidate_ids is not None and self._room_grids_compatible(candidate_ids, current_ids):
             self.state.candidate_room_count += 1
         else:
             self.state.candidate_room_count = 1
-        self.state.candidate_room_ids = list(room_ids)
-        self.state.candidate_room_conf = list(room_conf)
+        self.state.candidate_room_ids = current_ids
+        self.state.candidate_room_conf = current_conf
         if (
             self.state.candidate_room_count >= self.room_grid_stability_frames
             and not self.state.pending_merges
         ):
-            self.state.stable_room_ids = list(room_ids)
-            self.state.stable_room_conf = list(room_conf)
-        return list(self.state.stable_room_ids), list(self.state.stable_room_conf or room_conf)
+            self.state.stable_room_ids = current_ids
+            self.state.stable_room_conf = current_conf
+        return self.state.stable_room_ids, self.state.stable_room_conf or current_conf
 
     @staticmethod
     def _room_grids_compatible(previous_ids, current_ids):
@@ -795,7 +1132,31 @@ class RoomSegmenter:
             components.append(component)
         return components, labels
 
-    def _fallback_component_cells(self, segmentation_free, width, height):
+    @staticmethod
+    def _component_flat_indices(labels, stat, component_id, cv2):
+        left = int(stat[cv2.CC_STAT_LEFT])
+        top = int(stat[cv2.CC_STAT_TOP])
+        component_width = int(stat[cv2.CC_STAT_WIDTH])
+        component_height = int(stat[cv2.CC_STAT_HEIGHT])
+        rows, cols = np.nonzero(
+            labels[top:top + component_height, left:left + component_width] == component_id
+        )
+        return (rows + top) * labels.shape[1] + cols + left
+
+    def _fallback_component_cells(self, segmentation_free, width, height,
+                                  *, minimum_cells=None, cv2=None):
+        minimum = self.room_core_min_component_cells if minimum_cells is None else minimum_cells
+        if cv2 is not None:
+            count, labels, stats, _ = self._connected_components_with_stats(
+                segmentation_free, cv2, connectivity=4
+            )
+            accepted = {}
+            for component_id in range(1, count):
+                if int(stats[component_id, cv2.CC_STAT_AREA]) >= minimum:
+                    accepted[len(accepted) + 1] = self._component_flat_indices(
+                        labels, stats[component_id], component_id, cv2
+                    )
+            return accepted
         components, _ = self._free_components_with_labels(
             segmentation_free,
             width,
@@ -804,7 +1165,7 @@ class RoomSegmenter:
         accepted = {}
         next_temp_id = 1
         for component in components:
-            if len(component) < self.room_core_min_component_cells:
+            if len(component) < minimum:
                 continue
             accepted[next_temp_id] = component
             next_temp_id += 1
@@ -824,16 +1185,30 @@ class RoomSegmenter:
         elif self.state.prev_room_grid_signature == signature and self.state.prev_room_ids:
             previous_ids = self.state.prev_room_ids
 
+        # Materialize the previous raster once. Converting the complete room
+        # grid inside every component loop becomes expensive on large OCC
+        # maps with several seeded rooms.
+        previous_array = (
+            np.asarray(previous_ids, dtype=np.int32)
+            if previous_ids is not None
+            else None
+        )
+
         for temp_room_id, component in sorted(component_cells.items(), key=lambda item: -len(item[1])):
             best_prev_room_id = None
             best_overlap = 0
-            if previous_ids is not None:
-                overlap_counts = {}
-                for idx in component:
-                    prev_room_id = int(previous_ids[idx])
-                    if prev_room_id < 0:
-                        continue
-                    overlap_counts[prev_room_id] = overlap_counts.get(prev_room_id, 0) + 1
+            if previous_array is not None:
+                component_indices = np.asarray(component, dtype=np.int64)
+                previous_values = previous_array[component_indices]
+                previous_values = previous_values[previous_values >= 0]
+                if previous_values.size:
+                    values, counts = np.unique(previous_values, return_counts=True)
+                    overlap_counts = {
+                        int(value): int(count)
+                        for value, count in zip(values.tolist(), counts.tolist())
+                    }
+                else:
+                    overlap_counts = {}
                 if overlap_counts:
                     best_prev_room_id, best_overlap = max(
                         sorted(overlap_counts.items()),

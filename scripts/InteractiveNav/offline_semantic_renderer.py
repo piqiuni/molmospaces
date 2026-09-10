@@ -223,6 +223,10 @@ class GlobalCostmapReplay:
             if x == 0 and y == 0 and (w, h) == (self._grid.width, self._grid.height):
                 self._grid.values = patch.values
             elif x >= 0 and y >= 0 and x + w <= self._grid.width and y + h <= self._grid.height:
+                # Base-raster caches are keyed by the values-array identity.
+                # Apply local updates copy-on-write so a previously rendered
+                # frame cannot be silently changed underneath a cached image.
+                self._grid.values = self._grid.values.copy()
                 self._grid.values[y : y + h, x : x + w] = patch.values
             self._applied_update = index
         return self._grid
@@ -1486,6 +1490,67 @@ class OfflineSixPanelRenderer:
 
     def __init__(self, *, transforms: TransformResolver) -> None:
         self.transforms = transforms
+        # Base rasters are immutable for the lifetime of a RawGrid receipt,
+        # but a live six-panel frame can ask for the same OCC/costmap image
+        # several times (panel 2, room blend, semantic XY and the overview
+        # inset).  Keep a small identity-keyed cache so those consumers share
+        # one NumPy rasterization.  Retain the values array in each entry to
+        # prevent id reuse while a cached raster is alive; bound bytes as well
+        # as entry count because a few multi-million-cell maps can otherwise
+        # retain hundreds of megabytes during a replay seek.
+        self._grid_base_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._grid_base_cache_order: list[tuple[str, int]] = []
+        self._grid_base_cache_bytes = 0
+        self._grid_base_cache_max_bytes = 128 * 1024 * 1024
+
+    def _grid_base(self, grid: RawGrid | None, kind: str) -> np.ndarray | None:
+        """Return a shared immutable display raster for one grid receipt."""
+        if grid is None:
+            return None
+        values = grid.values
+        key = (str(kind), id(values))
+        cached = self._grid_base_cache.get(key)
+        if cached is not None and cached[0] is values:
+            return cached[1]
+        if kind == "costmap":
+            image = _costmap_base(grid)
+        elif kind == "room":
+            image = _room_base(grid)
+        else:
+            image = _occupancy_base(grid)
+        previous = self._grid_base_cache.get(key)
+        if previous is not None:
+            self._grid_base_cache_bytes -= int(
+                getattr(previous[0], "nbytes", 0)
+                + getattr(previous[1], "nbytes", 0)
+            )
+        self._grid_base_cache[key] = (values, image)
+        self._grid_base_cache_bytes += int(
+            getattr(values, "nbytes", 0) + getattr(image, "nbytes", 0)
+        )
+        try:
+            self._grid_base_cache_order.remove(key)
+        except ValueError:
+            pass
+        self._grid_base_cache_order.append(key)
+        # A live renderer normally has only the current OCC/room/costmap
+        # receipts. Keep a few historical entries for replay seeks without
+        # allowing large rasters to accumulate indefinitely.
+        while (
+            len(self._grid_base_cache_order) > 1
+            and (
+                len(self._grid_base_cache_order) > 8
+                or self._grid_base_cache_bytes > self._grid_base_cache_max_bytes
+            )
+        ):
+            old_key = self._grid_base_cache_order.pop(0)
+            old_entry = self._grid_base_cache.pop(old_key, None)
+            if old_entry is not None:
+                self._grid_base_cache_bytes -= int(
+                    getattr(old_entry[0], "nbytes", 0)
+                    + getattr(old_entry[1], "nbytes", 0)
+                )
+        return image
 
     def _world_to_image_px(self, grid: RawGrid, values: tuple[float, float, float] | None) -> tuple[int, int] | None:
         if values is None:
@@ -1499,6 +1564,25 @@ class OfflineSixPanelRenderer:
         return self.transforms.transform(
             float(values[0]), float(values[1]), float(values[2]) if len(values) > 2 else 0.0,
             source, target, step,
+        )
+
+    def _pose_frame(self, step: dict) -> str:
+        """Return the frame in which the live robot pose was captured.
+
+        Historical replay steps omitted ``pose_frame_id`` and conventionally
+        stored odometry poses, so odom remains the fallback.  Physical
+        packets now carry the field explicitly; honoring it prevents panel 2
+        and panel 3 from silently applying an odom->map transform twice (or
+        skipping it when a non-identity map correction is available).
+        """
+        return _frame_name(step.get("pose_frame_id")) or self.transforms.odom_frame
+
+    def _trajectory_frame(self, step: dict) -> str:
+        """Return the frame for trajectory samples, defaulting to pose frame."""
+        return (
+            _frame_name(step.get("trajectory_frame_id"))
+            or self._pose_frame(step)
+            or self.transforms.odom_frame
         )
 
     def _plan_poses(self, plan: dict | None, grid: RawGrid, step: int) -> list[tuple[float, float, float]]:
@@ -1532,14 +1616,16 @@ class OfflineSixPanelRenderer:
         snapshot_meta: dict | None = None,
         display_stamp_sec: float = 0.0,
         snapshot_selection_reason: str = "",
+        expand_crop_for_trajectory: bool = True,
     ) -> np.ndarray:
         width, height = panel_size
         if grid is None:
             panel = np.full((height, width, 3), 235, dtype=np.uint8)
             cv2.putText(panel, f"NO {title} YET", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 2, cv2.LINE_AA)
             return panel
-        base = _costmap_base(grid) if kind == "costmap" else _occupancy_base(grid)
-        pose = self._transform(step.get("pose"), self.transforms.odom_frame, grid.frame_id, step_index)
+        base = self._grid_base(grid, kind)
+        pose_frame = self._pose_frame(step)
+        pose = self._transform(step.get("pose"), pose_frame, grid.frame_id, step_index)
         raw_selection = step.get("semantic_selection") or {}
         selection = active_semantic_selection(step)
         goal_values = list(selection.get("goal_xyyaw") or [])
@@ -1559,7 +1645,7 @@ class OfflineSixPanelRenderer:
             converted
             for raw in trajectory_source
             if len(raw) >= 4
-            for converted in [self._transform((raw[1], raw[2], raw[3]), self.transforms.odom_frame, grid.frame_id, step_index)]
+            for converted in [self._transform((raw[1], raw[2], raw[3]), self._trajectory_frame(step), grid.frame_id, step_index)]
             if converted is not None
         ]
         global_plan = self._plan_poses(step.get("global_plan"), grid, step_index) if draw_global_plan else []
@@ -1613,7 +1699,7 @@ class OfflineSixPanelRenderer:
         # episode trajectory can begin outside a newly cropped local extent.
         # Include every still-representable historic point so offline replay
         # never silently drops early path history.
-        if crop is not None and trajectory_pixels:
+        if crop is not None and trajectory_pixels and expand_crop_for_trajectory:
             margin = max(8, int(math.ceil(4.5 / max(grid.resolution, 1e-6))))
             xs, ys = zip(*trajectory_pixels)
             crop = (
@@ -1854,7 +1940,7 @@ class OfflineSixPanelRenderer:
             layer = self._warp_grid(
                 (inset_w, inset_h),
                 occupancy,
-                _occupancy_base(occupancy),
+                self._grid_base(occupancy, "occupancy"),
                 to_px,
                 (248, 248, 248),
             )
@@ -1926,16 +2012,16 @@ class OfflineSixPanelRenderer:
             world_bounds = known_world_bounds(reference, 0.0) or (reference.origin_x, reference.origin_y, reference.origin_x + reference.width * reference.resolution, reference.origin_y + reference.height * reference.resolution)
         view_bounds = zoom_world_bounds(world_bounds, view_scale)
         scale, to_px = self._world_view(view_bounds, panel_size, margin=18, vertical_center=0.5)
-        occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
+        occ_layer = self._warp_grid(panel_size, occupancy, self._grid_base(occupancy, "occupancy"), to_px, (246, 246, 246))
         if occ_layer is not None:
             panel = cv2.addWeighted(occ_layer, 0.72, panel, 0.28, 0.0)
-        room_layer = self._warp_grid(panel_size, room, _room_base(room) if room else None, to_px, (246, 246, 246))
+        room_layer = self._warp_grid(panel_size, room, self._grid_base(room, "room"), to_px, (246, 246, 246))
         if room_layer is not None:
             panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
         if draw_global_plan:
             global_plan = self._plan_poses(step.get("global_plan"), reference, step_index)
             pose_for_plan = self._transform(
-                step.get("pose"), self.transforms.odom_frame, reference.frame_id, step_index
+                step.get("pose"), self._pose_frame(step), reference.frame_id, step_index
             )
             if global_plan and pose_for_plan is not None:
                 nearest = min(
@@ -2049,7 +2135,7 @@ class OfflineSixPanelRenderer:
                 1,
                 cv2.LINE_AA,
             )
-        pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
+        pose = self._transform(step.get("pose"), self._pose_frame(step), self.transforms.map_frame, step_index)
         if pose is not None:
             _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
         _draw_panel_title(panel, "ROOM SEGMENTS + INTERACTION", step_index)
@@ -2122,7 +2208,7 @@ class OfflineSixPanelRenderer:
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
         nodes = _bounded_nodes(graph, observed, target_ids)
         positions = [position for node in nodes if (position := _node_xy(node)) is not None]
-        pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
+        pose = self._transform(step.get("pose"), self._pose_frame(step), self.transforms.map_frame, step_index)
         if pose is not None:
             positions.append((pose[0], pose[1]))
         if not positions:
@@ -2138,7 +2224,7 @@ class OfflineSixPanelRenderer:
             world_bounds = (min_x, min_y, max_x, max_y)
         view_bounds = zoom_world_bounds(world_bounds, view_scale)
         scale, to_px = self._world_view(view_bounds, map_size, margin=28, vertical_center=0.53)
-        occ_layer = self._warp_grid(map_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
+        occ_layer = self._warp_grid(map_size, occupancy, self._grid_base(occupancy, "occupancy"), to_px, (246, 246, 246))
         if occ_layer is not None:
             panel = cv2.addWeighted(occ_layer, 0.35, panel, 0.65, 0.0)
         min_x, min_y, max_x, max_y = view_bounds

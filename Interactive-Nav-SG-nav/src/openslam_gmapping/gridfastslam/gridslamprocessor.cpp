@@ -5,6 +5,8 @@
 #include <set>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <streambuf>
 #include <gmapping/utils/stat.h>
 #include "gmapping/gridfastslam/gridslamprocessor.h"
 
@@ -14,10 +16,27 @@
 namespace GMapping {
 
 const double m_distanceThresholdCheck = 20;
+
+// The upstream implementation binds the default info stream to std::cout and
+// writes several lines for every accepted scan.  On the physical robot that
+// synchronous terminal I/O is slower than the scan update itself and can
+// back-pressure the single GMapping callback.  Keep the stream API intact,
+// but make the production default a zero-allocation sink.
+class NullStreamBuffer final : public std::streambuf
+{
+public:
+  int_type overflow(int_type character) override
+  {
+    return traits_type::not_eof(character);
+  }
+};
+
+NullStreamBuffer g_null_stream_buffer;
+std::ostream g_null_info_stream(&g_null_stream_buffer);
  
 using namespace std;
 
-  GridSlamProcessor::GridSlamProcessor(): m_infoStream(cout){
+  GridSlamProcessor::GridSlamProcessor(): m_infoStream(g_null_info_stream){
     
     period_ = 5.0;
     m_obsSigmaGain=1;
@@ -29,7 +48,7 @@ using namespace std;
   }
   
   GridSlamProcessor::GridSlamProcessor(const GridSlamProcessor& gsp) 
-    :last_update_time_(0.0), m_particles(gsp.m_particles), m_infoStream(cout){
+    :last_update_time_(0.0), m_particles(gsp.m_particles), m_infoStream(g_null_info_stream){
     
     period_ = 5.0;
 
@@ -55,11 +74,6 @@ using namespace std;
     m_angularDistance=gsp.m_angularDistance;
     m_neff=gsp.m_neff;
 	
-    cerr << "FILTER COPY CONSTRUCTOR" << endl;
-    cerr << "m_odoPose=" << m_odoPose.x << " " <<m_odoPose.y << " " << m_odoPose.theta << endl;
-    cerr << "m_lastPartPose=" << m_lastPartPose.x << " " <<m_lastPartPose.y << " " << m_lastPartPose.theta << endl;
-    cerr << "m_linearDistance=" << m_linearDistance << endl;
-    cerr << "m_angularDistance=" << m_linearDistance << endl;
     
 		
     m_xmin=gsp.m_xmin;
@@ -88,9 +102,7 @@ using namespace std;
 #endif
 
 
-    cerr  << "Tree: normalizing, resetting and propagating weights within copy construction/cloneing ..." ;
     updateTreeWeights(false);
-    cerr  << ".done!" <<endl;
   }
   
   GridSlamProcessor::GridSlamProcessor(std::ostream& infoS): m_infoStream(infoS){
@@ -404,12 +416,6 @@ void GridSlamProcessor::setMotionModelParameters
       if (m_infoStream)
 	m_infoStream << "update frame " <<  m_readingCount << endl
 		     << "update ld=" << m_linearDistance << " ad=" << m_angularDistance << endl;
-      
-      
-      cerr << "Laser Pose= " << reading.getPose().x << " " << reading.getPose().y 
-	   << " " << reading.getPose().theta << endl;
-      
-      
       //this is for converting the reading in a scan-matcher feedable form
       assert(reading.size()==m_beams);
       double * plainReading = new double[m_beams];
@@ -418,11 +424,18 @@ void GridSlamProcessor::setMotionModelParameters
       }
       m_infoStream << "m_count " << m_count << endl;
 
-      RangeReading* reading_copy = 
-              new RangeReading(reading.size(),
-                               &(reading[0]),
-                               static_cast<const RangeSensor*>(reading.getSensor()),
-                               reading.getTime());
+      // The odometry-locked path does not build particle-tree generations
+      // after its first scan, so it has no consumer for a per-frame
+      // RangeReading copy.  Retain only the first copy, which is owned by the
+      // initial TNode; scan-matching keeps the historical allocation because
+      // resample() stores it in the particle tree.
+      RangeReading* reading_copy = 0;
+      if (!m_useOdometryPose || !m_count)
+        reading_copy = new RangeReading(
+            reading.size(),
+            &(reading[0]),
+            static_cast<const RangeSensor*>(reading.getSensor()),
+            reading.getTime());
 
       if (m_count>0){
 	if (m_useOdometryPose){
@@ -469,7 +482,17 @@ void GridSlamProcessor::setMotionModelParameters
 	  m_outputStream << setiosflags(ios::fixed) << setprecision(6);
 	  m_outputStream << "NEFF " << m_neff << endl;
 	}
- 	resample(plainReading, adaptParticles, reading_copy);
+	 // In odometry-locked physical mapping the current particle map was
+	 // already updated above by ``registerScan``.  Calling ``resample`` here
+	 // would register the same scan a second time (and print its synchronous
+	 // "Registering Scans" diagnostics), doubling the mapper work on every
+	 // RGB-D frame.  The odometry path deliberately has one particle and does
+	 // not need a particle-tree generation/resampling step; keep the original
+	 // tree path untouched for normal scan-matching operation.
+	 if (!m_useOdometryPose)
+	   resample(plainReading, adaptParticles, reading_copy);
+	 else if (m_count > 0 && reading_copy)
+	   delete reading_copy;
 	
       } else {
 	m_infoStream << "Registering First Scan"<< endl;
@@ -536,4 +559,3 @@ void GridSlamProcessor::setMotionModelParameters
 
   
 };// end namespace
-

@@ -17,17 +17,46 @@ import zlib
 
 PROTOCOL_VERSION = 1
 WIRE_ZLIB_MAGIC = b"MSZ1"
+# JPEG/PNG bytes are already entropy-coded.  The outer envelope mainly
+# compresses JSON punctuation and base64 alphabet; the default LZ77 strategy
+# needlessly searches megabytes of high-entropy image text and can consume a
+# full 10 Hz period on the Go2 CPU. Huffman-only coding keeps the envelope
+# wire-compatible while making this pass bounded and predictable.
+WIRE_ZLIB_STRATEGY = zlib.Z_HUFFMAN_ONLY
 
 
 def now_wall() -> float:
     return time.time()
 
 
+def sample_clock_pair() -> tuple[float, float, float]:
+    """Sample wall time bracketed by monotonic time.
+
+    Under CPU pressure a thread can be descheduled between two clock reads.
+    The midpoint and measured span let the receiver reject such a sample
+    instead of mistaking scheduler latency for a host wall-clock step.
+    """
+
+    monotonic_before = time.monotonic()
+    wall = time.time()
+    monotonic_after = time.monotonic()
+    return (
+        wall,
+        .5 * (monotonic_before + monotonic_after),
+        max(0., monotonic_after - monotonic_before),
+    )
+
+
 def _b64(value: bytes) -> str:
     return base64.b64encode(value).decode("ascii")
 
 
-def encode_wire_packet(packet: Mapping[str, Any], *, compression_level: int = 1) -> bytes:
+def encode_wire_packet(
+    packet: Mapping[str, Any],
+    *,
+    compression_level: int = 1,
+    compression_strategy: int = WIRE_ZLIB_STRATEGY,
+) -> bytes:
     """Encode a packet without changing any RGB or uint16 depth samples.
 
     JPEG/PNG data is already compressed, but its base64 JSON representation
@@ -35,7 +64,14 @@ def encode_wire_packet(packet: Mapping[str, Any], *, compression_level: int = 1)
     of that overhead while keeping protocol-v1 payload semantics unchanged.
     """
     payload = json.dumps(dict(packet), separators=(",", ":")).encode("utf-8")
-    return WIRE_ZLIB_MAGIC + zlib.compress(payload, int(compression_level))
+    compressor = zlib.compressobj(
+        int(compression_level),
+        zlib.DEFLATED,
+        zlib.MAX_WBITS,
+        8,
+        int(compression_strategy),
+    )
+    return WIRE_ZLIB_MAGIC + compressor.compress(payload) + compressor.flush()
 
 
 def decode_wire_packet(raw: str | bytes) -> dict[str, Any]:
@@ -65,6 +101,8 @@ def image_packet(
     depth_intrinsics: Mapping[str, Any] | None = None,
     depth_to_color_extrinsics: Mapping[str, Any] | None = None,
     camera_imu: Mapping[str, Any] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
+    capture_timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,
@@ -83,11 +121,17 @@ def image_packet(
         "depth_intrinsics": dict(depth_intrinsics or intrinsics),
         "depth_to_color_extrinsics": dict(depth_to_color_extrinsics or {}),
         "camera_imu": dict(camera_imu or {}),
+        **({"capture_timing": dict(capture_timing)} if capture_timing else {}),
+        # Carry the body pose sampled with this capture.  The ROS bridge can
+        # publish an odom/TF entry before the cloud, and YOLO can use the same
+        # pose instead of waiting for the next independent telemetry packet.
+        "telemetry": dict(telemetry or {}),
         "color_depth_sync_ms": float(color_depth_sync_ms),
     }
 
 
 def hello_packet(*, host: str, streams: Mapping[str, Any]) -> dict[str, Any]:
+    wall, monotonic, pair_span_s = sample_clock_pair()
     return {
         "v": PROTOCOL_VERSION,
         "type": "hello",
@@ -96,16 +140,39 @@ def hello_packet(*, host: str, streams: Mapping[str, Any]) -> dict[str, Any]:
         "streams": dict(streams),
         "capabilities": ["rgb", "depth", "camera_info", "pose", "telemetry"],
         "actuation_enabled": False,
-        "stamp": now_wall(),
+        "stamp": wall,
+        # Paired source clocks let the receiver distinguish a real Go2 wall
+        # clock step from WebSocket/TCP head-of-line delay.  The field is
+        # additive and ignored by protocol-v1 peers that predate it.
+        "source_monotonic": monotonic,
+        "source_clock_pair_span_s": pair_span_s,
+    }
+
+
+def clock_probe_packet(*, seq: int) -> dict[str, Any]:
+    """Small send-time envelope used only for cross-host clock estimation."""
+
+    wall, monotonic, pair_span_s = sample_clock_pair()
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": "clock_probe",
+        "seq": int(seq),
+        "stamp": wall,
+        "source_monotonic": monotonic,
+        "source_clock_pair_span_s": pair_span_s,
+        "read_only": True,
     }
 
 
 def telemetry_packet(*, seq: int, telemetry: Mapping[str, Any]) -> dict[str, Any]:
+    wall, monotonic, pair_span_s = sample_clock_pair()
     return {
         "v": PROTOCOL_VERSION,
         "type": "telemetry",
         "seq": int(seq),
-        "stamp": now_wall(),
+        "stamp": wall,
+        "source_monotonic": monotonic,
+        "source_clock_pair_span_s": pair_span_s,
         "read_only": True,
         "telemetry": dict(telemetry),
     }

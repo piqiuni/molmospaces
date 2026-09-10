@@ -1,6 +1,7 @@
 import math
 import time
 from statistics import median
+from collections import defaultdict
 
 from .geometry_utils import euclidean_2d, grid_index, normalize_label, point_dict, world_to_grid
 
@@ -39,6 +40,26 @@ def _axial_yaw_delta(first, second):
 def _is_portal_label(label):
     normalized = normalize_label(label)
     return any(token in normalized for token in ("door", "portal", "gate"))
+
+
+# Cross-label duplicate tracking is intentionally limited to these alias
+# families.  Keep the sets at module scope: the duplicate pass runs on every
+# detector receipt and rebuilding them inside the pairwise loop adds needless
+# allocations when the scene contains many unrelated labels.
+_FURNITURE_DUPLICATE_LABELS = frozenset(
+    {"sofa", "bed", "couch", "settee", "divan", "bench"}
+)
+_APPLIANCE_DUPLICATE_LABELS = frozenset(
+    {
+        "fridge",
+        "refrigerator",
+        "freezer",
+        "locker",
+        "safe",
+        "water_dispenser",
+        "dispenser",
+    }
+)
 
 
 class ObjectMapStore:
@@ -97,7 +118,27 @@ class ObjectMapStore:
         }
         self.objects = []
         self.next_id = 1
+        self._last_update_stamp = None
         self.m1_canonical_labels = {}
+        # Matching indexes are rebuilt at each update-batch boundary and then
+        # maintained as tracks move/create.  They are deliberately secondary
+        # to the exact matcher below: a missing/invalid index falls back to the
+        # historical full insertion-order scan.
+        self._match_identity_index = None
+        self._match_spatial_index = None
+        self._match_spatial_bucket = {}
+        self._match_portal_ids = set()
+        self._match_index_order = {}
+        self._match_object_index = {}
+        self._match_index_cell_size = max(abs(self.match_distance), 1e-6)
+
+    def reset(self):
+        """Clear observation identity/state while preserving tracker tuning."""
+        self.objects = []
+        self.next_id = 1
+        self._last_update_stamp = None
+        self.m1_canonical_labels.clear()
+        self._invalidate_match_indexes()
 
     def set_m1_canonical_label(self, track_id, label):
         track_id = str(track_id or "")
@@ -112,7 +153,10 @@ class ObjectMapStore:
                     continue
                 obj["m1_canonical_label"] = label
                 obj["m1_confirmed"] = True
+                obj["semantic_name"] = label
+                obj["label_votes"] = {label: max(float(obj.get("conf", 0.0)), 0.05)}
                 break
+            self._invalidate_match_indexes()
 
     def _required_confirmations(self, label):
         return self.class_min_confirmations.get(
@@ -167,8 +211,24 @@ class ObjectMapStore:
 
     def update(self, detections, stamp):
         now = float(stamp if stamp is not None else time.time())
+        if not math.isfinite(now):
+            return False
+        if (self.objects and self._last_update_stamp is not None
+            and now <= self._last_update_stamp):
+            return False
+        # Clearing objects is the existing episode-reset interface. A reset
+        # must also allow the new episode's capture clock to start over.
+        self._last_update_stamp = now
+        self._rebuild_match_indexes()
         matched_ids = set()
         for det in detections:
+            # A detector can deliberately retain a 2-D-only record for
+            # visualization after skipping its expensive RGB-D lift.  It is
+            # not an observation for tracking; accepting it here would make
+            # the legacy fallbacks create a zero-sized track at the map
+            # origin.
+            if not isinstance(det, dict) or bool(det.get("geometry_skipped", False)):
+                continue
             source_instance_id = str(det.get("instance_id") or det.get("track_id") or "")
             canonical = self.m1_canonical_labels.get(source_instance_id, "")
             label = canonical or normalize_label(
@@ -183,13 +243,38 @@ class ObjectMapStore:
                 det["semantic_name"] = canonical
                 det["category"] = canonical
                 det["m1_canonicalized"] = True
-            pos = self._point_from_detection(det, "world_position", "position")
-            confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
-            yaw = _detection_yaw(det)
+            try:
+                pos = self._point_from_detection(
+                    det, "world_position", "position", "world_box3d_center", "box3d_center", "aabb_center",
+                    required=True,
+                )
+                confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
+                yaw = _detection_yaw(det)
+                size = self._point_from_detection(det, "world_box3d_size", "box3d_size", "size", "aabb_size")
+                center = self._point_from_detection(det, "world_box3d_center", "box3d_center", "aabb_center", "world_position", "position")
+                viz_center = self._point_from_detection(
+                    det, "world_box3d_center", "aabb_center", "box3d_center", "world_position", "position"
+                )
+                viz_size = self._point_from_detection(
+                    det, "world_box3d_size", "aabb_size", "box3d_size", "size"
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0
+                or (yaw is not None and not math.isfinite(yaw))
+                or any(not math.isfinite(float(value)) for point in (pos, size, center, viz_center, viz_size) for value in point.values())
+                or any(float(value) < 0.0 for point in (size, viz_size) for value in point.values())):
+                continue
             instance_id = source_instance_id
-            size = self._point_from_detection(det, "world_box3d_size", "box3d_size", "size")
-            center = self._point_from_detection(det, "world_box3d_center", "box3d_center", "world_position", "position")
             match = self._find_match(label, pos, size, instance_id, yaw=yaw)
+            if match is not None and int(match["object_id"]) in matched_ids:
+                # Several overlapping detector boxes in one image are not
+                # independent temporal confirmations of this physical track.
+                continue
+            if match is not None and match.get("m1_canonical_label"):
+                # Raw detector streams need not echo our generated track ID.
+                # Once geometry matches, retain the accepted M1 identity.
+                label = str(match["m1_canonical_label"])
             # Geometry is an admission/confirmation gate only. Once the track
             # is confirmed, close-range partial boxes keep updating it.
             if (
@@ -197,22 +282,6 @@ class ObjectMapStore:
                 and not self._passes_top_height_filter(label, det, center, size)
             ):
                 continue
-            viz_center = self._point_from_detection(
-                det,
-                "world_box3d_center",
-                "aabb_center",
-                "box3d_center",
-                "world_position",
-                "position",
-            )
-            viz_size = self._point_from_detection(
-                det,
-                "world_box3d_size",
-                "aabb_size",
-                "box3d_size",
-                "size",
-            )
-
             if match is None:
                 match = {
                     "object_id": self.next_id,
@@ -348,6 +417,7 @@ class ObjectMapStore:
             )
             match["last_seen"] = now
             matched_ids.add(int(match["object_id"]))
+            self._index_match_object(match)
 
         for obj in self.objects:
             if int(obj["object_id"]) in matched_ids:
@@ -357,6 +427,7 @@ class ObjectMapStore:
 
         self._merge_duplicate_tracks()
         self._purge_stale(now)
+        return True
 
     @staticmethod
     def _bbox_iou_2d(a, b):
@@ -381,113 +452,147 @@ class ObjectMapStore:
         if self.duplicate_bbox_iou_threshold <= 0.0 or len(self.objects) < 2:
             return
         removed = set()
-        ordered = sorted(
-            self.objects,
-            key=lambda obj: (-int(obj.get("observation_count", 0)), int(obj.get("object_id", 0))),
-        )
-        for index, keeper in enumerate(ordered):
-            if int(keeper.get("object_id", -1)) in removed:
-                continue
-            for duplicate in ordered[index + 1 :]:
-                duplicate_id = int(duplicate.get("object_id", -1))
-                if duplicate_id in removed:
+        # Eligibility is an equivalence relation: exact labels may merge with
+        # the same label, while cross-label merges are limited to one of the
+        # two explicit alias families.  Partitioning first preserves the
+        # original pairwise semantics but avoids scanning every unrelated
+        # label pair (the common scene has many one-off open-vocabulary
+        # labels).  Each group is sorted with the same keeper ordering as the
+        # former global pass, so ties and evidence dominance are unchanged.
+        groups = {}
+        for obj in self.objects:
+            label = str(obj.get("semantic_name") or "")
+            if label in _FURNITURE_DUPLICATE_LABELS:
+                group_key = ("family", "furniture")
+            elif label in _APPLIANCE_DUPLICATE_LABELS:
+                group_key = ("family", "appliance")
+            else:
+                group_key = ("label", label)
+            groups.setdefault(group_key, []).append(obj)
+        ordered_groups = [
+            sorted(
+                group,
+                key=lambda obj: (
+                    -int(obj.get("observation_count", 0)),
+                    int(obj.get("object_id", 0)),
+                ),
+            )
+            for group in groups.values()
+            if len(group) >= 2
+        ]
+        if not ordered_groups:
+            return
+        for ordered in ordered_groups:
+            for index, keeper in enumerate(ordered):
+                if int(keeper.get("object_id", -1)) in removed:
                     continue
-                bbox_iou = self._bbox_iou_2d(keeper.get("bbox_2d"), duplicate.get("bbox_2d"))
-                same_label = keeper.get("semantic_name") == duplicate.get("semantic_name")
-                # Cross-label merges are deliberately restricted to the
-                # furniture family where sofa/bed/couch are common aliases.
-                # Require stronger 2-D overlap than ordinary same-label NMS
-                # so adjacent furniture is not collapsed accidentally.
-                furniture = {"sofa", "bed", "couch", "settee", "divan", "bench"}
-                # Open-vocabulary detector labels can split one tall appliance
-                # into ``locker``/``safe`` (and M1 may later call both
-                # refrigerator).  A near-identical image box plus overlapping
-                # 3-D body is stronger duplicate evidence than the label in
-                # this case; keep adjacent appliances separate by requiring the
-                # configured high IoU and the existing 3-D overlap gate.
-                appliance_aliases = {
-                    "fridge",
-                    "refrigerator",
-                    "freezer",
-                    "locker",
-                    "safe",
-                    "water_dispenser",
-                    "dispenser",
-                }
-                cross_label = (
-                    not same_label
-                    and str(keeper.get("semantic_name") or "") in furniture
-                    and str(duplicate.get("semantic_name") or "") in furniture
-                    and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.70)
-                )
-                cross_label_appliance = (
-                    not same_label
-                    and str(keeper.get("semantic_name") or "") in appliance_aliases
-                    and str(duplicate.get("semantic_name") or "") in appliance_aliases
-                    and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.85)
-                )
-                if cross_label_appliance:
-                    cross_label = True
-                if not same_label and not cross_label:
-                    continue
-                if same_label and bbox_iou < self.duplicate_bbox_iou_threshold:
-                    continue
-                if cross_label and not cross_label_appliance and bbox_iou < 0.70:
-                    continue
-                if cross_label_appliance and bbox_iou < max(
-                    self.duplicate_bbox_iou_threshold, 0.85
-                ):
-                    continue
-                center_a = keeper.get("aabb_center", keeper.get("coord", [0.0, 0.0, 0.0]))
-                center_b = duplicate.get("aabb_center", duplicate.get("coord", [0.0, 0.0, 0.0]))
-                center_distance = math.dist([float(v) for v in center_a], [float(v) for v in center_b])
-                # Depth can jump between foreground/background surfaces while
-                # the 2-D mask remains the same object.  For near-identical
-                # image boxes, tolerate that depth disagreement and use a
-                # wider spatial gate; ordinary boxes retain the strict gate.
-                if center_distance >= self.match_distance and bbox_iou < 0.90:
-                    continue
-                overlap = self._aabb_overlap_ratio(
-                    center_a,
-                    keeper.get("aabb_size", [0.0, 0.0, 0.0]),
-                    center_b,
-                    duplicate.get("aabb_size", [0.0, 0.0, 0.0]),
-                )
-                if overlap < self.duplicate_3d_overlap_threshold and bbox_iou < 0.90:
-                    continue
-                keeper["conf"] = max(float(keeper.get("conf", 0.0)), float(duplicate.get("conf", 0.0)))
-                keeper["observation_count"] = max(
-                    int(keeper.get("observation_count", 0)),
-                    int(duplicate.get("observation_count", 0)),
-                )
-                keeper["max_visible_pixels"] = max(
-                    int(keeper.get("max_visible_pixels", 0)),
-                    int(duplicate.get("max_visible_pixels", 0)),
-                )
-                keeper["max_visible_fraction"] = max(
-                    float(keeper.get("max_visible_fraction", 0.0)),
-                    float(duplicate.get("max_visible_fraction", 0.0)),
-                )
-                keeper["max_consecutive_observations"] = max(
-                    int(keeper.get("max_consecutive_observations", 0)),
-                    int(duplicate.get("max_consecutive_observations", 0)),
-                )
-                keeper["last_seen"] = max(float(keeper.get("last_seen", 0.0)), float(duplicate.get("last_seen", 0.0)))
-                keeper["is_confirmed"] = bool(keeper.get("is_confirmed") or duplicate.get("is_confirmed"))
-                votes = dict(keeper.get("label_votes") or {})
-                for label, score in (duplicate.get("label_votes") or {}).items():
-                    # Sum evidence from both tracks so candidate_labels exposes
-                    # all plausible attributes while semantic_name remains the
-                    # highest-vote (dominant) interpretation.
-                    votes[label] = float(votes.get(label, 0.0)) + float(score)
-                keeper["label_votes"] = votes
-                keeper["semantic_name"] = max(
-                    sorted(votes.keys()),
-                    key=lambda key: (float(votes[key]), key == keeper.get("semantic_name")),
-                )
-                removed.add(duplicate_id)
+                for duplicate in ordered[index + 1 :]:
+                    duplicate_id = int(duplicate.get("object_id", -1))
+                    if duplicate_id in removed:
+                        continue
+                    same_label = keeper.get("semantic_name") == duplicate.get("semantic_name")
+                    keeper_label = str(keeper.get("semantic_name") or "")
+                    duplicate_label = str(duplicate.get("semantic_name") or "")
+                    # Different labels can only merge inside the explicitly
+                    # supported alias families.  Do this cheap check before IoU,
+                    # distance, and 3-D overlap calculations; the conditions
+                    # below remain unchanged for every eligible pair.
+                    if not same_label and not (
+                        keeper_label in _FURNITURE_DUPLICATE_LABELS
+                        and duplicate_label in _FURNITURE_DUPLICATE_LABELS
+                    ) and not (
+                        keeper_label in _APPLIANCE_DUPLICATE_LABELS
+                        and duplicate_label in _APPLIANCE_DUPLICATE_LABELS
+                    ):
+                        continue
+                    bbox_iou = self._bbox_iou_2d(
+                        keeper.get("bbox_2d"), duplicate.get("bbox_2d")
+                    )
+                    # Cross-label merges are deliberately restricted to the
+                    # furniture family where sofa/bed/couch are common aliases.
+                    # Require stronger 2-D overlap than ordinary same-label NMS
+                    # so adjacent furniture is not collapsed accidentally.
+                    # Open-vocabulary detector labels can split one tall appliance
+                    # into ``locker``/``safe`` (and M1 may later call both
+                    # refrigerator).  A near-identical image box plus overlapping
+                    # 3-D body is stronger duplicate evidence than the label in
+                    # this case; keep adjacent appliances separate by requiring the
+                    # configured high IoU and the existing 3-D overlap gate.
+                    cross_label = (
+                        not same_label
+                        and keeper_label in _FURNITURE_DUPLICATE_LABELS
+                        and duplicate_label in _FURNITURE_DUPLICATE_LABELS
+                        and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.70)
+                    )
+                    cross_label_appliance = (
+                        not same_label
+                        and keeper_label in _APPLIANCE_DUPLICATE_LABELS
+                        and duplicate_label in _APPLIANCE_DUPLICATE_LABELS
+                        and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.85)
+                    )
+                    if cross_label_appliance:
+                        cross_label = True
+                    if not same_label and not cross_label:
+                        continue
+                    if same_label and bbox_iou < self.duplicate_bbox_iou_threshold:
+                        continue
+                    if cross_label and not cross_label_appliance and bbox_iou < 0.70:
+                        continue
+                    if cross_label_appliance and bbox_iou < max(
+                        self.duplicate_bbox_iou_threshold, 0.85
+                    ):
+                        continue
+                    center_a = keeper.get("aabb_center", keeper.get("coord", [0.0, 0.0, 0.0]))
+                    center_b = duplicate.get("aabb_center", duplicate.get("coord", [0.0, 0.0, 0.0]))
+                    center_distance = math.dist([float(v) for v in center_a], [float(v) for v in center_b])
+                    # Depth can jump between foreground/background surfaces while
+                    # the 2-D mask remains the same object.  For near-identical
+                    # image boxes, tolerate that depth disagreement and use a
+                    # wider spatial gate; ordinary boxes retain the strict gate.
+                    if center_distance >= self.match_distance and bbox_iou < 0.90:
+                        continue
+                    overlap = self._aabb_overlap_ratio(
+                        center_a,
+                        keeper.get("aabb_size", [0.0, 0.0, 0.0]),
+                        center_b,
+                        duplicate.get("aabb_size", [0.0, 0.0, 0.0]),
+                    )
+                    if overlap < self.duplicate_3d_overlap_threshold and bbox_iou < 0.90:
+                        continue
+                    keeper["conf"] = max(float(keeper.get("conf", 0.0)), float(duplicate.get("conf", 0.0)))
+                    keeper["observation_count"] = max(
+                        int(keeper.get("observation_count", 0)),
+                        int(duplicate.get("observation_count", 0)),
+                    )
+                    keeper["max_visible_pixels"] = max(
+                        int(keeper.get("max_visible_pixels", 0)),
+                        int(duplicate.get("max_visible_pixels", 0)),
+                    )
+                    keeper["max_visible_fraction"] = max(
+                        float(keeper.get("max_visible_fraction", 0.0)),
+                        float(duplicate.get("max_visible_fraction", 0.0)),
+                    )
+                    keeper["max_consecutive_observations"] = max(
+                        int(keeper.get("max_consecutive_observations", 0)),
+                        int(duplicate.get("max_consecutive_observations", 0)),
+                    )
+                    keeper["last_seen"] = max(float(keeper.get("last_seen", 0.0)), float(duplicate.get("last_seen", 0.0)))
+                    keeper["is_confirmed"] = bool(keeper.get("is_confirmed") or duplicate.get("is_confirmed"))
+                    votes = dict(keeper.get("label_votes") or {})
+                    for label, score in (duplicate.get("label_votes") or {}).items():
+                        # Sum evidence from both tracks so candidate_labels exposes
+                        # all plausible attributes while semantic_name remains the
+                        # highest-vote (dominant) interpretation.
+                        votes[label] = float(votes.get(label, 0.0)) + float(score)
+                    keeper["label_votes"] = votes
+                    keeper["semantic_name"] = max(
+                        sorted(votes.keys()),
+                        key=lambda key: (float(votes[key]), key == keeper.get("semantic_name")),
+                    )
+                    removed.add(duplicate_id)
         if removed:
             self.objects = [obj for obj in self.objects if int(obj.get("object_id", -1)) not in removed]
+            self._invalidate_match_indexes()
 
     def as_obj_map(self):
         return [
@@ -651,11 +756,139 @@ class ObjectMapStore:
             blended_size.append(min(max(target, lower), upper))
         return blended_center, blended_size
 
+    def _invalidate_match_indexes(self):
+        """Invalidate secondary match indexes after out-of-band list changes."""
+
+        self._match_identity_index = None
+        self._match_spatial_index = None
+        self._match_spatial_bucket = {}
+        self._match_portal_ids = set()
+        self._match_index_order = {}
+        self._match_object_index = {}
+
+    def _match_spatial_key(self, coord):
+        try:
+            x = float(coord[0])
+            y = float(coord[1])
+            cell_size = float(self._match_index_cell_size)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x, y, cell_size)):
+            return None
+        return (math.floor(x / cell_size), math.floor(y / cell_size))
+
+    def _rebuild_match_indexes(self):
+        identity_index = {}
+        spatial_index = defaultdict(list)
+        spatial_bucket = {}
+        portal_ids = set()
+        index_order = {}
+        object_index = {}
+        for order, obj in enumerate(self.objects):
+            object_id = int(obj.get("object_id", -1))
+            if object_id < 0:
+                continue
+            object_index[object_id] = obj
+            index_order[object_id] = order
+            instance_id = str(obj.get("instance_id") or "")
+            if instance_id:
+                # Preserve the first object, matching the historical scan on
+                # a detector-ID collision.
+                identity_index.setdefault(instance_id, object_id)
+            key = self._match_spatial_key(obj.get("coord") or [])
+            if key is not None:
+                spatial_index[key].append(object_id)
+                spatial_bucket[object_id] = key
+            if _is_portal_label(obj.get("semantic_name")):
+                portal_ids.add(object_id)
+        self._match_identity_index = identity_index
+        self._match_spatial_index = dict(spatial_index)
+        self._match_spatial_bucket = spatial_bucket
+        self._match_portal_ids = portal_ids
+        self._match_index_order = index_order
+        self._match_object_index = object_index
+
+    def _index_match_object(self, obj):
+        """Insert/reposition one track in the active batch indexes."""
+
+        if self._match_spatial_index is None or obj is None:
+            return
+        object_id = int(obj.get("object_id", -1))
+        if object_id < 0:
+            return
+        self._match_object_index[object_id] = obj
+        self._match_index_order.setdefault(object_id, len(self._match_index_order))
+        instance_id = str(obj.get("instance_id") or "")
+        if instance_id and self._match_identity_index is not None:
+            self._match_identity_index.setdefault(instance_id, object_id)
+
+        old_key = self._match_spatial_bucket.get(object_id)
+        new_key = self._match_spatial_key(obj.get("coord") or [])
+        if old_key != new_key:
+            if old_key is not None:
+                old_bucket = self._match_spatial_index.get(old_key, [])
+                try:
+                    old_bucket.remove(object_id)
+                except ValueError:
+                    pass
+                if not old_bucket:
+                    self._match_spatial_index.pop(old_key, None)
+                self._match_spatial_bucket.pop(object_id, None)
+            if new_key is not None:
+                self._match_spatial_index.setdefault(new_key, []).append(object_id)
+                self._match_spatial_bucket[object_id] = new_key
+        if _is_portal_label(obj.get("semantic_name")):
+            self._match_portal_ids.add(object_id)
+        else:
+            self._match_portal_ids.discard(object_id)
+
+    def _indexed_match_candidates(self, label, pos):
+        """Return nearby/all-portal candidates in historical insertion order."""
+
+        if self._match_spatial_index is None:
+            return None
+        candidate_ids = set()
+        key = self._match_spatial_key([pos.get("x"), pos.get("y")])
+        if key is not None and self.match_distance > 0.0:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    candidate_ids.update(
+                        self._match_spatial_index.get(
+                            (key[0] + dx, key[1] + dy), ()
+                        )
+                    )
+        if (
+            self.portal_cross_view_match_enabled
+            and _is_portal_label(label)
+        ):
+            candidate_ids.update(self._match_portal_ids)
+        if not candidate_ids:
+            return []
+        ordered_ids = sorted(
+            candidate_ids,
+            key=lambda object_id: self._match_index_order.get(object_id, 1 << 60),
+        )
+        return [
+            self._match_object_index[object_id]
+            for object_id in ordered_ids
+            if object_id in self._match_object_index
+        ]
+
     def _find_match(self, label, pos, size, instance_id, yaw=None):
         best = None
         best_score = math.inf
-        for obj in self.objects:
-            if instance_id and obj.get("instance_id") == instance_id:
+        identity = str(instance_id or "")
+        if identity and self._match_identity_index is not None:
+            object_id = self._match_identity_index.get(identity)
+            if object_id is not None:
+                obj = self._match_object_index.get(object_id)
+                if obj is not None:
+                    return obj
+        candidates = self._indexed_match_candidates(label, pos)
+        if candidates is None:
+            candidates = self.objects
+        for obj in candidates:
+            if identity and obj.get("instance_id") == identity:
                 return obj
             obj_pos = point_dict(obj["coord"][0], obj["coord"][1], obj["coord"][2])
             dist = euclidean_2d(pos, obj_pos)
@@ -731,20 +964,26 @@ class ObjectMapStore:
         normal_distance = abs(-math.sin(old_yaw) * delta_x + math.cos(old_yaw) * delta_y)
         return normal_distance + 0.25 * _axial_yaw_delta(old_yaw, yaw)
 
-    def _point_from_detection(self, det, *keys):
+    def _point_from_detection(self, det, *keys, required=False):
         for key in keys:
             value = det.get(key)
+            if value is None:
+                continue
             if isinstance(value, dict):
+                if "x" not in value or "y" not in value:
+                    raise ValueError(f"Incomplete geometry field: {key}")
                 return point_dict(value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0))
             # Physical YOLOE transport uses compact JSON arrays for 3-D
             # centers/sizes, while older ROS detections use point dicts.
             # Accept both so graph/map visualization preserves the measured
             # box dimensions instead of falling back to a zero-size marker.
             if isinstance(value, (list, tuple)) and len(value) >= 3:
-                try:
-                    return point_dict(value[0], value[1], value[2])
-                except (TypeError, ValueError):
-                    continue
+                return point_dict(value[0], value[1], value[2])
+            # A corrupt supplied measurement must not fall through to a
+            # default zero vector, even when another alias happens to exist.
+            raise ValueError(f"Invalid geometry field: {key}")
+        if required:
+            raise ValueError("Missing measured object position")
         return point_dict()
 
     def _size_compatible(self, old_size, new_size):
@@ -834,7 +1073,10 @@ class ObjectMapStore:
             )
             if age_ok or persistent:
                 retained.append(obj)
+        changed = len(retained) != len(self.objects)
         self.objects = retained
+        if changed:
+            self._invalidate_match_indexes()
 
 
 class SceneGridStore:

@@ -6,6 +6,7 @@ START_SCRIPT="${ROOT_DIR}/start_physical_nav.sh"
 RUNTIME_DIR="${PHYSICAL_NAV_RUNTIME_DIR:-/tmp/molmospaces-physical-nav-${UID}}"
 LOG_DIR="${PHYSICAL_NAV_LOG_DIR:-${RUNTIME_DIR}/logs}"
 PID_FILE="${RUNTIME_DIR}/supervisor.pid"
+GATEWAY_FINGERPRINT_FILE="${PHYSICAL_NAV_GATEWAY_FINGERPRINT_FILE:-${RUNTIME_DIR}/gateway.fingerprint}"
 SERVICE_LOG="${LOG_DIR}/service.log"
 
 usage() {
@@ -217,10 +218,10 @@ stop_web_gateway() {
   if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null &&
      [[ "$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)" == *physical_six_panel_server.py* ]]; then
     kill -TERM "${pid}" 2>/dev/null || true
-    rm -f "${RUNTIME_DIR}/gateway.pid"
+    rm -f "${RUNTIME_DIR}/gateway.pid" "${GATEWAY_FINGERPRINT_FILE}"
     echo "web gateway stopped (pid=${pid})"
   else
-    rm -f "${RUNTIME_DIR}/gateway.pid"
+    rm -f "${RUNTIME_DIR}/gateway.pid" "${GATEWAY_FINGERPRINT_FILE}"
     echo "web gateway is not running"
   fi
 }

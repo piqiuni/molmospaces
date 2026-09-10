@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-08-03
+最后更新：2026-09-10
 
 ## 1. 文档定位
 
@@ -32,6 +32,321 @@
 
 如果只是改动文档、配置或高层设计，不需要跑重型测试。  
 如果只是改动某个局部模块，优先使用最小相关命令，而不是整套系统全启动。
+
+### 实物网页与状态转发离线回归
+
+在已配置 ROS Noetic、`mlspaces` 和 Node.js 的开发环境中，从仓库根目录运行：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/physical_nav/tests/test_physical_platform.py \
+  scripts/InteractiveNav/physical_nav/tests/test_orientation_display.py \
+  scripts/InteractiveNav/physical_nav/tests/test_showcase_polling.py
+```
+
+该检查不连接 Go2、不启动 ROS 服务。Node.js 测试执行浏览器轮询逻辑，验证
+原生面板不会继续下载旧整图、解码失败可重试；缺少 Node.js 时该项跳过。
+性能改造与在线验收记录见
+[实物性能优化记录](scripts/InteractiveNav/physical_nav/PERFORMANCE_OPTIMIZATION_PLAN.md)。
+
+候选碰撞与批量栅格寻路回归（同样不启动 ROS）：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+conda run -n mlspaces python -m pytest -q \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_occupancy_path.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_semantic_candidate_occupancy.py
+```
+
+Goal 切换、M2 旧结果隔离与任务完成判定可在相同 `PYTHONPATH` 下运行
+`test_target_revision.py`、`test_step_ready_contract.py` 和
+`test_mission_completion.py`（均位于上述 `semantic_decision_py_pkg/tests/`）。
+
+容器最近优先排序与观测/交互索引对应关系可运行同目录
+`test_behavior_candidates.py`；覆盖切向观测点排在基准面之前时仍保持原接触轴。
+`test_occupancy_path.py` 同时检查无效回边不重复执行足迹查询。
+
+点云后台线程的过载进度与连接隔离，在上述 ROS Python 环境中运行
+`scripts/InteractiveNav/physical_nav/tests/test_sensor_cloud_progress.py`。
+覆盖投影期间持续来新帧仍有输出、等待槽只保留最新帧、重连前后拒绝旧结果，
+并检查发布序号及采集时间戳；不启动 ROS master 或连接机器人。
+
+GMapping 时间元数据的 C++ 离线回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_gmapping_ingress_timing.py`。
+需要本地 `g++`，会在 pytest 临时目录编译小型测试，不启动 ROS 服务。
+主节点构建：`cmake --build Interactive-Nav-SG-nav/build --target slam_gmapping -j4`。
+开启 `pipeline_timing_enabled` 后，`tf_filter_wait` 为过滤器内部等待，
+`map_source_age` 为 OCC 发布结束时的累计采集帧龄；语义建图端
+`occupancy_source_age_at_callback` 为接收回调入口的累计帧龄。
+帧龄包含前面阶段，不能与阶段耗时相加，也不能直接相减不同窗口的平均值
+推断纯网络延迟。ROS 回调入口之前的调度/传输时间尚未独立分离。
+
+YOLO RGB-D 配对离线回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_yolo_rgbd_pairing.py`。
+在上述 ROS Python 环境运行；不构造模型、不加载 GPU、不连接机器人。
+覆盖双向回调错位、只取最新完整对、严格采集时间匹配、帧号复用、标定晚到、
+缓存容量及 legacy seq=0 路径。
+补充真实 `rospy.msg.serialize_message` 回归：ROS1 会重写 Header.seq 为
+每个 topic 独立的发布计数，不能把它作为跨 topic 的采集 ID。正常 RGB-D
+配对使用完全相同的归一化采集 stamp，两个序号只供诊断；测试还覆盖
+独立计数偏移、同计数不同时间拒绝、同一采集重发去重和计数重启。
+
+逐帧位姿/标定权威数据回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_capture_context.py`。
+在上述 ROS Python 环境中运行，不启动模型、ROS master 或机器人。覆盖
+RGB/depth/context 三路全部到达顺序、缺失位姿不重新匹配、缓存容量、标定
+与分辨率绑定、只取最新完整帧，以及真实 sensor publish 使用同一遥测发布
+context 和采集 TF。
+
+新版 YOLO 默认订阅 `/physical_nav/capture_context`（`std_msgs/String`、
+JSON version=1），其中包含采集 `stamp/seq`、该帧遥测与匹配诊断、RGB/depth
+内参、深度单位/外参和 frame 名。三路必须以相同采集 stamp 关联；缺少
+context 不自动回退到独立遥测匹配。更新部署时 sensor bridge 与 YOLO
+需要一起更新，录制 ROS bag 时须包含此 topic。仅对没有该数据的旧 bag，
+显式传入 `--capture-context-topic ''` 启用旧匹配路径；这不提供逐帧一致性保证。
+
+context 中的 `depth_to_base` 是本次采集实际使用的 parent←depth 变换，
+包含 `parent_frame/child_frame/translation/quaternion_xyzw`；与 TF 复用同一次
+计算，YOLO 不再用自己的启动外参或 IMU 开关重新推导它。当前直接世界坐标
+路径要求 parent 为 `tf_frame_base_link`。缺失/非法变换或 frame 不匹配时
+保持 2D-only，report 的 `capture_pose_status` 标明原因，不回退旧外参。
+离线回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_capture_transform_authority.py`。
+使用实际 TF 发布路径的发布器替身与真实 infer 路径（固定检测输出），
+覆盖陈旧本地参数、原生深度基线、IMU 校正、变换只计算一次与非法值拒绝。
+
+TF2 时间戳冲突回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_capture_tf_cache.py`。
+用本机真实 `tf2_ros.Buffer(debug=False)` 验证首个相同 child/stamp 的变换
+保留，不连接 ROS master。bridge 保留最多 512 个时间戳的发送绑定；相同
+内容去重，矛盾姿态拒绝，已淘汰时间戳不能重新写入。新增子 frame 仍可补发。
+context/report 的 `capture_tf_status` 为 `published/duplicate` 时允许世界
+几何；冲突、过旧或无有效采集位姿时仍提供 RGB-D/2D 输出，但不生成该帧
+世界点云或 3D 检测。`capture_tf_conflict_count` 记录本进程累计冲突次数。
+不通过改写采集时间、等待后继样本或重新发布“更正 TF”掩盖冲突。
+
+遥测样本年龄回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_telemetry_sample_age.py`。
+Go2 的顶层 `received_at` 是 sport-state 回调收据；本地通过
+`pose_ros_stamp = received_at + (envelope_ros_stamp - envelope_source_stamp)`
+转换样本时间，不能直接使用相机帧/遥测发送时间替代它。ROS telemetry
+的 stamp、匹配历史和周期 TF 均使用这个样本时间。采集 TF/图像仍保留
+采集 stamp；`capture_pose_match.delta_sec` 才是实际的样本匹配偏差。
+覆盖缓存姿态不被新帧刷新年龄、回退时保留样本年龄、非法/遥远未来时间
+拒绝，以及旧姿态不得凭新相机序号替换新姿态。测试不代表 DDS 原始测量
+时刻或相机曝光时刻已硬件同步；received_at 本身仍是回调收据时间。
+
+Go2 端 IMU 估计器离线回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_imu_estimator.py`。
+不需要 ROS、RealSense、Unitree SDK 或 websocket-client；网络库改在实际
+publish 入口加载。覆盖 NaN/Inf/零重力/坏时间戳、后续恢复、有效分量独立
+更新、无效数据不完成校准，以及真实 read 路径用 SDK 替身验证不刷新
+latest_motion。测试不启动发送循环。本项修改涉及 Go2 端脚本，实测前需
+同步部署，但本轮没有连接或修改正在充电的机器。
+
+Go2 RGB-D 采集、编码与网络发送解耦回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_capture_codec_decoupling.py scripts/InteractiveNav/physical_nav/tests/test_go2_source_lifecycle.py`。
+采集线程在取得 D435i 帧后立即复制 SDK 缓冲并提交到容量为 1 的最新帧槽；
+JPEG/PNG 在独立 codec worker 和持久双线程 executor 中编码，网络发送只读取
+最新编码结果。阻塞编码时中间原始帧应被替换而不是排队，编码异常不能杀死
+worker；D435 启动后的初始化异常必须停止已经启动的 pipeline。发送端默认
+`--max-frame-age-s 0.5`，超龄编码帧直接丢弃，断线重连不应重发本连接已经
+成功发送的旧序号。现场分别查看 `sensor capture`、`sensor codec` 和
+`sensor transport`：前者含采集成功/错误、最新成功年龄和 codec 累计状态；
+后者含 packet 构造、socket 发送以及从采集到发送完成的 delivery age。
+这些离线测试只证明队列边界、所有权和生命周期，不代表 Jetson 上真实
+JPEG/PNG、USB 或 Wi-Fi 耗时；实测仍需确认线程退出和 pipeline.stop 行为。
+
+D435i SDK frame queue 与曝光时刻姿态回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_realsense_frame_queue_ingress.py scripts/InteractiveNav/physical_nav/tests/test_camera_imu_component_age.py`。
+Go2 采集器用 `pipeline.start(config, rs.frame_queue(...))` 将 librealsense
+回调直接落到有界 C++ 队列；采集线程逐个消费 accel/gyro，RGB-D 只保留
+最新完整对。默认容量由 `PHYSICAL_NAV_GO2_SENSOR_QUEUE_CAPACITY=128` 或
+`--sensor-queue-capacity` 控制。`sensor capture` 的 `ingress` 字段报告每流
+dequeued/unique/missing/gap/duplicate/late、有效频率、连续健康时长、队列
+近似高水位、被替换视频和无效/无法配对帧；IMU 修正只有在所需分量连续
+健康至少 0.5 s 后才重新放行。
+
+标准 pipeline 会将同步 color/depth 作为原生 frameset、把 motion 作为
+单帧送入队列。为兼容后端差异，`align none/depth` 还可按相同且非空的
+timestamp domain、严格小于 `min(50 ms, 500/min_fps ms)` 配对独立视频帧；
+`align color` 必须交给原生 frameset 和 `rs.align`，遇到应用层伪 frameset
+会明确计数并拒绝。测试覆盖 10/100/200 Hz 混合输入、latest-only、缺帧/
+重复/乱序、30 Hz 配对窗口、未知时间域拒绝、single/composite 模式切换、
+depth 曝光前的同域姿态选择、关闭唤醒和幂等 stop。它不替代实机验证；
+现场仍须确认 SDK 实际交付类型、frame-number 零 gap、effective_hz 约
+100/200 Hz、queue_high_water 明显低于容量，以及相机断开后的退出行为。
+
+D435i 原始深度帧曝光身份与设备时钟映射回归：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav" \
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/physical_nav/tests/test_go2_exposure_timing.py
+```
+
+覆盖 `SENSOR_TIMESTAMP` 曝光中点、`FRAME_TIMESTAMP` 读出起点、
+GLOBAL_TIME 曝光换算、未知时间域拒绝，以及 hardware clock 低延迟包络
+必须满足 8 个样本且跨越至少 0.5 s 才可作为源 epoch。还覆盖正负
+100 ppm 一小时漂移、持续 400 ms USB backlog 的 holdover，以及 depth/IMU
+原始 SDK domain 不同时通过已映射 Go2-host epoch 做曝光前因果选样。测试使用
+SDK 替身，不证明实机固件一定提供全部元数据，也不测绝对曝光延迟。
+
+Go2 主机时间到本机 ROS epoch 的握手映射回归：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav" \
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/physical_nav/tests/test_source_epoch_mapping.py
+```
+
+覆盖每个 transport generation 的 `hello + 2 clock_probe` 三次小包预热、
+传感器大包收据不反向污染偏移、预热期 fail-closed、重连隔离和 source stamp
+到 ROS stamp 的映射诊断。小包同时携带 Go2 wall/monotonic，测试确认 TCP
+head-of-line 延迟不会被误判为 wall-clock step，单个损坏时刻只暂停而不重置；
+另覆盖正负 100 ppm 一小时漂移、400 ms 持续 backlog holdover，以及时间回拨
+期间持续禁止 TF/world cloud，直到真实投影时刻越过 ROS 水位。单向小包只能
+得到含最小单程网络延迟的偏移上界，不能替代 chrony/PTP 或四时间戳往返同步，
+也不能由离线测试证明跨机绝对同步。
+
+实物 raw recorder 的采集时间元数据持久化回归：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav" \
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/physical_nav/tests/test_physical_raw_recorder.py
+```
+
+检查相机 manifest 保留 packet stamp、`capture_timing` 与 session time，避免
+离线分析只剩文件写入时刻。该测试使用小型合成 RGB-D，不验证真实相机、
+跨主机时钟或持续录制吞吐。
+
+IMU 独立样本时间戳与有效频率回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_imu_sample_identity.py`。
+accel/gyro 分别要求新的有限、非负 SDK 时间戳；重复或乱序的样本不能
+重复滤波、倒退积分基准、推进参考校准或刷新最近观测。首次时间戳 0
+合法。`camera_imu.imu_valid_updates.accel/gyro` 为本采集器累计有效更新数，
+Go2 的 `sensor capture` 日志同步输出 `imu_updates`。用同一进程相邻记录
+的计数差除以时间差衡量有效处理频率；重启后计数重置，不与上一进程相减。
+目前不自动把硬件时间戳回退当成新纪元；真正的设备时钟重置需重新初始化
+采集器。此测试不启动硬件，不能证明实机有多少重复帧或达到配置频率。
+
+IMU 重力滤波的时间响应回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_imu_time_response.py`。
+Go2 脚本支持 `--imu-gravity-tau-s`，默认约 0.495 s，等价于原来 100 Hz
+下的 alpha=0.98；现在每个新 accel 样本使用 `exp(-dt/tau)`，dt 来自 SDK
+时间戳。首次样本或超过 0.25 s 的断流恢复只使用一次名义 0.01 s 权重，
+不把缺失区间看成持续有效的重力观测。motion 的 `imu_gravity_dt_s`、
+`imu_gravity_gap` 记录本次权重时间与断流标记。参数须有限且为正。
+测试比较多采样率/不均匀采样的已校准阶跃，不代表启动校准时间、噪声抑制
+或行走补偿验收；gyro yaw 逻辑仍未改变。
+
+IMU 启动参考姿态的连续静止窗口回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_go2_imu_reference_time.py`。
+不再用固定 250 帧作为就绪条件；10–200 Hz 都要求连续 2.5 s 的稳定
+D435i 硬件时间。相邻 accel 缺口超过 0.25 s、加速度模长偏离标准重力
+超过 0.75 m/s²、gyro 模长超过 0.08 rad/s，或重力方向相对候选窗口
+跨越 0.035 rad，都会重开候选窗口。测试同时覆盖小幅传感器噪声和时间
+抖动可完成校准，以及锁定瞬间 correction 为零。现场诊断查看
+`camera_imu.imu_calibration_status` 与 `imu_calibration_elapsed_s`；长期
+无法完成说明安装仍在晃动或阈值需要依据实测数据调整，不能绕过稳定门。
+
+IMU 分量年龄与采集/定时 TF 门控回归（需要上述 ROS Python 环境）：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_camera_imu_component_age.py`。
+源端分别保留 `camera_imu.component_received_at.accel/gyro`，gyro 更新不能
+刷新旧 accel。比较 Go2 源时钟中的帧/机身样本时间，不使用本机收包时间。
+默认 yaw 关闭仅检查 accel；开启 yaw 时同时检查 gyro，默认容差 0.15 s。
+过期采集保留 RGB/2D，但不排入点云和世界 3D 检测；定时 TF 路径只跳过
+相机分支，保留有效底盘 odom/TF。新样本到达后恢复，不回退到名义安装角。
+context 与 YOLO 报告的 `camera_imu_match` 给出状态和有符号分量年龄。
+旧协议无独立收据为 `legacy_unverified`，仍兼容放行；关闭/校准中/无 IMU
+沿用原行为。严格年龄保证需要同步部署 Go2 与本机 bridge。TF 消费者仍可能
+保留旧缓存，跳过发布不等于清空所有消费者的旧 TF；实测需同时观察 stamp。
+
+YOLO 采集位姿门控离线回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_yolo_capture_pose.py`。
+使用固定模型输出测试真实 infer 路径，覆盖位姿缺失/非法时保留 2D 而不生成
+世界几何、有效零位姿、恢复后继续 lifting，以及显式 yaw 与空 IMU rpy。
+
+机身姿态在实际 odom/TF 发布与 YOLO 世界变换间的一致性：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_body_pose_consistency.py`。
+使用发布器替身检查真实 publish_pose，不启动 ROS master；覆盖 wxyz/xyzw、
+非单位四元数、字典格式、机身姿态字段、相机姿态隔离、坏样本和恢复。
+
+传感器/YOLO 时间匹配一致性：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_telemetry_time_match.py`。
+默认最大偏差 0.15 s；实际值由 sensor 的 `telemetry_max_delta_sec` 私有参数
+经锁存 `/physical_nav/depth_calibration` 同步给 YOLO，不等待后继遥测。
+YOLO report 的 `capture_pose_match` 包含 `delta_sec/max_delta_sec/accepted`。
+accepted 只说明时间匹配，位姿字段有效性另看 `capture_pose_status`。
+
+遥测发布与接收的身份/时间对应回归：
+`conda run -n mlspaces python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_telemetry_receipt_identity.py`。
+将真实 update_telemetry 输出交给 YOLO callback，检查迟到包不重标新姿态时间、
+连接隔离、帧号重置、时钟回退后的恢复及旧捕获拒绝；不需要 ROS master。
+
+`test_body_pose_consistency.py` 还覆盖周期 TF 的 ROS 时间域、时钟回退恢复、
+历史 TF 与实时 odom 分流，以及采集/定时器并发发布。两条入口使用同一
+发布锁；重复周期刷新不把缓存姿态重标为 now，历史帧不倒退实时 odom。
+
+重复门合并的 M1 确认与公共身份回归：
+`conda run -n mlspaces python -m pytest -q Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_portal_merge_confirmation.py`。
+覆盖 ready/pending/failed/stale 下保留有效确认门 ID 与其潜在房间、观测次数
+和可见性合并、后续 M1 结果路由，以及低置信度 ready 不能覆盖有效状态。
+不加载模型或连接 ROS；两个已确认门各自拥有子房间的合并不在本项验收范围。
+
+终态停止可联合运行 `semantic_decision_py_pkg/tests/test_semantic_behavior_executor_static.py`
+和 `scripts/InteractiveNav/physical_nav/tests/test_velocity_stop_mux.py`，覆盖真实
+状态机终态、取消发送失败、重复回调、停止保持期间的残留速度及恢复新指令。
+
+M1 房间调度回归（使用本地假模型，不调用在线模型或启动 ROS）：
+
+四层图的父子关系持久化与缓存边界回归：
+`conda run -n mlspaces python -m pytest -q Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_graph_hierarchy_lifetime.py`。
+覆盖遮挡后容器框收缩、邻近重叠容器、重新看见后解除包含关系、停用房间、
+删除父容器，以及小于 1 cm 的边界变化与缓存容量；不调用在线模型。
+
+`semantic_mapping_py_pkg/tests/test_interaction_graph_store.py` 还覆盖 M1 门的
+置信度/几何/两帧确认、首次确认开放后的潜在房间，以及失败 M3 不能修改
+开门状态。默认门 fixture 使用有效尺寸，坏几何测试显式指定尺寸；测试
+通过不代表真实门识别或建图质量已经验收。
+
+潜在房间几何与 ID 复用专项：
+`conda run -n mlspaces python -m pytest -q Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_provisional_room_geometry.py`。
+检查房间在门附近、开门不重复创建、旧 ID 坐标回退修复与引用清理；
+图上潜在房间不应被当作 OCC 已观测自由空间。
+
+房间线程门提示交接与 reset 隔离可在下列同一 `PYTHONPATH` 下运行
+`Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_room_portal_worker.py`。
+覆盖分割锁被占用时检测/reset 不等待、64 批有界队列、两次观测确认、
+跨实验开门请求隔离与无 OCC 时的状态重置；不依赖机器人或 ROS master。
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+conda run -n mlspaces python -m pytest -q \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_room_m1_dispatch.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_room_attribute_inference.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_attribute_inference_queue.py
+```
+
+覆盖跨房间/跨线程共享调度间隔、等待时证据替换/超时/关闭、在途请求失效后
+仍保留冷却，以及纯文本请求与成功缓存；不代表在线模型吞吐量已经实测。
+
+在相同环境下加入 `test_attribute_inference_request_state.py` 和
+`test_attribute_inference_filter.py`，检查物体 M1 的图像配对、默认元数据隔离、
+实物检测类别假设、M1 类别纠正、多视角顺序及无效姿态过滤。假模型纠正 locker
+为 water_dispenser 的结果还会送入真实 graph store，验证后续 locker 检测不
+覆盖已接受的名称；模型辨认准确率需另用真实采集图像验证。
+
+M3 的交互后新帧、取消/超时及按需图像编码检查（不调用模型）：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages" \
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/physical_nav/tests/test_m3_fresh_frames.py \
+  scripts/InteractiveNav/physical_nav/tests/test_m3_lazy_image.py
+```
 
 ---
 

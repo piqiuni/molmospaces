@@ -40,6 +40,7 @@
 #include "message_filters/subscriber.h"
 #include "tf/message_filter.h"
 #include "nav_msgs/Odometry.h"
+#include "ingress_timing_buffer.h"
 
 #include "gmapping/gridfastslam/gridslamprocessor.h"
 #include "gmapping/sensor/sensor_base/sensor.h"
@@ -80,7 +81,10 @@ class SlamGMapping
       PIPELINE_STAGE_PROJECTION,
       PIPELINE_STAGE_ADD_SCAN,
       PIPELINE_STAGE_UPDATE_MAP,
+      PIPELINE_STAGE_LOCAL_OVERWRITE,
       PIPELINE_STAGE_MAP_PUBLISH,
+      PIPELINE_STAGE_TF_FILTER_WAIT,
+      PIPELINE_STAGE_MAP_SOURCE_AGE,
       PIPELINE_STAGE_COUNT
     };
 
@@ -100,10 +104,18 @@ class SlamGMapping
       PIPELINE_EVENT_ADD_SCAN_REJECTED,
       PIPELINE_EVENT_MAP_UPDATE,
       PIPELINE_EVENT_MAP_PUBLISHED,
+      // Source capture clocks can step backwards when the sensor bridge
+      // reconnects.  Keep this observational for now: do not drop or reset
+      // the mapper until a live run confirms the restart boundary.
+      PIPELINE_EVENT_SOURCE_STAMP_REGRESSION,
       PIPELINE_EVENT_COUNT
     };
 
     struct PipelineTimingTrace;
+    struct_mapping::IngressTimingBuffer pointcloud_ingress_timing_;
+    struct_mapping::IngressTimingBuffer organized_depth_ingress_timing_;
+    message_filters::Connection pointcloud_ingress_connection_;
+    message_filters::Connection organized_depth_ingress_connection_;
 
     ros::NodeHandle node_;
     ros::Publisher entropy_publisher_;
@@ -137,8 +149,20 @@ class SlamGMapping
 
     bool got_map_;
     nav_msgs::GetMap::Response map_;
+    // ``ScanMatcherMap`` changes only along the current scan rays (and when
+    // the map grows).  Keep the previous serialized raster so updateMap can
+    // refresh a bounded scan neighbourhood instead of calling cell() for
+    // every cell on every depth frame.  A full raster is still produced on
+    // the first frame and after geometry changes.
+    bool map_raster_initialized_;
 
     ros::Duration map_update_interval_;
+    // Map publication cadence is a host-side scheduling concern.  Using the
+    // sensor capture stamp here makes publication stop after a Go2/bridge
+    // reconnect whose source clock/sequence starts over or steps backwards.
+    // Keep the capture stamp on the OccupancyGrid header, but gate updates by
+    // monotonic wall time.
+    ros::WallTime last_map_update_wall_time_;
     tf::Transform map_to_odom_;
     boost::mutex map_to_odom_mutex_;
     boost::mutex map_mutex_;
@@ -185,6 +209,13 @@ class SlamGMapping
     double angleDiff(double a, double b) const;
     bool worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const;
     bool hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec = NULL);
+    bool observeSourceStampRegression(const char* source, const ros::Time& stamp);
+    void pointCloudFilterFailure(
+        const sensor_msgs::PointCloud2::ConstPtr& cloud,
+        tf::FilterFailureReason reason);
+    void organizedDepthFilterFailure(
+        const sensor_msgs::LaserScan::ConstPtr& scan,
+        tf::FilterFailureReason reason);
     void finishPipelineTiming(PipelineTimingTrace* timing_trace);
     
     // Parameters used by GMapping
@@ -244,6 +275,22 @@ class SlamGMapping
     int pointcloud_scan_min_support_neighbors_;
     double pointcloud_scan_support_tolerance_abs_m_;
     double pointcloud_scan_support_tolerance_rel_;
+
+    // Scratch storage for PointCloud2 -> LaserScan projection.  GMapping is
+    // driven by ros::spin() in this node, so the callback is single-threaded;
+    // retaining the per-beam vectors removes thousands of small allocations
+    // from every 10 Hz RGB-D frame without changing the projection result.
+    int projection_scratch_beam_count_ = 0;
+    std::vector<std::vector<float> > projection_beam_ranges_;
+    std::vector<size_t> projection_beam_no_return_samples_;
+    std::vector<float> projection_candidate_ranges_;
+    std::vector<uint8_t> projection_candidate_observed_;
+    std::vector<uint8_t> projection_candidate_no_return_;
+    std::vector<uint8_t> projection_observed_;
+    // RangeReading copies its input, so the temporary doubles only need to
+    // live through addScan(). Reuse the backing storage between 10-Hz frames
+    // to avoid a malloc/free pair for every pseudo-laser callback.
+    std::vector<double> scan_ranges_scratch_;
     
     // 障碍物膨胀参数
     bool enable_obstacle_inflation_;
@@ -268,6 +315,13 @@ class SlamGMapping
     std::vector<unsigned short> overwrite_free_counts_;
     std::vector<unsigned short> overwrite_occupied_counts_;
     std::vector<ros::Time> overwrite_last_seen_;
+    // Only cells that have an active 0/100 override need to be copied back
+    // into each freshly serialized OCC map.  The previous implementation
+    // scanned the complete map (which can contain millions of cells) every
+    // depth frame.
+    std::vector<uint8_t> overwrite_active_flags_;
+    std::vector<size_t> overwrite_active_indices_;
+    size_t overwrite_active_count_ = 0;
 
     // 时间同步保护参数
     bool enable_time_sync_guard_;
@@ -299,6 +353,17 @@ class SlamGMapping
     double pipeline_timing_window_odom_delta_total_ms_;
     double pipeline_timing_window_odom_delta_max_ms_;
     boost::mutex pipeline_timing_mutex_;
+
+    // Last non-zero capture stamp observed at callback ingress, kept per
+    // source.  The bridge's source clock may restart independently of ROS
+    // wall time, so this is diagnostic rather than a filtering decision.
+    boost::mutex source_stamp_mutex_;
+    ros::Time last_pointcloud_source_stamp_;
+    ros::Time last_organized_depth_source_stamp_;
+    double source_stamp_regression_tolerance_sec_;
+    boost::mutex filter_failure_mutex_;
+    uint64_t filter_failure_pointcloud_count_;
+    uint64_t filter_failure_organized_depth_count_;
     
     ros::NodeHandle private_nh_;
     

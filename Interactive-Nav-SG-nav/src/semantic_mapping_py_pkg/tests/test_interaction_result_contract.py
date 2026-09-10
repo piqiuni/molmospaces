@@ -1,3 +1,5 @@
+import pytest
+
 from semantic_mapping_py_pkg.interaction_result_contract import (
     merge_interaction_result_with_command,
     take_pending_interaction_command,
@@ -43,25 +45,39 @@ def test_opaque_result_recovers_only_public_command_metadata() -> None:
     assert "joint_infos" not in merged
 
 
-def test_result_fields_take_precedence_over_command_metadata() -> None:
-    merged = merge_interaction_result_with_command(
-        {
-            "command_id": "command_1",
-            "node_id": "portal_result",
-            "action": "close",
-            "success": True,
-        },
-        {
-            "command_id": "command_1",
-            "node_id": "portal_command",
-            "action": "open",
-            "expected_state": "open",
-        },
-    )
+def test_result_cannot_redirect_command_to_another_target_or_action() -> None:
+    with pytest.raises(ValueError, match="identity_conflict"):
+        merge_interaction_result_with_command(
+            {
+                "command_id": "command_1",
+                "node_id": "portal_result",
+                "action": "close",
+                "success": True,
+            },
+            {
+                "command_id": "command_1",
+                "node_id": "portal_command",
+                "action": "open",
+                "expected_state": "open",
+            },
+        )
 
-    assert merged["node_id"] == "portal_result"
-    assert merged["action"] == "close"
-    assert merged["expected_state"] == "open"
+
+@pytest.mark.parametrize("field", ["episode_id", "decision_id", "candidate_id", "node_id", "object_id", "action"])
+def test_conflicting_identity_does_not_consume_pending_command(field):
+    command = {"command_id": "cmd", "episode_id": "e1", "decision_id": "d1",
+               "candidate_id": "c1", "node_id": "door1", "object_id": "object1", "action": "open"}
+    pending = {"cmd": dict(command)}
+    with pytest.raises(ValueError, match=field):
+        take_pending_interaction_command(pending, {**command, field: "wrong"})
+    assert pending == {"cmd": command}
+    valid = {"command_id": "cmd", "success": True, "event_id": "result-event"}
+    recovered = merge_interaction_result_with_command(valid, take_pending_interaction_command(pending, valid))
+    assert recovered["episode_id"] == "e1"
+    assert recovered["node_id"] == "door1"
+    assert recovered["event_id"] == "result-event"
+    assert not pending
+    assert take_pending_interaction_command(pending, valid) is None
 
 
 def test_pending_command_matches_command_id_when_event_ids_differ() -> None:

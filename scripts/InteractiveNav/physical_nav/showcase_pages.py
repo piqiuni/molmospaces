@@ -3,6 +3,116 @@
 from __future__ import annotations
 
 
+_SHOWCASE_CAMERA_10HZ_SCRIPT = r"""
+/* Keep the expensive six-panel snapshot at 5 Hz, but refresh the source
+   resolution camera overlay independently at 10 Hz.  The two latest-only
+   guards prevent a slow LAN response from creating duplicate requests. */
+let _showcaseSnapshotBusy=false,_showcaseCameraOverlayBusy=false;
+let _showcaseSnapshotRevision=null,_showcaseCameraOverlayRevision=null;
+function _showcaseRevisionUrl(path,revision){
+  if(revision===null)return path;
+  return path+'?after='+encodeURIComponent(revision);
+}
+function _showcaseResponseRevision(response,fallback){
+  const value=response.headers.get('X-Physical-Image-Revision');
+  return value!==null&&Number.isFinite(Number(value))?Number(value):fallback;
+}
+async function _showcaseSnapshotTick(){
+  if(document.hidden||_showcaseSnapshotBusy)return;
+  _showcaseSnapshotBusy=true;
+  try{
+    const response=await fetch(_showcaseRevisionUrl('/snapshot.jpg',_showcaseSnapshotRevision),{cache:'no-store'});
+    if(response.status===204)return;
+    if(!response.ok)throw new Error('snapshot '+response.status);
+    const image=await createImageBitmap(await response.blob());
+    try{
+      [['view3',960,0],['view6',960,270]].forEach(([id,x,y])=>{
+        const canvas=document.getElementById(id);if(!canvas)return;
+        canvas.getContext('2d').drawImage(image,x,y,480,270,0,0,480,270);
+      });
+      _showcaseSnapshotRevision=_showcaseResponseRevision(response,_showcaseSnapshotRevision);
+    }finally{image.close();}
+  }catch(_){
+    const live=document.getElementById('live');if(live)live.textContent='画面重连中';
+  }finally{_showcaseSnapshotBusy=false;}
+}
+async function refreshCameraOverlay(){
+  if(document.hidden||_showcaseCameraOverlayBusy)return;
+  _showcaseCameraOverlayBusy=true;
+  try{
+    const response=await fetch(_showcaseRevisionUrl('/camera-overlay.jpg',_showcaseCameraOverlayRevision),{cache:'no-store'});
+    if(response.status===204)return;
+    if(!response.ok)throw new Error('camera overlay '+response.status);
+    const image=await createImageBitmap(await response.blob()),canvas=document.getElementById('view1');
+    try{
+      if(canvas){
+        if(canvas.width!==image.width||canvas.height!==image.height){canvas.width=image.width;canvas.height=image.height;}
+        canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height);
+      }
+      _showcaseCameraOverlayRevision=_showcaseResponseRevision(response,_showcaseCameraOverlayRevision);
+      const live=document.getElementById('live');if(live)live.textContent='实时运行中';
+    }finally{image.close();}
+  }catch(_){
+    /* The next 10-Hz tick retries without disturbing map/state updates. */
+  }finally{_showcaseCameraOverlayBusy=false;}
+}
+video=_showcaseSnapshotTick;
+setInterval(refreshCameraOverlay,100);
+refreshCameraOverlay();
+"""
+
+_ACADEMIC_CAMERA_10HZ_SCRIPT = r"""
+/* Academic views keep the composite snapshot heartbeat at 5 Hz while the
+   perception canvas follows the independent 10-Hz camera overlay. */
+let _academicSnapshotBusy=false,_academicCameraOverlayBusy=false;
+let _academicSnapshotRevision=null,_academicCameraOverlayRevision=null;
+function _academicRevisionUrl(path,revision){
+  if(revision===null)return path;
+  return path+'?after='+encodeURIComponent(revision);
+}
+function _academicResponseRevision(response,fallback){
+  const value=response.headers.get('X-Physical-Image-Revision');
+  return value!==null&&Number.isFinite(Number(value))?Number(value):fallback;
+}
+async function _academicSnapshotTick(){
+  if(document.hidden||_academicSnapshotBusy)return;
+  _academicSnapshotBusy=true;
+  try{
+    const response=await fetch(_academicRevisionUrl('/snapshot.jpg',_academicSnapshotRevision),{cache:'no-store'});
+    if(response.status===204)return;
+    if(!response.ok)throw new Error('snapshot '+response.status);
+    await response.blob();
+    _academicSnapshotRevision=_academicResponseRevision(response,_academicSnapshotRevision);
+  }catch(_){
+    const live=document.getElementById('live');if(live)live.textContent='RECONNECTING';
+  }finally{_academicSnapshotBusy=false;}
+}
+async function refreshCameraOverlay(){
+  if(document.hidden||_academicCameraOverlayBusy)return;
+  _academicCameraOverlayBusy=true;
+  try{
+    const response=await fetch(_academicRevisionUrl('/camera-overlay.jpg',_academicCameraOverlayRevision),{cache:'no-store'});
+    if(response.status===204)return;
+    if(!response.ok)throw new Error('camera overlay '+response.status);
+    const image=await createImageBitmap(await response.blob()),canvas=document.getElementById('a');
+    try{
+      if(canvas){
+        if(canvas.width!==image.width||canvas.height!==image.height){canvas.width=image.width;canvas.height=image.height;}
+        canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height);
+      }
+      _academicCameraOverlayRevision=_academicResponseRevision(response,_academicCameraOverlayRevision);
+      const live=document.getElementById('live');if(live)live.textContent='LIVE';
+    }finally{image.close();}
+  }catch(_){
+    /* Retry on the next 10-Hz tick. */
+  }finally{_academicCameraOverlayBusy=false;}
+}
+video=_academicSnapshotTick;
+setInterval(refreshCameraOverlay,100);
+refreshCameraOverlay();
+"""
+
+
 def build_showcase_page(theme: str) -> str:
     light = theme == "light"
     title = "具身智能交互导航" if light else "具身智能交互导航展示平台"
@@ -157,19 +267,31 @@ footer{{height:48px;border:1px solid var(--line);border-radius:10px;background:v
 <section class='panel agent'><h2>交互导航 Agent</h2><div class='block'><h3>MLLM 调用汇总</h3><div id='calls' class='calls'></div><div class='note'>M3 为规则验证，不调用模型</div></div><div class='block'><h3>候选 subgoal 列表</h3><div id='candidates' class='candidate-list'></div></div><div class='block'><h3>Agent 当前行为时间线</h3><div id='timeline' class='timeline'></div></div></section></aside></main>
 <footer><span class='flow-step'><span class='flow-icon'>◉</span><b>真实环境输入</b></span><span class='flow-arrow'>➜</span><span class='flow-step'><span class='flow-icon'>◈</span><b>开放词汇感知</b></span><span class='flow-arrow'>➜</span><span class='flow-step'><span class='flow-icon'>◇</span><b>语义交互图</b></span><span class='flow-arrow'>➜</span><span class='flow-step'><span class='flow-icon'>◎</span><b>MLLM 决策</b></span><span class='flow-arrow'>➜</span><span class='flow-step'><span class='flow-icon'>✓</span><b>状态验证</b></span><a href='/' class='debug'>Debug 页面</a></footer></div>
 <script>
-const $=id=>document.getElementById(id),txt=v=>String(v??'').replace(/\\s+/g,' ').trim(),clip=(v,n=54)=>{{v=txt(v);return v.length>n?v.slice(0,n)+'…':v}},num=(v,d=1)=>Number.isFinite(Number(v))?Number(v).toFixed(d):'--';setTimeout(()=>{{draw=function(b,c){{const v=$('view1').getContext('2d');v.drawImage(c,0,0,480,270);[['view3',960,0],['view6',960,270]].forEach(([id,x,y])=>{{const q=$(id).getContext('2d');q.drawImage(b,x,y,480,270,0,0,480,270)}});$('live').textContent='实时运行中'}}}},0);
+{_SHOWCASE_CAMERA_10HZ_SCRIPT}
+const $=id=>document.getElementById(id),txt=v=>String(v??'').replace(/\\s+/g,' ').trim(),clip=(v,n=54)=>{{v=txt(v);return v.length>n?v.slice(0,n)+'…':v}},num=(v,d=1)=>Number.isFinite(Number(v))?Number(v).toFixed(d):'--';
 function result(e){{if(!e)return '等待调用';if(e.error)return '调用失败';let v=e.raw_text??e.response?.raw_text??e.payload?.result??'';if(typeof v==='object')v=JSON.stringify(v);try{{const o=JSON.parse(v);return clip([o.candidate_id,Array.isArray(o.ranked_ids)?o.ranked_ids.join(' → '):'',o.label,o.state,o.reason].filter(Boolean).join(' · '))}}catch(_){{return clip(v||'调用完成')}}}}
-function renderMetrics(s){{const t=s.telemetry||{{}},b=t.battery||{{}},v=Array.isArray(t.velocity)?Math.hypot(...t.velocity.slice(0,3).map(Number)):Number(t.speed||0),yaw=Number(t.yaw),data=[['🔋','电量',num(b.soc??t.battery_soc,0)+' %'],['↗','速度',num(v,2)+' m/s'],['⟳','航向',Number.isFinite(yaw)?num(yaw*180/Math.PI,1)+'°':'--'],['◉','动作模式',t.mode===undefined?'--':'模式 '+t.mode],['📷','D435i',s.link?.connected===false?'离线':'在线'],['◇','语义节点',String(s.graph?.node_count??0)]];const box=$('metrics');box.replaceChildren();data.forEach(([icon,n,v])=>{{const m=document.createElement('div');m.className='metric';m.innerHTML='<span class="icon"></span><span class="name"></span><span class="value"></span>';m.querySelector('.icon').textContent=icon;m.querySelector('.name').textContent=n;m.querySelector('.value').textContent=v;box.append(m)}});const safe=$('safe');safe.replaceChildren();[['D435i 在线',s.link?.connected!==false],['实物动作安全阻断',true],['感知目标 '+(s.detections?.length??0),false]].forEach(([v,ok])=>{{const p=document.createElement('span');p.className='pill '+(ok?'ok':'');p.textContent=v;safe.append(p)}});$('robot-live').textContent=s.link?.connected===false?'离线':'在线';$('detect-meta').textContent='D435i · YOLOE-26l PF Seg · '+(s.detections?.length??0)+' targets'}}
+function liveYaw(t){{const raw=t?.yaw,direct=(raw===null||raw===undefined||raw==='')?NaN:Number(raw);if(Number.isFinite(direct))return direct;const r=t?.imu?.rpy;if(Array.isArray(r)&&Number.isFinite(Number(r[2])))return Number(r[2]);const q=t?.imu?.quaternion;if(Array.isArray(q)&&q.length>=4){{const w=Number(q[0]),x=Number(q[1]),y=Number(q[2]),z=Number(q[3]);if([w,x,y,z].every(Number.isFinite))return Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))}}return NaN}}
+function renderMetrics(s){{const t=s.telemetry||{{}},b=t.battery||{{}},v=Array.isArray(t.velocity)?Math.hypot(...t.velocity.slice(0,3).map(Number)):Number(t.speed||0),yaw=liveYaw(t),data=[['🔋','电量',num(b.soc??t.battery_soc,0)+' %'],['↗','速度',num(v,2)+' m/s'],['⟳','航向',Number.isFinite(yaw)?num(yaw*180/Math.PI,1)+'°':'--'],['◉','动作模式',t.mode===undefined?'--':'模式 '+t.mode],['📷','D435i',s.link?.connected===false?'离线':'在线'],['◇','语义节点',String(s.graph?.node_count??0)]];const box=$('metrics');box.replaceChildren();data.forEach(([icon,n,v])=>{{const m=document.createElement('div');m.className='metric';m.innerHTML='<span class="icon"></span><span class="name"></span><span class="value"></span>';m.querySelector('.icon').textContent=icon;m.querySelector('.name').textContent=n;m.querySelector('.value').textContent=v;box.append(m)}});const safe=$('safe');safe.replaceChildren();[['D435i 在线',s.link?.connected!==false],['实物动作安全阻断',true],['感知目标 '+(s.detections?.length??0),false]].forEach(([v,ok])=>{{const p=document.createElement('span');p.className='pill '+(ok?'ok':'');p.textContent=v;safe.append(p)}});$('robot-live').textContent=s.link?.connected===false?'离线':'在线';$('detect-meta').textContent='D435i · YOLOE-26l PF Seg · '+(s.detections?.length??0)+' targets'}}
 function renderCandidates(s){{const n=s.navigation||{{}},c=n.candidates||s.candidates||{{}},items=Array.isArray(c)?c:(Array.isArray(c.candidates)?c.candidates:[]),sel=n.selection||{{}},selected=String(sel.candidate_id||n.decision_trace?.model_selected_candidate_id||n.execution_state?.candidate_id||'');const box=$('candidates');if(!box)return;box.replaceChildren();if(!items.length){{box.innerHTML='<div class=\"empty\">暂无候选 subgoal</div>';return}}items.slice(0,12).forEach((item,index)=>{{const id=String(item.id||item.candidate_id||item.target_id||item.target_name||('candidate-'+index)),name=String(item.target_name||item.label||item.target_id||id),kind=String(item.behavior_type||item.type||item.subject_type||'EXPLORE').toUpperCase(),distance=item.distance_m??item.distance??item.cost;const row=document.createElement('div');row.className='candidate '+(id===selected?'selected':'');row.innerHTML='<span class=\"candidate-id\"></span><span class=\"candidate-name\"></span><span class=\"candidate-kind\"></span>';row.children[0].textContent=id;row.children[1].textContent=name;row.children[2].textContent=kind+(distance!=null?' · '+Number(distance).toFixed(2)+'m':'');box.append(row)}})}}
 function renderCalls(s){{const all=[...(s.mllm?.M1||[]),...(s.mllm?.M2||[]),...(s.mllm?.M3||[])].sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));const latest={{M1:all.find(x=>x.stage==='M1'),M2:all.find(x=>x.stage==='M2'),M3:all.find(x=>x.stage==='M3')}};const box=$('calls');box.replaceChildren();['M1','M2','M3'].forEach(stage=>{{const e=latest[stage],r=document.createElement('div');r.className='call';r.innerHTML='<span class="stage"></span><span class="result"></span><span class="latency"></span>';r.children[0].textContent=stage;r.children[1].textContent=e?result(e):(stage==='M1'?'等待交互属性识别':stage==='M2'?'等待子目标选择':'等待交互结果评价');r.children[2].textContent=e?.latency_s!=null?num(e.latency_s,2)+' s':'--';box.append(r)}})}}
 let lastSig='';function renderTimeline(s){{const n=s.navigation||{{}},d=n.decision_trace||{{}},e=n.execution_state||{{}},f=n.behavior_feedback||{{}},r=n.interaction_result||{{}},candidate=d.executed_candidate_id||d.model_selected_candidate_id||d.active_candidate_id||e.candidate_id||'等待候选',target=(n.selection||{{}}).target_name||(n.selection||{{}}).target_id||e.target_name||e.target_id||'',region=d.selected_region||d.exploration_region||e.region_name||e.frontier_name||'',state=e.state||'IDLE',behavior=e.behavior_type||'',status=f.status||r.status||'',transition=(r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'';const events=[['◉','感知','更新 RGB-D、检测与语义地图'],['AI','推理',d.model_reason||d.model_error||'评估交互可达性'],['◎','子目标',target||region||candidate],['→','当前指令',behavior?state+' · '+behavior+(target?' · 目标 '+target:''):state==='EXPLORE'?'探索区域 '+(region||candidate):state==='IDLE'?'保持待机':state],['✓','执行反馈',status||'等待行为反馈'],['M3','结果验证',transition||'等待状态/图一致性验证']];const sig=JSON.stringify(events);if(sig===lastSig)return;lastSig=sig;const box=$('timeline');box.replaceChildren();events.forEach((x,i)=>{{const row=document.createElement('div');row.className='event '+(i===5&&transition?'good':'');const now=new Date();row.innerHTML='<span class="time"></span><span class="dot"></span><span class="eventtext"><b></b><span></span></span>';row.children[0].textContent=now.toLocaleTimeString().slice(0,8);row.children[1].textContent=x[0];row.children[2].children[0].textContent=x[1];row.children[2].children[1].textContent=clip(x[2],70);box.append(row)}})}}
 function renderTask(s){{const n=s.navigation||{{}},d=n.decision_trace||{{}},e=n.execution_state||{{}},r=s.interaction_result||{{}},fb=n.behavior_feedback||s.behavior_feedback||{{}},target=n.task_target||n.goal||d.task_target||s.task_target||'等待任务输入',candidate=d.model_selected_candidate_id||d.active_candidate_id||e.candidate_id||'等待语义目标';let status='实时感知与建图';const failed=r.success===false||/FAIL|ERROR|TIMEOUT|REJECT|ABORT/i.test(String(r.status||fb.status||e.state||''));if(failed)status='失败：'+(r.reason||r.detail||r.status||fb.status||'interaction_failed');else if(r.pre_state&&r.post_state)status=r.pre_state+' → '+r.post_state;else status=e.state||status;const a=$('task-target'),b=$('task-goal'),c=$('task-status');if(a)a.textContent=clip(target,42);if(b)b.textContent='高层目标：'+clip(candidate,42);if(c)c.textContent='状态：'+clip(status,42)}}
 function darkMap(){{const q=$("view3").getContext('2d'),w=480,h=270;q.fillStyle='#091321';q.fillRect(0,0,w,h);q.strokeStyle='#173554';q.lineWidth=1;for(let x=0;x<w;x+=16){{q.beginPath();q.moveTo(x,0);q.lineTo(x,h);q.stroke()}}for(let y=0;y<h;y+=16){{q.beginPath();q.moveTo(0,y);q.lineTo(w,y);q.stroke()}}q.fillStyle='#1b2c42';[[30,25,175,32],[280,20,160,38],[30,180,125,52],[230,170,205,60]].forEach(a=>q.fillRect(...a));q.strokeStyle='#42dfc0';q.lineWidth=2;q.strokeRect(190,105,35,45);q.fillStyle='#58baff';q.beginPath();q.arc(210,150,8,0,7);q.fill();q.strokeStyle='#64e88b';q.setLineDash([5,4]);q.beginPath();q.moveTo(210,150);q.lineTo(330,95);q.stroke();q.setLineDash([]);q.fillStyle='#f2bf55';q.font='12px sans-serif';q.fillText('ROOM · REACHABILITY',18,22);q.fillStyle='#8da7c3';q.fillText('Go2 pose',220,168);q.fillStyle='#64e88b';q.fillText('candidate portal',300,90)}}function darkGraph(){{const q=$("view6").getContext('2d'),w=480,h=270;q.fillStyle='#091321';q.fillRect(0,0,w,h);q.font='12px sans-serif';q.fillStyle='#8da7c3';q.fillText('ROOM',18,28);q.fillText('PORTAL',18,96);q.fillText('CONTAINER',18,164);q.fillText('OBJECT',18,232);const nodes=[[95,22,'Office','#42dfc0'],[95,90,'door · open','#64e88b'],[95,158,'fridge · closed','#58baff'],[95,226,'target · unknown','#8da7c3'],[270,90,'lobby door','#f2bf55'],[270,158,'cabinet · open','#64e88b'],[400,226,'object','#8da7c3']];q.strokeStyle='#31547a';q.lineWidth=2;[[0,1],[1,2],[2,3],[0,4],[4,5],[5,6]].forEach(([a,b])=>{{q.beginPath();q.moveTo(nodes[a][0]+55,nodes[a][1]+16);q.lineTo(nodes[b][0],nodes[b][1]+16);q.stroke()}});nodes.forEach(([x,y,t,c])=>{{q.fillStyle='#10233a';q.strokeStyle=c;q.strokeRect(x,y,105,32);q.fillStyle=c;q.fillText(t,x+8,y+21)}});q.fillStyle='#f2bf55';q.fillText('SELECTED SUBGOAL',330,24)}}let busy=false;function draw(b,c){{$('view1').getContext('2d').drawImage(c,0,0,480,270);darkMap();darkGraph();$('live').textContent='实时运行中'}}async function video(){{if(busy)return;busy=true;try{{const ts=Date.now(),rs=await Promise.all([fetch('/snapshot.jpg?t='+ts,{{cache:'no-store'}}),fetch('/camera-overlay.jpg?t='+ts,{{cache:'no-store'}})]),b=await createImageBitmap(await rs[0].blob()),c=await createImageBitmap(await rs[1].blob());draw(b,c);b.close();c.close()}}catch(_){{$('live').textContent='画面重连中'}}finally{{busy=false}}}}async function state(){{try{{const r=await fetch('/api/state-summary?t='+Date.now(),{{cache:'no-store'}}),s=await r.json();renderMetrics(s);renderCalls(s);renderCandidates(s);renderTimeline(s);renderTask(s)}}catch(_){{$('robot-live').textContent='重连中'}}}}setInterval(video,200);setInterval(state,1000);video();state();
 /* Redraw the spatial and interaction panels from raw map/graph receipts. */
-function renderRawSpatial(v){{const q=$('view3').getContext('2d'),w=480,h=270,g=v?.occupancy;if(!g||!Array.isArray(g.data)||!g.width||!g.height){{q.fillStyle='#eef1f5';q.fillRect(0,0,w,h);q.fillStyle='#60758e';q.font='13px sans-serif';q.fillText('等待 OCC 原始数据',16,26);return}}q.fillStyle=document.body.classList.contains('dark')?'#091321':'#eef1f5';q.fillRect(0,0,w,h);const gw=Number(g.width),gh=Number(g.height),res=Number(g.resolution)||.05,step=Math.max(1,Math.ceil(Math.max(gw,gh)/150)),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2;for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){{const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?(document.body.classList.contains('dark')?'#29384a':'#c4cbd3'):z>=50?(document.body.classList.contains('dark')?'#f1f4f7':'#30343a'):(document.body.classList.contains('dark')?'#0e2033':'#fafafa');q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}}const origin=g.origin||{{}},p=v.telemetry?.map_position||v.telemetry?.position||[0,0,0],px=ox+(Number(p[0])-Number(origin.x||0))/res*cell,py=oy+(gh-(Number(p[1])-Number(origin.y||0))/res)*cell;if(Number.isFinite(px)&&Number.isFinite(py)){{q.fillStyle='#1586ff';q.beginPath();q.arc(px,py,6,0,Math.PI*2);q.fill();const yaw=Number(v.telemetry?.yaw||0),tx=px+18*Math.cos(yaw),ty=py-18*Math.sin(yaw);q.strokeStyle='#1586ff';q.lineWidth=2;q.beginPath();q.moveTo(px,py);q.lineTo(tx,ty);q.stroke()}}for(const d of (v.mapped_detections||[])){{const a=d.position||{{}},dx=ox+(Number(a.x)-Number(origin.x||0))/res*cell,dy=oy+(gh-(Number(a.y)-Number(origin.y||0))/res)*cell;if(Number.isFinite(dx)&&Number.isFinite(dy)){{q.fillStyle='#d89a18';q.beginPath();q.arc(dx,dy,3,0,Math.PI*2);q.fill()}}}}q.fillStyle=document.body.classList.contains('dark')?'#9db1c8':'#425770';q.font='11px sans-serif';q.fillText(`OCC · ${{gw}}×${{gh}} · ${{res.toFixed(2)}} m/cell`,10,16)}}
+function gridWorldPixel(g,point,cell,ox,oy){{
+  if(!g||!Array.isArray(point)||point.length<2)return [NaN,NaN];
+  const origin=g.origin||{{}},res=Number(g.resolution)||.05;
+  const qx=Number(origin.qx||0),qy=Number(origin.qy||0),qz=Number(origin.qz||0),qw=Number(origin.qw||1);
+  const originYaw=Math.atan2(2*(qw*qz+qx*qy),1-2*(qy*qy+qz*qz));
+  const dx=Number(point[0])-Number(origin.x||0),dy=Number(point[1])-Number(origin.y||0);
+  const localX=Math.cos(originYaw)*dx+Math.sin(originYaw)*dy;
+  const localY=-Math.sin(originYaw)*dx+Math.cos(originYaw)*dy;
+  return [ox+localX/res*cell,oy+(Number(g.height)-localY/res)*cell];
+}}
+function renderRawSpatial(v){{const q=$('view3').getContext('2d'),w=480,h=270,g=v?.occupancy;if(!g||!Array.isArray(g.data)||!g.width||!g.height){{q.fillStyle='#eef1f5';q.fillRect(0,0,w,h);q.fillStyle='#60758e';q.font='13px sans-serif';q.fillText('等待 OCC 原始数据',16,26);return}}q.fillStyle=document.body.classList.contains('dark')?'#091321':'#eef1f5';q.fillRect(0,0,w,h);const gw=Number(g.width),gh=Number(g.height),step=Math.max(1,Math.ceil(Math.max(gw,gh)/150)),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2;for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){{const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?(document.body.classList.contains('dark')?'#29384a':'#c4cbd3'):z>=50?(document.body.classList.contains('dark')?'#f1f4f7':'#30343a'):(document.body.classList.contains('dark')?'#0e2033':'#fafafa');q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}}const p=v.telemetry?.position||v.telemetry?.map_position||[0,0,0],posePixel=gridWorldPixel(g,p,cell,ox,oy),px=posePixel[0],py=posePixel[1];if(Number.isFinite(px)&&Number.isFinite(py)){{q.fillStyle='#1586ff';q.beginPath();q.arc(px,py,6,0,Math.PI*2);q.fill();const origin=g.origin||{{}},originYaw=Math.atan2(2*(Number(origin.qw||1)*Number(origin.qz||0)+Number(origin.qx||0)*Number(origin.qy||0)),1-2*(Number(origin.qy||0)**2+Number(origin.qz||0)**2)),yaw=liveYaw(v.telemetry)-originYaw,tx=px+18*Math.cos(yaw),ty=py-18*Math.sin(yaw);q.strokeStyle='#1586ff';q.lineWidth=2;q.beginPath();q.moveTo(px,py);q.lineTo(tx,ty);q.stroke()}}for(const d of (v.mapped_detections||[])){{const a=d.position||{{}},pixel=gridWorldPixel(g,[a.x,a.y],cell,ox,oy),dx=pixel[0],dy=pixel[1];if(Number.isFinite(dx)&&Number.isFinite(dy)){{q.fillStyle='#d89a18';q.beginPath();q.arc(dx,dy,3,0,Math.PI*2);q.fill()}}}}q.fillStyle=document.body.classList.contains('dark')?'#9db1c8':'#425770';q.font='11px sans-serif';q.fillText(`OCC · ${{gw}}×${{gh}} · ${{(Number(g.resolution)||.05).toFixed(2)}} m/cell`,10,16)}}
 function renderRawGraph(v){{const q=$('view6').getContext('2d'),w=480,h=270,g=v?.graph||{{}},nodes=Array.isArray(g.nodes)?g.nodes:[],edges=Array.isArray(g.edges)?g.edges:[];q.fillStyle=document.body.classList.contains('dark')?'#091321':'#f8f9fa';q.fillRect(0,0,w,h);if(!nodes.length){{q.fillStyle='#60758e';q.font='13px sans-serif';q.fillText('等待语义 Graph 原始数据',16,26);return}}const pts=nodes.map((n,i)=>{{const c=n.aabb_center||n.centroid||n.position||[],x=Number(c[0]),y=Number(c[1]);return {{n,x:Number.isFinite(x)?x:(i%5),y:Number.isFinite(y)?y:Math.floor(i/5)}}}}),xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys),sx=400/Math.max(1,maxx-minx),sy=220/Math.max(1,maxy-miny),sc=Math.min(sx,sy),mx=x=>40+(x-minx)*sc,my=y=>235-(y-miny)*sc,byId=new Map();pts.forEach((p,i)=>{{const id=String(p.n.id??p.n.instance_id??p.n.name??i);byId.set(id,p)}});q.strokeStyle=document.body.classList.contains('dark')?'#476887':'#9aa9b8';q.lineWidth=1.3;for(const e of edges){{const a=byId.get(String(e.source??e.from??e.u??'')),b=byId.get(String(e.target??e.to??e.v??''));if(a&&b){{q.beginPath();q.moveTo(mx(a.x),my(a.y));q.lineTo(mx(b.x),my(b.y));q.stroke()}}}}for(const p of pts){{const n=p.n,type=String(n.type||n.node_type||'object').toLowerCase(),inter=n.interaction||{{}},state=String(inter.state||n.state||'').toLowerCase(),color=type.includes('room')?'#4abf87':type.includes('portal')||type.includes('door')?'#d89a18':type.includes('container')||/fridge|cabinet|drawer/.test(String(n.label||''))?'#42a5d5':'#8b96a3';q.fillStyle=color;q.beginPath();q.arc(mx(p.x),my(p.y),4,0,Math.PI*2);q.fill();q.fillStyle=document.body.classList.contains('dark')?'#d7e5f2':'#33465c';q.font='10px sans-serif';q.fillText(clip(n.label||n.name||n.id||type,20),mx(p.x)+6,my(p.y)-5)}}q.fillStyle=document.body.classList.contains('dark')?'#9db1c8':'#425770';q.font='11px sans-serif';q.fillText(`Graph · ${{nodes.length}} nodes · ${{edges.length}} edges`,10,16)}}
 function renderVisualization(v){{renderRawSpatial(v);renderRawGraph(v)}}
-let visualizationBusy=false;async function refreshVisualization(){{if(visualizationBusy)return;visualizationBusy=true;try{{const rs=await Promise.all([fetch('/api/visualization-data?t='+Date.now(),{{cache:'no-store'}}),fetch('/api/occupancy?t='+Date.now(),{{cache:'no-store'}})]);if(rs[0].ok){{const v=await rs[0].json();if(rs[1].ok)v.occupancy=await rs[1].json();renderVisualization(v)}}}}catch(_){{}}finally{{visualizationBusy=false}}}}
+let visualizationData={{}},visualizationBusy=false,visualizationRevision={{map:null,graph:null,telemetry:null,detection:null,navigation:null}};async function refreshVisualization(){{if(visualizationBusy)return;visualizationBusy=true;try{{const q=new URLSearchParams({{t:Date.now()}});if(visualizationRevision.map!==null)q.set('after_map',visualizationRevision.map);if(visualizationRevision.graph!==null)q.set('after_graph',visualizationRevision.graph);if(visualizationRevision.telemetry!==null)q.set('after_telemetry',visualizationRevision.telemetry);if(visualizationRevision.detection!==null)q.set('after_detection',visualizationRevision.detection);if(visualizationRevision.navigation!==null)q.set('after_navigation',visualizationRevision.navigation);const response=await fetch('/api/visualization-data?'+q.toString(),{{cache:'no-store'}});const readHeader=(name,fallback)=>{{const value=response.headers.get(name);return value===null?fallback:Number(value)}};visualizationRevision.map=readHeader('X-Physical-Map-Revision',visualizationRevision.map);visualizationRevision.graph=readHeader('X-Physical-Graph-Revision',visualizationRevision.graph);visualizationRevision.telemetry=readHeader('X-Physical-Telemetry-Revision',visualizationRevision.telemetry);visualizationRevision.detection=readHeader('X-Physical-Detection-Revision',visualizationRevision.detection);visualizationRevision.navigation=readHeader('X-Physical-Navigation-Revision',visualizationRevision.navigation);if(response.status===204)return;if(response.ok){{const patch=await response.json();visualizationData={{...visualizationData,...patch}};renderVisualization(visualizationData)}}}}catch(_){{}}finally{{visualizationBusy=false}}}}
 /* The showcase timeline records only the three runtime behavior modes.  A new
    row is added when navigation, exploration, or interaction becomes active. */
 let behaviorHistory=[];
@@ -205,15 +327,18 @@ def build_academic_page() -> str:
 <section class='cell'><div class='title'><span class='letter'>C</span><b>分层交互 Graph</b><small>Room → Portal → Container → Object</small></div><div class='canvas-wrap'><canvas id='c' width='720' height='405'></canvas></div><div class='legend'><span class='key green'><i class='sw'></i>open</span><span class='key red'><i class='sw'></i>closed</span><span class='key gold'><i class='sw'></i>selected subgoal</span></div></section>
 <section class='cell'><div class='title'><span class='letter'>D</span><b>Agent 决策</b><small>M1 / M2 / NAVIGATE / INTERACT / M3</small></div><div class='decision'><div class='stack' id='steps'><div class='step'><strong>M1 · 交互属性识别</strong>等待感知输入</div><div class='step'><strong>M2 · 子目标选择</strong>等待候选目标</div><div class='step'><strong>NAVIGATE / INTERACT</strong>只读动作记录</div><div class='step m3'><strong>M3 · 状态验证</strong>规则一致性检查</div></div><div class='timeline' id='timeline'></div></div></section></main><div class='foot'>A 感知 → B 地图 → C 交互图 → D Agent 决策；页面仅读取统一运行时状态。</div>
 <script>
+__ACADEMIC_CAMERA_10HZ__
 const $=id=>document.getElementById(id),clip=(v,n=62)=>String(v??'').replace(/\s+/g,' ').trim().slice(0,n),ctx=id=>$(id).getContext('2d');
 function draw(b,c){ctx('a').drawImage(c,0,0,720,405)}
-function drawAcademicRaw(v){const q=ctx('b'),w=q.canvas.width,h=q.canvas.height,g=v?.occupancy;q.fillStyle='#f8f9fa';q.fillRect(0,0,w,h);if(g&&Array.isArray(g.data)&&g.width&&g.height){const gw=Number(g.width),gh=Number(g.height),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2,step=Math.max(1,Math.ceil(Math.max(gw,gh)/180));for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?'#c4cbd3':z>=50?'#30343a':'#fafafa';q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}const o=g.origin||{},p=v.telemetry?.map_position||v.telemetry?.position||[0,0,0],r=Number(g.resolution)||.05,px=ox+(Number(p[0])-Number(o.x||0))/r*cell,py=oy+(gh-(Number(p[1])-Number(o.y||0))/r)*cell;q.fillStyle='#1765d1';q.beginPath();q.arc(px,py,9,0,Math.PI*2);q.fill()}else{q.fillStyle='#60758e';q.font='16px Arial';q.fillText('等待 OCC 原始数据',20,30)}const c=ctx('c'),nodes=Array.isArray(v?.graph?.nodes)?v.graph.nodes:[],edges=Array.isArray(v?.graph?.edges)?v.graph.edges:[];c.fillStyle='#f8f9fa';c.fillRect(0,0,w,h);if(!nodes.length){c.fillStyle='#60758e';c.font='16px Arial';c.fillText('等待语义 Graph 原始数据',20,30);return}const pts=nodes.map((n,i)=>{const a=n.aabb_center||n.centroid||n.position||[];return {n,x:Number.isFinite(Number(a[0]))?Number(a[0]):i%8,y:Number.isFinite(Number(a[1]))?Number(a[1]):Math.floor(i/8)}}),xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys),sc=Math.min(820/Math.max(1,maxx-minx),470/Math.max(1,maxy-miny)),mx=x=>70+(x-minx)*sc,my=y=>500-(y-miny)*sc,idmap=new Map();pts.forEach((p,i)=>idmap.set(String(p.n.id??p.n.instance_id??i),p));c.strokeStyle='#9aa9b8';for(const e of edges){const a=idmap.get(String(e.source??e.from??'')),b=idmap.get(String(e.target??e.to??''));if(a&&b){c.beginPath();c.moveTo(mx(a.x),my(a.y));c.lineTo(mx(b.x),my(b.y));c.stroke()}}for(const p of pts){const n=p.n,t=String(n.type||n.node_type||'object').toLowerCase();c.fillStyle=t.includes('room')?'#198344':t.includes('portal')||t.includes('door')?'#c18400':t.includes('container')?'#1e5bb5':'#7f8b98';c.beginPath();c.arc(mx(p.x),my(p.y),7,0,Math.PI*2);c.fill();c.fillStyle='#24364c';c.font='12px Arial';c.fillText(clip(n.label||n.name||n.id||t,22),mx(p.x)+10,my(p.y)-7)}}
-async function academicVisualization(){try{const r=await fetch('/api/visualization-data?t='+Date.now(),{cache:'no-store'});if(r.ok)drawAcademicRaw(await r.json())}catch(_){} }
+function academicGridPixel(g,point,cell,ox,oy){if(!g||!Array.isArray(point)||point.length<2)return [NaN,NaN];const o=g.origin||{},r=Number(g.resolution)||.05,qx=Number(o.qx||0),qy=Number(o.qy||0),qz=Number(o.qz||0),qw=Number(o.qw||1),yaw=Math.atan2(2*(qw*qz+qx*qy),1-2*(qy*qy+qz*qz)),dx=Number(point[0])-Number(o.x||0),dy=Number(point[1])-Number(o.y||0),lx=Math.cos(yaw)*dx+Math.sin(yaw)*dy,ly=-Math.sin(yaw)*dx+Math.cos(yaw)*dy;return [ox+lx/r*cell,oy+(Number(g.height)-ly/r)*cell]}
+function drawAcademicRaw(v){const q=ctx('b'),w=q.canvas.width,h=q.canvas.height,g=v?.occupancy;q.fillStyle='#f8f9fa';q.fillRect(0,0,w,h);if(g&&Array.isArray(g.data)&&g.width&&g.height){const gw=Number(g.width),gh=Number(g.height),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2,step=Math.max(1,Math.ceil(Math.max(gw,gh)/180));for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?'#c4cbd3':z>=50?'#30343a':'#fafafa';q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}const p=v.telemetry?.position||v.telemetry?.map_position||[0,0,0],pixel=academicGridPixel(g,p,cell,ox,oy),px=pixel[0],py=pixel[1];q.fillStyle='#1765d1';q.beginPath();q.arc(px,py,9,0,Math.PI*2);q.fill()}else{q.fillStyle='#60758e';q.font='16px Arial';q.fillText('等待 OCC 原始数据',20,30)}const c=ctx('c'),nodes=Array.isArray(v?.graph?.nodes)?v.graph.nodes:[],edges=Array.isArray(v?.graph?.edges)?v.graph.edges:[];c.fillStyle='#f8f9fa';c.fillRect(0,0,w,h);if(!nodes.length){c.fillStyle='#60758e';c.font='16px Arial';c.fillText('等待语义 Graph 原始数据',20,30);return}const pts=nodes.map((n,i)=>{const a=n.aabb_center||n.centroid||n.position||[];return {n,x:Number.isFinite(Number(a[0]))?Number(a[0]):i%8,y:Number.isFinite(Number(a[1]))?Number(a[1]):Math.floor(i/8)}}),xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys),sc=Math.min(820/Math.max(1,maxx-minx),470/Math.max(1,maxy-miny)),mx=x=>70+(x-minx)*sc,my=y=>500-(y-miny)*sc,idmap=new Map();pts.forEach((p,i)=>idmap.set(String(p.n.id??p.n.instance_id??i),p));c.strokeStyle='#9aa9b8';for(const e of edges){const a=idmap.get(String(e.source??e.from??'')),b=idmap.get(String(e.target??e.to??''));if(a&&b){c.beginPath();c.moveTo(mx(a.x),my(a.y));c.lineTo(mx(b.x),my(b.y));c.stroke()}}for(const p of pts){const n=p.n,t=String(n.type||n.node_type||'object').toLowerCase();c.fillStyle=t.includes('room')?'#198344':t.includes('portal')||t.includes('door')?'#c18400':t.includes('container')?'#1e5bb5':'#7f8b98';c.beginPath();c.arc(mx(p.x),my(p.y),7,0,Math.PI*2);c.fill();c.fillStyle='#24364c';c.font='12px Arial';c.fillText(clip(n.label||n.name||n.id||t,22),mx(p.x)+10,my(p.y)-7)}}
+let academicVisualizationData={},academicVisualizationRevision={map:null,graph:null,telemetry:null,detection:null,navigation:null};
+async function academicVisualization(){try{const q=new URLSearchParams({t:Date.now()});if(academicVisualizationRevision.map!==null)q.set('after_map',academicVisualizationRevision.map);if(academicVisualizationRevision.graph!==null)q.set('after_graph',academicVisualizationRevision.graph);if(academicVisualizationRevision.telemetry!==null)q.set('after_telemetry',academicVisualizationRevision.telemetry);if(academicVisualizationRevision.detection!==null)q.set('after_detection',academicVisualizationRevision.detection);if(academicVisualizationRevision.navigation!==null)q.set('after_navigation',academicVisualizationRevision.navigation);const r=await fetch('/api/visualization-data?'+q.toString(),{cache:'no-store'});const readHeader=(name,fallback)=>{const value=r.headers.get(name);return value===null?fallback:Number(value)};academicVisualizationRevision.map=readHeader('X-Physical-Map-Revision',academicVisualizationRevision.map);academicVisualizationRevision.graph=readHeader('X-Physical-Graph-Revision',academicVisualizationRevision.graph);academicVisualizationRevision.telemetry=readHeader('X-Physical-Telemetry-Revision',academicVisualizationRevision.telemetry);academicVisualizationRevision.detection=readHeader('X-Physical-Detection-Revision',academicVisualizationRevision.detection);academicVisualizationRevision.navigation=readHeader('X-Physical-Navigation-Revision',academicVisualizationRevision.navigation);if(r.status===204)return;if(r.ok){const patch=await r.json();academicVisualizationData={...academicVisualizationData,...patch};drawAcademicRaw(academicVisualizationData)}}catch(_){} }
 async function video(){try{const ts=Date.now(),rs=await Promise.all([fetch('/snapshot.jpg?t='+ts,{cache:'no-store'}),fetch('/camera-overlay.jpg?t='+ts,{cache:'no-store'})]);draw(await createImageBitmap(await rs[0].blob()),await createImageBitmap(await rs[1].blob()));$('live').textContent='LIVE'}catch(_){$('live').textContent='RECONNECTING'}}
 function textOf(e){if(!e)return '等待调用';return clip(e.raw_text??e.response?.raw_text??e.payload?.result??'调用完成')}
 function state(s){const n=s.navigation||{},d=n.decision_trace||{},e=n.execution_state||{},r=s.interaction_result||{},m1=(s.mllm?.M1||[])[0],m2=(s.mllm?.M2||[])[0];$('detect-meta').textContent='D435i · YOLOE-26l PF Seg · '+(s.detections?.length??0)+' targets';$('steps').innerHTML='<div class="step"><strong>M1 · 交互属性识别</strong>'+clip(textOf(m1))+'</div><div class="step"><strong>M2 · 子目标选择</strong>'+clip(textOf(m2))+'</div><div class="step"><strong>NAVIGATE / INTERACT</strong>'+clip(e.behavior_type||e.state||'只读动作记录')+'</div><div class="step m3"><strong>M3 · 状态验证</strong>'+clip((r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'规则一致性检查')+'</div>';const ev=[['感知','RGB-D + YOLOE'],['M1','交互属性'],['M2','子目标 '+(d.model_selected_candidate_id||'等待')],['NAV',''+(e.state||'IDLE')],['M3',''+((r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'等待验证')]];$('timeline').innerHTML=ev.map(x=>'<div class="event '+(x[0]==='M3'?'good':'')+'"><b>'+x[0]+'</b><span>'+clip(x[1])+'</span></div>').join('')}
 async function poll(){try{const r=await fetch('/api/state-summary?t='+Date.now(),{cache:'no-store'});state(await r.json())}catch(_){}}setInterval(video,200);setInterval(poll,1000);setInterval(academicVisualization,1000);video();poll();academicVisualization();
-</script></html>"""
+</script></html>""".replace("__ACADEMIC_CAMERA_10HZ__", _ACADEMIC_CAMERA_10HZ_SCRIPT)
 
 
 ACADEMIC_SHOWCASE_HTML = build_academic_page()
@@ -237,15 +362,18 @@ def build_academic_page_strict() -> str:
 <section class='cell'><div class='title'><span class='letter'>C</span><b>分层交互 Graph</b><small>Room → Portal → Container → Object</small></div><div class='canvas-wrap'><canvas id='c' width='960' height='540'></canvas></div><div class='legend'><span class='key green'><i class='sw'></i>open / reachable</span><span class='key red'><i class='sw'></i>closed / blocked</span><span class='key gold'><i class='sw'></i>selected subgoal</span></div></section>
 <section class='cell'><div class='title'><span class='letter'>D</span><b>Agent 决策</b><small>M1 / M2 / NAVIGATE / INTERACT / M3</small></div><div class='decision'><div class='stack' id='steps'><div class='step'><strong>M1 · 交互属性识别</strong>等待感知输入</div><div class='step'><strong>M2 · 子目标选择</strong>等待候选目标</div><div class='step interact'><strong>NAVIGATE / INTERACT</strong>只读动作记录</div><div class='step m3'><strong>M3 · 状态验证</strong>规则一致性检查</div></div><div class='timeline' id='timeline'></div></div></section></main><footer class='foot'>A 感知 → B 地图 → C 交互图 → D Agent 决策　·　页面仅读取统一运行时状态</footer></div>
 <script>
+__ACADEMIC_CAMERA_10HZ__
 const $=id=>document.getElementById(id),clip=(v,n=62)=>String(v??'').replace(/\s+/g,' ').trim().slice(0,n),ctx=id=>$(id).getContext('2d');
 function draw(b,c){const a=ctx('a').canvas;a.width=960;a.height=720;ctx('a').drawImage(c,0,0,960,720);b.close();c.close()}
-function drawAcademicRaw(v){const q=ctx('b'),w=q.canvas.width,h=q.canvas.height,g=v?.occupancy;q.fillStyle='#f8f9fa';q.fillRect(0,0,w,h);if(g&&Array.isArray(g.data)&&g.width&&g.height){const gw=Number(g.width),gh=Number(g.height),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2,step=Math.max(1,Math.ceil(Math.max(gw,gh)/180));for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?'#c4cbd3':z>=50?'#30343a':'#fafafa';q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}const o=g.origin||{},p=v.telemetry?.map_position||v.telemetry?.position||[0,0,0],r=Number(g.resolution)||.05,px=ox+(Number(p[0])-Number(o.x||0))/r*cell,py=oy+(gh-(Number(p[1])-Number(o.y||0))/r)*cell;q.fillStyle='#1765d1';q.beginPath();q.arc(px,py,10,0,Math.PI*2);q.fill()}const c=ctx('c'),nodes=Array.isArray(v?.graph?.nodes)?v.graph.nodes:[],edges=Array.isArray(v?.graph?.edges)?v.graph.edges:[];c.fillStyle='#f8f9fa';c.fillRect(0,0,w,h);if(!nodes.length){c.fillStyle='#60758e';c.font='18px Arial';c.fillText('等待语义 Graph 原始数据',22,34);return}const pts=nodes.map((n,i)=>{const a=n.aabb_center||n.centroid||n.position||[];return {n,x:Number.isFinite(Number(a[0]))?Number(a[0]):i%8,y:Number.isFinite(Number(a[1]))?Number(a[1]):Math.floor(i/8)}}),xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys),sc=Math.min(820/Math.max(1,maxx-minx),470/Math.max(1,maxy-miny)),mx=x=>70+(x-minx)*sc,my=y=>500-(y-miny)*sc,idmap=new Map();pts.forEach((p,i)=>idmap.set(String(p.n.id??p.n.instance_id??i),p));c.strokeStyle='#9aa9b8';for(const e of edges){const a=idmap.get(String(e.source??e.from??'')),b=idmap.get(String(e.target??e.to??''));if(a&&b){c.beginPath();c.moveTo(mx(a.x),my(a.y));c.lineTo(mx(b.x),my(b.y));c.stroke()}}for(const p of pts){const n=p.n,t=String(n.type||n.node_type||'object').toLowerCase();c.fillStyle=t.includes('room')?'#198344':t.includes('portal')||t.includes('door')?'#c18400':t.includes('container')?'#1e5bb5':'#7f8b98';c.beginPath();c.arc(mx(p.x),my(p.y),8,0,Math.PI*2);c.fill();c.fillStyle='#24364c';c.font='13px Arial';c.fillText(clip(n.label||n.name||n.id||t,24),mx(p.x)+11,my(p.y)-8)}}
-async function academicVisualization(){try{const r=await fetch('/api/visualization-data?t='+Date.now(),{cache:'no-store'});if(r.ok)drawAcademicRaw(await r.json())}catch(_){} }
+function academicGridPixel(g,point,cell,ox,oy){if(!g||!Array.isArray(point)||point.length<2)return [NaN,NaN];const o=g.origin||{},r=Number(g.resolution)||.05,qx=Number(o.qx||0),qy=Number(o.qy||0),qz=Number(o.qz||0),qw=Number(o.qw||1),yaw=Math.atan2(2*(qw*qz+qx*qy),1-2*(qy*qy+qz*qz)),dx=Number(point[0])-Number(o.x||0),dy=Number(point[1])-Number(o.y||0),lx=Math.cos(yaw)*dx+Math.sin(yaw)*dy,ly=-Math.sin(yaw)*dx+Math.cos(yaw)*dy;return [ox+lx/r*cell,oy+(Number(g.height)-ly/r)*cell]}
+function drawAcademicRaw(v){const q=ctx('b'),w=q.canvas.width,h=q.canvas.height,g=v?.occupancy;q.fillStyle='#f8f9fa';q.fillRect(0,0,w,h);if(g&&Array.isArray(g.data)&&g.width&&g.height){const gw=Number(g.width),gh=Number(g.height),cell=Math.min(w/gw,h/gh),ox=(w-gw*cell)/2,oy=(h-gh*cell)/2,step=Math.max(1,Math.ceil(Math.max(gw,gh)/180));for(let y=0;y<gh;y+=step)for(let x=0;x<gw;x+=step){const z=Number(g.data[y*gw+x]??-1);q.fillStyle=z<0?'#c4cbd3':z>=50?'#30343a':'#fafafa';q.fillRect(ox+x*cell,oy+(gh-y-step)*cell,Math.max(1,cell*step+.3),Math.max(1,cell*step+.3))}const p=v.telemetry?.position||v.telemetry?.map_position||[0,0,0],pixel=academicGridPixel(g,p,cell,ox,oy),px=pixel[0],py=pixel[1];q.fillStyle='#1765d1';q.beginPath();q.arc(px,py,10,0,Math.PI*2);q.fill()}const c=ctx('c'),nodes=Array.isArray(v?.graph?.nodes)?v.graph.nodes:[],edges=Array.isArray(v?.graph?.edges)?v.graph.edges:[];c.fillStyle='#f8f9fa';c.fillRect(0,0,w,h);if(!nodes.length){c.fillStyle='#60758e';c.font='18px Arial';c.fillText('等待语义 Graph 原始数据',22,34);return}const pts=nodes.map((n,i)=>{const a=n.aabb_center||n.centroid||n.position||[];return {n,x:Number.isFinite(Number(a[0]))?Number(a[0]):i%8,y:Number.isFinite(Number(a[1]))?Number(a[1]):Math.floor(i/8)}}),xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),minx=Math.min(...xs),maxx=Math.max(...xs),miny=Math.min(...ys),maxy=Math.max(...ys),sc=Math.min(820/Math.max(1,maxx-minx),470/Math.max(1,maxy-miny)),mx=x=>70+(x-minx)*sc,my=y=>500-(y-miny)*sc,idmap=new Map();pts.forEach((p,i)=>idmap.set(String(p.n.id??p.n.instance_id??i),p));c.strokeStyle='#9aa9b8';for(const e of edges){const a=idmap.get(String(e.source??e.from??'')),b=idmap.get(String(e.target??e.to??''));if(a&&b){c.beginPath();c.moveTo(mx(a.x),my(a.y));c.lineTo(mx(b.x),my(b.y));c.stroke()}}for(const p of pts){const n=p.n,t=String(n.type||n.node_type||'object').toLowerCase();c.fillStyle=t.includes('room')?'#198344':t.includes('portal')||t.includes('door')?'#c18400':t.includes('container')?'#1e5bb5':'#7f8b98';c.beginPath();c.arc(mx(p.x),my(p.y),8,0,Math.PI*2);c.fill();c.fillStyle='#24364c';c.font='13px Arial';c.fillText(clip(n.label||n.name||n.id||t,24),mx(p.x)+11,my(p.y)-8)}}
+let academicVisualizationData={},academicVisualizationRevision={map:null,graph:null,telemetry:null,detection:null,navigation:null};
+async function academicVisualization(){try{const q=new URLSearchParams({t:Date.now()});if(academicVisualizationRevision.map!==null)q.set('after_map',academicVisualizationRevision.map);if(academicVisualizationRevision.graph!==null)q.set('after_graph',academicVisualizationRevision.graph);if(academicVisualizationRevision.telemetry!==null)q.set('after_telemetry',academicVisualizationRevision.telemetry);if(academicVisualizationRevision.detection!==null)q.set('after_detection',academicVisualizationRevision.detection);if(academicVisualizationRevision.navigation!==null)q.set('after_navigation',academicVisualizationRevision.navigation);const r=await fetch('/api/visualization-data?'+q.toString(),{cache:'no-store'});const readHeader=(name,fallback)=>{const value=r.headers.get(name);return value===null?fallback:Number(value)};academicVisualizationRevision.map=readHeader('X-Physical-Map-Revision',academicVisualizationRevision.map);academicVisualizationRevision.graph=readHeader('X-Physical-Graph-Revision',academicVisualizationRevision.graph);academicVisualizationRevision.telemetry=readHeader('X-Physical-Telemetry-Revision',academicVisualizationRevision.telemetry);academicVisualizationRevision.detection=readHeader('X-Physical-Detection-Revision',academicVisualizationRevision.detection);academicVisualizationRevision.navigation=readHeader('X-Physical-Navigation-Revision',academicVisualizationRevision.navigation);if(r.status===204)return;if(r.ok){const patch=await r.json();academicVisualizationData={...academicVisualizationData,...patch};drawAcademicRaw(academicVisualizationData)}}catch(_){} }
 async function video(){try{const ts=Date.now(),rs=await Promise.all([fetch('/snapshot.jpg?t='+ts,{cache:'no-store'}),fetch('/camera-overlay.jpg?t='+ts,{cache:'no-store'})]);draw(await createImageBitmap(await rs[0].blob()),await createImageBitmap(await rs[1].blob()));$('live').textContent='LIVE'}catch(_){$('live').textContent='RECONNECTING'}}
 function textOf(e){if(!e)return '等待调用';return clip(e.raw_text??e.response?.raw_text??e.payload?.result??'调用完成')}
 function state(s){const n=s.navigation||{},d=n.decision_trace||{},e=n.execution_state||{},r=s.interaction_result||{},m1=(s.mllm?.M1||[])[0],m2=(s.mllm?.M2||[])[0];$('detect-meta').textContent='Intel RealSense D435i · YOLOE-26l PF Seg · '+(s.detections?.length??0)+' targets';$('steps').innerHTML='<div class="step"><strong>M1 · 交互属性识别</strong>'+clip(textOf(m1))+'</div><div class="step"><strong>M2 · 子目标选择</strong>'+clip(textOf(m2))+'</div><div class="step interact"><strong>NAVIGATE / INTERACT</strong>'+clip(e.behavior_type||e.state||'只读动作记录')+'</div><div class="step m3"><strong>M3 · 状态验证</strong>'+clip((r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'规则一致性检查')+'</div>';const ev=[['感知','RGB-D + YOLOE'],['M1','交互属性'],['M2','子目标 '+(d.model_selected_candidate_id||'等待')],['NAV',''+(e.state||'IDLE')],['M3',''+((r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'等待验证')]];$('timeline').innerHTML=ev.map(x=>'<div class="event '+(x[0]==='M3'?'good':'')+'"><b>'+x[0]+'</b><span>'+clip(x[1])+'</span></div>').join('')}
 async function poll(){try{const r=await fetch('/api/state-summary?t='+Date.now(),{cache:'no-store'});state(await r.json())}catch(_){} }setInterval(video,200);setInterval(poll,1000);setInterval(academicVisualization,1000);video();poll();academicVisualization();
-</script></html>"""
+</script></html>""".replace("__ACADEMIC_CAMERA_10HZ__", _ACADEMIC_CAMERA_10HZ_SCRIPT)
 
 
 # Export the strict 16:9 academic template used by /showcase-academic.
@@ -260,88 +388,58 @@ def _use_original_renderer_panels(html: str, spatial_id: str, graph_id: str) -> 
     those native outputs directly so their geometry, labels, candidates and
     interaction states stay identical to the debug six-panel definition.
     """
+    # setInterval retains the original function object: rebinding ``video``
+    # later cannot cancel it. Remove obsolete registrations and initial calls
+    # before any script runs. Native panel 3 already includes the global path
+    # in its cropped viewport, so it needs no second raw-grid overlay/poller.
+    for poller, period in (("video", 200), ("refreshVisualization", 1000),
+                           ("academicVisualization", 1000)):
+        html = html.replace(f"setInterval({poller},{period});", "")
+        html = html.replace(f"{poller}();", "")
     script = r"""<script>
 /* Panel 03/06 are native OfflineSixPanelRenderer outputs. */
 if (typeof renderVisualization === 'function') renderVisualization = function(){};
 if (typeof drawAcademicRaw === 'function') drawAcademicRaw = function(){};
 let originalRendererPanelsBusy = false;
+const originalRendererPanelRevisions = [null, null];
 async function refreshOriginalRendererPanels() {
   if (document.hidden || originalRendererPanelsBusy) return;
   originalRendererPanelsBusy = true;
   try {
-    const stamp = Date.now();
-    const responses = await Promise.all([
-      fetch('/original-panel3.jpg?t=' + stamp, {cache: 'no-store'}),
-      fetch('/original-panel6.jpg?t=' + stamp, {cache: 'no-store'})
-    ]);
-    if (!responses[0].ok || !responses[1].ok) throw new Error('original panel unavailable');
-    const images = await Promise.all(responses.slice(0, 2).map(async response =>
-      createImageBitmap(await response.blob())
-    ));
-    const visualization = navigationOverlayData;
-    const spatial = document.getElementById('__SPATIAL_ID__');
-    const graph = document.getElementById('__GRAPH_ID__');
-    if (spatial) {
-      spatial.width = images[0].width;
-      spatial.height = images[0].height;
-      spatial.getContext('2d').drawImage(images[0], 0, 0);
-      drawNavigationOverlay(spatial, visualization);
-    }
-    if (graph) {
-      graph.width = images[1].width;
-      graph.height = images[1].height;
-      graph.getContext('2d').drawImage(images[1], 0, 0);
-    }
-    images.forEach(image => image.close());
+    // Each HTTP request can straddle a render or fail independently. Advance
+    // its cursor only after display succeeds, so a decode failure is retried.
+    await Promise.allSettled([
+      ['/original-panel3.jpg', '__SPATIAL_ID__'],
+      ['/original-panel6.jpg', '__GRAPH_ID__']
+    ].map(async ([endpoint, id], index) => {
+      const query = new URLSearchParams();
+      if (originalRendererPanelRevisions[index] !== null)
+        query.set('after', originalRendererPanelRevisions[index]);
+      const response = await fetch(endpoint + '?' + query.toString(), {cache: 'no-store'});
+      if (response.status === 204) return;
+      if (!response.ok) throw new Error('original panel unavailable');
+      const image = await createImageBitmap(await response.blob());
+      try {
+        const canvas = document.getElementById(id);
+        if (!canvas) return;
+        if (canvas.width !== image.width || canvas.height !== image.height) {
+          canvas.width = image.width;
+          canvas.height = image.height;
+        }
+        canvas.getContext('2d').drawImage(image, 0, 0);
+        const revision = response.headers.get('X-Physical-Panel-Revision');
+        if (revision !== null && Number.isFinite(Number(revision)))
+          originalRendererPanelRevisions[index] = Number(revision);
+      } finally { image.close(); }
+    }));
   } catch (_) {
     /* Camera/state polling owns the visible connection indicator. */
   } finally {
     originalRendererPanelsBusy = false;
   }
 }
-let navigationOverlayData={};
-let navigationOverlayDataBusy=false;
-async function refreshNavigationOverlayData(){
-  if(document.hidden||navigationOverlayDataBusy)return;
-  navigationOverlayDataBusy=true;
-  try{const response=await fetch('/api/visualization-data?t='+Date.now(),{cache:'no-store'});if(response.ok)navigationOverlayData=await response.json()}catch(_){}finally{navigationOverlayDataBusy=false}
-}
-function navigationPoint(value) {
-  if (Array.isArray(value) && value.length >= 2) return {x:Number(value[0]), y:Number(value[1])};
-  if (!value || typeof value !== 'object') return null;
-  if (Array.isArray(value.point)) return navigationPoint(value.point);
-  if (value.position) return navigationPoint(value.position);
-  if (value.pose) return navigationPoint(value.pose);
-  const x=Number(value.x), y=Number(value.y);
-  return Number.isFinite(x)&&Number.isFinite(y) ? {x,y} : null;
-}
-function navigationPath(value) {
-  if (Array.isArray(value)) return value.map(navigationPoint).filter(Boolean);
-  if (!value || typeof value !== 'object') return [];
-  for (const key of ['poses','path','points','plan']) {
-    if (Array.isArray(value[key])) return navigationPath(value[key]);
-  }
-  return [];
-}
-function drawNavigationOverlay(canvas, visualization) {
-  const g=visualization?.occupancy, nav=visualization?.navigation||{};
-  if (!g || !g.width || !g.height) return;
-  const ctx=canvas.getContext('2d'), width=canvas.width, height=canvas.height;
-  const resolution=Number(g.resolution)||0.1, origin=g.origin||{};
-  const ox=Number(origin.x)||0, oy=Number(origin.y)||0;
-  const toCanvas=p=>({x:Math.max(0,Math.min(width-1,(p.x-ox)/(Number(g.width)*resolution)*width)),y:Math.max(0,Math.min(height-1,height-(p.y-oy)/(Number(g.height)*resolution)*height))});
-  const path=navigationPath(nav.global_plan);
-  if (path.length>=2) {
-    ctx.save(); ctx.strokeStyle='#35d6ff'; ctx.lineWidth=Math.max(3,width/320); ctx.shadowColor='#001b2b'; ctx.shadowBlur=4;
-    ctx.beginPath(); path.forEach((point,index)=>{const p=toCanvas(point); index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)}); ctx.stroke();
-    const end=toCanvas(path[path.length-1]); ctx.fillStyle='#35d6ff'; ctx.beginPath(); ctx.arc(end.x,end.y,5,0,Math.PI*2); ctx.fill();
-    ctx.font='600 12px sans-serif'; ctx.fillText('GLOBAL PLAN',Math.min(width-105,Math.max(8,end.x+8)),Math.max(16,end.y-8)); ctx.restore();
-  }
-}
 setInterval(refreshOriginalRendererPanels, 200);
-setInterval(refreshNavigationOverlayData, 1000);
 refreshOriginalRendererPanels();
-refreshNavigationOverlayData();
 </script>""".replace("__SPATIAL_ID__", spatial_id).replace("__GRAPH_ID__", graph_id)
     marker = "</body>" if "</body>" in html else "</html>"
     return html.replace(marker, script + marker)

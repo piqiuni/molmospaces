@@ -174,6 +174,10 @@ struct SlamGMapping::PipelineTimingTrace
     if (owner != NULL && owner->pipeline_timing_enabled_)
     {
       active = true;
+      // Measure ingress age even when the optional time-sync rejection guard
+      // is disabled. Diagnostic coverage must not depend on drop policy.
+      if (!source_stamp_in.isZero())
+        observeSourceAge((ros::Time::now() - source_stamp_in).toSec() * 1000.0);
     }
   }
 
@@ -248,6 +252,8 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
   uint64_t odom_delta_count = 0;
   double odom_delta_total_ms = 0.0;
   double odom_delta_max_ms = 0.0;
+  uint64_t filter_failure_pointcloud_count = 0;
+  uint64_t filter_failure_organized_depth_count = 0;
 
   {
     boost::mutex::scoped_lock lock(pipeline_timing_mutex_);
@@ -342,6 +348,14 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
   if (!should_log)
     return;
 
+  {
+    boost::mutex::scoped_lock lock(filter_failure_mutex_);
+    filter_failure_pointcloud_count = filter_failure_pointcloud_count_;
+    filter_failure_organized_depth_count = filter_failure_organized_depth_count_;
+    filter_failure_pointcloud_count_ = 0;
+    filter_failure_organized_depth_count_ = 0;
+  }
+
   const double callback_avg = stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL] > 0
       ? stage_total_ms[PIPELINE_STAGE_CALLBACK_TOTAL] /
             static_cast<double>(stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL])
@@ -372,6 +386,10 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
       ? stage_total_ms[PIPELINE_STAGE_UPDATE_MAP] /
             static_cast<double>(stage_counts[PIPELINE_STAGE_UPDATE_MAP])
       : 0.0;
+  const double local_overwrite_avg = stage_counts[PIPELINE_STAGE_LOCAL_OVERWRITE] > 0
+      ? stage_total_ms[PIPELINE_STAGE_LOCAL_OVERWRITE] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_LOCAL_OVERWRITE])
+      : 0.0;
   const double map_publish_avg = stage_counts[PIPELINE_STAGE_MAP_PUBLISH] > 0
       ? stage_total_ms[PIPELINE_STAGE_MAP_PUBLISH] /
             static_cast<double>(stage_counts[PIPELINE_STAGE_MAP_PUBLISH])
@@ -391,10 +409,14 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
       "counts{processed=%llu throttled=%llu stale_drop=%llu stale_accept=%llu "
       "unsynced_drop=%llu transform_fail=%llu projection_fail=%llu "
       "filtered_publish=%llu mapper_init=%llu add_attempt=%llu add_ok=%llu "
-      "add_reject=%llu map_update=%llu map_publish=%llu} "
+      "add_reject=%llu map_update=%llu map_publish=%llu "
+      "source_stamp_regression=%llu "
+      "filter_failures{pointcloud=%llu organized_depth=%llu}} "
       "ms_avg/max{callback=%.2f/%.2f filter=%.2f/%.2f "
       "transform=%.2f/%.2f filtered_publish=%.2f/%.2f projection=%.2f/%.2f "
-      "addScan=%.2f/%.2f updateMap=%.2f/%.2f map_publish=%.2f/%.2f}",
+      "addScan=%.2f/%.2f updateMap=%.2f/%.2f local_overwrite=%.2f/%.2f "
+      "map_publish=%.2f/%.2f tf_filter_wait=%.2f/%.2f "
+      "map_source_age=%.2f/%.2f}",
       static_cast<unsigned long long>(window_callbacks),
       static_cast<unsigned long long>(window_pointcloud_callbacks),
       static_cast<unsigned long long>(window_organized_depth_callbacks),
@@ -416,6 +438,9 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
       static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_REJECTED]),
       static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_UPDATE]),
       static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_PUBLISHED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_SOURCE_STAMP_REGRESSION]),
+      static_cast<unsigned long long>(filter_failure_pointcloud_count),
+      static_cast<unsigned long long>(filter_failure_organized_depth_count),
       callback_avg, stage_max_ms[PIPELINE_STAGE_CALLBACK_TOTAL],
       filter_avg, stage_max_ms[PIPELINE_STAGE_FILTER],
       transform_avg, stage_max_ms[PIPELINE_STAGE_TRANSFORM],
@@ -424,7 +449,16 @@ void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
       projection_avg, stage_max_ms[PIPELINE_STAGE_PROJECTION],
       add_scan_avg, stage_max_ms[PIPELINE_STAGE_ADD_SCAN],
       update_map_avg, stage_max_ms[PIPELINE_STAGE_UPDATE_MAP],
-      map_publish_avg, stage_max_ms[PIPELINE_STAGE_MAP_PUBLISH]);
+      local_overwrite_avg, stage_max_ms[PIPELINE_STAGE_LOCAL_OVERWRITE],
+      map_publish_avg, stage_max_ms[PIPELINE_STAGE_MAP_PUBLISH],
+      stage_counts[PIPELINE_STAGE_TF_FILTER_WAIT] > 0
+          ? stage_total_ms[PIPELINE_STAGE_TF_FILTER_WAIT] /
+              stage_counts[PIPELINE_STAGE_TF_FILTER_WAIT] : -1.0,
+      stage_max_ms[PIPELINE_STAGE_TF_FILTER_WAIT],
+      stage_counts[PIPELINE_STAGE_MAP_SOURCE_AGE] > 0
+          ? stage_total_ms[PIPELINE_STAGE_MAP_SOURCE_AGE] /
+              stage_counts[PIPELINE_STAGE_MAP_SOURCE_AGE] : -1.0,
+      stage_max_ms[PIPELINE_STAGE_MAP_SOURCE_AGE]);
 }
 
 SlamGMapping::SlamGMapping():
@@ -472,6 +506,8 @@ void SlamGMapping::init()
 
   got_first_scan_ = false;
   got_map_ = false;
+  map_raster_initialized_ = false;
+  last_map_update_wall_time_ = ros::WallTime(0, 0);
   overwrite_layer_initialized_ = false;
   overwrite_correction_anchor_initialized_ = false;
   
@@ -499,6 +535,14 @@ void SlamGMapping::init()
   private_nh_.param("pipeline_timing_enabled", pipeline_timing_enabled_, false);
   private_nh_.param("pipeline_timing_log_every", pipeline_timing_log_every_, 20);
   pipeline_timing_log_every_ = std::max(1, pipeline_timing_log_every_);
+  private_nh_.param("source_stamp_regression_tolerance_sec",
+                    source_stamp_regression_tolerance_sec_, 0.001);
+  source_stamp_regression_tolerance_sec_ = std::max(
+      0.0, source_stamp_regression_tolerance_sec_);
+  last_pointcloud_source_stamp_ = ros::Time(0);
+  last_organized_depth_source_stamp_ = ros::Time(0);
+  filter_failure_pointcloud_count_ = 0;
+  filter_failure_organized_depth_count_ = 0;
   pipeline_timing_window_callbacks_ = 0;
   pipeline_timing_window_pointcloud_callbacks_ = 0;
   pipeline_timing_window_organized_depth_callbacks_ = 0;
@@ -700,18 +744,40 @@ void SlamGMapping::startLiveSlam()
   scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::PointCloud2>(
       node_, "registered_scan", scan_filter_queue_size_);
   scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(
-      *scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
+      tf_, odom_frame_, scan_filter_queue_size_);
   scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
   scan_filter_->registerCallback([this](auto msg){ pointCloudCallback(msg); });
+  scan_filter_->registerFailureCallback(
+      [this](const sensor_msgs::PointCloud2::ConstPtr& msg,
+             tf::FilterFailureReason reason) {
+        pointCloudFilterFailure(msg, reason);
+      });
+  pointcloud_ingress_connection_ = scan_filter_sub_->registerCallback(
+      [this](const sensor_msgs::PointCloud2::ConstPtr& msg) {
+        if (pipeline_timing_enabled_)
+          pointcloud_ingress_timing_.record(msg.get(), ros::SteadyTime::now().toSec());
+        scan_filter_->add(msg);
+      });
   if (mapping_scan_source_ == "organized_depth")
   {
     organized_depth_scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::LaserScan>(
         node_, mapping_scan_topic_, scan_filter_queue_size_);
     organized_depth_scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(
-        *organized_depth_scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
+        tf_, odom_frame_, scan_filter_queue_size_);
     organized_depth_scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
     organized_depth_scan_filter_->registerCallback(
         [this](const sensor_msgs::LaserScan::ConstPtr& msg) { laserCallback(msg); });
+    organized_depth_scan_filter_->registerFailureCallback(
+        [this](const sensor_msgs::LaserScan::ConstPtr& msg,
+               tf::FilterFailureReason reason) {
+          organizedDepthFilterFailure(msg, reason);
+        });
+    organized_depth_ingress_connection_ = organized_depth_scan_filter_sub_->registerCallback(
+        [this](const sensor_msgs::LaserScan::ConstPtr& msg) {
+          if (pipeline_timing_enabled_)
+            organized_depth_ingress_timing_.record(msg.get(), ros::SteadyTime::now().toSec());
+          organized_depth_scan_filter_->add(msg);
+        });
   }
 
   transform_thread_ = new boost::thread(boost::bind(&SlamGMapping::publishLoop, this, transform_publish_period_));
@@ -825,6 +891,8 @@ void SlamGMapping::resetCallback(const std_msgs::Empty::ConstPtr& msg)
 
   got_first_scan_ = false;
   got_map_ = false;
+  map_raster_initialized_ = false;
+  last_map_update_wall_time_ = ros::WallTime(0, 0);
   laser_count_ = 0;
   map_ = nav_msgs::GetMap::Response();
   overwrite_layer_initialized_ = false;
@@ -832,6 +900,9 @@ void SlamGMapping::resetCallback(const std_msgs::Empty::ConstPtr& msg)
   overwrite_free_counts_.clear();
   overwrite_occupied_counts_.clear();
   overwrite_last_seen_.clear();
+  overwrite_active_flags_.clear();
+  overwrite_active_indices_.clear();
+  overwrite_active_count_ = 0;
   overwrite_correction_anchor_initialized_ = false;
   map_to_odom_ = tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Point(0, 0, 0));
 
@@ -856,6 +927,8 @@ void SlamGMapping::publishLoop(double transform_publish_period){
 
 SlamGMapping::~SlamGMapping()
 {
+  pointcloud_ingress_connection_.disconnect();
+  organized_depth_ingress_connection_.disconnect();
   if(transform_thread_){
     transform_thread_->join();
     delete transform_thread_;
@@ -1078,8 +1151,11 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
   if(scan.ranges.size() != gsp_laser_beam_count_)
     return false;
 
-  // GMapping wants an array of doubles...
-  double* ranges_double = new double[scan.ranges.size()];
+  // GMapping wants an array of doubles.  RangeReading copies this array in
+  // its constructor, so keep one callback-local scratch vector rather than
+  // allocating/freeing a fresh heap block for every RGB-D frame.
+  scan_ranges_scratch_.resize(scan.ranges.size());
+  double* ranges_double = scan_ranges_scratch_.data();
   // If the angle increment is negative, we have to invert the order of the readings.
   if (do_reverse_range_)
   {
@@ -1128,10 +1204,6 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
                                  gsp_laser_,
                                  scan.header.stamp.toSec());
 
-  // ...but it deep copies them in RangeReading constructor, so we don't
-  // need to keep our array around.
-  delete[] ranges_double;
-
   reading.setPose(gmap_pose);
 
   /*
@@ -1151,13 +1223,23 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 {
   PipelineTimingTrace timing_trace(
       this, "pointcloud", cloud->header.seq, cloud->header.stamp);
+  if (pipeline_timing_enabled_)
+    timing_trace.stage(PIPELINE_STAGE_TF_FILTER_WAIT,
+        pointcloud_ingress_timing_.takeMs(cloud.get(), ros::SteadyTime::now().toSec()));
+  if (observeSourceStampRegression("pointcloud", cloud->header.stamp))
+  {
+    timing_trace.event(PIPELINE_EVENT_SOURCE_STAMP_REGRESSION);
+    ROS_WARN_THROTTLE(
+        2.0,
+        "Pointcloud source stamp regressed after bridge reconnect: stamp=%.6f",
+        cloud->header.stamp.toSec());
+  }
   if (enable_time_sync_guard_)
   {
     const ros::Time now = ros::Time::now();
     if (!cloud->header.stamp.isZero())
     {
       const double cloud_age_sec = (now - cloud->header.stamp).toSec();
-      timing_trace.observeSourceAge(cloud_age_sec * 1000.0);
       if (cloud_age_sec > max_cloud_age_sec_)
       {
         if (enforce_cloud_age_drop_)
@@ -1208,21 +1290,28 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   }
   timing_trace.event(PIPELINE_EVENT_PROCESSED);
 
-  static ros::Time last_map_update(0,0);
-
-  // 创建点云副本用于滤波（避免修改原始消息）
-  const ros::WallTime filter_started = ros::WallTime::now();
-  sensor_msgs::PointCloud2 filtered_cloud = *cloud;
+  // Create one mutable copy for filtering/TF.  The previous path copied this
+  // message a second time into a ConstPtr immediately before projection;
+  // with an RGB-D cloud that needlessly copied ~100--200 KB on every frame
+  // and increased allocator pressure in the single mapping callback.
+  sensor_msgs::PointCloud2::Ptr filtered_cloud =
+      boost::make_shared<sensor_msgs::PointCloud2>(*cloud);
   
-  // 应用高度滤波
-  filterPointCloudByHeight(filtered_cloud);
-  timing_trace.stage(PIPELINE_STAGE_FILTER, wallElapsedMs(filter_started));
-
   // GMapping only supports planar laser frames. The incoming /registered_scan may
   // follow the real head-camera pose (with pitch/roll), so we level it into the
   // robot base frame before synthesizing the 2D scan used by gmapping.
   const ros::WallTime transform_started = ros::WallTime::now();
-  const bool transform_ok = transformPointCloudToFrame(filtered_cloud, base_frame_);
+  // In the physical profile the height gate is explicitly defined in
+  // ``base_frame_``.  Transforming first lets the filter read the already
+  // transformed Z value and avoids a second full point-cloud transform just
+  // to evaluate the height predicate.  Keep the historical filter-then-
+  // transform order for configurations that use a different height frame.
+  const bool filter_after_transform =
+      enable_height_filter_ && !filter_height_frame_.empty() &&
+      filter_height_frame_ == base_frame_;
+  bool transform_ok = true;
+  if (filter_after_transform)
+    transform_ok = transformPointCloudToFrame(*filtered_cloud, base_frame_);
   timing_trace.stage(PIPELINE_STAGE_TRANSFORM, wallElapsedMs(transform_started));
   if(!transform_ok)
   {
@@ -1230,12 +1319,36 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     timing_trace.event(PIPELINE_EVENT_TRANSFORM_FAILURE);
     return;
   }
+
+  if (filter_after_transform)
+  {
+    const ros::WallTime filter_started = ros::WallTime::now();
+    filterPointCloudByHeight(*filtered_cloud);
+    timing_trace.stage(PIPELINE_STAGE_FILTER, wallElapsedMs(filter_started));
+  }
+  else
+  {
+    const ros::WallTime filter_started = ros::WallTime::now();
+    filterPointCloudByHeight(*filtered_cloud);
+    timing_trace.stage(PIPELINE_STAGE_FILTER, wallElapsedMs(filter_started));
+    // The non-default path retains the prior semantics: height is evaluated
+    // in its configured frame before the cloud is converted to base_frame_.
+    const ros::WallTime second_transform_started = ros::WallTime::now();
+    if (!transformPointCloudToFrame(*filtered_cloud, base_frame_))
+    {
+      ROS_WARN_THROTTLE(2.0, "Failed to transform pointcloud into base frame for planar gmapping");
+      timing_trace.event(PIPELINE_EVENT_TRANSFORM_FAILURE);
+      return;
+    }
+    timing_trace.stage(PIPELINE_STAGE_TRANSFORM,
+                       wallElapsedMs(second_transform_started));
+  }
   
   // 发布滤波后的点云
   if (filtered_cloud_pub_.getNumSubscribers() > 0)
   {
     const ros::WallTime filtered_publish_started = ros::WallTime::now();
-    filtered_cloud_pub_.publish(filtered_cloud);
+    filtered_cloud_pub_.publish(*filtered_cloud);
     timing_trace.stage(
         PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH,
         wallElapsedMs(filtered_publish_started));
@@ -1250,14 +1363,38 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   // Convert PointCloud2 to LaserScan
   sensor_msgs::LaserScan scan;
   const ros::WallTime projection_started = ros::WallTime::now();
-  sensor_msgs::PointCloud2::ConstPtr filtered_cloud_ptr = boost::make_shared<sensor_msgs::PointCloud2>(filtered_cloud);
-  const bool projection_ok = convertPointCloudToLaserScan(filtered_cloud_ptr, scan);
+  const bool projection_ok = convertPointCloudToLaserScan(filtered_cloud, scan);
   timing_trace.stage(PIPELINE_STAGE_PROJECTION, wallElapsedMs(projection_started));
   if(!projection_ok)
   {
     ROS_WARN("Failed to convert point cloud to laser scan");
     timing_trace.event(PIPELINE_EVENT_PROJECTION_FAILURE);
     return;
+  }
+
+  // The ingress guard above only measures age before the transform, height
+  // filter and cloud-to-scan projection.  Under transient CPU pressure those
+  // stages can consume most of the freshness budget; applying such a scan to
+  // GMapping would paint walls at an already obsolete robot pose even though
+  // the subscriber itself has queue size one.  Recheck immediately before
+  // the first stateful mapper operation so stale in-flight work is discarded
+  // rather than committed to OCC.
+  if (enable_time_sync_guard_ && enforce_cloud_age_drop_ &&
+      !cloud->header.stamp.isZero())
+  {
+    const double processing_age_sec =
+        (ros::Time::now() - cloud->header.stamp).toSec();
+    if (processing_age_sec > max_cloud_age_sec_)
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "Drop pointcloud after projection: age=%.3fs exceeds "
+          "max_cloud_age_sec=%.3fs",
+          processing_age_sec,
+          max_cloud_age_sec_);
+      timing_trace.event(PIPELINE_EVENT_STALE_DROP);
+      return;
+    }
   }
 
   // We can't initialize the mapper until we've got the first scan
@@ -1320,13 +1457,22 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
       }
     }
 
-    if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
+    // Schedule publication from host monotonic time.  The scan stamp remains
+    // the causal capture timestamp in the map header, but it may reset or step
+    // backwards when the Go2 sensor bridge reconnects; comparing it directly
+    // previously left OCC unpublished until the restarted clock caught up.
+    const ros::WallTime map_now = ros::WallTime::now();
+    const double since_last_map_update =
+        last_map_update_wall_time_.toSec() > 0.0
+            ? (map_now - last_map_update_wall_time_).toSec()
+            : std::numeric_limits<double>::infinity();
+    if(!got_map_ || since_last_map_update >= map_update_interval_.toSec())
     {
       timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
       const ros::WallTime update_map_started = ros::WallTime::now();
       updateMap(scan, &timing_trace);
       timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
-      last_map_update = cloud->header.stamp;
+      last_map_update_wall_time_ = ros::WallTime::now();
       ROS_INFO("Map updated at time %.2f", cloud->header.stamp.toSec());
     }
   } else {
@@ -1341,6 +1487,17 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 {
   PipelineTimingTrace timing_trace(
       this, "organized_depth", scan->header.seq, scan->header.stamp);
+  if (pipeline_timing_enabled_)
+    timing_trace.stage(PIPELINE_STAGE_TF_FILTER_WAIT,
+        organized_depth_ingress_timing_.takeMs(scan.get(), ros::SteadyTime::now().toSec()));
+  if (observeSourceStampRegression("organized_depth", scan->header.stamp))
+  {
+    timing_trace.event(PIPELINE_EVENT_SOURCE_STAMP_REGRESSION);
+    ROS_WARN_THROTTLE(
+        2.0,
+        "Organized depth source stamp regressed after bridge reconnect: stamp=%.6f",
+        scan->header.stamp.toSec());
+  }
   if (mapping_scan_source_ != "organized_depth")
     return;
 
@@ -1350,7 +1507,6 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     if (!scan->header.stamp.isZero())
     {
       const double scan_age_sec = (now - scan->header.stamp).toSec();
-      timing_trace.observeSourceAge(scan_age_sec * 1000.0);
       if (scan_age_sec > max_cloud_age_sec_ && enforce_cloud_age_drop_)
       {
         ROS_WARN_THROTTLE(
@@ -1384,8 +1540,6 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     return;
   }
   timing_trace.event(PIPELINE_EVENT_PROCESSED);
-
-  static ros::Time last_map_update(0,0);
 
   // We can't initialize the mapper until we've got the first scan
   if(!got_first_scan_)
@@ -1428,13 +1582,18 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
       }
     }
 
-    if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
+    const ros::WallTime map_now = ros::WallTime::now();
+    const double since_last_map_update =
+        last_map_update_wall_time_.toSec() > 0.0
+            ? (map_now - last_map_update_wall_time_).toSec()
+            : std::numeric_limits<double>::infinity();
+    if(!got_map_ || since_last_map_update >= map_update_interval_.toSec())
     {
       timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
       const ros::WallTime update_map_started = ros::WallTime::now();
       updateMap(*scan, &timing_trace);
       timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
-      last_map_update = scan->header.stamp;
+      last_map_update_wall_time_ = ros::WallTime::now();
       ROS_DEBUG("Updated the map");
     }
   } else
@@ -1479,7 +1638,10 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
 {
   ROS_DEBUG("Update map");
   boost::mutex::scoped_lock map_lock (map_mutex_);
-  GMapping::GridSlamProcessor::Particle best =
+  // updateMap is read-only with respect to the winning particle.  Binding a
+  // reference avoids copying its trajectory/map handle on every OCC publish;
+  // that copy becomes increasingly expensive as a physical run grows.
+  const GMapping::GridSlamProcessor::Particle& best =
           gsp_->getParticles()[gsp_->getBestParticleIndex()];
   std_msgs::Float64 entropy;
   entropy.data = computePoseEntropy();
@@ -1503,12 +1665,25 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
   // Serialize the already-updated map instead.
   const GMapping::ScanMatcherMap& smap = best.map;
 
-  // the map may have expanded, so resize ros message as well
-  if(map_.map.info.width != (unsigned int) smap.getMapSizeX() || map_.map.info.height != (unsigned int) smap.getMapSizeY()) {
+  // The map may have expanded, so resize the ROS message as well.  A changed
+  // origin/resolution is also a geometry change even when the dimensions stay
+  // equal (for example after a reset or a moving map window).
+  const GMapping::Point map_world_min = smap.map2world(GMapping::IntPoint(0, 0));
+  const bool map_geometry_changed =
+      !map_raster_initialized_ ||
+      map_.map.info.width != static_cast<unsigned int>(smap.getMapSizeX()) ||
+      map_.map.info.height != static_cast<unsigned int>(smap.getMapSizeY()) ||
+      map_.map.data.size() !=
+          static_cast<size_t>(smap.getMapSizeX()) * static_cast<size_t>(smap.getMapSizeY()) ||
+      std::fabs(map_.map.info.resolution - delta_) > 1e-12 ||
+      std::fabs(map_.map.info.origin.position.x - map_world_min.x) > 1e-9 ||
+      std::fabs(map_.map.info.origin.position.y - map_world_min.y) > 1e-9;
+
+  if(map_geometry_changed) {
 
     // NOTE: The results of ScanMatcherMap::getSize() are different from the parameters given to the constructor
     //       so we must obtain the bounding box in a different way
-    GMapping::Point wmin = smap.map2world(GMapping::IntPoint(0, 0));
+    GMapping::Point wmin = map_world_min;
     GMapping::Point wmax = smap.map2world(GMapping::IntPoint(smap.getMapSizeX(), smap.getMapSizeY()));
     xmin_ = wmin.x; ymin_ = wmin.y;
     xmax_ = wmax.x; ymax_ = wmax.y;
@@ -1520,14 +1695,47 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
     map_.map.info.height = smap.getMapSizeY();
     map_.map.info.origin.position.x = xmin_;
     map_.map.info.origin.position.y = ymin_;
-    map_.map.data.resize(map_.map.info.width * map_.map.info.height);
+    // New cells are unknown until this frame's bounded raster pass fills
+    // them.  ``resize`` alone value-initialises them to free (0), which can
+    // briefly expose unobserved map fringes as traversable space.
+    map_.map.data.assign(
+        map_.map.info.width * map_.map.info.height,
+        static_cast<int8_t>(-1));
 
     ROS_DEBUG("map origin: (%f, %f)", map_.map.info.origin.position.x, map_.map.info.origin.position.y);
   }
 
-  for(int x=0; x < smap.getMapSizeX(); x++)
+  // GMapping's registerScan only modifies cells traversed by the current
+  // scan (plus the small endpoint neighbourhood).  Re-serializing the whole
+  // hierarchical map was a dominant OCC latency source once the map grew.
+  // Refresh a conservative square around the best pose; if the map grew or
+  // this is the first frame, the pass naturally covers the complete map.
+  int raster_x_min = 0;
+  int raster_x_max = smap.getMapSizeX() - 1;
+  int raster_y_min = 0;
+  int raster_y_max = smap.getMapSizeY() - 1;
+  // The physical profile locks mapping to capture-time odometry and a single
+  // particle, so only the current scan neighbourhood can change.  When a
+  // caller enables full scan matching/particle mapping, however, resampling
+  // or a loop-closure correction may replace cells far from the current pose;
+  // retain the conservative full-raster path for that mode.
+  if (!map_geometry_changed && use_odom_pose_for_mapping_)
   {
-    for(int y=0; y < smap.getMapSizeY(); y++)
+    const double raster_radius = std::max(maxUrange_, pointcloud_scan_range_max_);
+    const int radius_cells = static_cast<int>(std::ceil(raster_radius / std::max(delta_, 1e-6))) + 3;
+    const int center_x = static_cast<int>(std::floor(
+        (best.pose.x - map_.map.info.origin.position.x) / std::max(delta_, 1e-6)));
+    const int center_y = static_cast<int>(std::floor(
+        (best.pose.y - map_.map.info.origin.position.y) / std::max(delta_, 1e-6)));
+    raster_x_min = std::max(0, center_x - radius_cells);
+    raster_x_max = std::min(smap.getMapSizeX() - 1, center_x + radius_cells);
+    raster_y_min = std::max(0, center_y - radius_cells);
+    raster_y_max = std::min(smap.getMapSizeY() - 1, center_y + radius_cells);
+  }
+
+  for(int x = raster_x_min; x <= raster_x_max; x++)
+  {
+    for(int y = raster_y_min; y <= raster_y_max; y++)
     {
       /// @todo Sort out the unknown vs. free vs. obstacle thresholding
       GMapping::IntPoint p(x, y);
@@ -1544,11 +1752,17 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
         map_.map.data[MAP_IDX(map_.map.info.width, x, y)] = 0;
     }
   }
+  map_raster_initialized_ = true;
   got_map_ = true;
 
   if (enable_local_overwrite_)
   {
+    const ros::WallTime overwrite_started = ros::WallTime::now();
     applyLocalOverwrite(map_.map, scan, best.pose);
+    if (timing_trace != NULL)
+      timing_trace->stage(
+          PIPELINE_STAGE_LOCAL_OVERWRITE,
+          wallElapsedMs(overwrite_started));
   }
   
   // 应用障碍物膨胀
@@ -1575,6 +1789,9 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
     timing_trace->stage(
         PIPELINE_STAGE_MAP_PUBLISH, wallElapsedMs(map_publish_started));
     timing_trace->event(PIPELINE_EVENT_MAP_PUBLISHED);
+    if (!scan.header.stamp.isZero())
+      timing_trace->stage(PIPELINE_STAGE_MAP_SOURCE_AGE,
+          (ros::Time::now() - scan.header.stamp).toSec() * 1000.0);
   }
 }
 
@@ -1624,14 +1841,43 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   scan.ranges.assign(num_beams, std::numeric_limits<float>::quiet_NaN());
   scan.intensities.assign(num_beams, 0.0f);
 
-  std::vector<std::vector<float> > beam_ranges(
-      static_cast<size_t>(num_beams));
+  // Reuse projection scratch buffers between frames.  The beam count is
+  // normally fixed by the configured angular increment; only a parameter
+  // change/reinitialisation takes the resize path.  ``clear`` preserves each
+  // inner vector's capacity, so the common frame performs no heap allocation
+  // while points are appended.
+  if (projection_scratch_beam_count_ != num_beams)
+  {
+    projection_scratch_beam_count_ = num_beams;
+    projection_beam_ranges_.clear();
+    projection_beam_ranges_.resize(static_cast<size_t>(num_beams));
+    projection_beam_no_return_samples_.assign(
+        static_cast<size_t>(num_beams), 0);
+    projection_candidate_ranges_.resize(static_cast<size_t>(num_beams));
+    projection_candidate_observed_.resize(static_cast<size_t>(num_beams));
+    projection_candidate_no_return_.resize(static_cast<size_t>(num_beams));
+    projection_observed_.resize(static_cast<size_t>(num_beams));
+  }
+  for (std::vector<float>& samples : projection_beam_ranges_)
+    samples.clear();
+  std::fill(projection_beam_no_return_samples_.begin(),
+            projection_beam_no_return_samples_.end(), 0);
+  std::fill(projection_candidate_ranges_.begin(),
+            projection_candidate_ranges_.end(),
+            std::numeric_limits<float>::quiet_NaN());
+  std::fill(projection_candidate_observed_.begin(),
+            projection_candidate_observed_.end(), 0);
+  std::fill(projection_candidate_no_return_.begin(),
+            projection_candidate_no_return_.end(), 0);
+  std::fill(projection_observed_.begin(), projection_observed_.end(), 0);
+
+  std::vector<std::vector<float> >& beam_ranges = projection_beam_ranges_;
   // A far finite point is not a hit in the local map, but it is valid evidence
   // that the camera ray stayed clear all the way to our mapping horizon. Keep
   // that evidence separate from finite in-range obstacle samples; a completely
   // empty bin still remains unknown because it may be outside the camera FoV.
-  std::vector<size_t> beam_no_return_samples(
-      static_cast<size_t>(num_beams), 0);
+  std::vector<size_t>& beam_no_return_samples =
+      projection_beam_no_return_samples_;
   size_t finite_points = 0;
   size_t planar_points = 0;
   size_t no_return_points = 0;
@@ -1672,10 +1918,10 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     ++planar_points;
   }
 
-  std::vector<float> candidate_ranges(
-      static_cast<size_t>(num_beams), std::numeric_limits<float>::quiet_NaN());
-  std::vector<uint8_t> candidate_observed(static_cast<size_t>(num_beams), 0);
-  std::vector<uint8_t> candidate_no_return(static_cast<size_t>(num_beams), 0);
+  std::vector<float>& candidate_ranges = projection_candidate_ranges_;
+  std::vector<uint8_t>& candidate_observed = projection_candidate_observed_;
+  std::vector<uint8_t>& candidate_no_return =
+      projection_candidate_no_return_;
   size_t rejected_sparse = 0;
   size_t rejected_near_cluster = 0;
   size_t no_return_fallbacks = 0;
@@ -1758,7 +2004,7 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     ++candidate_count;
   }
 
-  std::vector<uint8_t> observed(static_cast<size_t>(num_beams), 0);
+  std::vector<uint8_t>& observed = projection_observed_;
   size_t rejected_angular_support = 0;
   for (int i = 0; i < num_beams; ++i)
   {
@@ -1863,6 +2109,16 @@ bool SlamGMapping::transformPointCloudToFrame(sensor_msgs::PointCloud2& cloud, c
   sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+  // ``tf::Transform * tf::Vector3`` constructs temporary Bullet objects for
+  // every RGB-D point.  The transform is constant for this cloud, so extract
+  // its three matrix rows once and apply the affine operation directly.  This
+  // keeps the coordinate convention identical while removing thousands of
+  // per-point operator/temporary calls from the 10-Hz mapping callback.
+  const tf::Matrix3x3& basis = target_from_source.getBasis();
+  const tf::Vector3 row_x = basis.getRow(0);
+  const tf::Vector3 row_y = basis.getRow(1);
+  const tf::Vector3 row_z = basis.getRow(2);
+  const tf::Vector3 origin = target_from_source.getOrigin();
   const size_t point_count = cloud.width * cloud.height;
 
   for (size_t i = 0; i < point_count; ++i, ++iter_x, ++iter_y, ++iter_z)
@@ -1873,11 +2129,15 @@ bool SlamGMapping::transformPointCloudToFrame(sensor_msgs::PointCloud2& cloud, c
     if (std::isnan(x) || std::isnan(y) || std::isnan(z))
       continue;
 
-    const tf::Vector3 p_src(x, y, z);
-    const tf::Vector3 p_tgt = target_from_source * p_src;
-    *iter_x = static_cast<float>(p_tgt.x());
-    *iter_y = static_cast<float>(p_tgt.y());
-    *iter_z = static_cast<float>(p_tgt.z());
+    const double transformed_x =
+        row_x.x() * x + row_x.y() * y + row_x.z() * z + origin.x();
+    const double transformed_y =
+        row_y.x() * x + row_y.y() * y + row_y.z() * z + origin.y();
+    const double transformed_z =
+        row_z.x() * x + row_z.y() * y + row_z.z() * z + origin.z();
+    *iter_x = static_cast<float>(transformed_x);
+    *iter_y = static_cast<float>(transformed_y);
+    *iter_z = static_cast<float>(transformed_z);
   }
 
   cloud.header.frame_id = target_frame;
@@ -1931,6 +2191,18 @@ void SlamGMapping::filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud)
   
   size_t original_points = cloud.width * cloud.height;
   size_t filtered_points = 0;
+
+  // Only the transformed Z coordinate is needed for the height gate.  Avoid
+  // constructing a tf::Vector3 and multiplying a full transform for every
+  // point; the affine row is constant for the complete cloud.
+  tf::Vector3 height_row_z(0.0, 0.0, 1.0);
+  tf::Vector3 height_origin(0.0, 0.0, 0.0);
+  if (use_transformed_height)
+  {
+    const tf::Matrix3x3& height_basis = source_to_height_tf.getBasis();
+    height_row_z = height_basis.getRow(2);
+    height_origin = source_to_height_tf.getOrigin();
+  }
   
   // 单次遍历，原地移动有效点到前面
   for (size_t i = 0; i < original_points; ++i, ++iter_x_read, ++iter_y_read, ++iter_z_read)
@@ -1946,9 +2218,10 @@ void SlamGMapping::filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud)
     double z_for_filter = z;
     if (use_transformed_height)
     {
-      tf::Vector3 p_src(x, y, z);
-      tf::Vector3 p_height = source_to_height_tf * p_src;
-      z_for_filter = p_height.z();
+      z_for_filter = height_row_z.x() * x +
+                     height_row_z.y() * y +
+                     height_row_z.z() * z +
+                     height_origin.z();
     }
 
     // 检查高度是否在指定范围内（可在目标高度坐标系中判定）
@@ -2125,14 +2398,29 @@ void SlamGMapping::clearOverwriteCell(size_t idx)
   overwrite_free_counts_[idx] = 0;
   overwrite_occupied_counts_[idx] = 0;
   overwrite_last_seen_[idx] = ros::Time(0);
+  if (idx < overwrite_active_flags_.size() && overwrite_active_flags_[idx])
+  {
+    overwrite_active_flags_[idx] = 0;
+    if (overwrite_active_count_ > 0)
+      --overwrite_active_count_;
+  }
 }
 
 void SlamGMapping::clearOverwriteLayer()
 {
-  std::fill(overwrite_values_.begin(), overwrite_values_.end(), static_cast<int8_t>(-1));
-  std::fill(overwrite_free_counts_.begin(), overwrite_free_counts_.end(), static_cast<unsigned short>(0));
-  std::fill(overwrite_occupied_counts_.begin(), overwrite_occupied_counts_.end(), static_cast<unsigned short>(0));
-  std::fill(overwrite_last_seen_.begin(), overwrite_last_seen_.end(), ros::Time(0));
+  for (size_t idx : overwrite_active_indices_)
+  {
+    if (idx >= overwrite_values_.size())
+      continue;
+    overwrite_values_[idx] = -1;
+    overwrite_free_counts_[idx] = 0;
+    overwrite_occupied_counts_[idx] = 0;
+    overwrite_last_seen_[idx] = ros::Time(0);
+    if (idx < overwrite_active_flags_.size())
+      overwrite_active_flags_[idx] = 0;
+  }
+  overwrite_active_indices_.clear();
+  overwrite_active_count_ = 0;
 }
 
 double SlamGMapping::angleDiff(double a, double b) const
@@ -2192,6 +2480,9 @@ void SlamGMapping::syncOverwriteLayerToMap(const nav_msgs::MapMetaData& info)
     overwrite_free_counts_.clear();
     overwrite_occupied_counts_.clear();
     overwrite_last_seen_.clear();
+    overwrite_active_flags_.clear();
+    overwrite_active_indices_.clear();
+    overwrite_active_count_ = 0;
     return;
   }
 
@@ -2202,42 +2493,52 @@ void SlamGMapping::syncOverwriteLayerToMap(const nav_msgs::MapMetaData& info)
   std::vector<unsigned short> new_free_counts(cell_count, 0);
   std::vector<unsigned short> new_occupied_counts(cell_count, 0);
   std::vector<ros::Time> new_last_seen(cell_count, ros::Time(0));
+  std::vector<uint8_t> new_active_flags(cell_count, 0);
+  std::vector<size_t> new_active_indices;
+  new_active_indices.reserve(overwrite_active_indices_.size());
+  size_t new_active_count = 0;
 
   if (overwrite_layer_initialized_ && !overwrite_values_.empty())
   {
-    for (unsigned int y = 0; y < overwrite_layer_info_.height; ++y)
+    for (size_t old_idx : overwrite_active_indices_)
     {
-      for (unsigned int x = 0; x < overwrite_layer_info_.width; ++x)
+      if (old_idx >= overwrite_values_.size() ||
+          old_idx >= overwrite_active_flags_.size() ||
+          !overwrite_active_flags_[old_idx])
+        continue;
+      const unsigned int old_y = static_cast<unsigned int>(
+          old_idx / overwrite_layer_info_.width);
+      const unsigned int old_x = static_cast<unsigned int>(
+          old_idx % overwrite_layer_info_.width);
+
+      const double wx = overwrite_layer_info_.origin.position.x +
+                        (static_cast<double>(old_x) + 0.5) * overwrite_layer_info_.resolution;
+      const double wy = overwrite_layer_info_.origin.position.y +
+                        (static_cast<double>(old_y) + 0.5) * overwrite_layer_info_.resolution;
+
+      int new_mx = 0;
+      int new_my = 0;
+      if (!worldToMapInfo(info, wx, wy, new_mx, new_my))
+        continue;
+
+      const size_t new_idx = MAP_IDX(info.width, new_mx, new_my);
+      if (new_idx >= new_values.size())
+        continue;
+
+      if (new_last_seen[new_idx].isZero() ||
+          overwrite_last_seen_[old_idx] >= new_last_seen[new_idx])
       {
-        const size_t old_idx = MAP_IDX(overwrite_layer_info_.width, x, y);
-        if (old_idx >= overwrite_values_.size())
-          continue;
-        if (overwrite_values_[old_idx] < 0 &&
-            overwrite_free_counts_[old_idx] == 0 &&
-            overwrite_occupied_counts_[old_idx] == 0)
-          continue;
-
-        const double wx = overwrite_layer_info_.origin.position.x +
-                          (static_cast<double>(x) + 0.5) * overwrite_layer_info_.resolution;
-        const double wy = overwrite_layer_info_.origin.position.y +
-                          (static_cast<double>(y) + 0.5) * overwrite_layer_info_.resolution;
-
-        int new_mx = 0;
-        int new_my = 0;
-        if (!worldToMapInfo(info, wx, wy, new_mx, new_my))
-          continue;
-
-        const size_t new_idx = MAP_IDX(info.width, new_mx, new_my);
-        if (new_idx >= new_values.size())
-          continue;
-
-        if (new_last_seen[new_idx].isZero() ||
-            overwrite_last_seen_[old_idx] >= new_last_seen[new_idx])
+        new_values[new_idx] = overwrite_values_[old_idx];
+        new_free_counts[new_idx] = overwrite_free_counts_[old_idx];
+        new_occupied_counts[new_idx] = overwrite_occupied_counts_[old_idx];
+        new_last_seen[new_idx] = overwrite_last_seen_[old_idx];
+        if ((overwrite_values_[old_idx] == 0 ||
+             overwrite_values_[old_idx] == 100) &&
+            !new_active_flags[new_idx])
         {
-          new_values[new_idx] = overwrite_values_[old_idx];
-          new_free_counts[new_idx] = overwrite_free_counts_[old_idx];
-          new_occupied_counts[new_idx] = overwrite_occupied_counts_[old_idx];
-          new_last_seen[new_idx] = overwrite_last_seen_[old_idx];
+          new_active_flags[new_idx] = 1;
+          new_active_indices.push_back(new_idx);
+          ++new_active_count;
         }
       }
     }
@@ -2248,6 +2549,9 @@ void SlamGMapping::syncOverwriteLayerToMap(const nav_msgs::MapMetaData& info)
   overwrite_free_counts_.swap(new_free_counts);
   overwrite_occupied_counts_.swap(new_occupied_counts);
   overwrite_last_seen_.swap(new_last_seen);
+  overwrite_active_flags_.swap(new_active_flags);
+  overwrite_active_indices_.swap(new_active_indices);
+  overwrite_active_count_ = new_active_count;
   overwrite_layer_initialized_ = true;
 }
 
@@ -2274,6 +2578,67 @@ bool SlamGMapping::hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec)
   return best_dt <= max_odom_cloud_time_diff_;
 }
 
+bool SlamGMapping::observeSourceStampRegression(const char* source,
+                                                 const ros::Time& stamp)
+{
+  if (stamp.isZero() || source == NULL)
+    return false;
+
+  boost::mutex::scoped_lock lock(source_stamp_mutex_);
+  ros::Time* previous = NULL;
+  if (std::strcmp(source, "pointcloud") == 0)
+    previous = &last_pointcloud_source_stamp_;
+  else
+    previous = &last_organized_depth_source_stamp_;
+
+  const bool regressed = !previous->isZero() &&
+      stamp.toSec() + source_stamp_regression_tolerance_sec_ < previous->toSec();
+  // Keep the greatest observed stamp. A delayed old packet must not move the
+  // diagnostic baseline backwards and turn the next packet into a false
+  // regression.
+  if (previous->isZero() || stamp > *previous)
+    *previous = stamp;
+  return regressed;
+}
+
+void SlamGMapping::pointCloudFilterFailure(
+    const sensor_msgs::PointCloud2::ConstPtr& cloud,
+    tf::FilterFailureReason reason)
+{
+  const double wait_ms = pipeline_timing_enabled_
+      ? pointcloud_ingress_timing_.takeMs(cloud.get(), ros::SteadyTime::now().toSec()) : -1.0;
+  {
+    boost::mutex::scoped_lock lock(filter_failure_mutex_);
+    ++filter_failure_pointcloud_count_;
+  }
+  ROS_WARN_THROTTLE(
+      2.0,
+      "Pointcloud dropped by TF MessageFilter (reason=%d stamp=%.6f frame=%s wait_ms=%.2f); "
+      "queue/filter drops are not included in callback timing",
+      static_cast<int>(reason),
+      cloud ? cloud->header.stamp.toSec() : 0.0,
+      cloud ? cloud->header.frame_id.c_str() : "", wait_ms);
+}
+
+void SlamGMapping::organizedDepthFilterFailure(
+    const sensor_msgs::LaserScan::ConstPtr& scan,
+    tf::FilterFailureReason reason)
+{
+  const double wait_ms = pipeline_timing_enabled_
+      ? organized_depth_ingress_timing_.takeMs(scan.get(), ros::SteadyTime::now().toSec()) : -1.0;
+  {
+    boost::mutex::scoped_lock lock(filter_failure_mutex_);
+    ++filter_failure_organized_depth_count_;
+  }
+  ROS_WARN_THROTTLE(
+      2.0,
+      "Organized depth scan dropped by TF MessageFilter (reason=%d stamp=%.6f frame=%s wait_ms=%.2f); "
+      "queue/filter drops are not included in callback timing",
+      static_cast<int>(reason),
+      scan ? scan->header.stamp.toSec() : 0.0,
+      scan ? scan->header.frame_id.c_str() : "", wait_ms);
+}
+
 void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
                                        const sensor_msgs::LaserScan& scan,
                                        const GMapping::OrientedPoint& sensor_pose)
@@ -2295,12 +2660,27 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
 
   const double resolution = map.info.resolution;
   const double usable_radius = std::max(0.0, std::min(local_overwrite_radius_, maxUrange_));
-  if (usable_radius <= 0.0)
+  if (resolution <= 0.0 || usable_radius <= 0.0)
     return;
 
-  int sensor_mx = 0;
-  int sensor_my = 0;
-  if (!worldToMap(map, sensor_pose.x, sensor_pose.y, sensor_mx, sensor_my))
+  // Convert the sensor pose into map-cell coordinates once.  The previous
+  // implementation called worldToMap (two subtractions, divisions and
+  // bounds checks) for every sample along every pseudo-laser ray.  At the
+  // physical 0.5-degree/7.9-m profile that is roughly 50--60k calls per
+  // frame.  The map origin is axis-aligned in this mapper, so the same
+  // result can be obtained by keeping the coordinates in cell units and
+  // truncating only at the point where a cell is touched.
+  const double inv_resolution = 1.0 / resolution;
+  const double origin_x = map.info.origin.position.x;
+  const double origin_y = map.info.origin.position.y;
+  const double sensor_grid_x = (sensor_pose.x - origin_x) * inv_resolution;
+  const double sensor_grid_y = (sensor_pose.y - origin_y) * inv_resolution;
+  const int map_width = static_cast<int>(map.info.width);
+  const int map_height = static_cast<int>(map.info.height);
+  if (map_width <= 0 || map_height <= 0 ||
+      sensor_grid_x < 0.0 || sensor_grid_y < 0.0 ||
+      sensor_grid_x >= static_cast<double>(map_width) ||
+      sensor_grid_y >= static_cast<double>(map_height))
   {
     ROS_WARN_THROTTLE(5.0, "Local overwrite skipped: sensor pose is outside map bounds");
     return;
@@ -2336,20 +2716,29 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
     const double cos_theta = std::cos(beam_angle);
     const double sin_theta = std::sin(beam_angle);
     const bool hit_within_radius = valid_hit && measured_range <= usable_radius;
+    const bool short_trace = trace_range < resolution;
 
     for (int step = 1; step <= step_count; ++step)
     {
       if (hit_within_radius && step == step_count)
         continue;
 
-      const double dist = std::min(trace_range, static_cast<double>(step) * resolution);
-      const double wx = sensor_pose.x + dist * cos_theta;
-      const double wy = sensor_pose.y + dist * sin_theta;
-
-      int mx = 0;
-      int my = 0;
-      if (!worldToMap(map, wx, wy, mx, my))
+      // ``step_count`` is floor(trace_range / resolution), so every normal
+      // step is exactly one cell-length from the previous step.  A ray
+      // shorter than one cell is the only partial step.  Keeping the ray in
+      // grid units removes the per-sample world-coordinate divisions while
+      // preserving the original truncation convention.
+      const double step_scale = short_trace
+          ? trace_range * inv_resolution
+          : static_cast<double>(step);
+      const double grid_x = sensor_grid_x + step_scale * cos_theta;
+      const double grid_y = sensor_grid_y + step_scale * sin_theta;
+      if (grid_x < 0.0 || grid_y < 0.0 ||
+          grid_x >= static_cast<double>(map_width) ||
+          grid_y >= static_cast<double>(map_height))
         break;
+      const int mx = static_cast<int>(grid_x);
+      const int my = static_cast<int>(grid_y);
 
       const int idx = MAP_IDX(map.info.width, mx, my);
       if (idx >= static_cast<int>(overwrite_values_.size()))
@@ -2370,18 +2759,26 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
           overwrite_values_[idx] != 0)
       {
         overwrite_values_[idx] = 0;
+        if (!overwrite_active_flags_[idx])
+        {
+          overwrite_active_flags_[idx] = 1;
+          overwrite_active_indices_.push_back(idx);
+          ++overwrite_active_count_;
+        }
         ++updated_free_cells;
       }
     }
 
     if (hit_within_radius && local_overwrite_mark_occupied_)
     {
-      const double hit_wx = sensor_pose.x + measured_range * cos_theta;
-      const double hit_wy = sensor_pose.y + measured_range * sin_theta;
-      int hit_mx = 0;
-      int hit_my = 0;
-      if (worldToMap(map, hit_wx, hit_wy, hit_mx, hit_my))
+      const double hit_grid_x = sensor_grid_x + measured_range * inv_resolution * cos_theta;
+      const double hit_grid_y = sensor_grid_y + measured_range * inv_resolution * sin_theta;
+      if (hit_grid_x >= 0.0 && hit_grid_y >= 0.0 &&
+          hit_grid_x < static_cast<double>(map_width) &&
+          hit_grid_y < static_cast<double>(map_height))
       {
+        const int hit_mx = static_cast<int>(hit_grid_x);
+        const int hit_my = static_cast<int>(hit_grid_y);
         const int hit_idx = MAP_IDX(map.info.width, hit_mx, hit_my);
         if (hit_idx >= static_cast<int>(overwrite_values_.size()))
           continue;
@@ -2396,6 +2793,12 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
             overwrite_values_[hit_idx] != 100)
         {
           overwrite_values_[hit_idx] = 100;
+          if (!overwrite_active_flags_[hit_idx])
+          {
+            overwrite_active_flags_[hit_idx] = 1;
+            overwrite_active_indices_.push_back(static_cast<size_t>(hit_idx));
+            ++overwrite_active_count_;
+          }
           ++updated_occupied_cells;
         }
       }
@@ -2423,8 +2826,12 @@ void SlamGMapping::applyOverwriteLayer(nav_msgs::OccupancyGrid& map)
   size_t applied_occupied_cells = 0;
   size_t expired_cells = 0;
 
-  for (size_t idx = 0; idx < overwrite_values_.size(); ++idx)
+  for (size_t idx : overwrite_active_indices_)
   {
+    if (idx >= overwrite_values_.size() ||
+        idx >= overwrite_active_flags_.size() ||
+        !overwrite_active_flags_[idx])
+      continue;
     if (local_overwrite_ttl_sec_ > 0.0 &&
         !overwrite_last_seen_[idx].isZero() &&
         (now - overwrite_last_seen_[idx]).toSec() > local_overwrite_ttl_sec_)
@@ -2444,6 +2851,22 @@ void SlamGMapping::applyOverwriteLayer(nav_msgs::OccupancyGrid& map)
       map.data[idx] = 100;
       ++applied_occupied_cells;
     }
+  }
+
+  // Expired cells are lazily marked inactive above. Compact occasionally so
+  // repeated observations cannot make the sparse index grow without bound.
+  if (overwrite_active_indices_.size() > 256 &&
+      overwrite_active_indices_.size() >
+          2 * std::max<size_t>(1, overwrite_active_count_))
+  {
+    std::vector<size_t> compact;
+    compact.reserve(overwrite_active_indices_.size());
+    for (size_t idx : overwrite_active_indices_)
+    {
+      if (idx < overwrite_active_flags_.size() && overwrite_active_flags_[idx])
+        compact.push_back(idx);
+    }
+    overwrite_active_indices_.swap(compact);
   }
 
   ROS_DEBUG_THROTTLE(2.0,

@@ -12,6 +12,9 @@ scan_filter_tolerance_sec: 0.03
 # publication. Set false for baseline-throughput runs without telemetry.
 pipeline_timing_enabled: true
 pipeline_timing_log_every: 20
+# Diagnostic only: report capture-clock regressions after a sensor bridge
+# reconnect; do not discard scans based on this value yet.
+source_stamp_regression_tolerance_sec: 0.001
 # Keep the legacy PointCloud2 mapping path by default. The organized-depth POC
 # overrides this at launch; PointCloud2 is still retained for local costmap.
 mapping_scan_source: pointcloud
@@ -98,9 +101,12 @@ pointcloud_scan_support_tolerance_abs_m: 0.10
 pointcloud_scan_support_tolerance_rel: 0.03
 
 # 障碍物膨胀参数
-enable_obstacle_inflation: true
-inflation_radius: 0.10  # 膨胀半径（米）
-inscribed_radius: 0.05  # 障碍物核心区域
+# Keep the SLAM occupancy grid raw.  move_base/costmap performs inflation in
+# its own layer; doing it here copied and scanned the entire map on every
+# accepted depth frame and made the OCC timestamp lag behind the robot.
+enable_obstacle_inflation: false
+inflation_radius: 0.10  # 膨胀半径（米），仅在显式重新启用时使用
+inscribed_radius: 0.05  # 障碍物核心区域，仅在显式重新启用时使用
 
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
 enable_local_overwrite: false

@@ -14,6 +14,7 @@ import threading
 
 import rospy
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
 
 def _is_zero(message: Twist, epsilon: float = 1.0e-4) -> bool:
@@ -40,6 +41,7 @@ class VelocityCommandMux:
         self.output_topic = rospy.get_param(
             "~output_topic", "/physical_nav/shadow_cmd_vel"
         )
+        self.stop_topic = rospy.get_param("~stop_topic", "/physical_nav/base_stop")
         self.publish_rate_hz = max(
             5.0, float(rospy.get_param("~publish_rate_hz", 20.0))
         )
@@ -60,6 +62,7 @@ class VelocityCommandMux:
         self._semantic_at = rospy.Time(0)
         self._semantic_active_until = rospy.Time(0)
         self._semantic_stop_until = rospy.Time(0)
+        self._explicit_stop_until = rospy.Time(0)
         self._last_source = "none"
 
         self.publisher = rospy.Publisher(self.output_topic, Twist, queue_size=1)
@@ -69,6 +72,7 @@ class VelocityCommandMux:
         rospy.Subscriber(
             self.semantic_topic, Twist, self._semantic_callback, queue_size=1
         )
+        rospy.Subscriber(self.stop_topic, String, self._stop_callback, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.publish_rate_hz), self._publish
         )
@@ -80,14 +84,32 @@ class VelocityCommandMux:
             self.publish_rate_hz,
         )
 
+    def _stop_callback(self, message: String) -> None:
+        if message.data != "stop":
+            return
+        with self._lock:
+            # Explicit terminal stops do not need a prior semantic velocity
+            # lease. Drop commands received during the hold so expiry cannot
+            # resurrect a residual command from the canceled action.
+            self._explicit_stop_until = rospy.Time.now() + rospy.Duration(self.semantic_stop_hold_s)
+            self._move_base = Twist()
+            self._semantic = Twist()
+            self._move_base_at = rospy.Time(0)
+            self._semantic_at = rospy.Time(0)
+            self._semantic_active_until = rospy.Time(0)
+
     def _move_base_callback(self, message: Twist) -> None:
         with self._lock:
+            if rospy.Time.now() <= self._explicit_stop_until:
+                return
             self._move_base = message
             self._move_base_at = rospy.Time.now()
 
     def _semantic_callback(self, message: Twist) -> None:
         now = rospy.Time.now()
         with self._lock:
+            if now <= self._explicit_stop_until:
+                return
             was_active = now <= self._semantic_active_until
             self._semantic = message
             self._semantic_at = now
@@ -116,7 +138,10 @@ class VelocityCommandMux:
             )
             semantic_stopping = now <= self._semantic_stop_until
 
-            if semantic_active or semantic_stopping:
+            if now <= self._explicit_stop_until:
+                selected = Twist()
+                source = "explicit_stop"
+            elif semantic_active or semantic_stopping:
                 selected = self._semantic
                 source = "semantic"
             elif move_base_age <= self.move_base_timeout_s:
@@ -125,11 +150,13 @@ class VelocityCommandMux:
             else:
                 selected = Twist()
                 source = "stale_stop"
+            # Serialize publish with stop receipts; otherwise a timer could
+            # snapshot forward velocity, then publish it after a stop arrived.
+            self.publisher.publish(selected)
 
         if source != self._last_source:
             rospy.loginfo("velocity mux source: %s", source)
             self._last_source = source
-        self.publisher.publish(selected)
 
 
 if __name__ == "__main__":

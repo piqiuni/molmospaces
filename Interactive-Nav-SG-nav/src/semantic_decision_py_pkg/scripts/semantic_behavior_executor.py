@@ -1397,6 +1397,13 @@ class SemanticBehaviorExecutor:
         self.active_skill_plan: dict = {}
         self.pending_skill_actions: list[dict] = []
         self.interaction_command_sequence = 0
+        # Interaction commands/results are events, not retained state.  Keep
+        # the exact physical command/event currently in flight so a delayed
+        # result for an earlier retry cannot be accepted merely because it
+        # carries the same candidate id.
+        self._active_interaction_command_id = ""
+        self._active_interaction_event_id = ""
+        self._active_interaction_episode_id = ""
         self.interaction_observation_sequence = 0
         self.verification_retries = 0
         self.model_events: list[dict] = []
@@ -1406,7 +1413,10 @@ class SemanticBehaviorExecutor:
             topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
             String,
             queue_size=10,
-            latch=True,
+            # Feedback is consumed as a terminal event by the decision node;
+            # replaying the last result after a restart can mutate a fresh
+            # episode's cooldown/mission state.
+            latch=False,
         )
         self.external_recovery_feedback_pub = rospy.Publisher(
             topics.get("recovery_feedback", "/semantic_decision/recovery_feedback"),
@@ -1423,13 +1433,17 @@ class SemanticBehaviorExecutor:
             topics.get("explore_command", "/explore_py/command"),
             String,
             queue_size=4,
-            latch=True,
+            # Reservations/cancel/finalize are commands.  A newly started
+            # ExplorePy must not execute the last command from a prior run.
+            latch=False,
         )
         self.interaction_command_pub = rospy.Publisher(
             topics.get("interaction_command", "/semantic_decision/interaction_command"),
             String,
             queue_size=4,
-            latch=True,
+            # Physical/simulator interaction commands are one-shot events;
+            # latching would replay an old open command on subscriber restart.
+            latch=False,
         )
         # ExplorePy and the semantic executor share one display seam.  Publishing
         # every actually dispatched fallback goal keeps the video overlay bound
@@ -1450,6 +1464,11 @@ class SemanticBehaviorExecutor:
         )
         self.cmd_vel_pub = rospy.Publisher(
             topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=2
+        )
+        base_stop_topic = str(topics.get("base_stop", "") or "")
+        self.base_stop_pub = (
+            rospy.Publisher(base_stop_topic, String, queue_size=1)
+            if base_stop_topic else None
         )
         self.tf_listener = tf.TransformListener()
         self.move_base = actionlib.SimpleActionClient(
@@ -1624,6 +1643,13 @@ class SemanticBehaviorExecutor:
             self.pending_skill_actions = []
             self._clear_drawer_scan_execution_wait_locked()
             self.interaction_command_sequence = 0
+            self._active_interaction_command_id = ""
+            self._active_interaction_event_id = ""
+            self._active_interaction_episode_id = str(
+                selection.get("episode_id")
+                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                or ""
+            )
             self.interaction_observation_sequence = 0
             self.verification_retries = 0
             self.model_events = []
@@ -1650,20 +1676,24 @@ class SemanticBehaviorExecutor:
             request = json.loads(message.data)
         except json.JSONDecodeError:
             return
-        selection = None
-        cancel_navigation = False
-        finalize_explore = False
+        if not isinstance(request, dict):
+            return
         with self.lock:
-            if self.selection is None:
+            if self.selection is None or getattr(self, "_terminal_cleanup_in_progress", False):
                 return
             requested_decision_id = str(request.get("decision_id") or "")
             active_decision_id = str(self.selection.get("decision_id") or "")
             if requested_decision_id != active_decision_id:
                 return
+            if request.get("candidate_id") and str(request["candidate_id"]) != str(
+                self.selection.get("candidate_id") or ""
+            ):
+                return
             reason = str(request.get("reason") or "")
             if reason not in {
                 "preempted_by_target",
                 "interaction_target_resolved",
+                "mission_changed",
             }:
                 return
             behavior_type = str(
@@ -1676,36 +1706,25 @@ class SemanticBehaviorExecutor:
                 and behavior_type != "INTERACT"
             ):
                 return
+            if reason == "mission_changed" and not (
+                behavior_type in {"NAVIGATE", "EXPLORE", "SCAN"}
+                or (behavior_type == "INTERACT" and self.machine.state in {
+                    STATE_NAVIGATING, STATE_APPROACH_INTERACTION,
+                })
+            ):
+                # No acknowledged cancellation interface exists for an
+                # already-issued interaction. Let it finish under its owner.
+                return
             selection = dict(self.selection)
-            cancel_navigation = self.machine.state in {
-                STATE_NAVIGATING,
-                STATE_APPROACH_INTERACTION,
-                STATE_WAITING_FOR_DRAWER_SCAN,
-                STATE_WAITING_FOR_INTERACTION_OBSERVATION,
-                STATE_VERIFYING,
-            }
-            finalize_explore = reason == "preempted_by_target"
-            self._clear_navigation_tracking_locked(active_decision_id)
-            self.selection = None
-            self.machine.reset()
-        if cancel_navigation:
-            self.move_base.cancel_goal()
-        detail = {
-            "reason": reason,
-            "replacement_candidate_id": str(
-                request.get("replacement_candidate_id") or ""
-            ),
-            "resolved_state": str(request.get("resolved_state") or ""),
-        }
-        if finalize_explore and selection is not None:
-            self._publish_explore_command(
-                selection,
-                action="finalize_frontier",
-                success=False,
-                detail=detail,
-            )
-        if selection is not None:
-            self._publish_feedback(selection, "CANCELED", False, detail)
+        self._finish_terminal({
+            "candidate": selection, "success": False, "canceled": True,
+            "finalize_explore": behavior_type == "EXPLORE",
+            "detail": {
+                "reason": reason,
+                "replacement_candidate_id": str(request.get("replacement_candidate_id") or ""),
+                "resolved_state": str(request.get("resolved_state") or ""),
+            },
+        })
 
     def _explore_feedback_callback(self, message: String) -> None:
         try:
@@ -2823,6 +2842,13 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
+            # Consume the one-shot result identity before any state-machine
+            # transition.  A duplicate ROS delivery must not advance a
+            # multi-step interaction or re-run M3 while the next command is
+            # being prepared.
+            self._active_interaction_command_id = ""
+            self._active_interaction_event_id = ""
+            self._active_interaction_episode_id = ""
             if str(payload.get("command_id") or "") == str(
                 (getattr(self, "_drawer_scan_execution_wait", {}) or {}).get(
                     "command_id", ""
@@ -4905,6 +4931,11 @@ class SemanticBehaviorExecutor:
             "command_id": self._command_id(candidate),
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
+            "episode_id": str(
+                candidate.get("episode_id")
+                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                or ""
+            ),
             "action": action,
             "cluster_id": (candidate.get("metadata") or {}).get(
                 "cluster_id", candidate.get("target_id", "")
@@ -5023,6 +5054,11 @@ class SemanticBehaviorExecutor:
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
+            "episode_id": str(
+                candidate.get("episode_id")
+                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                or ""
+            ),
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "object_id": interaction.get("object_id", candidate.get("target_name", "")),
             "node_type": node_type,
@@ -5093,6 +5129,13 @@ class SemanticBehaviorExecutor:
             self.pre_interaction_image_sequence = self.latest_image_sequence
             if drawer_sequence_type == "drawer_scan":
                 self._arm_drawer_scan_execution_wait_locked(payload)
+            # Bind the next result to this exact one-shot command.  The
+            # previous candidate id is intentionally not sufficient because a
+            # bounded retry reuses the candidate while changing its command
+            # and event sequence.
+            self._active_interaction_command_id = str(payload["command_id"])
+            self._active_interaction_event_id = str(payload["event_id"])
+            self._active_interaction_episode_id = str(payload.get("episode_id") or "")
         self.interaction_command_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
@@ -12783,15 +12826,39 @@ class SemanticBehaviorExecutor:
 
     def _finish_terminal(self, command: dict) -> None:
         with self.lock:
+            if self.selection is None or getattr(self, "_terminal_cleanup_in_progress", False):
+                return
             selection = dict(self.selection or {})
             decision_id = str(selection.get("decision_id") or "")
-            was_navigating = self.machine.state in {
+            origin = command.get("candidate") or {}
+            if origin and (
+                str(origin.get("decision_id") or "") != decision_id
+                or str(origin.get("candidate_id") or "")
+                != str(selection.get("candidate_id") or "")
+            ):
+                return
+            if (command.get("canceled")
+                and (command.get("detail") or {}).get("reason") == "mission_changed"
+                and str(selection.get("behavior_type") or "").upper() == "INTERACT"
+                and self.machine.state not in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}):
+                # Recheck at the cleanup commit: approach may have completed
+                # after the preempt callback released its validation lock.
+                return
+            self._terminal_cleanup_in_progress = True
+            # _finish() has already moved the state machine to SUCCEEDED or
+            # FAILED. Use the owned behavior, not that terminal state, to
+            # decide whether residual base commands need to be stopped.
+            owned_base_motion = str(selection.get("behavior_type") or "").upper() in {
+                "NAVIGATE", "EXPLORE", "INTERACT", "SCAN",
+            } or self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
             }
-            status = "SUCCEEDED" if command.get("success") else "FAILED"
+            success = bool(command.get("success"))
+            status = "CANCELED" if command.get("canceled") else ("SUCCEEDED" if success else "FAILED")
             detail = dict(command.get("detail") or {})
             if decision_id:
+                self._clear_navigation_tracking_locked(decision_id)
                 self._navigation_failure_recovery_attempts.pop(decision_id, None)
             drawer_scan_wait = self._drawer_scan_wait_records.pop(decision_id, None)
             self._drawer_scan_wait_contexts.pop(decision_id, None)
@@ -12799,12 +12866,79 @@ class SemanticBehaviorExecutor:
                 detail.setdefault("drawer_scan_wait", drawer_scan_wait)
             if self.model_events:
                 detail["mllm_events"] = list(self.model_events)
-            self._publish_feedback(selection, status, bool(command.get("success")), detail)
-            self.selection = None
+            # Retain the selection as a busy fence until cancel/zero below.
+            # New selections must not start between resetting the machine
+            # and issuing a stop that would then belong to their predecessor.
+            self._active_interaction_command_id = ""
+            self._active_interaction_event_id = ""
+            self._active_interaction_episode_id = ""
             self._clear_drawer_scan_execution_wait_locked()
             self.machine.reset()
-        if was_navigating:
+        if owned_base_motion:
+            # ``cancel_goal`` is asynchronous.  On the physical lane DWA can
+            # therefore publish one or more residual commands before its
+            # actionlib state changes to PREEMPTED; if the next semantic
+            # decision is dispatched in that window the base may move past a
+            # successfully reached object.  Send an explicit zero through the
+            # executor's semantic command channel after cancelling.  The
+            # physical velocity mux treats a zero received while this lease is
+            # active as a bounded stop hold, while simulator/remapped lanes
+            # simply ignore the extra zero once move_base is quiescent.
+            stop_detail = self._send_owned_base_stop()
+            detail["terminal_stop"] = stop_detail
+            if not (stop_detail["cancel_sent"] and stop_detail["zero_sent"]
+                    and stop_detail.get("hold_sent", True)):
+                detail["behavior_outcome_success"] = success
+                detail["behavior_outcome_reason"] = detail.get("reason", "")
+                detail["reason"] = "terminal_stop_send_failed"
+                success, status = False, "FAILED"
+        if command.get("finalize_explore"):
+            try:
+                self._publish_explore_command(
+                    selection, action="finalize_frontier", success=False, detail=detail
+                )
+            except Exception as exc:
+                detail["explore_finalize_error"] = str(exc)
+                success, status = False, "FAILED"
+        # Publish the terminal state only after cancel/zero sends have been
+        # attempted (send errors force failure). The decision node is allowed
+        # to dispatch the next subgoal immediately after this callback; doing
+        # this in the opposite order races residual DWA output with the new
+        # command and can make the robot overshoot or rotate in place.
+        with self.lock:
+            self.selection = None
+            self._terminal_cleanup_in_progress = False
+            self._publish_feedback(selection, status, success, detail)
+
+    def _send_owned_base_stop(self) -> dict:
+        """Attempt both stop commands; a failed cancel must not suppress zero.
+
+        These receipt flags describe local sends, not server/physical stop
+        confirmation. The successor fence checks controller action quiescence;
+        physical stopping still requires odometry/real-world validation.
+        """
+        result = {"cancel_sent": False, "zero_sent": False, "errors": []}
+        try:
             self.move_base.cancel_goal()
+            result["cancel_sent"] = True
+        except Exception as exc:
+            result["errors"].append(f"cancel: {exc}")
+        try:
+            self.cmd_vel_pub.publish(Twist())
+            result["zero_sent"] = True
+        except Exception as exc:
+            result["errors"].append(f"zero: {exc}")
+        stop_pub = getattr(self, "base_stop_pub", None)
+        if stop_pub is not None:
+            try:
+                stop_pub.publish(String(data="stop"))
+                result["hold_sent"] = True
+            except Exception as exc:
+                result["hold_sent"] = False
+                result["errors"].append(f"stop_hold: {exc}")
+        if result["errors"]:
+            rospy.logwarn("[semantic_behavior_executor] base stop send failed: %s", result["errors"])
+        return result
 
     def _publish_feedback(
         self, selection: dict, status: str, success: bool | None, detail: dict
@@ -12816,23 +12950,70 @@ class SemanticBehaviorExecutor:
             "target_id": selection.get("target_id", ""),
             "target_name": selection.get("target_name", ""),
             "command_id": self._command_id(selection),
+            "episode_id": str(
+                selection.get("episode_id")
+                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                or ""
+            ),
             "status": status,
             "success": success,
             "detail": detail,
             "timestamp": time.time(),
         }
+        if isinstance(detail, dict) and detail.get("event_id"):
+            payload["event_id"] = str(detail["event_id"])
         self.feedback_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
 
     def _matches_active(self, payload: dict) -> bool:
-        if self.selection is None:
+        selection = self.selection
+        if selection is None:
             return False
+        behavior_type = str(selection.get("behavior_type") or "").upper()
         command_id = str(payload.get("command_id") or "")
         candidate_id = str(payload.get("candidate_id") or "")
-        return command_id == self._command_id(self.selection) or (
-            candidate_id and candidate_id == str(self.selection.get("candidate_id") or "")
+        expected_command_id = self._command_id(selection)
+        active_interaction_command_id = str(
+            getattr(self, "_active_interaction_command_id", "") or ""
         )
+        if active_interaction_command_id:
+            expected_command_id = active_interaction_command_id
+
+        # An explicit command id is authoritative.  Never fall back to a
+        # candidate id when it is present: retries intentionally reuse a
+        # candidate while changing the command sequence.
+        if command_id:
+            if command_id != expected_command_id:
+                return False
+        elif active_interaction_command_id:
+            # Once a physical command has been emitted, a result without its
+            # exact id is ambiguous and could be an old opaque result.
+            return False
+        elif not candidate_id or candidate_id != str(selection.get("candidate_id") or ""):
+            return False
+
+        expected_event_id = str(
+            getattr(self, "_active_interaction_event_id", "") or ""
+        )
+        if expected_event_id:
+            if str(payload.get("event_id") or "") != expected_event_id:
+                return False
+
+        expected_episode_id = str(
+            getattr(self, "_active_interaction_episode_id", "")
+            or selection.get("episode_id")
+            or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+            or ""
+        )
+        payload_episode_id = str(payload.get("episode_id") or "")
+        # ExplorePy's legacy feedback contract does not echo episode_id; its
+        # command_id is already unique per reservation.  Interaction/M3
+        # results, on the other hand, must carry the episode to prevent a
+        # cross-run replay.
+        if behavior_type == "INTERACT" and expected_episode_id and payload_episode_id != expected_episode_id:
+            return False
+        return True
 
     @staticmethod
     def _command_id(candidate: dict) -> str:

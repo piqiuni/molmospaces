@@ -249,7 +249,9 @@ class DoorOccRuntimeController:
                 "/semantic_mapping/interaction_result",
                 String,
                 queue_size=2,
-                latch=True,
+                # This is an event stream; latching a completed door result
+                # would replay it to a mapper/executor started in a later run.
+                latch=False,
             )
             self._interaction_result_pub = (publisher, String)
         except Exception as exc:

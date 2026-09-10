@@ -4,6 +4,7 @@ import json
 import math
 import sys
 from pathlib import Path
+import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 if str(PACKAGE_ROOT) not in sys.path:
@@ -17,6 +18,13 @@ from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
 
 
 def observation(**kwargs):
+    # State/visibility tests need a geometrically valid door. Degenerate-box
+    # tests supply their own size and continue to exercise rejection.
+    default_size = (
+        [0.1, 0.9, 2.0]
+        if kwargs.get("is_door") or kwargs.get("semantic_name") == "door"
+        else [0.1, 0.1, 0.1]
+    )
     base = {
         "observation_id": "obs",
         "instance_id": "",
@@ -25,7 +33,7 @@ def observation(**kwargs):
         "confidence": 1.0,
         "position": [0.0, 0.0, 0.0],
         "aabb_center": [0.0, 0.0, 0.0],
-        "aabb_size": [0.1, 0.1, 0.1],
+        "aabb_size": default_size,
         "room_id": None,
         "parent": None,
         "children": [],
@@ -194,6 +202,50 @@ def test_portal_child_room_waits_for_two_frames_and_m1():
     assert portal.attributes["potential_room_ids"] == [child.room_id]
 
 
+@pytest.mark.parametrize("confidence", [0.0, 0.49, -0.1, 1.1, float("nan"), float("inf"), "bad"])
+def test_unreliable_m1_cannot_confirm_portal_or_open_it(confidence):
+    store = InteractionGraphStore(scene_id="confidence_gate")
+    detected = observation(instance_id="door_1", semantic_name="door", category="door", room_id=1)
+    for stamp in (1.0, 2.0):
+        store.update_observations([detected], stamp=stamp, source_mode="detector_online")
+    portal = store.nodes["portal_door_1"]
+    before_state = dict(portal.interaction)
+    patch = {
+        "object_id": portal.id, "attribute_status": "ready",
+        "confidence": confidence, "source": "mllm_attribute_inference",
+        "interaction_class": "portal", "observed_object_name": "door",
+        "interactable": True, "coarse_state": "open",
+        "portal_aperture_evidence": {"open_aperture": "visible", "confidence": 0.95},
+    }
+    assert not store.apply_attribute_patch(patch, stamp=3.0)
+    assert portal.interaction["state"] == before_state["state"]
+    assert not portal.attributes.get("persistent_semantic_node", False)
+    assert store.ensure_provisional_room_for_portal(portal) is None
+    assert store.apply_attribute_patch({**patch, "confidence": 0.95, "coarse_state": "closed"}, stamp=4.0)
+    accepted_attributes = dict(portal.attributes)
+    accepted_interaction = dict(portal.interaction)
+    assert not store.apply_attribute_patch(patch, stamp=5.0)
+    assert portal.attributes == accepted_attributes
+    assert portal.interaction == accepted_interaction
+
+
+@pytest.mark.parametrize("size", [[0.1, 0.1, 0.1], [0.01, 0.01, 2.0], [1.0, 0.1, 0.2]])
+def test_degenerate_portal_geometry_cannot_create_topology_even_with_m1(size):
+    store = InteractionGraphStore(scene_id="bad_portal_geometry")
+    detected = observation(instance_id="door_1", semantic_name="door", category="door", room_id=1,
+                           aabb_size=size)
+    for stamp in (1.0, 2.0):
+        store.update_observations([detected], stamp=stamp, source_mode="detector_online")
+    portal = next(node for node in store.nodes.values() if node.attributes.get("instance_id") == "door_1")
+    store.apply_attribute_patch({
+        "object_id": portal.id, "attribute_status": "ready", "confidence": 0.95,
+        "source": "mllm_attribute_inference", "observed_object_name": "door",
+        "interaction_class": "portal", "interactable": True, "coarse_state": "closed",
+    }, stamp=3.0)
+    assert portal.type != "portal"
+    assert store.ensure_provisional_room_for_portal(portal) is None
+
+
 def test_wall_panel_m1_rejection_does_not_create_portal_child_room():
     store = InteractionGraphStore(scene_id="test_scene")
     detected = observation(
@@ -225,6 +277,44 @@ def test_wall_panel_m1_rejection_does_not_create_portal_child_room():
     portal = store.nodes["portal_portal_1"]
     assert not portal.attributes.get("persistent_semantic_node", False)
     assert store.ensure_provisional_room_for_portal(portal) is None
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", "stale"])
+def test_m1_request_status_preserves_confirmed_portal_and_its_room(status):
+    store = InteractionGraphStore(scene_id="request_vs_evidence")
+    detected = observation(instance_id="door_1", semantic_name="door", category="door", room_id=1)
+    for stamp in (1.0, 2.0):
+        store.update_observations([detected], stamp=stamp, source_mode="detector_online")
+    portal = store.nodes["portal_door_1"]
+    patch = {"object_id": portal.id, "attribute_status": "ready", "confidence": 0.95,
+             "source": "mllm_attribute_inference", "observed_object_name": "door",
+             "interaction_class": "portal", "interactable": True, "coarse_state": "closed",
+             "request_sequence": 1}
+    store.apply_attribute_patch({"object_id": portal.id, "attribute_status": status,
+                                 "request_sequence": 1}, stamp=2.05)
+    assert not portal.attributes.get("attribute_last_ready")
+    assert store.ensure_provisional_room_for_portal(portal) is None
+    store.apply_attribute_patch(patch, stamp=2.1)
+    child = store.ensure_provisional_room_for_portal(portal)
+    assert child is not None
+    store.apply_attribute_patch({"object_id": portal.id, "attribute_status": status,
+                                 "request_sequence": 2, "error": "transport_issue"}, stamp=3.0)
+    # Request telemetry must remain honest; it is not a fresh successful view.
+    assert portal.attributes["attribute_status"] == status
+    assert "approach_ready" not in portal.attributes["attribute_last_ready"]
+    assert "view_state" not in portal.attributes["attribute_last_ready"]
+    store.update_observations([], stamp=4.0, source_mode="detector_online")
+    store.prune_unqualified_provisional_rooms()
+    assert portal.attributes.get("persistent_semantic_node") is True
+    assert child.id in store.nodes and store.nodes[child.id].attributes["active"]
+    assert store.ensure_provisional_room_for_portal(portal).id == child.id
+    # A later actual semantic correction still revokes the portal topology.
+    store.apply_attribute_patch({**patch, "request_sequence": 3,
+                                "observed_object_name": "wall_panel", "interaction_class": "none",
+                                "interactable": False}, stamp=5.0)
+    store.prune_unqualified_provisional_rooms()
+    assert not portal.attributes.get("persistent_semantic_node", False)
+    assert child.id not in store.nodes or not store.nodes[child.id].attributes.get("active", True)
 
 
 def test_incremental_room_object_graph_growth():
@@ -335,6 +425,54 @@ def test_support_and_container_hierarchy_assignment():
     relations = {(edge["src_id"], edge["relation"], edge["dst_id"]) for edge in graph["edges"]}
     assert ("support_table_1", "supports", "object_apple_1") in relations
     assert ("container_fridge_1", "contains", "object_milk_1") in relations
+
+
+def test_parent_candidates_bucket_by_room_but_keep_unknown_room_fallback():
+    """Known-room parents do not leak across rooms; unknown remains eligible."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="table_other_room",
+                semantic_name="table",
+                room_id=2,
+                position=[1.0, 1.0, 0.4],
+                aabb_center=[1.0, 1.0, 0.4],
+                aabb_size=[1.0, 1.0, 0.8],
+            ),
+            observation(
+                instance_id="table_unknown_room",
+                semantic_name="countertop",
+                room_id=None,
+                position=[1.0, 1.0, 0.4],
+                aabb_center=[1.0, 1.0, 0.4],
+                aabb_size=[1.0, 1.0, 0.8],
+            ),
+            observation(
+                instance_id="apple_room_one",
+                semantic_name="apple",
+                room_id=1,
+                position=[1.0, 1.0, 0.82],
+                aabb_center=[1.0, 1.0, 0.82],
+                aabb_size=[0.1, 0.1, 0.1],
+            ),
+        ]
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert (
+        "support_table_unknown_room",
+        "supports",
+        "object_apple_room_one",
+    ) in relations
+    assert (
+        "support_table_other_room",
+        "supports",
+        "object_apple_room_one",
+    ) not in relations
 
 
 def test_open_refrigerator_maps_contents_projected_outside_closed_aabb() -> None:
@@ -1165,6 +1303,77 @@ def test_object_store_associates_same_door_across_viewpoints():
     assert abs(tracked[0]["yaw"]) < 0.10
 
 
+def test_object_store_match_indexes_keep_identity_and_cross_label_semantics():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=1)
+    store.update(
+        [
+            {
+                "semantic_class": "chair",
+                "instance_id": "chair_track",
+                "confidence": 0.9,
+                "world_position": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_center": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_size": {"x": 0.6, "y": 0.6, "z": 0.8},
+            },
+            {
+                "semantic_class": "table",
+                "instance_id": "table_track",
+                "confidence": 0.9,
+                "world_position": {"x": 4.0, "y": 0.0, "z": 0.4},
+                "world_box3d_center": {"x": 4.0, "y": 0.0, "z": 0.4},
+                "world_box3d_size": {"x": 0.8, "y": 0.8, "z": 0.8},
+            },
+        ],
+        stamp=1.0,
+    )
+    assert store._match_identity_index["chair_track"] == 1
+    identity_match = store._find_match(
+        "chair",
+        {"x": 100.0, "y": 100.0, "z": 0.4},
+        {"x": 0.6, "y": 0.6, "z": 0.8},
+        "chair_track",
+    )
+    assert identity_match["object_id"] == 1
+
+    # The spatial index is label-agnostic: cross-label AABB association must
+    # still see the chair even though the incoming label is a different one.
+    store.update(
+        [
+            {
+                "semantic_class": "couch",
+                "confidence": 0.9,
+                "world_position": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_center": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_size": {"x": 0.6, "y": 0.6, "z": 0.8},
+            }
+        ],
+        stamp=2.0,
+    )
+    assert len(store.objects) == 2
+    assert store.objects[0]["observation_count"] == 2
+
+
+def test_object_store_match_indexes_invalidate_after_purge():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=1, stale_after_sec=0.1)
+    store.update(
+        [
+            {
+                "semantic_class": "chair",
+                "instance_id": "stale_track",
+                "confidence": 0.9,
+                "world_position": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_center": {"x": 0.0, "y": 0.0, "z": 0.4},
+                "world_box3d_size": {"x": 0.4, "y": 0.4, "z": 0.8},
+            }
+        ],
+        stamp=1.0,
+    )
+    store.update([], stamp=2.0)
+    assert store.objects == []
+    assert store._match_identity_index is None
+    assert store._match_spatial_index is None
+
+
 def test_portal_graph_freezes_first_measured_reference_yaw():
     store = InteractionGraphStore(scene_id="test_scene")
     first = observation(
@@ -1865,26 +2074,23 @@ def test_open_partial_portal_creates_graph_only_child_room_until_far_side_is_obs
     scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
-    store.update_observations(
-        [
-            observation(
-                instance_id="door_partial",
-                semantic_name="door",
-                is_door=True,
-                is_articulable=True,
-                joint_type="hinge",
-                joint_range=[0.0, 1.0],
-                joint_value=0.0,
-                position=[4.0, 4.0, 1.0],
-                aabb_center=[4.0, 4.0, 1.0],
-                aabb_size=[0.2, 1.0, 2.0],
-            )
-        ],
-        source_mode="realtime_gt_observation",
+    door = observation(
+        instance_id="door_partial", semantic_name="door", is_door=True,
+        is_articulable=True, joint_type="hinge", joint_range=[0.0, 1.0], joint_value=0.0,
+        position=[4.0, 4.0, 1.0], aabb_center=[4.0, 4.0, 1.0], aabb_size=[0.2, 1.0, 2.0],
     )
+    for stamp in (1.0, 2.0):
+        store.update_observations([door], stamp=stamp, source_mode="realtime_gt_observation")
     portal_id = next(
         node["id"] for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
     )
+    # Creating graph-only far-side rooms requires two observations and M1,
+    # independently of the later successful interaction result.
+    assert store.apply_attribute_patch({
+        "object_id": portal_id, "attribute_status": "ready", "confidence": 0.95,
+        "source": "mllm_attribute_inference", "observed_object_name": "door",
+        "interaction_class": "portal", "interactable": True, "coarse_state": "closed",
+    }, stamp=2.1)
 
     assert store.update_interaction_result(
         {
@@ -2526,6 +2732,7 @@ def test_non_articulated_portal_feedback_persists_static_capability() -> None:
         semantic_name="doorframe",
         is_door=False,
         is_articulable=False,
+        aabb_size=[0.1, 0.9, 2.0],
     )
     doorframe["source_object_name"] = "doorframe_static_1"
     store.update_observations(
@@ -3251,7 +3458,8 @@ def test_room_geometry_commit_resets_confirmation_streak() -> None:
     assert size[:2] == [1.5, 1.0]
 
 
-def test_failed_portal_open_result_cannot_promote_open_state() -> None:
+@pytest.mark.parametrize("source", ["interaction_result", "oracle_interaction", "executor_state_verification"])
+def test_failed_portal_open_result_cannot_promote_open_state(source) -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     door = observation(
         instance_id="door_failed_open",
@@ -3265,6 +3473,7 @@ def test_failed_portal_open_result_cannot_promote_open_state() -> None:
     assert store.update_interaction_result(
         {
             "node_id": "portal_door_failed_open",
+            "source": source,
             "action": "open",
             "post_state": "open",
             "success": False,
@@ -3380,10 +3589,12 @@ def test_m1_visual_open_portal_clears_interaction_without_map_connectivity():
         is_articulable=True,
         frame_index=31,
     )
+    store.update_observations([{**door, "frame_index": 30}], stamp=30.0, source_mode="detector_online")
     store.update_observations([door], stamp=31.0, source_mode="detector_online")
     assert store.apply_attribute_patch(
         {
             "object_id": "track_0031",
+            "observed_object_name": "door",
             "attribute_status": "ready",
             "observation_frame_index": 31,
             "interactable": True,
