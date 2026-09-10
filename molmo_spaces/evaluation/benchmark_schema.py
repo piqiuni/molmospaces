@@ -197,6 +197,7 @@ class NavToObjTaskSpec(BaseTaskSpec):
     pickup_obj_candidates: list[str] | None = None  # All candidate instances
     pickup_obj_start_pose: list[float] | None = Field(default=None, min_length=7, max_length=7)
     receptacle_name: str | None = None
+    selection_mode: Literal["specific_instance", "any_candidate"] = "any_candidate"
 
     # Success criteria
     succ_pos_threshold: float = 1.5  # meters
@@ -258,7 +259,7 @@ class LanguageSpec(BaseModel):
 
     task_description: str
 
-    # These fields were introduced after the first frozen V3 release. Keep
+    # These fields were introduced after the first frozen V3 release.  Keep
     # legacy benchmark records loadable with conservative object-goal defaults.
     instruction_type: Literal[
         "object_goal",

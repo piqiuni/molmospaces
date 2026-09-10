@@ -1,7 +1,7 @@
 """Task configuration classes for MolmoSpaces experiments."""
 
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -175,6 +175,7 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     )
     pickup_obj_category: str | None = None  # Semantic category (e.g., "apple")
     pickup_obj_synset: str | None = None  # WordNet synset (e.g., "apple.n.01")
+    selection_mode: Literal["specific_instance", "any_candidate"] = "any_candidate"
 
     # For compatibility with EvalTaskSampler (not used in nav tasks, but needed for shared code)
     receptacle_name: str | None = None
