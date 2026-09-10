@@ -28,7 +28,7 @@ except ImportError:  # Allow direct ``python episode_topdown.py`` use.
     from benchmark_io import load_benchmark_episodes
 
 
-TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v3"
+TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v4"
 _UNKNOWN_MIN = 50
 _UNKNOWN_MAX = 250
 
@@ -319,54 +319,29 @@ def _polyline_length_m(points_xy: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(points_xy, axis=0), axis=1).sum())
 
 
-def _reconstruct_gt_oracle_path(scene_map: Any, episode: dict[str, Any]) -> dict[str, Any] | None:
-    """Recompute the V3 source ``P_open`` for post-eval visualization only.
+def _frozen_oracle_stage_path(episode: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the benchmark's frozen oracle navigation stages as a polyline.
 
-    The builder computes a single all-open route from the frozen robot start to
-    the terminal navigation goal, then derives the door approach point from that
-    route.  It does *not* concatenate separate start-to-door and door-to-goal
-    plans.  Reusing its helper preserves that definition here.
+    Rendering must not import the research-time planner that originally created
+    a benchmark.  The benchmark already freezes every navigation phase endpoint;
+    joining those points gives a stable, auditable reference without making the
+    standalone evaluator depend on method code.
     """
 
     start = _benchmark_start_pose(episode)
     stages = _oracle_navigation_stages(episode)
     if start is None or not stages:
         return None
-    from scripts.InteractiveNav import explore_molmo_interactions as emi
-
-    # ``explore_molmo_interactions`` keeps its heavyweight numerical imports
-    # lazy.  The live-scene loader initializes them as a side effect, but the
-    # precomputed-map fast path below does not, so initialize them explicitly
-    # before calling its planner helper.
-    emi.ensure_runtime_dependencies()
-    terminal = np.asarray(stages[-1]["xy"], dtype=float)
-    path_xy = emi.compute_path_from_map(
-        scene_map,
-        np.asarray(start["xy"], dtype=float),
-        terminal,
-        downscale_factor=5,
-    )
-    if path_xy is None or not len(path_xy):
-        return {
-            "source": "recomputed_v3_all_open_source_planner",
-            "complete": False,
-            "xy": np.empty((0, 2), dtype=float),
-            "start": start,
-            "stages": stages,
-            "planner": {"px_per_m": int(scene_map.px_per_m), "downscale_factor": 5},
-        }
-    path_xy = np.asarray(path_xy, dtype=float)
-    # The helper snaps boundary points to its grid.  Keep the exact frozen start
-    # and terminal goal visible in the final plot.
-    path_xy[0] = np.asarray(start["xy"], dtype=float)
-    path_xy[-1] = terminal
+    path_points = [np.asarray(start["xy"], dtype=float)]
+    path_points.extend(np.asarray(stage["xy"], dtype=float) for stage in stages)
+    path_xy = np.asarray(path_points, dtype=float)
     return {
-        "source": "recomputed_v3_all_open_source_planner",
-        "complete": True,
+        "source": "frozen_oracle_plan_stages",
+        "complete": False,
         "xy": path_xy,
         "start": start,
         "stages": stages,
-        "planner": {"px_per_m": int(scene_map.px_per_m), "downscale_factor": 5},
+        "planner": None,
         "length_m": _polyline_length_m(path_xy),
     }
 
@@ -686,21 +661,30 @@ def _resolve_scene_model_path(
     house_index = int(episode["house_index"])
     filename = f"{data_split}_{house_index}.xml"
     repo_root = Path(__file__).resolve().parents[3]
-    # Prefer the complete development asset tree.  Its scene XML resolves the
-    # sibling ``../../objects`` includes used by ProcTHOR assets correctly.
-    scenes_roots = [
-        repo_root / "assets" / "scenes",
-        repo_root.parent / "molmospaces" / "assets" / "scenes",
-    ]
+    scenes_roots = [repo_root / "assets" / "scenes"]
+    registry_error: Exception | None = None
     try:
         # This follows the same asset-root selection as the evaluator, including
         # an MLSPACES_SCENES_ROOT supplied by the local environment.
-        from molmo_spaces.molmo_spaces_constants import get_scenes_root
+        from molmo_spaces.molmo_spaces_constants import get_scenes, get_scenes_root
+        from molmo_spaces.utils.lazy_loading_utils import install_scene_from_path
 
         scenes_roots.append(Path(get_scenes_root()))
-    except Exception:
-        pass
-    # Development installs commonly keep the resource cache beside this checkout.
+        scene_entry = get_scenes(scene_dataset, data_split)[data_split][house_index]
+        registry_path_value = (
+            scene_entry.get("base") if isinstance(scene_entry, dict) else scene_entry
+        )
+        if registry_path_value is not None:
+            registry_path = Path(str(registry_path_value)).expanduser()
+            if not registry_path.is_file():
+                install_scene_from_path(registry_path)
+            if registry_path.is_file():
+                return registry_path.absolute()
+    except Exception as exc:
+        # Explicit/local candidates below still make the report usable when a
+        # resource registry is unavailable or intentionally disabled.
+        registry_error = exc
+
     candidates: list[Path] = []
     for scenes_root in dict.fromkeys(scenes_roots):
         candidates.extend(
@@ -719,6 +703,11 @@ def _resolve_scene_model_path(
         "Could not resolve the static scene XML for "
         f"dataset={scene_dataset!r}, split={data_split!r}, house={house_index}. "
         "Pass --scene-model-path explicitly."
+        + (
+            f" Resource registry lookup failed with {type(registry_error).__name__}: {registry_error}"
+            if registry_error is not None
+            else ""
+        )
     )
 
 
@@ -785,45 +774,27 @@ def _load_static_scene_map(
     """Load the complete scene map, preferring its precomputed occupancy PNG."""
 
     from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
-    from scripts.InteractiveNav.read_scene_room_properties import build_scene_config
 
-    # A completed evaluator can have lazily installed a scene that is not linked
-    # into this checkout any more.  In that case the scene-only sampler below
-    # still knows how to restore the frozen house from the resource cache, so do
-    # not reject a post-eval report merely because a stable XML path is absent.
+    # Prefer a stable XML when available, but allow a registry-provided
+    # precomputed map to render a completed episode without one.
     try:
         source_model_path: Path | None = _resolve_scene_model_path(episode, context, scene_model_path)
     except FileNotFoundError:
         if scene_model_path is not None:
             raise
         source_model_path = None
-    coverage_agent_radius_m = float(coverage_metadata.get("gt_agent_radius_m", 0.1))
+    from molmo_spaces.configs.task_sampler_configs import NavToObjTaskSamplerConfig
+
+    default_agent_radius_m = float(NavToObjTaskSamplerConfig().robot_safety_radius)
+    agent_radius_m = float(
+        coverage_metadata.get("gt_agent_radius_m", default_agent_radius_m)
+    )
     dataset_name = str(episode.get("scene_dataset", "")).lower()
     is_ithor = "ithor" in dataset_name
-    # The V3 builder's source P_open used 200 px/m and planner downscale=5.
-    # Keep that resolution for the static background too, so the replayed GT
-    # route uses the identical map scale rather than a visualization-only proxy.
+    # The frozen V3 map contract uses approximately 200 px/m.  Keep that
+    # resolution for the static background and coverage projection.
     px_per_m = int(round(float(coverage_metadata.get("oracle_route_px_per_m", 200))))
     map_cls = iTHORMap if is_ithor else ProcTHORMap
-    # Load through the same scene-only sampler used by the reference drawing
-    # script.  It performs the project asset/mirror setup before ProcTHORMap
-    # compiles XML with relative object includes.
-    robot = str(episode.get("robot", {}).get("robot_name", "rby1"))
-    args = argparse.Namespace(
-        robot=robot if robot in {"droid", "rby1", "rum"} else "rby1",
-        scene_dataset=str(episode.get("scene_dataset", "procthor-10k")),
-        data_split=str(episode.get("data_split", "val")),
-        house_ind=int(episode["house_index"]),
-        variant="base",
-        seed=2,
-    )
-    cfg = build_scene_config(args)
-    configured_radius = getattr(cfg.task_sampler_config, "robot_safety_radius", None)
-    agent_radius_m = (
-        float(configured_radius)
-        if isinstance(configured_radius, (int, float)) and float(configured_radius) > 0.0
-        else coverage_agent_radius_m
-    )
     precomputed_map_path = _resolve_precomputed_scene_map_path(
         episode=episode,
         source_model_path=source_model_path,
@@ -852,47 +823,25 @@ def _load_static_scene_map(
                 "precomputed_complete_scene_map",
                 precomputed_map_path,
             )
-    sampler = cfg.task_sampler_config.task_sampler_class(cfg)
-    try:
-        # Current BaseMujocoTaskSampler.update_scene accepts only scene_path;
-        # older versions also accepted a redundant ``variant`` keyword.
-        # Passing only the stable argument avoids a post-config API mismatch.
-        if source_model_path is None:
-            sampler.update_scene()
-        else:
-            sampler.update_scene(scene_path=str(source_model_path))
-        runtime_model_path = str(sampler.env.current_model_path)
-        if is_ithor:
-            scene_map = map_cls.from_mj_model_path(
-                model_path=runtime_model_path,
-                agent_radius=agent_radius_m,
-                px_per_m=px_per_m,
-                device_id=None,
-            )
-        else:
-            from scripts.InteractiveNav import explore_molmo_interactions as emi
-
-            # This is the same all-open dynamic state used by the V3 builder for
-            # P_open.  ``build_live_procthor_map`` copies the live joint state
-            # into its occupancy model, unlike an XML-only static render.
-            emi.open_all_doors(sampler.env)
-            scene_map = emi.build_live_procthor_map(
-                sampler.env.current_model,
-                sampler.env.current_data,
-                model_path=runtime_model_path,
-                px_per_m=px_per_m,
-                agent_radius=agent_radius_m,
-                device_id=None,
-                treat_all_non_interactive_doorways_as_open=True,
-            )
-    finally:
-        sampler.close()
+    if source_model_path is None:
+        raise FileNotFoundError(
+            "The scene has neither a precomputed map nor a resolvable base XML."
+        )
+    # Generate the fallback through the tracked simulator map module.  The core
+    # ProcTHOR implementation clears traversable doorway regions and avoids any
+    # dependency on benchmark-generation or exploration scripts.
+    scene_map = map_cls.from_mj_model_path(
+        model_path=str(source_model_path),
+        agent_radius=agent_radius_m,
+        px_per_m=px_per_m,
+        device_id=None,
+    )
     return (
         scene_map,
-        Path(runtime_model_path) if source_model_path is None else source_model_path,
+        source_model_path,
         agent_radius_m,
         px_per_m,
-        "live_all_open_scene_map",
+        "generated_core_scene_map",
         None,
     )
 
@@ -1157,14 +1106,8 @@ def render_episode_topdown(
             "yaw": float(trajectory_yaw[0]) if len(trajectory_yaw) else None,
             "source": "recorder_trajectory_fallback",
         }
-    gt_oracle_path: dict[str, Any] | None = None
+    gt_oracle_path = _frozen_oracle_stage_path(episode)
     gt_oracle_path_error: str | None = None
-    try:
-        gt_oracle_path = _reconstruct_gt_oracle_path(scene_map, episode)
-    except Exception as error:
-        # The rest of the post-eval report remains useful if a historic episode
-        # has incomplete frozen oracle metadata.
-        gt_oracle_path_error = f"{type(error).__name__}: {error}"
     if ros_map_available:
         coverage_label, coverage_metadata = _coverage_summary(
             debug_dir,
@@ -1177,26 +1120,6 @@ def render_episode_topdown(
             "source": "evaluator_trace_fallback",
             "exploration_coverage_ratio": None,
         }
-    if gt_oracle_path is None:
-        # A lightweight ROS-only report may not have enough map resolution for
-        # the source planner.  The frozen oracle navigate stages still provide
-        # an honest GT polyline for visual comparison.
-        stage_points = []
-        if benchmark_start is not None:
-            stage_points.append(np.asarray(benchmark_start["xy"], dtype=float))
-        stage_points.extend(np.asarray(stage["xy"], dtype=float) for stage in _oracle_navigation_stages(episode))
-        if len(stage_points) >= 2:
-            stage_xy = np.asarray(stage_points, dtype=float)
-            gt_oracle_path = {
-                "source": "frozen_oracle_plan_stages",
-                "complete": False,
-                "xy": stage_xy,
-                "start": benchmark_start,
-                "stages": _oracle_navigation_stages(episode),
-                "length_m": _polyline_length_m(stage_xy),
-                "planner": None,
-            }
-
     fig, ax = plt.subplots(figsize=(13.0, 10.0), dpi=160)
     world_min, world_max = _draw_scene_background(ax, scene_map, scene_classes)
     world_margin = max(0.35, 0.04 * float(np.max(world_max - world_min)))
@@ -1332,7 +1255,7 @@ def render_episode_topdown(
     path_text = "unknown" if not isinstance(path_length, (int, float)) else f"{float(path_length):.2f} m"
     gt_path_text = "unavailable"
     if gt_oracle_path is not None and isinstance(gt_oracle_path.get("length_m"), (int, float)):
-        qualifier = "reconstructed" if gt_oracle_path.get("complete") else "partial"
+        qualifier = "reconstructed" if gt_oracle_path.get("complete") else "frozen stages"
         gt_path_text = f"{float(gt_oracle_path['length_m']):.2f} m ({qualifier})"
     title = f"InteractiveNav V3 eval top-down — {case_label}"
     subtitle = f"{coverage_label}  |  GT oracle route: {gt_path_text}  |  driven path: {path_text}  |  terminal: {status_label}"
@@ -1344,7 +1267,7 @@ def render_episode_topdown(
         Patch(facecolor="#f6bd60", label="observed / uncertain"),
         Patch(facecolor="#76b85a", label="mapped free"),
         Patch(facecolor="#d32f2f", label="false occupied"),
-        Line2D([], [], color="#7c3aed", lw=2.2, linestyle=(0, (5, 2.4)), label="GT oracle route (reconstructed)"),
+        Line2D([], [], color="#7c3aed", lw=2.2, linestyle=(0, (5, 2.4)), label="GT oracle plan (frozen stages)"),
         Line2D([], [], color="#06b6d4", lw=2, label="robot trajectory"),
         Line2D([], [], marker="^", color="w", markerfacecolor="#2563eb", markeredgecolor="white", markersize=8, label="benchmark start + heading"),
         Line2D([], [], marker="o", color="w", markerfacecolor="#ef4444", markeredgecolor="white", markersize=7, label="final pose"),
