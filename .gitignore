@@ -68,3 +68,5 @@ __pycache__/
 !/scripts/InteractiveNav/force_interaction_runtime.py
 !/scripts/InteractiveNav/interactive_nav_v3.py
 !/scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py
+!/scripts/InteractiveNav/check_simulator_scope_parity.py
+!/scripts/InteractiveNav/simulator_scope.txt

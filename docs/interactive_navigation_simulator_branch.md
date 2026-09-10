@@ -57,6 +57,13 @@ versions are tracked in Git. The wrapper applies those asset versions, restores
 all recorded object and articulation state before the first observation, and
 evaluates the three domains in deterministic round-robin order.
 
+The default `interactive_nav_v3` simulator profile explicitly locks the policy,
+control, and physics periods to `200/10/10 ms` and uses the legacy RBY1 yaw
+branch mapping shared with the complete experiment stack. The `upstream_main`
+profile selects `200/2/2 ms` and nearest-equivalent yaw for controlled upstream
+comparisons. Use `custom` only with all four dt/yaw options; the
+resolved profile is included in every run signature and manifest.
+
 Use the bundled stop policy for the smallest real-scene wiring check:
 
 ```bash
@@ -82,8 +89,11 @@ It should be trusted code and could read local files on its own. Use process or
 container isolation for untrusted submissions. Runtime/setup exceptions,
 missing rows, and runtime-ineligible formal episodes produce a nonzero wrapper
 exit code; ordinary policy failures remain valid scored outcomes and do not fail
-the command. Top-down rendering is a best-effort reporting artifact and does not
-change scoring or the exit code. Custom benchmark audits may explicitly use
+the command. Top-down rendering is enabled by default and uses the frozen oracle
+stage endpoints plus the tracked core scene-map loader; it does not import the
+benchmark-generation or navigation-method scripts from `codex/exp-setting`.
+Rendering remains a best-effort reporting artifact and does not change scoring
+or the exit code. Custom benchmark audits may explicitly use
 `--allow-runtime-ineligible`.
 
 `scripted_oracle` is evaluator diagnostics only. It follows frozen waypoints and
@@ -107,3 +117,13 @@ excluding `scripts/InteractiveNav/*`, with an explicit allow-list only for this
 branch's evaluator, schema, frozen benchmark, and their simulator-side support
 files. Git ignore rules do not remove tracked files during a reverse merge, so
 directionality remains the actual isolation guarantee.
+
+`scripts/InteractiveNav/simulator_scope.txt` is the machine-readable shared
+surface. After synchronizing this branch into the complete branch, verify that
+its blobs are identical:
+
+```bash
+python scripts/InteractiveNav/check_simulator_scope_parity.py \
+  --sim-ref interactive-nav/sim \
+  --full-ref codex/exp-setting
+```
