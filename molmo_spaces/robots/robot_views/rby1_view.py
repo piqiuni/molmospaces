@@ -19,6 +19,7 @@ from mujoco import MjData
 from molmo_spaces.robots.robot_views.abstract import (
     FreeJointRobotBaseGroup,
     GripperGroup,
+    HoloBaseYawControlMode,
     HoloJointsRobotBaseGroup,
     MJCFFrameMixin,
     RobotBaseGroup,
@@ -234,12 +235,18 @@ class RBY1HoloBaseGroup(HoloJointsRobotBaseGroup):
     The RBY1 base uses three virtual holonomic joints for x, y and theta control.
     """
 
-    def __init__(self, mj_data: MjData, namespace: str = "") -> None:
+    def __init__(
+        self,
+        mj_data: MjData,
+        namespace: str = "",
+        yaw_control_mode: HoloBaseYawControlMode = "nearest_equivalent",
+    ) -> None:
         """Initialize the RBY1 holo base.
 
         Args:
             mj_data: The MuJoCo data structure containing the current simulation state
             namespace: Optional prefix for all joint/body names to support multiple robots
+            yaw_control_mode: How targets crossing the +/-pi branch are mapped
         """
         model = mj_data.model
         world_site_id = model.site(f"{namespace}world").id
@@ -247,7 +254,15 @@ class RBY1HoloBaseGroup(HoloJointsRobotBaseGroup):
         joints = [model.joint(f"{namespace}base_{axis}").id for axis in ["x", "y", "theta"]]
         act = [model.actuator(f"{namespace}base_{axis}_act").id for axis in ["x", "y", "theta"]]
         root_body_id = model.body(f"{namespace}base")
-        super().__init__(mj_data, world_site_id, holo_base_site_id, joints, act, root_body_id)
+        super().__init__(
+            mj_data,
+            world_site_id,
+            holo_base_site_id,
+            joints,
+            act,
+            root_body_id,
+            yaw_control_mode=yaw_control_mode,
+        )
 
 
 class RBY1HeadGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
@@ -298,7 +313,13 @@ class RBY1RobotView(RobotView):
     managed by this class.
     """
 
-    def __init__(self, mj_data: MjData, namespace: str = "", holo_base: bool = False) -> None:
+    def __init__(
+        self,
+        mj_data: MjData,
+        namespace: str = "",
+        holo_base: bool = False,
+        holo_base_yaw_control_mode: HoloBaseYawControlMode = "nearest_equivalent",
+    ) -> None:
         """Initialize the RBY1 robot.
 
         Args:
@@ -309,7 +330,11 @@ class RBY1RobotView(RobotView):
         base = (
             RBY1BaseGroup(mj_data, namespace=namespace)
             if not holo_base
-            else RBY1HoloBaseGroup(mj_data, namespace=namespace)
+            else RBY1HoloBaseGroup(
+                mj_data,
+                namespace=namespace,
+                yaw_control_mode=holo_base_yaw_control_mode,
+            )
         )
         move_groups = {
             "base": base,

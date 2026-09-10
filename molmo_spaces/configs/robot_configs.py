@@ -9,7 +9,7 @@ This module contains:
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from mujoco import MjData
@@ -284,8 +284,12 @@ class RBY1Config(BaseRobotConfig):
     }
 
     use_holo_base: bool = True  # Whether to use virtual holonomic base joints or not
-    # Some ProcTHOR layouts extend beyond the legacy +/-25 m actuator range.
+    # The legacy robot XML limits planar x/y to +/-25 m, which is smaller than
+    # some ProcTHOR scenes and creates an invisible navigation boundary.
     holo_base_position_limit_m: float = 100.0
+    holo_base_yaw_control_mode: Literal[
+        "nearest_equivalent", "legacy_branch_reset"
+    ] = "legacy_branch_reset"
     command_mode: dict[str, str | None] = {
         "arm": "joint_position",  # e.g., "joint_position", "joint_velocity", "ee_position", "ee_velocity"
         "gripper": "joint_position",
@@ -298,7 +302,11 @@ class RBY1Config(BaseRobotConfig):
 
     def model_post_init(self, _context):
         super().model_post_init(_context)
-        self.robot_view_factory = partial(RBY1RobotView, holo_base=self.use_holo_base)
+        self.robot_view_factory = partial(
+            RBY1RobotView,
+            holo_base=self.use_holo_base,
+            holo_base_yaw_control_mode=self.holo_base_yaw_control_mode,
+        )
 
 
 class RBY1MConfig(RBY1Config):

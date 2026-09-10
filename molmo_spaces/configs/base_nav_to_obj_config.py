@@ -36,8 +36,11 @@ class NavToObjBaseConfig(MlSpacesExpConfig):
         "lookat": np.array([0.0, 0.0, 0.5]),
     }
     policy_dt_ms: float = 200.0  # policy time step
-    ctrl_dt_ms: float = 2.0  # control time step
-    sim_dt_ms: float = 2.0  # simulation time step
+    # Keep the navigation simulator timing compatible with the legacy
+    # interactive-nav RBY1 controller.  The main branch's 2 ms pair changes
+    # the per-policy-step base tracking response and breaks the ROS scan.
+    ctrl_dt_ms: float = 10.0  # control time step
+    sim_dt_ms: float = 10.0  # simulation time step
     task_horizon: int = 500  # Maximum steps per episode to prevent infinite runs
     record_videos: bool = False  # Whether to record videos of episodes
 

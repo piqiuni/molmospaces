@@ -22,6 +22,10 @@ from molmo_spaces.utils.linalg_utils import (
 from molmo_spaces.utils.mj_model_and_data_utils import body_pose, site_pose
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat, pose_mat_to_pos_quat
 
+HoloBaseYawControlMode: TypeAlias = Literal[
+    "nearest_equivalent", "legacy_branch_reset"
+]
+
 
 class MoveGroup(ABC):
     """Base class for any collection of joints and actuators in a robot.
@@ -531,6 +535,7 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
         joint_ids: list[int],
         actuator_ids: list[int],
         root_body_id: int,
+        yaw_control_mode: HoloBaseYawControlMode = "nearest_equivalent",
     ):
         """Initialize a HoloJointsRobotBase that has virtual holonomic joints and uses site control.
 
@@ -542,6 +547,7 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
                        NOTE: Assumed order is [x, y, theta].
             actuator_ids: List of actuator IDs that control the base
             root_body_id: The ID of the body that represents the robot base
+            yaw_control_mode: How targets crossing the +/-pi branch are mapped.
         """
         super().__init__(mj_data, joint_ids, actuator_ids, root_body_id)
 
@@ -558,6 +564,9 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
 
         self._world_site_id = world_site_id
         self._holo_base_site_id = holo_base_site_id
+        if yaw_control_mode not in {"nearest_equivalent", "legacy_branch_reset"}:
+            raise ValueError(f"Unsupported holonomic base yaw mode: {yaw_control_mode!r}")
+        self._yaw_control_mode = yaw_control_mode
 
     @property
     def pose(self) -> np.ndarray:
@@ -592,9 +601,20 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
         """
         ctrl = ctrl.copy()
 
-        # Wrap target yaw to be within +-pi of current yaw
-        curr_yaw = self.joint_pos[2]
-        ctrl[2] = curr_yaw + normalize_ang_error(ctrl[2] - curr_yaw)
+        if self._yaw_control_mode == "legacy_branch_reset":
+            # Preserve the legacy RBY1 mapping used by the InteractiveNav V3
+            # benchmark. Move qpos to the equivalent branch before applying a
+            # target that crosses the joint's [-pi, pi] representation.
+            ctrl[2] = normalize_ang_error(ctrl[2])
+            theta_qpos_idx = self.mj_model.jnt_qposadr[self._joint_ids[2]]
+            current_theta = self.mj_data.qpos[theta_qpos_idx]
+            if abs(current_theta - ctrl[2]) > np.pi:
+                self.mj_data.qpos[theta_qpos_idx] = ctrl[2]
+        else:
+            # Upstream-main behavior: retain the current qpos branch and choose
+            # the closest equivalent target.
+            curr_yaw = self.joint_pos[2]
+            ctrl[2] = curr_yaw + normalize_ang_error(ctrl[2] - curr_yaw)
 
         self.mj_data.ctrl[self._actuator_ids] = ctrl
 

@@ -64,6 +64,7 @@ def _load_scene(scene_path: Path, metadata_path: Path | None):
         data,
         robot_config.robot_namespace,
         holo_base=robot_config.use_holo_base,
+        holo_base_yaw_control_mode=robot_config.holo_base_yaw_control_mode,
     )
     for group_name, joint_pos in robot_config.init_qpos.items():
         if group_name == "base":
