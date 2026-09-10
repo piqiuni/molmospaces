@@ -29,6 +29,8 @@ default:
 
 ```bash
 python scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \
+  --benchmark-root scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1 \
+  --pinned-assets-file scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1/pinned_assets.json \
   --output-dir /home/ldl/outputs/interactive-nav/external_policy_eval \
   --policy factory \
   --policy-factory your_package.your_policy:build_policy \
