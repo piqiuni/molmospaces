@@ -1069,6 +1069,15 @@ def get_nav_task_sensors(exp_config):
             uuid=camera_name,
         )
         sensors.append(cam_rgb)
+
+        if camera_spec.record_depth:
+            sensors.append(
+                DepthSensor(
+                    camera_name=camera_name,
+                    img_resolution=exp_config.camera_config.img_resolution,
+                    uuid=f"{camera_name}_depth",
+                )
+            )
     # Robot State sensors
     sensors.append(RobotBasePoseSensor(uuid="robot_base_pose"))
     sensors.append(RobotJointPositionSensor(uuid="qpos", max_joints=25))

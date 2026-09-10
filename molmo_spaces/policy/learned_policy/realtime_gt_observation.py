@@ -42,9 +42,38 @@ def _joint_type_name(joint_type: Any) -> str:
 
 
 def _safe_body_aabb(model, data, body_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return a world-space AABB without allowing one bad filter to erase it.
+
+    ``body_aabb`` uses ``visible_only`` (the utility API was renamed from the
+    older ``visual_only`` spelling).  A visible-only body can legitimately have
+    no qualifying geoms, so retry with the complete body hierarchy before
+    reporting a zero-sized geometry.
+    """
+
+    def _valid(size: np.ndarray) -> bool:
+        values = np.asarray(size, dtype=np.float64).reshape(-1)
+        return values.size >= 3 and bool(np.all(np.isfinite(values[:3]))) and bool(
+            np.all(values[:3] > 1e-6)
+        )
+
     try:
-        return body_aabb(model, data, body_id, visual_only=True)
+        center, size = body_aabb(model, data, body_id, visible_only=True)
+        if _valid(size):
+            return center, size
+        # Some assets put their collision geometry in groups excluded from the
+        # visual filter.  Their full body AABB is still valid interaction
+        # geometry and is preferable to silently publishing [0, 0, 0].
+        full_center, full_size = body_aabb(model, data, body_id, visible_only=False)
+        if _valid(full_size):
+            return full_center, full_size
+        return center, size
     except Exception:
+        try:
+            center, size = body_aabb(model, data, body_id, visible_only=False)
+            if _valid(size):
+                return center, size
+        except Exception:
+            pass
         return data.xpos[body_id].copy(), np.zeros(3, dtype=np.float64)
 
 
@@ -160,7 +189,12 @@ def _interaction_approach_axis_xy(model, data, joint_infos: list[dict[str, Any]]
         norm = float(np.linalg.norm(tangent_xy))
         if norm > 1e-6:
             hinge_axes.append(tangent_xy / norm)
-    return _aligned_mean_axis(slide_axes or hinge_axes)
+    # For appliances with both a hinged door and internal slide rails, the
+    # hinged door motion is the operational front.  Using the slide direction
+    # here makes the graph publish a tray/rail axis, which later produces an
+    # apparently reachable but physically wrong refrigerator anchor.  Drawers
+    # and slide-only containers retain their slide direction.
+    return _aligned_mean_axis(hinge_axes or slide_axes)
 
 
 def _bbox_area(bbox: list[float] | list[int]) -> float:
@@ -508,6 +542,7 @@ class RealtimeGTObservationPublisher:
         data = env.current_data
         camera = env.camera_manager.registry[self.camera_name]
         camera_position = np.asarray(camera.pos, dtype=np.float64).copy()
+        camera_forward = np.asarray(camera.forward, dtype=np.float64).copy()
         image_size = [int(segmentation.shape[1]), int(segmentation.shape[0])]
         observations = []
         for spec_index, visible_pixels, bbox_2d, mask_rle in visible:
@@ -575,6 +610,11 @@ class RealtimeGTObservationPublisher:
             "camera_name": self.camera_name,
             "stamp_sec": capture_stamp_sec,
             "capture_stamp_sec": capture_stamp_sec,
+            "observation_pose_xyyaw": [
+                float(camera_position[0]),
+                float(camera_position[1]),
+                float(np.arctan2(camera_forward[1], camera_forward[0])),
+            ],
             # Public telemetry names the observation contract rather than the
             # evaluator implementation.  The mapping callback already knows
             # this arrives on its dedicated realtime-GT subscription.

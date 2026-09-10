@@ -182,6 +182,63 @@ def test_slide_joint_open_direction_defines_container_front_axis():
     assert axis == [0.0, -1.0]
 
 
+def test_hinge_axis_defines_front_for_container_with_internal_slide():
+    class JointModel:
+        jnt_bodyid = np.asarray([1, 1])
+
+        @staticmethod
+        def joint(name):
+            return FakeNamedElement({"door_hinge": 0, "tray_slide": 1}[name], name)
+
+    class JointData:
+        xaxis = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+        xanchor = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        xpos = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    axis = realtime_gt._interaction_approach_axis_xy(
+        JointModel(),
+        JointData(),
+        [
+            {
+                "joint_name": "door_hinge",
+                "joint_type": "hinge",
+                "joint_range": [0.0, 1.5],
+                "joint_value": 0.0,
+            },
+            {
+                "joint_name": "tray_slide",
+                "joint_type": "slide",
+                "joint_range": [0.0, 0.5],
+                "joint_value": 0.0,
+            },
+        ],
+    )
+
+    assert axis == [0.0, 1.0]
+
+
+def test_safe_body_aabb_retries_without_visible_filter_for_empty_geometry():
+    original_aabb = realtime_gt.body_aabb
+    calls = []
+
+    def fake_aabb(_model, _data, _body_id, *, visible_only=True):
+        calls.append(visible_only)
+        if visible_only:
+            return np.asarray([1.0, 2.0, 3.0]), np.zeros(3)
+        return np.asarray([4.0, 5.0, 6.0]), np.asarray([0.5, 1.0, 1.5])
+
+    realtime_gt.body_aabb = fake_aabb
+    try:
+        data = type("BodyData", (), {"xpos": np.zeros((2, 3))})()
+        center, size = realtime_gt._safe_body_aabb(object(), data, 1)
+    finally:
+        realtime_gt.body_aabb = original_aabb
+
+    assert calls == [True, False]
+    np.testing.assert_array_equal(center, [4.0, 5.0, 6.0])
+    np.testing.assert_array_equal(size, [0.5, 1.0, 1.5])
+
+
 def test_visible_fraction_rejects_small_observed_extent():
     camera_position = np.asarray([0.0, 0.0, 0.0])
     camera_forward = np.asarray([1.0, 0.0, 0.0])
@@ -411,8 +468,8 @@ def test_publisher_applies_min_visible_fraction_to_projected_object_extent():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([1.0, 1.0, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -445,8 +502,8 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -457,6 +514,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert first["episode_reset"] is True
         assert first["capture_step"] == 0
         assert first["image_size"] == [5, 5]
+        assert first["observation_pose_xyyaw"] == [0.0, 0.0, 0.0]
         observation = first["observations"][0]
         assert set(observation) == {
             "id",
@@ -525,8 +583,8 @@ def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
@@ -597,8 +655,8 @@ def test_realtime_gt_reuses_private_snapshot_but_force_always_renders_fresh():
     )
     original_aabb = realtime_gt.body_aabb
 
-    def fake_aabb(_model, data, body_id, visual_only=True):
-        assert visual_only is True
+    def fake_aabb(_model, data, body_id, visible_only=True):
+        assert visible_only is True
         return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
 
     realtime_gt.body_aabb = fake_aabb
