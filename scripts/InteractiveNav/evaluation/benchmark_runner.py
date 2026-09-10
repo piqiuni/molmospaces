@@ -112,12 +112,78 @@ from .trusted_interaction_skill import (
     TrustedInteractionSkill,
 )
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v14"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v15"
 PUBLIC_OBSERVATION_SCHEMA_VERSION = "interactive_nav_public_observation_v2"
 INITIAL_STATE_REPLAY_VERSION = "interactive_nav_v3_initial_state_replay_v2"
 INTERACTION_EXECUTION_MODE = "canonical_locked_force"
 STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
 DYNAMIC_MAX_STEPS_CAP = 2000
+
+
+@dataclass(frozen=True)
+class SimulatorProtocolProfile:
+    """Physics/control semantics that must not drift between code branches."""
+
+    policy_dt_ms: float
+    ctrl_dt_ms: float
+    sim_dt_ms: float
+    holo_base_yaw_control_mode: Literal[
+        "nearest_equivalent", "legacy_branch_reset"
+    ]
+
+
+SIMULATOR_PROTOCOL_PROFILES: dict[str, SimulatorProtocolProfile] = {
+    # This is the timing/yaw behavior used by the complete InteractiveNav
+    # experiments and is therefore the canonical frozen benchmark protocol.
+    "interactive_nav_v3": SimulatorProtocolProfile(
+        policy_dt_ms=200.0,
+        ctrl_dt_ms=10.0,
+        sim_dt_ms=10.0,
+        holo_base_yaw_control_mode="legacy_branch_reset",
+    ),
+    # Retain an explicit upstream-main profile for controlled migration tests.
+    "upstream_main": SimulatorProtocolProfile(
+        policy_dt_ms=200.0,
+        ctrl_dt_ms=2.0,
+        sim_dt_ms=2.0,
+        holo_base_yaw_control_mode="nearest_equivalent",
+    ),
+}
+DEFAULT_SIMULATOR_PROFILE = "interactive_nav_v3"
+
+
+def resolve_simulator_protocol(
+    profile_name: str,
+    *,
+    policy_dt_ms: float | None = None,
+    ctrl_dt_ms: float | None = None,
+    sim_dt_ms: float | None = None,
+    holo_base_yaw_control_mode: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a named simulator profile or validate a fully explicit custom one."""
+
+    profile = SIMULATOR_PROTOCOL_PROFILES.get(profile_name)
+    provided = {
+        "policy_dt_ms": policy_dt_ms,
+        "ctrl_dt_ms": ctrl_dt_ms,
+        "sim_dt_ms": sim_dt_ms,
+        "holo_base_yaw_control_mode": holo_base_yaw_control_mode,
+    }
+    if profile is not None:
+        defaults = asdict(profile)
+        return {
+            name: defaults[name] if value is None else value
+            for name, value in provided.items()
+        }
+    if profile_name != "custom":
+        raise ValueError(f"Unsupported simulator profile: {profile_name!r}")
+    missing = [name for name, value in provided.items() if value is None]
+    if missing:
+        raise ValueError(
+            "custom simulator profile requires explicit values for: "
+            + ", ".join(missing)
+        )
+    return provided
 
 # Established ROS exploration posture.  The asymmetric shoulder roll tucks the
 # arms beside the torso so they neither move after the first navigation action
@@ -152,9 +218,15 @@ class BenchmarkEvaluationConfig:
     video_fps: float = 5.0
     camera_names: list[str] = field(default_factory=lambda: ["head_camera"])
     image_resolution: tuple[int, int] | None = (640, 480)
+    simulator_profile: Literal[
+        "interactive_nav_v3", "upstream_main", "custom"
+    ] = DEFAULT_SIMULATOR_PROFILE
     policy_dt_ms: float = 200.0
     ctrl_dt_ms: float = 10.0
     sim_dt_ms: float = 10.0
+    holo_base_yaw_control_mode: Literal[
+        "nearest_equivalent", "legacy_branch_reset"
+    ] = "legacy_branch_reset"
     force_duration_seconds: float = 2.0
     force_collection_hz: float = 5.0
     force_target_fraction: float = 1.0
@@ -204,6 +276,7 @@ class BenchmarkEvaluationConfig:
     restricted_gt_min_visible_fraction: float = 0.2
     restricted_gt_max_distance_m: float = 4.0
     quality_gate_only: bool = False
+    allow_runtime_ineligible: bool = False
     runtime_joint_position_tolerance: float = 0.02
     runtime_joint_fraction_tolerance: float = 0.05
     runtime_base_position_tolerance_m: float = 0.05
@@ -260,6 +333,30 @@ class BenchmarkEvaluationConfig:
             raise ValueError(f"{self.policy} requires head_camera for RGB/depth and pose publication")
         if not self.camera_names:
             raise ValueError("camera_names must not be empty")
+        if self.simulator_profile != "custom":
+            expected_profile = SIMULATOR_PROTOCOL_PROFILES.get(self.simulator_profile)
+            if expected_profile is None:
+                raise ValueError(
+                    f"Unsupported simulator_profile: {self.simulator_profile!r}"
+                )
+            actual = (
+                float(self.policy_dt_ms),
+                float(self.ctrl_dt_ms),
+                float(self.sim_dt_ms),
+                self.holo_base_yaw_control_mode,
+            )
+            expected = (
+                expected_profile.policy_dt_ms,
+                expected_profile.ctrl_dt_ms,
+                expected_profile.sim_dt_ms,
+                expected_profile.holo_base_yaw_control_mode,
+            )
+            if actual != expected:
+                raise ValueError(
+                    f"simulator_profile {self.simulator_profile!r} requires "
+                    f"policy/ctrl/sim/yaw={expected!r}, got {actual!r}; use "
+                    "simulator_profile='custom' for an intentional variant"
+                )
         if self.image_resolution is not None and min(self.image_resolution) <= 0:
             raise ValueError("image_resolution must be positive")
         for name, value in (
@@ -970,8 +1067,12 @@ def _build_replay_config(
         K_damping=None,
         action_noise_config=SimpleNamespace(enabled=False),
         holo_base_position_limit_m=100.0,
+        holo_base_yaw_control_mode=config.holo_base_yaw_control_mode,
         robot_view_factory=lambda mj_data, namespace: RBY1RobotView(
-            mj_data, namespace, holo_base=True
+            mj_data,
+            namespace,
+            holo_base=True,
+            holo_base_yaw_control_mode=config.holo_base_yaw_control_mode,
         ),
         # BaseRobotConfig exposes this method; keep the lightweight replay
         # namespace compatible without invoking Pydantic model copying.
@@ -5021,9 +5122,19 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--video-fps", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["head_camera"])
     parser.add_argument("--image-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=[640, 480])
-    parser.add_argument("--policy-dt-ms", type=float, default=200.0)
-    parser.add_argument("--ctrl-dt-ms", type=float, default=10.0)
-    parser.add_argument("--sim-dt-ms", type=float, default=10.0)
+    parser.add_argument(
+        "--simulator-profile",
+        choices=[*SIMULATOR_PROTOCOL_PROFILES, "custom"],
+        default=DEFAULT_SIMULATOR_PROFILE,
+        help="Named physics/control protocol; custom requires all dt/yaw arguments.",
+    )
+    parser.add_argument("--policy-dt-ms", type=float)
+    parser.add_argument("--ctrl-dt-ms", type=float)
+    parser.add_argument("--sim-dt-ms", type=float)
+    parser.add_argument(
+        "--holo-base-yaw-control-mode",
+        choices=["nearest_equivalent", "legacy_branch_reset"],
+    )
     parser.add_argument("--force-duration-seconds", type=float, default=2.0)
     parser.add_argument("--force-collection-hz", type=float, default=5.0)
     parser.add_argument("--force-target-fraction", type=float, default=1.0)
@@ -5164,6 +5275,11 @@ def parse_args() -> BenchmarkEvaluationConfig:
         action="store_true",
         help="Load and validate runtime consistency without executing policy actions.",
     )
+    parser.add_argument(
+        "--allow-runtime-ineligible",
+        action="store_true",
+        help="Return success despite runtime-ineligible rows (audit/debug only).",
+    )
     parser.add_argument("--runtime-joint-position-tolerance", type=float, default=0.02)
     parser.add_argument("--runtime-joint-fraction-tolerance", type=float, default=0.05)
     parser.add_argument("--runtime-base-position-tolerance-m", type=float, default=0.05)
@@ -5188,6 +5304,13 @@ def parse_args() -> BenchmarkEvaluationConfig:
     )
     parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
+    simulator_protocol = resolve_simulator_protocol(
+        args.simulator_profile,
+        policy_dt_ms=args.policy_dt_ms,
+        ctrl_dt_ms=args.ctrl_dt_ms,
+        sim_dt_ms=args.sim_dt_ms,
+        holo_base_yaw_control_mode=args.holo_base_yaw_control_mode,
+    )
     return BenchmarkEvaluationConfig(
         benchmark=args.benchmark,
         output_dir=args.output_dir,
@@ -5211,9 +5334,13 @@ def parse_args() -> BenchmarkEvaluationConfig:
         video_fps=args.video_fps,
         camera_names=list(args.camera_names),
         image_resolution=tuple(args.image_resolution),
-        policy_dt_ms=args.policy_dt_ms,
-        ctrl_dt_ms=args.ctrl_dt_ms,
-        sim_dt_ms=args.sim_dt_ms,
+        simulator_profile=args.simulator_profile,
+        policy_dt_ms=simulator_protocol["policy_dt_ms"],
+        ctrl_dt_ms=simulator_protocol["ctrl_dt_ms"],
+        sim_dt_ms=simulator_protocol["sim_dt_ms"],
+        holo_base_yaw_control_mode=simulator_protocol[
+            "holo_base_yaw_control_mode"
+        ],
         force_duration_seconds=args.force_duration_seconds,
         force_collection_hz=args.force_collection_hz,
         force_target_fraction=args.force_target_fraction,
@@ -5265,6 +5392,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         restricted_gt_min_visible_fraction=args.restricted_gt_min_visible_fraction,
         restricted_gt_max_distance_m=args.restricted_gt_max_distance_m,
         quality_gate_only=args.quality_gate_only,
+        allow_runtime_ineligible=args.allow_runtime_ineligible,
         runtime_joint_position_tolerance=args.runtime_joint_position_tolerance,
         runtime_joint_fraction_tolerance=args.runtime_joint_fraction_tolerance,
         runtime_base_position_tolerance_m=args.runtime_base_position_tolerance_m,
@@ -5276,11 +5404,28 @@ def parse_args() -> BenchmarkEvaluationConfig:
     )
 
 
+def _evaluation_exit_code(
+    output: Mapping[str, Any], *, allow_runtime_ineligible: bool
+) -> int:
+    summary = output["summary"]
+    planned_count = len(summary.get("episode_indices", ()))
+    return int(
+        int(summary.get("exception_count", 0)) > 0
+        or int(summary.get("result_count", 0)) != planned_count
+        or (
+            int(summary.get("runtime_ineligible_episode_count", 0)) > 0
+            and not allow_runtime_ineligible
+        )
+    )
+
+
 def main() -> int:
     config = parse_args()
     output = run_evaluation(config)
     print(json.dumps(output["summary"], indent=2, ensure_ascii=False))
-    return 0
+    return _evaluation_exit_code(
+        output, allow_runtime_ineligible=config.allow_runtime_ineligible
+    )
 
 
 if __name__ == "__main__":

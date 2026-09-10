@@ -146,12 +146,19 @@ def test_gzip_benchmark_loader_and_dry_run(tmp_path: Path) -> None:
     assert manifest["selected_episode_count"] == 3
     assert len(manifest["wrapper_implementation_sha256"]) == 64
     assert manifest["domain_counts"] == {"channel": 1, "container": 1, "mixed": 1}
-    assert manifest["protocol_version"] == "interactive_nav_v3_benchmark_eval_v14"
+    assert manifest["protocol_version"] == "interactive_nav_v3_benchmark_eval_v15"
     assert (
         manifest["public_observation_schema_version"]
         == "interactive_nav_public_observation_v2"
     )
     assert manifest["interaction_execution_mode"] == "canonical_locked_force"
+    assert manifest["simulator_profile"] == "interactive_nav_v3"
+    assert manifest["simulator_protocol"] == {
+        "policy_dt_ms": 200.0,
+        "ctrl_dt_ms": 10.0,
+        "sim_dt_ms": 10.0,
+        "holo_base_yaw_control_mode": "legacy_branch_reset",
+    }
     assert manifest["pinned_assets"]["versions"]["scenes"] == {
         "procthor-10k-val": "20251217"
     }

@@ -126,6 +126,14 @@ for the smallest real-scene integration run.
 
 ## Reproducibility and parallelism
 
+The evaluator records an explicit simulator profile instead of inheriting a
+branch-local default. The formal `interactive_nav_v3` profile is
+`policy_dt_ms=200`, `ctrl_dt_ms=10`, `sim_dt_ms=10`, with
+`legacy_branch_reset` RBY1 yaw mapping. The `upstream_main` comparison profile
+uses `200/2/2 ms` and `nearest_equivalent` yaw. A `custom` profile is accepted
+only when all dt and yaw values are supplied explicitly. Changing profile
+changes the run signature and results must not be compared as the same protocol.
+
 One episode owns one MuJoCo context.  `--workers N` starts up to N independent
 processes; this is required because MuJoCo renderers and episode state are not
 thread safe.  `--resume` only skips episode directories whose completed trace

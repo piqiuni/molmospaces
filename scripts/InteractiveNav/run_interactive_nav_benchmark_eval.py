@@ -71,6 +71,7 @@ DEFAULT_BENCHMARK_ROOT = (
     / "interactive_nav_v3_procthor10k_val_release_v1_1"
 )
 DOMAIN_NAMES = ("channel", "container", "mixed")
+SIMULATOR_PROFILE_NAMES = ("interactive_nav_v3", "upstream_main", "custom")
 DEFAULT_PINNED_ASSETS_FILE = DEFAULT_BENCHMARK_ROOT / "pinned_assets.json"
 
 
@@ -651,7 +652,18 @@ class _Progress:
 def _make_config(args: argparse.Namespace, source: Path, output_dir: Path) -> dict[str, Any]:
     # Import lazily: ``--help`` and selection validation should work without
     # initializing MuJoCo, while child workers use the canonical dataclass.
-    from scripts.InteractiveNav.evaluation.benchmark_runner import BenchmarkEvaluationConfig
+    from scripts.InteractiveNav.evaluation.benchmark_runner import (
+        BenchmarkEvaluationConfig,
+        resolve_simulator_protocol,
+    )
+
+    simulator_protocol = resolve_simulator_protocol(
+        args.simulator_profile,
+        policy_dt_ms=args.policy_dt_ms,
+        ctrl_dt_ms=args.ctrl_dt_ms,
+        sim_dt_ms=args.sim_dt_ms,
+        holo_base_yaw_control_mode=args.holo_base_yaw_control_mode,
+    )
 
     config = BenchmarkEvaluationConfig(
         benchmark=source,
@@ -671,6 +683,14 @@ def _make_config(args: argparse.Namespace, source: Path, output_dir: Path) -> di
         image_resolution=None
         if args.image_resolution is None
         else tuple(int(value) for value in args.image_resolution),
+        simulator_profile=args.simulator_profile,
+        policy_dt_ms=simulator_protocol["policy_dt_ms"],
+        ctrl_dt_ms=simulator_protocol["ctrl_dt_ms"],
+        sim_dt_ms=simulator_protocol["sim_dt_ms"],
+        holo_base_yaw_control_mode=simulator_protocol[
+            "holo_base_yaw_control_mode"
+        ],
+        allow_runtime_ineligible=bool(args.allow_runtime_ineligible),
         progress_every=max(1, int(args.progress_every)),
     )
     config.validate()
@@ -701,6 +721,14 @@ def _build_schedule(args: argparse.Namespace) -> tuple[list[ScheduledEpisode], d
     # Signatures are domain-specific and include the selected local indices;
     # this keeps --resume safe when one domain's source or selection changes.
     from scripts.InteractiveNav.evaluation import benchmark_runner
+
+    simulator_protocol = benchmark_runner.resolve_simulator_protocol(
+        args.simulator_profile,
+        policy_dt_ms=args.policy_dt_ms,
+        ctrl_dt_ms=args.ctrl_dt_ms,
+        sim_dt_ms=args.sim_dt_ms,
+        holo_base_yaw_control_mode=args.holo_base_yaw_control_mode,
+    )
 
     for domain in DOMAIN_NAMES:
         domain_items = [item for item in selected if item.domain == domain]
@@ -755,6 +783,8 @@ def _build_schedule(args: argparse.Namespace) -> tuple[list[ScheduledEpisode], d
         ),
         "initial_state_replay_version": benchmark_runner.INITIAL_STATE_REPLAY_VERSION,
         "interaction_execution_mode": benchmark_runner.INTERACTION_EXECUTION_MODE,
+        "simulator_profile": args.simulator_profile,
+        "simulator_protocol": simulator_protocol,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "workers": int(args.workers),
         "policy": args.policy,
@@ -832,6 +862,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-fps", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["head_camera"])
     parser.add_argument("--image-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=[640, 480])
+    parser.add_argument(
+        "--simulator-profile",
+        choices=SIMULATOR_PROFILE_NAMES,
+        default="interactive_nav_v3",
+        help=(
+            "Physics/control protocol. interactive_nav_v3 is the frozen "
+            "200/10/10 ms legacy-yaw benchmark profile."
+        ),
+    )
+    parser.add_argument("--policy-dt-ms", type=float)
+    parser.add_argument("--ctrl-dt-ms", type=float)
+    parser.add_argument("--sim-dt-ms", type=float)
+    parser.add_argument(
+        "--holo-base-yaw-control-mode",
+        choices=("nearest_equivalent", "legacy_branch_reset"),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--allow-runtime-ineligible",
@@ -925,6 +971,8 @@ def main(argv: list[str] | None = None) -> int:
             "domains",
             "allow_runtime_ineligible",
             "render_topdown",
+            "simulator_profile",
+            "simulator_protocol",
         ):
             if previous_manifest.get(key) != manifest.get(key):
                 raise ValueError(

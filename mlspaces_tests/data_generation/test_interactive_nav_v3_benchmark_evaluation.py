@@ -6,6 +6,7 @@ resume behavior.  They never create a MuJoCo task or load a scene.
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from dataclasses import replace
@@ -1086,7 +1087,10 @@ def test_config_validation_and_index_selection_are_local() -> None:
         ).validate()
     with pytest.raises(ValueError, match="integer multiple"):
         benchmark_runner.BenchmarkEvaluationConfig(
-            benchmark=Path("benchmark.json"), output_dir=Path("out"), policy_dt_ms=205.0
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            simulator_profile="custom",
+            policy_dt_ms=205.0,
         ).validate()
     with pytest.raises(ValueError, match="duplicates"):
         benchmark_runner.BenchmarkEvaluationConfig(
@@ -1116,6 +1120,75 @@ def test_config_validation_and_index_selection_are_local() -> None:
         replace(config, ros_command_starvation_timeout_s=-1.0).validate()
     with pytest.raises(ValueError, match="observation_turn_multiplier"):
         replace(config, ros_observation_turn_multiplier=0.5).validate()
+
+
+def test_named_simulator_profiles_lock_timing_and_yaw_semantics() -> None:
+    interactive = benchmark_runner.resolve_simulator_protocol(
+        "interactive_nav_v3"
+    )
+    assert interactive == {
+        "policy_dt_ms": 200.0,
+        "ctrl_dt_ms": 10.0,
+        "sim_dt_ms": 10.0,
+        "holo_base_yaw_control_mode": "legacy_branch_reset",
+    }
+    upstream = benchmark_runner.resolve_simulator_protocol("upstream_main")
+    assert upstream == {
+        "policy_dt_ms": 200.0,
+        "ctrl_dt_ms": 2.0,
+        "sim_dt_ms": 2.0,
+        "holo_base_yaw_control_mode": "nearest_equivalent",
+    }
+    with pytest.raises(ValueError, match="requires policy/ctrl/sim/yaw"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            simulator_profile="interactive_nav_v3",
+            ctrl_dt_ms=2.0,
+        ).validate()
+    with pytest.raises(ValueError, match="requires explicit values"):
+        benchmark_runner.resolve_simulator_protocol("custom")
+
+
+def test_low_level_cli_exit_code_rejects_incomplete_evaluation() -> None:
+    complete = {
+        "summary": {
+            "episode_indices": [0],
+            "result_count": 1,
+            "exception_count": 0,
+            "runtime_ineligible_episode_count": 0,
+        }
+    }
+    assert (
+        benchmark_runner._evaluation_exit_code(
+            complete, allow_runtime_ineligible=False
+        )
+        == 0
+    )
+
+    ineligible = copy.deepcopy(complete)
+    ineligible["summary"]["runtime_ineligible_episode_count"] = 1
+    assert (
+        benchmark_runner._evaluation_exit_code(
+            ineligible, allow_runtime_ineligible=False
+        )
+        == 1
+    )
+    assert (
+        benchmark_runner._evaluation_exit_code(
+            ineligible, allow_runtime_ineligible=True
+        )
+        == 0
+    )
+
+    exception = copy.deepcopy(complete)
+    exception["summary"]["exception_count"] = 1
+    assert (
+        benchmark_runner._evaluation_exit_code(
+            exception, allow_runtime_ineligible=True
+        )
+        == 1
+    )
 
 
 def test_video_output_resolves_lazy_saver(
