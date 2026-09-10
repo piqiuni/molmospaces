@@ -1,4 +1,9 @@
-# InteractiveNav V3 ProcTHOR validation benchmark
+# InteractiveNav V3 ProcTHOR validation benchmark (legacy v1.1)
+
+This is the historical runtime-qualified bundle. The complete v1.2 candidate
+release is now the repository default at
+`../interactive_nav_v3_procthor10k_val_release_v1_2`; use this directory only
+when reproducing an older v1.1 run.
 
 This directory carries the three scoring domains from frozen release
 `interactive-nav-v3-procthor10k-val-release-v1.1`:
@@ -18,7 +23,9 @@ records its content hash in every run manifest/signature. Override it explicitly
 with `--pinned-assets-file` only when auditing another compatible asset build.
 
 Both the V3 evaluator and the mixed-domain wrapper accept `.json` and
-`.json.gz` transparently. The wrapper uses this directory by default:
+`.json.gz` transparently. Pass this directory explicitly with
+`--benchmark-root` when reproducing v1.1; the wrapper no longer selects it by
+default:
 
 ```bash
 python scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \

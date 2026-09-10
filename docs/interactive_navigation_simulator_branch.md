@@ -45,12 +45,16 @@ transition, sibling-joint movement, or failure to find a collision-free pose.
 
 ## Standalone benchmark evaluation
 
-The repository includes the frozen ProcTHOR validation release in
-`scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1`:
+The repository includes the complete frozen ProcTHOR validation release in
+`scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_2`:
 
 - Channel: 1,000 episodes
-- Container: 976 episodes
-- Mixed: 992 episodes
+- Container: 1,000 episodes
+- Mixed: 1,000 episodes
+
+The three shards therefore contain the full 3,000-episode candidate set. The
+previous v1.1 runtime-qualified bundle remains in the repository only for
+historical/reproduction use; it is not selected by the default evaluator.
 
 The archives, their SHA-256 digests, and the release-pinned robot/scene/object
 versions are tracked in Git. The wrapper applies those asset versions, restores

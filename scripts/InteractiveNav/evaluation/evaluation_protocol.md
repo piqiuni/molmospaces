@@ -21,21 +21,24 @@ bundle's `pinned_assets.json`; the standalone wrapper does this automatically.
 
 ## Fixed input
 
-The formal validation input is the runtime-qualified v1.1 release bundled as
-three losslessly compressed domain shards:
+The formal validation input is the complete v1.2 release bundled as three
+losslessly compressed domain shards:
 
 ```text
-scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1/
+scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_2/
 ```
 
-The formal scoring denominator is 2968: 1000 Channel, 976 Container and 992
-Mixed. The evaluator must not modify the frozen JSON. Each episode's
-`scene_modifications` is the authoritative initial object/articulation state.
+The formal scoring denominator is 3000: 1000 Channel, 1000 Container and 1000
+Mixed. This release contains every candidate episode; no domain is truncated or
+quality-gate filtered at bundle publication time. The evaluator must not modify
+the frozen JSON. Each episode's `scene_modifications` is the authoritative
+initial object/articulation state.
 
 The evaluator transparently reads `.json` and `.json.gz`. The omitted aggregate
-is exactly `channel + container + mixed` in that order, so the three shards retain
-all 2,968 formal episodes without duplicating 135 MB in Git. `manifest.json`
-records both archive and uncompressed hashes.
+has the same episode list as `channel + container + mixed` in that order, so the
+three shards retain all 3,000 formal episodes without duplicating the large
+aggregate in Git. `manifest.json` records both archive and uncompressed hashes,
+as well as the source aggregate hash.
 
 ### Runtime compatibility gate
 
