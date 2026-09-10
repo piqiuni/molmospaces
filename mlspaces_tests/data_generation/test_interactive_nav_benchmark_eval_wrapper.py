@@ -374,6 +374,11 @@ def test_example_external_factory_uses_public_contract() -> None:
 def test_bundled_benchmark_matches_manifest() -> None:
     root = MODULE.DEFAULT_BENCHMARK_ROOT
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert root.name == "interactive_nav_v3_procthor10k_val_release_v1_2"
+    assert manifest["release_id"] == "interactive-nav-v3-procthor10k-val-release-v1.2"
+    assert manifest["candidate_episode_count"] == 3000
+    assert manifest["formal_episode_count"] == 3000
+    assert manifest["excluded_episode_count"] == 0
     total = 0
     case_ids: set[str] = set()
     for domain in MODULE.DOMAIN_NAMES:
