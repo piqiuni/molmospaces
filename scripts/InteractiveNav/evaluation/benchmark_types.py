@@ -178,6 +178,12 @@ class EpisodeResult:
     interaction_precision_episode: float | None = None
     episode_total_cost: float | None = None
     episode_total_cost_breakdown: dict[str, Any] = field(default_factory=dict)
+    # Diagnostic-only endpoint for releases whose natural-language target
+    # description does not uniquely identify one same-category instance.
+    # ``success`` and ``nav_success`` remain strict selected-instance scores.
+    goal_definition_relaxed_success: bool = False
+    goal_definition_relaxed_instance_id: str | None = None
+    goal_definition_relaxed_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

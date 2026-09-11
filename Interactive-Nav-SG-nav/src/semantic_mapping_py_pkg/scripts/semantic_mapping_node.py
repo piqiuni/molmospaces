@@ -887,13 +887,18 @@ class SemanticMappingNode:
         room_commit = None
         with self.lock:
             commit_lock_wait_ms = (time.perf_counter() - commit_lock_t0) * 1000.0
-            # New raw OCC alone does not invalidate a same-geometry topology
-            # result.  Portal-hint changes and episode resets do, so a room
-            # result can make forward progress under a 5 Hz mapping stream.
+            # Do not publish a room grid against a newer raw OCC source.  The
+            # worker remains latest-only, but an older result must be discarded
+            # before it can overwrite the graph/readiness watermark and strand
+            # a newly opened room behind a stale decomposition.
             if (
                 epoch == int(self._room_epoch)
                 and topology_revision == int(
                     getattr(self, "_room_topology_revision", 0)
+                )
+                and self._room_snapshot_is_current_locked(
+                    raw=raw,
+                    input_revision=input_revision,
                 )
             ):
                 self.latest_room_segment_grid = room_grid
@@ -967,6 +972,10 @@ class SemanticMappingNode:
                     int(room_commit["epoch"]) == int(self._room_epoch)
                     and int(room_commit["topology_revision"])
                     == int(getattr(self, "_room_topology_revision", 0))
+                    and self._room_snapshot_is_current_locked(
+                        raw=raw,
+                        input_revision=input_revision,
+                    )
                 ):
                     self._room_last_commit = dict(room_commit)
             # In strict mode the worker is the event that makes the causal
@@ -1021,6 +1030,25 @@ class SemanticMappingNode:
         except (TypeError, ValueError):
             return False
         return left_step >= 0 and right_step >= 0 and left_step == right_step
+
+    def _room_snapshot_is_current_locked(self, *, raw, input_revision):
+        """Return whether a room result still describes the latest OCC source.
+
+        The room worker is deliberately latest-only.  A high-rate mapper can
+        publish another callback while segmentation is running, so revision
+        equality is the normal fast path.  Some publishers resend the same
+        source frame, however; accepting that exact source avoids starving the
+        worker without ever committing a result for a newer map.
+        """
+
+        current_revision = int(getattr(self, "_room_input_revision", 0))
+        if int(input_revision) == current_revision:
+            return True
+        current_raw = getattr(self, "latest_occupancy_grid", None)
+        return self._same_occupancy_source(
+            self._occupancy_source_identity(raw),
+            self._occupancy_source_identity(current_raw),
+        )
 
     def _semantic_mapping_ready_payload_for_bundle(self, bundle):
         """Build the mapper readiness watermark for one published bundle.
@@ -1364,6 +1392,7 @@ class SemanticMappingNode:
     def interaction_result_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
         deferred_room_refresh_result = None
+        refresh_room_immediately = False
         pending_node_id = ""
         with self.lock:
             command = self._take_interaction_command_locked(parsed)
@@ -1395,6 +1424,16 @@ class SemanticMappingNode:
                 # traversability to the planner.
                 self._post_open_planning_refresh_after_stamp_sec = stamp
                 self._post_open_room_refresh_result = dict(parsed)
+                # A room split is a graph/topology product, not a costmap
+                # readiness gate. Refresh it immediately from the latest raw
+                # grid as soon as a confirmed portal result arrives; the next
+                # OCC frame still drives the causal planning-map bridge.
+                refresh_room_immediately = (
+                    getattr(self, "latest_occupancy_grid", None) is not None
+                )
+                if refresh_room_immediately:
+                    deferred_room_refresh_result = dict(parsed)
+                    self._post_open_room_refresh_result = None
                 rospy.loginfo(
                     "[semantic_mapping_node.py] armed post-open raw OCC bridge: "
                     "result_stamp=%.6f node_id=%s node_type=%s "
@@ -1408,6 +1447,12 @@ class SemanticMappingNode:
         pending_changed = self._set_planning_interaction_pending(
             pending_node_id, False
         )
+        if refresh_room_immediately:
+            self._enqueue_room_refresh(
+                force_stable=bool(getattr(self, "room_post_open_force_refresh", True)),
+                post_open_result=deferred_room_refresh_result,
+                reason="post_open_result",
+            )
         if (changed or pending_changed) and not is_portal_open:
             self._safe_publish_bundle(self._collect_publish_bundle())
 

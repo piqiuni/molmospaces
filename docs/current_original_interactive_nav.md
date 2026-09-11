@@ -147,6 +147,12 @@ COMMON=(
 
 每个批次重点检查 `aggregate_metrics.json`、`resource_telemetry.csv` 及各 episode 的 `episode_result.json`。
 
+`episode_result.json` 中的 `success` / `nav_success` 始终按冻结
+benchmark 的 selected-instance 严格计分。对于目标描述尚未提供唯一实例约束的场景，
+评测器另外记录 `goal_definition_relaxed_success`（以及对应的
+`goal_definition_relaxed_instance_id`）；该字段只用于分析“到达同类目标”的情况，
+不会改变正式 SR。
+
 ## 5. 当前 benchmark 在哪里
 
 本机实际的正式冻结 V3 benchmark 已确认位于：

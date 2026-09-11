@@ -23,7 +23,7 @@ import numpy as np
 import yaml
 
 
-TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v3"
+TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v4"
 _UNKNOWN_MIN = 50
 _UNKNOWN_MAX = 250
 
@@ -472,15 +472,20 @@ def _load_events(debug_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_graph_nodes(debug_dir: Path) -> list[dict[str, Any]]:
+def _load_graph_payload(debug_dir: Path) -> dict[str, Any]:
     candidates = [debug_dir / "graph" / "graph_latest.json", debug_dir / "graph_latest.json"]
     for path in candidates:
         if not path.is_file():
             continue
         payload = _load_json(path)
         if isinstance(payload, dict) and isinstance(payload.get("nodes"), list):
-            return [row for row in payload["nodes"] if isinstance(row, dict)]
-    return []
+            return payload
+    return {}
+
+
+def _load_graph_nodes(debug_dir: Path) -> list[dict[str, Any]]:
+    payload = _load_graph_payload(debug_dir)
+    return [row for row in payload.get("nodes", []) if isinstance(row, dict)]
 
 
 def _graph_point(node: dict[str, Any]) -> np.ndarray | None:
@@ -506,6 +511,24 @@ def _event_approach_point(event: dict[str, Any]) -> np.ndarray | None:
         point = _as_xy(command.get(key))
         if point is not None:
             return point
+    return None
+
+
+def _event_action_pose(event: dict[str, Any]) -> list[float] | None:
+    """Return the simulator-validated robot pose for an interaction action."""
+
+    payload = event.get("payload", {})
+    payload = payload if isinstance(payload, dict) else {}
+    validation = payload.get("interaction_pose_validation")
+    validation = validation if isinstance(validation, dict) else {}
+    for key in ("actual_pose_xyyaw", "trajectory_pose_xyyaw", "approach_pose_xyyaw"):
+        value = validation.get(key) or payload.get(key)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                values = [float(item) for item in value[:3]]
+            except (TypeError, ValueError):
+                continue
+            return values
     return None
 
 
@@ -566,6 +589,7 @@ def _extract_actual_markers(
             continue
         status = str(attempt.get("result_status") or attempt.get("status") or "unknown")
         succeeded = status.upper() in {"SUCCEEDED", "SUCCESS", "COMPLETED"}
+        action_pose = _event_action_pose(events_by_request.get(str(request_id), {}))
         markers.append(
             {
                 "xy": point,
@@ -574,6 +598,7 @@ def _extract_actual_markers(
                 "success": succeeded,
                 "request_id": request_id,
                 "instance_id": attempt.get("instance_id"),
+                "action_pose_xyyaw": action_pose,
             }
         )
     return markers
@@ -1066,7 +1091,7 @@ def render_episode_topdown(
     matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
+    from matplotlib.patches import Patch, Rectangle
 
     episode_result_path = Path(episode_result_path).resolve()
     benchmark_path = Path(benchmark_path).resolve()
@@ -1151,6 +1176,15 @@ def render_episode_topdown(
         trajectory_source = "evaluator_trace" if len(trajectory_xy) else "unavailable"
     target, gt_markers = _extract_gt_markers(episode, context)
     actual_markers = _extract_actual_markers(result, context, debug_dir)
+    graph_payload = _load_graph_payload(debug_dir)
+    graph_nodes = [
+        row for row in graph_payload.get("nodes", []) if isinstance(row, dict)
+    ]
+    graph_nodes_by_id = {
+        str(row.get("id")): row
+        for row in graph_nodes
+        if row.get("id") is not None
+    }
     benchmark_start = _benchmark_start_pose(episode)
     if benchmark_start is None and len(trajectory_xy):
         benchmark_start = {
@@ -1204,6 +1238,87 @@ def render_episode_topdown(
     ax.set_xlim(float(world_min[0] - world_margin), float(world_max[0] + world_margin))
     ax.set_ylim(float(world_min[1] - world_margin), float(world_max[1] + world_margin))
     ax.set_aspect("equal", adjustable="box")
+    # The graph JSON is the live semantic graph, not the frozen scene map.  In
+    # particular, portal nodes can be absent from the static occupancy raster
+    # while still being the only route-changing objects.  Draw them explicitly
+    # on top of the complete scene so a missing door in the figure cannot be
+    # mistaken for a missing door in the graph itself.
+    graph_portal_count = 0
+    graph_edge_count = 0
+    for edge in graph_payload.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "") not in {"connects", "adjacent_via"}:
+            continue
+        src = graph_nodes_by_id.get(str(edge.get("src_id")))
+        dst = graph_nodes_by_id.get(str(edge.get("dst_id")))
+        if src is None or dst is None:
+            continue
+        if src.get("type") != "portal" and dst.get("type") != "portal":
+            continue
+        src_xy = _graph_point(src)
+        dst_xy = _graph_point(dst)
+        if src_xy is None or dst_xy is None:
+            continue
+        ax.plot(
+            [src_xy[0], dst_xy[0]],
+            [src_xy[1], dst_xy[1]],
+            color="#fb7185" if edge.get("relation") == "connects" else "#f59e0b",
+            linewidth=0.9,
+            linestyle=(0, (2, 2)),
+            alpha=0.52,
+            zorder=3,
+        )
+        graph_edge_count += 1
+    for node in graph_nodes:
+        if str(node.get("type") or "") != "portal":
+            continue
+        center = _graph_point(node)
+        if center is None:
+            continue
+        attributes = node.get("attributes", {})
+        attributes = attributes if isinstance(attributes, dict) else {}
+        raw_size = attributes.get("viz_aabb_size") or node.get("aabb_size") or [0.25, 0.25]
+        try:
+            width = max(0.08, float(raw_size[0]))
+            height = max(0.08, float(raw_size[1]))
+        except (TypeError, ValueError, IndexError):
+            width = height = 0.25
+        ax.add_patch(
+            Rectangle(
+                (float(center[0]) - width / 2.0, float(center[1]) - height / 2.0),
+                width,
+                height,
+                fill=False,
+                edgecolor="#ef4444",
+                linewidth=1.8,
+                linestyle="-",
+                alpha=0.96,
+                zorder=6,
+            )
+        )
+        ax.scatter(
+            float(center[0]),
+            float(center[1]),
+            s=52,
+            marker="D",
+            color="#ef4444",
+            edgecolors="white",
+            linewidths=0.65,
+            zorder=7,
+        )
+        label = str(node.get("label") or node.get("id") or "door")
+        ax.annotate(
+            f"door:{label}",
+            xy=(float(center[0]), float(center[1])),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=6.6,
+            color="#7f1d1d",
+            zorder=8,
+            bbox={"facecolor": "white", "edgecolor": "#fecaca", "alpha": 0.88, "pad": 1.2},
+        )
+        graph_portal_count += 1
     if gt_oracle_path is not None and len(gt_oracle_path["xy"]) >= 2:
         gt_path_xy = np.asarray(gt_oracle_path["xy"], dtype=float)
         ax.plot(
@@ -1319,7 +1434,37 @@ def render_episode_topdown(
                 )
                 actual_interaction_paths.append(
                     {
+                        "kind": "approach",
                         "from_xy": approach_xy.astype(float).tolist(),
+                        "to_xy": marker_xy.astype(float).tolist(),
+                        "request_id": marker.get("request_id"),
+                    }
+                )
+        action_pose = marker.get("action_pose_xyyaw")
+        if isinstance(action_pose, (list, tuple)) and len(action_pose) >= 2:
+            try:
+                action_xy = np.asarray(
+                    [float(action_pose[0]), float(action_pose[1])], dtype=float
+                )
+            except (TypeError, ValueError):
+                action_xy = None
+            if action_xy is not None and np.linalg.norm(action_xy - marker_xy) > 1e-4:
+                ax.annotate(
+                    "",
+                    xy=(marker_xy[0], marker_xy[1]),
+                    xytext=(action_xy[0], action_xy[1]),
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "color": "#f97316",
+                        "lw": 2.1,
+                        "alpha": 0.95,
+                    },
+                    zorder=12,
+                )
+                actual_interaction_paths.append(
+                    {
+                        "kind": "interaction_reach",
+                        "from_xy": action_xy.astype(float).tolist(),
                         "to_xy": marker_xy.astype(float).tolist(),
                         "request_id": marker.get("request_id"),
                     }
@@ -1328,6 +1473,8 @@ def render_episode_topdown(
         draw_marker(marker, color=color, marker_style="X", size=88, text=f"Actual interaction {index}")
 
     case_label = str(result.get("case_id", episode_index))
+    if len(case_label) > 64:
+        case_label = f"{case_label[:28]}…{case_label[-31:]}"
     status_label = str(result.get("terminal_reason", result.get("status", "unknown")))
     path_length = result.get("navigation_path_length_m")
     path_text = "unknown" if not isinstance(path_length, (int, float)) else f"{float(path_length):.2f} m"
@@ -1335,9 +1482,49 @@ def render_episode_topdown(
     if gt_oracle_path is not None and isinstance(gt_oracle_path.get("length_m"), (int, float)):
         qualifier = "reconstructed" if gt_oracle_path.get("complete") else "partial"
         gt_path_text = f"{float(gt_oracle_path['length_m']):.2f} m ({qualifier})"
-    title = f"InteractiveNav V3 eval top-down — {case_label}"
-    subtitle = f"{coverage_label}  |  GT oracle route: {gt_path_text}  |  driven path: {path_text}  |  terminal: {status_label}"
-    ax.set_title(f"{title}\n{subtitle}", loc="left", fontsize=11.5, pad=12)
+    nav_target = episode.get("interactive_nav", {}).get("target", {})
+    target_label = (
+        nav_target.get("category")
+        if isinstance(nav_target, dict)
+        else None
+    )
+    if not target_label and target is not None:
+        target_label = target.get("object_name")
+    if not target_label and isinstance(nav_target, dict):
+        target_label = nav_target.get("selected_instance")
+    target_label = str(target_label or "unknown")
+    title = f"InteractiveNav V3 eval top-down — {case_label}\nObject goal: {target_label}"
+    subtitle = (
+        f"{coverage_label}  |  GT route: {gt_path_text}  |  driven: {path_text}  |  "
+        f"terminal: {status_label}"
+    )
+    # Case IDs are intentionally compacted above but still contain long
+    # underscore-delimited tokens.  Allow those tokens to break so the title
+    # stays within the same visual column as the map instead of extending far
+    # beyond it.
+    wrapped_title = "\n".join(
+        textwrap.wrap(
+            title,
+            width=60,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+    )
+    wrapped_subtitle = "\n".join(
+        textwrap.wrap(
+            subtitle,
+            width=86,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+    )
+    ax.set_title(
+        f"{wrapped_title}\n{wrapped_subtitle}",
+        loc="left",
+        fontsize=13.5,
+        linespacing=1.18,
+        pad=14,
+    )
     ax.set_axis_off()
     legend_handles = [
         Patch(facecolor="#2f3437", label="static obstacle / wall"),
@@ -1353,6 +1540,8 @@ def render_episode_topdown(
         Line2D([], [], marker="D", color="w", markerfacecolor="#d946ef", markeredgecolor="white", markersize=7, label="GT required interaction"),
         Line2D([], [], marker="X", color="w", markerfacecolor="#ef4444", markeredgecolor="white", markersize=7, label="actual interaction (red=failed)"),
         Line2D([], [], color="#f97316", lw=1.8, linestyle=(0, (3, 2)), label="actual interaction approach path"),
+        Line2D([], [], color="#f97316", lw=2.1, marker=">", markerfacecolor="#f97316", label="interaction action reach"),
+        Line2D([], [], color="#ef4444", lw=1.8, marker="D", markerfacecolor="none", label="live graph portal / door"),
     ]
     ax.legend(
         handles=legend_handles,
@@ -1433,6 +1622,16 @@ def render_episode_topdown(
         "gt_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in gt_markers],
         "actual_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in actual_markers],
         "actual_interaction_paths": actual_interaction_paths,
+        "live_graph": {
+            "source": str(
+                debug_dir / "graph" / "graph_latest.json"
+                if (debug_dir / "graph" / "graph_latest.json").is_file()
+                else debug_dir / "graph_latest.json"
+            ),
+            "portal_count": int(graph_portal_count),
+            "portal_edge_count": int(graph_edge_count),
+            "graph_revision": graph_payload.get("graph_revision"),
+        },
         "fallbacks_used": {
             "target": target is not None and target["source"] != "evaluator_private_geometry",
             "gt_interaction_count": sum(row["source"] != "evaluator_private_geometry" for row in gt_markers),

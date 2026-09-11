@@ -536,6 +536,8 @@ class RestrictedRosObjectGoalRuntime:
     opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]]
     target_source_by_opaque_id: dict[str, str]
     goal_evidence: PublicGoalEvidenceLedger
+    category_target_source_by_opaque_id: dict[str, str] = field(default_factory=dict)
+    category_goal_evidence: PublicGoalEvidenceLedger | None = None
     published_frame_sink: Callable[[Mapping[str, Any]], bool] | None = None
 
 
@@ -644,6 +646,51 @@ def _perception_source_skill_aliases(
         if len(candidates) == 1:
             aliases[source_name] = next(iter(candidates))
     return aliases
+
+
+def _category_goal_source_names(
+    *,
+    task: Any,
+    episode: Mapping[str, Any],
+) -> list[str]:
+    """Return same-category scene objects for a diagnostic relaxed endpoint.
+
+    The frozen V3 score remains selected-instance based.  This auxiliary list
+    is intentionally derived only from the live scene and is used to report
+    whether a policy reached *a* visually/evaluator-valid object of the
+    requested category when the release description is not instance-unique.
+    """
+
+    target = episode.get("interactive_nav", {}).get("target", {})
+    if not isinstance(target, Mapping):
+        return []
+    category = str(target.get("category") or "").strip().casefold()
+    if not category:
+        return []
+    selected = str(target.get("selected_instance") or "").strip()
+    object_manager = task.env.object_managers[task.env.current_batch_index]
+    names: list[str] = []
+    try:
+        objects = object_manager.list_top_level_objects()
+    except Exception:
+        objects = []
+    for obj in objects:
+        try:
+            name = str(obj.name)
+            object_category = str(
+                object_manager.get_annotation_category(obj)
+                or object_manager.category_from_name(obj)
+                or ""
+            ).strip().casefold()
+        except Exception:
+            continue
+        if name and object_category == category:
+            names.append(name)
+    if selected and selected not in names:
+        # Keep the selected target in the diagnostic domain even if the
+        # category annotation is absent in an older scene metadata release.
+        names.append(selected)
+    return sorted(dict.fromkeys(names))
 
 
 def _build_restricted_ros_object_goal_runtime(
@@ -832,10 +879,19 @@ def _build_restricted_ros_object_goal_runtime(
         episode_id=perception.episode_id,
         target_instance_ids=target_source_by_opaque_id,
     )
+    category_target_source_by_opaque_id = {
+        perception.registry.public_id_for(source_name): source_name
+        for source_name in _category_goal_source_names(task=task, episode=episode)
+    }
+    category_goal_evidence = PublicGoalEvidenceLedger(
+        episode_id=perception.episode_id,
+        target_instance_ids=category_target_source_by_opaque_id,
+    )
     initial_frame = perception.build(task, force=True)
     if initial_frame is not None:
         published = adapter.publish_restricted_gt_frame(initial_frame, capture_step=0)
         goal_evidence.record_frame(published, capture_step=0)
+        category_goal_evidence.record_frame(published, capture_step=0)
         if published_frame_sink is not None:
             published_frame_sink(published)
     return RestrictedRosObjectGoalRuntime(
@@ -846,6 +902,8 @@ def _build_restricted_ros_object_goal_runtime(
         opaque_to_joints=opaque_to_joints,
         target_source_by_opaque_id=target_source_by_opaque_id,
         goal_evidence=goal_evidence,
+        category_target_source_by_opaque_id=category_target_source_by_opaque_id,
+        category_goal_evidence=category_goal_evidence,
         published_frame_sink=published_frame_sink,
     )
 
@@ -2554,6 +2612,11 @@ def _publish_restricted_ros_frame(
         published,
         capture_step=int(decision_index),
     )
+    if runtime.category_goal_evidence is not None:
+        runtime.category_goal_evidence.record_frame(
+            published,
+            capture_step=int(decision_index),
+        )
     if runtime.published_frame_sink is not None:
         runtime.published_frame_sink(published)
     return True
@@ -2562,6 +2625,8 @@ def _publish_restricted_ros_frame(
 def _private_target_distances_m(
     task: Any,
     runtime: RestrictedRosObjectGoalRuntime,
+    *,
+    source_by_opaque_id: Mapping[str, str] | None = None,
 ) -> dict[str, float]:
     """Return private target ranges keyed by policy-visible opaque ids.
 
@@ -2576,7 +2641,12 @@ def _private_target_distances_m(
         dtype=float,
     )
     result: dict[str, float] = {}
-    for opaque_id, source_name in runtime.target_source_by_opaque_id.items():
+    source_mapping = (
+        runtime.target_source_by_opaque_id
+        if source_by_opaque_id is None
+        else source_by_opaque_id
+    )
+    for opaque_id, source_name in source_mapping.items():
         try:
             target = objects.get_object_by_name(source_name)
             target_xy = np.asarray(target.position[:2], dtype=float)
@@ -2601,6 +2671,34 @@ def _verify_restricted_goal_status(
         episode_id=runtime.perception.episode_id,
         evidence=runtime.goal_evidence,
         private_distances_m=_private_target_distances_m(task, runtime),
+        distance_threshold_m=threshold,
+    )
+
+
+def _verify_relaxed_category_goal_status(
+    *,
+    task: Any,
+    runtime: RestrictedRosObjectGoalRuntime,
+    episode: dict[str, Any],
+    payload: dict[str, Any],
+) -> GoalClaimVerification:
+    """Verify a category-level diagnostic endpoint without changing formal SR."""
+
+    evidence = runtime.category_goal_evidence
+    if evidence is None or len(runtime.category_target_source_by_opaque_id) <= 1:
+        return GoalClaimVerification(False, "category_goal_not_ambiguous")
+    threshold = float(
+        episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
+    )
+    return verify_target_goal_claim(
+        payload,
+        episode_id=runtime.perception.episode_id,
+        evidence=evidence,
+        private_distances_m=_private_target_distances_m(
+            task,
+            runtime,
+            source_by_opaque_id=runtime.category_target_source_by_opaque_id,
+        ),
         distance_threshold_m=threshold,
     )
 
@@ -3621,6 +3719,7 @@ def evaluate_episode(
     private_visualization: dict[str, Any] | None = None
     accepted_goal_claim = False
     last_goal_claim_verification: GoalClaimVerification | None = None
+    last_relaxed_category_goal_verification: GoalClaimVerification | None = None
     effective_max_steps = int(config.max_steps)
     step_budget_basis: dict[str, Any] = {
         "evaluator_private": True,
@@ -3901,6 +4000,15 @@ def evaluate_episode(
                 if verification is not None:
                     last_goal_claim_verification = verification
                     accepted_goal_claim = bool(verification.accepted)
+                    if not verification.accepted and restricted_ros_runtime is not None:
+                        relaxed = _verify_relaxed_category_goal_status(
+                            task=task,
+                            runtime=restricted_ros_runtime,
+                            episode=episode,
+                            payload=goal_payload,
+                        )
+                        if relaxed.accepted:
+                            last_relaxed_category_goal_verification = relaxed
                 if ros_policy_termination is not None and (
                     verification is None or bool(verification.accepted)
                 ):
@@ -4026,6 +4134,15 @@ def evaluate_episode(
                     if verification is not None:
                         last_goal_claim_verification = verification
                         accepted_goal_claim = bool(verification.accepted)
+                        if not verification.accepted and restricted_ros_runtime is not None:
+                            relaxed = _verify_relaxed_category_goal_status(
+                                task=task,
+                                runtime=restricted_ros_runtime,
+                                episode=episode,
+                                payload=goal_payload,
+                            )
+                            if relaxed.accepted:
+                                last_relaxed_category_goal_verification = relaxed
                     if ros_policy_termination is not None and (
                         verification is None or bool(verification.accepted)
                     ):
@@ -4327,6 +4444,15 @@ def evaluate_episode(
                 if verification is not None:
                     last_goal_claim_verification = verification
                     accepted_goal_claim = bool(verification.accepted)
+                    if not verification.accepted and restricted_ros_runtime is not None:
+                        relaxed = _verify_relaxed_category_goal_status(
+                            task=task,
+                            runtime=restricted_ros_runtime,
+                            episode=episode,
+                            payload=goal_payload,
+                        )
+                        if relaxed.accepted:
+                            last_relaxed_category_goal_verification = relaxed
                 if ros_policy_termination is not None and (
                     verification is None or bool(verification.accepted)
                 ):
@@ -4436,6 +4562,20 @@ def evaluate_episode(
             ),
             episode_total_cost=episode_total_cost,
             episode_total_cost_breakdown=episode_total_cost_breakdown,
+            goal_definition_relaxed_success=bool(
+                last_relaxed_category_goal_verification is not None
+                and last_relaxed_category_goal_verification.accepted
+            ),
+            goal_definition_relaxed_instance_id=(
+                None
+                if last_relaxed_category_goal_verification is None
+                else last_relaxed_category_goal_verification.target_instance_id
+            ),
+            goal_definition_relaxed_reason=(
+                None
+                if last_relaxed_category_goal_verification is None
+                else last_relaxed_category_goal_verification.reason
+            ),
         ).to_dict()
         if transient_target_discovery is not None and private_visualization is not None:
             # Keep the scan-time target evidence beside other evaluator-only
@@ -4451,6 +4591,10 @@ def evaluate_episode(
             "task_success": task_success,
             "interaction_conditioned_success": interaction_conditioned_success,
             "success": interaction_conditioned_success,
+            "goal_definition_relaxed_success": bool(
+                last_relaxed_category_goal_verification is not None
+                and last_relaxed_category_goal_verification.accepted
+            ),
         }
         if not restricted_public_mode:
             terminal_trace["interaction_score"] = terminal_score.to_dict()

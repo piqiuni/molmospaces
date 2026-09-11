@@ -439,9 +439,6 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             policy.prepare_episode_reset()
         observation, _info = task.reset()
         log.info("task.reset() completed.")
-        # print(f"Observation: {observation}", flush=True)
-        if viewer is not None:
-            viewer.sync()
 
         policy.task = task
         policy.reset()
@@ -458,6 +455,12 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             observation = task.get_observations()
             if task.observation_cache:
                 task.observation_cache[0] = observation
+        # The first viewer render must happen after benchmark initial-state
+        # enforcement.  Otherwise a scene whose recorded state is closed can
+        # briefly expose an open doorway to a recorder/ROS subscriber before
+        # the force controller applies the required reset.
+        if viewer is not None:
+            viewer.sync()
         runtime_target_publisher = getattr(policy, "runtime_target_publisher", None)
         if runtime_target_publisher is not None:
             policy.runtime_target_selection = runtime_target_publisher.publish(
