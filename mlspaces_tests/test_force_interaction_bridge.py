@@ -824,8 +824,9 @@ def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None
     ]
     assert controller._pending["all_joint_names"] == ["top", "middle", "bottom"]
 
+@pytest.mark.parametrize("transition_steps", [3, 20])
 def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
-    monkeypatch,
+    monkeypatch, transition_steps,
 ) -> None:
     advances = []
     view_profiles = []
@@ -868,7 +869,7 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         interaction_execution_mode="smooth",
-        interaction_transition_steps=3,
+        interaction_transition_steps=transition_steps,
     )
     controller._head_view_controller.command = (
         lambda _env, profile, **_kwargs: view_profiles.append(profile) or {"applied": True}
@@ -885,16 +886,20 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
 
     result = None
-    for step in range(3):
+    for step in range(transition_steps):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
+        if step < transition_steps - 1:
+            assert result is None
+            assert controller.should_pause_navigation()
 
     assert result is not None
-    assert advances == [1.0 / 3.0, 2.0 / 3.0, 1.0]
+    assert advances == [(step + 1) / transition_steps for step in range(transition_steps)]
     assert view_profiles == ["default"]
     assert result["interaction_execution_mode"] == "smooth"
-    assert result["interaction_transition_steps"] == 3
-    assert result["task_steps_consumed"] == 3
+    assert result["interaction_transition_steps"] == transition_steps
+    assert result["task_steps_consumed"] == transition_steps
+    assert result["physics_substeps"] == 2 * transition_steps
     assert result["source"] == "force_smooth_interaction"
 
 

@@ -2,8 +2,10 @@ import inspect
 import math
 import queue
 import threading
+from unittest.mock import Mock
 
 import numpy as np
+import pytest
 
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 
@@ -232,7 +234,71 @@ def test_cmd_vel_action_uses_fixed_policy_dt_not_wall_clock() -> None:
     np.testing.assert_allclose(action["base"], [1.1, 2.0, 0.25], atol=1e-6)
 
 
-def test_step_sync_reports_action_source_and_fixed_control_dt() -> None:
+def _velocity_policy(yaw=0.0, *, allow_lateral=False):
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.cmd_vel_linear_gain = 3.0
+    policy.cmd_vel_control_dt_s = 0.2
+    policy.allow_lateral_cmd_vel = allow_lateral
+    policy.last_cmd_vel_lateral_rejected = False
+    policy.lateral_cmd_vel_rejection_count = 0
+    policy._rospy = Mock()
+    policy._extract_base_pose_from_observation = lambda _: np.array(
+        [1.0, 2.0, 0.0, math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
+    )
+    return policy
+
+
+@pytest.mark.parametrize("yaw", [0.0, math.pi / 2, -1.2])
+@pytest.mark.parametrize("vy", [0.012969, -0.498824, 0.8, float("nan")])
+def test_nonholonomic_lateral_command_holds_entire_pose(yaw, vy) -> None:
+    policy = _velocity_policy(yaw)
+    action = policy._cmd_vel_to_base_action(np.array([0.3, vy, 0.8]), object())
+
+    np.testing.assert_allclose(action["base"], [1.0, 2.0, yaw], atol=1e-6)
+    assert policy.last_cmd_vel_lateral_rejected
+    assert policy.lateral_cmd_vel_rejection_count == 1
+    policy._rospy.logwarn_throttle.assert_called_once()
+
+
+@pytest.mark.parametrize("vx,wz", [(0.46, 0.0), (0.0, 1.25), (-0.1, -0.5)])
+def test_nonholonomic_guard_preserves_forward_reverse_and_turn_commands(vx, wz) -> None:
+    yaw = 1.0
+    policy = _velocity_policy(yaw)
+    action = policy._cmd_vel_to_base_action(np.array([vx, 0.0, wz]), object())
+
+    np.testing.assert_allclose(
+        action["base"],
+        [1 + vx * 0.6 * math.cos(yaw), 2 + vx * 0.6 * math.sin(yaw), yaw + wz * 0.2],
+        atol=1e-6,
+    )
+    assert not policy.last_cmd_vel_lateral_rejected
+    assert policy.lateral_cmd_vel_rejection_count == 0
+
+
+def test_lateral_guard_recovers_and_preserves_measured_odom() -> None:
+    policy = _velocity_policy()
+    policy._cmd_vel_to_base_action(np.array([0.3, -0.49, 0.5]), object())
+    action = policy._cmd_vel_to_base_action(np.array([0.3, 1e-8, 0.0]), object())
+
+    np.testing.assert_allclose(action["base"], [1.18, 2.0, 0.0], atol=1e-6)
+    assert not policy.last_cmd_vel_lateral_rejected
+    assert policy.lateral_cmd_vel_rejection_count == 1
+    twist = policy._estimate_planar_twist(np.array([0.0, 0.0, 0.0]), np.array([0.0, -0.1, 0.0]), 0.2)
+    assert math.isclose(twist[1], -0.5)
+
+
+def test_holonomic_bridge_callers_keep_lateral_motion() -> None:
+    parameter = inspect.signature(RosBridgePolicy.__init__).parameters["allow_lateral_cmd_vel"]
+    assert parameter.default is True
+    policy = _velocity_policy(math.pi / 2, allow_lateral=True)
+    action = policy._cmd_vel_to_base_action(np.array([0.0, 0.2, 0.0]), object())
+
+    np.testing.assert_allclose(action["base"], [0.88, 2.0, math.pi / 2], atol=1e-6)
+    assert not policy.last_cmd_vel_lateral_rejected
+
+
+@pytest.mark.parametrize("action_source", ["cmd_vel", "lateral_cmd_vel_rejected"])
+def test_step_sync_reports_action_source_and_fixed_control_dt(action_source) -> None:
     import json
 
     published = []
@@ -253,7 +319,7 @@ def test_step_sync_reports_action_source_and_fixed_control_dt() -> None:
     policy._step_sync_pub = Publisher()
     policy._String = StringMessage
     policy._step_idx = 7
-    policy.last_action_source = "cmd_vel"
+    policy.last_action_source = action_source
     policy.cmd_vel_control_dt_s = 0.2
 
     policy._publish_step_sync(Stamp())
@@ -262,7 +328,7 @@ def test_step_sync_reports_action_source_and_fixed_control_dt() -> None:
     assert payload == {
         "step_index": 7,
         "stamp_sec": 12.5,
-        "action_source": "cmd_vel",
+        "action_source": action_source,
         "cmd_vel_control_dt_s": 0.2,
     }
 

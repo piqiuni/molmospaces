@@ -31,6 +31,7 @@ from semantic_mapping_py_pkg.interaction_result_contract import (
     take_pending_interaction_command,
 )
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text, observation_stamp_seconds
+from semantic_mapping_py_pkg.occupancy_transport import NumpyOccupancyGrid, occupancy_data_snapshot
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
@@ -358,7 +359,7 @@ class SemanticMappingNode:
                 "[semantic_mapping_node.py] PointCloud2 subscription disabled; "
                 "legacy scene_attribute messages will be ignored"
             )
-        self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1)
+        self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, NumpyOccupancyGrid, self.occupancy_callback, queue_size=1)
         self.room_context_sub = rospy.Subscriber(self.room_context_topic, String, self.room_context_callback, queue_size=1)
         self.gt_observation_sub = rospy.Subscriber(
             self.gt_observations_topic,
@@ -2220,11 +2221,11 @@ class SemanticMappingNode:
             self._planning_overlay_was_active = False
 
     def _build_grid_from_snapshot(self, data, info):
-        grid = OccupancyGrid()
+        grid = NumpyOccupancyGrid()
         grid.header.stamp = rospy.Time.now()
         grid.header.frame_id = self.world_frame
         grid.info = info
-        grid.data = [int(value) for value in data]
+        grid.data = occupancy_data_snapshot(data)
         return grid
 
     def _build_planning_products_from_snapshot(self, raw, graph_payload):
@@ -2456,14 +2457,14 @@ class SemanticMappingNode:
     def _build_occupancy_copy(self, data, *, raw=None):
         if raw is None:
             raw = self.latest_occupancy_grid
-        grid = OccupancyGrid()
+        grid = NumpyOccupancyGrid()
         # Keep the raw map timestamp so downstream consumers can pair the
         # semantic overlay and clear mask with the exact source occupancy map.
         grid.header.seq = raw.header.seq
         grid.header.stamp = raw.header.stamp
         grid.header.frame_id = raw.header.frame_id or self.world_frame
         grid.info = raw.info
-        grid.data = [int(value) for value in data]
+        grid.data = occupancy_data_snapshot(data)
         return grid
 
     def _build_cropped_room_segment_grid(self, room_ids, *, raw=None):

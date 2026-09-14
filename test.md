@@ -1,19 +1,70 @@
 # 交互导航开发测试手册
 
-最后更新：2026-09-14
+最后更新：2026-09-15
+
+### 2026-09-15: 跳过等待后的十场并行 500-step 回归
+
+- 当前可提交的完整性能记录：[2026-09-15 性能检查点](docs/interactive_nav_performance_20260915.md)。提交前扩大回归 1218 + 13 = 1231 项通过；没有重新启动另一轮仿真。
+- H1-H10、seed=house、10 worker、500-step 上限，原生线程各 1、录制开启；8 场达到上限，H2/H3 在 371/286 步因 `no_eligible_candidates_after_bounded_recovery` 提前结束，共 4657 步。整批墙钟 725.060 秒；平均 0.751 秒/step，P95 1.047 秒。
+- 相比最近十场 R5：平均 step 耗时下降 2.1%，覆盖率 72.15% -> 72.20%；门调用/物理成功 10/4 -> 11/6，另有 1 次静态通道确认，门失败 6 -> 4；容器调用/成功均为 8/8，无待返回。两轮还相差横移修复与机器人锁定缓存，不是跳过等待的单变量 A/B。
+- `navigation_hold` 207 步，ready 后平均等待 0.619 ms、最大 0.924 ms；无未 ready 放行、无误计动作超时。M1 237/237 无请求错误或超时。GT 分母、批处理参数与 R5 十场均一致，源码运行期间无变化。
+- 十个视频 exact-step 对齐，全部 4657 帧完整解码通过。日志审计未发现运行期崩溃；H2/H3/H4/H6/H8/H9/H10 仍有关闭期内存释放告警。本轮专用端口 16201-16210 已释放。
+- 不能宣称逐场无退化：H3 覆盖率 45.73% -> 27.82%、无交互且提前结束，该场未触发 navigation_hold；H10 的 17.84 个百分点提升几乎抵消了 H3 的下降。H8 容器成功 1 -> 0。结果、逐场耗时、差异说明及全部视频见 [本轮报告](/home/ldl/molmospaces-exp-setting/outputs/navigation_hold_500/report.md)；原始批次为 `/home/ldl/outputs/interactive-nav/batch_timeopt_navigation_hold_500_20260915_020704`。
+
+### 2026-09-15: 交互期间跳过导航指令等待
+
+- 仿真主循环仅在交互控制器 `should_pause_navigation()` 为真时，调用 `RosBridgePolicy.get_action(..., hold_navigation=True)`。原传感器发布和本帧地图 ready 等待完成后返回保持动作，记录 `action_source=navigation_hold`，不计入连续动作超时；未 ready 时保留原导航等待路径，其他调用者默认行为不变。
+- 保留原 fresh-command gate、step sync、录制 ACK、`task.step`、交互 before/after 回调和躯干视角目标；未修改物理子步、交互步数、距离、容差、地图发布频率或其他优化项。
+- 验证 142 项通过：`mlspaces_tests/test_ros_bridge_navigation_hold.py`、`test_nav_ros_scene_timeout.py`、`test_ros_bridge_policy_twist.py`、`test_force_interaction_bridge.py`、`test_force_robot_lock_cache.py`、`test_force_contact_lookup.py`。新测试覆盖延迟 ready、ready 失败、bootstrap、ROS shutdown、普通导航超时，以及保持 20 步后第 21 步恢复导航，逐步检查传感器/录制与躯干指令保留。
+- 测试使用下述组件验证相同的 `/home/ldl` 临时/缓存目录、Conda Python 与 ROS `PYTHONPATH`，通过 `python -m pytest -q -p no:cacheprovider` 运行这六个文件。本次没有启动 500-step ROS 仿真，不据此宣称整场性能提升。
+
+### 2026-09-15: 后续耗时优化的组件验证
+
+- 本次只修改交互期间的机器人锁定回调，缓存同一次交互的 base/group views、零速度模板和控制数组形状；模型、data 或 robot view 更换时退回原查询路径。保留全部物理子步、锁定回调、`mj_forward`、相机更新以及 base ctrl setter，不调整交互距离或容差。
+- 定向测试 99 项通过。新增真实小型 MuJoCo 力驱动轨迹逐元素对比、yaw 跨界与缓存失效测试；交互状态机同时覆盖 3/20 步，第 20 步之前不返回完成，物理子步计数不变。该次组件验证时尚未实现“交互时跳过导航动作等待”，不能把该测试当作这一优化的端到端验收。
+- H1 静态组件微基准：锁定回调 9.301 -> 9.271 ms/次，约 0.3%，收益很小；其中 `mj_forward` 约 9.048 ms。渲染场景更新复用约节省 0.1 ms/三通道渲染，去重 RGB readback 约节省 0.8-1.0 ms；三个视角中的一个连原始基线 RGB 重复渲染都不完全一致，因此未修改生产渲染路径。
+- H1 静态 GT 的位打包压缩样本约 17.1 KB，解压逐位一致；新地图算法与旧评测相差 6648 个可导航像素，旧算法重放精确复现旧分母 1789027。正式缓存必须固定算法、资产和机器人半径版本，不可直接改变历史覆盖率口径。
+- 本次未跑 500-step ROS 回归、未做全量 GT 扫描。完整命令、实测数据、并行扫描/报错方案及六项建议见 [后续优化分析](/home/ldl/molmospaces-exp-setting/outputs/speed_followup_20260915/report.md)。
+
+### 2026-09-14: 横移修复后 H1 单 worker 500-step 实测
+
+- H1、seed=1、1 worker、原生数值线程 1、500 step 已完成；运行期间源码哈希未变。总墙钟 757.865 秒，step 总计 506.351 秒，平均 1.013 秒/step，P50 0.805 秒，P95 2.691 秒；视频 500 帧 exact-step 对齐且抽样可解码。
+- 覆盖率 43.99%。门指令 2 次，成功 1 次，另一次在 step 497 发出、500 步结束时未返回；容器 1 次成功，为抽屉扫描。M1 28 次全部有效返回。关闭阶段仍有一次内存释放告警。
+- 1579 条 stamped 速度指令全部 vy=0，无横移拒绝保护触发；实际位姿估计侧向速度峰值仍有 0.133 m/s，不能宣称物理侧向位移完全消失。
+- 对照上轮 10-worker 的 H1：平均 0.915 秒/step，覆盖率 49.67%，无成功物理交互。本轮普通步均值约快 8.9%，但更多交互前置控制增加约 83.1 秒，使完整均值慢 10.6%。两轮横移修复、路线及交互不同，不是并发数单变量 A/B，不代表无质量退化。
+- [视频、逐阶段耗时、残留问题与复现命令](/home/ldl/molmospaces-exp-setting/outputs/h1_lateral_fix_500/report.md)；[原始输出](/home/ldl/outputs/interactive-nav/batch_h1_lateral_fix_1worker_500_20260914_213404)。
+
+### 2026-09-14: 非全向导航横移修复
+
+- DWA 保持 `min_vel_y=max_vel_y=0`，将 `acc_lim_y` 从 0 改为 2.5，`vy_samples` 从 0 改为 1。横向制动窗口现在覆盖 `max_vel_trans=0.5` / `controller_frequency=5` 的一个控制周期，避免把非零 odom 横向速度重新采样为导航指令。
+- 当前十场仿真入口 `scripts/InteractiveNav/run_nav_ros_sim.py` 默认 `--allow_lateral_cmd_vel false`；残留非法横移指令整步保持当前位姿，记录 `action_source=lateral_cmd_vel_rejected` 和累计拒绝告警，不仅截断横向分量后继续执行原前进/转向分量。明确使用全向规划器时可以设为 true；通用 `RosBridgePolicy` 默认仍兼容全向调用者。
+- 保留真实 odom 横向速度、前向/旋转速度参数、3.0 线速度增益、0.2 秒控制周期、交互与到位条件。没有修改底盘物理或强制清零实际速度。
+- 验证：相关 Python 回归 204 项通过；本机 ROS DWA 动态窗口七组输入均只产生 vy=0，旧 acc_lim_y=0 负对照能复现失败；H1 的 2057 条原始消息转换回放中，937 条横移指令被拒绝、1120 条正常指令保持原样。这不是场景重跑，尚未验证修复后十场运动与覆盖率。
+- 扩展回归需将 `/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages` 加入 `PYTHONPATH`，与五轮评测原有测试环境一致；否则既有 executor 测试的 ROS stub 缺少 `rospy.numpy_msg`。命令与结果见 [修复验证](/home/ldl/molmospaces-exp-setting/outputs/nav_lateral_fix/report.md)。
+- 前后视频均为 15 fps，每仿真步 0.2 秒，没有改变播放倍率。R0->R5 的 H1 `timeout_noop` 从 139 减至 32，轨迹长度从 11.98 增至 21.93 m；视频运动更连贯还包含轨迹变化和原有异常横移，不能仅用计算加速解释，也不是提高了速度上限。
+
+### 2026-09-14: 五轮时间优化评测
+
+- 检查点为 `c0386aa4e`（时间优化前）。已完成额外同代码 R0 对照及五轮 H1-H10、10 worker、500-step 上限评测；优化改动尚未提交 git。
+- 最近完整评测 R5（横移修复前）：实际 4840 step，9 场满 500，H2 在 340 step 提前结束；加权平均 0.768 秒/step、P95 1.083 秒、整批墙钟 844.173 秒。R0 为 1.551 秒/step，因此平均降低 50.5%。覆盖率 72.15%，门调用/成功 10/4，容器 8/8，无待返回命令。
+- 不代表全面无退化：H1 本轮门成功和容器调用均为零；六次门失败全部为 `non_articulated` 拒绝。关闭期的内存释放告警仍存在。R4 首次数组真假判断异常已修复并完整重跑，失败现场保留。
+- 五项实现分别是原生线程限制、深度射线/掩码复用、ROS NumPy 地图传输、地图预处理按掩码复用、交互接触拓扑查询缓存。未改变分辨率、物理步数、交互距离、安全距离和到达条件。
+- 批处理新增 `--native-threads-per-worker`，默认 `1`，`0` 保留库默认；显式设置的 `OPENBLAS_NUM_THREADS` / `OMP_NUM_THREADS` / `MKL_NUM_THREADS` 优先，并记录在场景结果的 `native_thread_environment` 中。
+- 最终相关测试 1180+13=1193 项通过；两处同名 `test_force_interaction_bridge.py` 分开运行。六个有效批次的 60 个视频均 exact-step 对齐，运行期间源码未变；测试不等于全仓库验收。
+- [完整报告、历史对照与复现命令](/home/ldl/molmospaces-exp-setting/outputs/time_optimization_5rounds/report.md)；[逐场数据及最新十个视频](/home/ldl/molmospaces-exp-setting/outputs/time_optimization_5rounds/report_tables.md)。最新输出：`/home/ldl/outputs/interactive-nav/batch_timeopt_r5_contacts_500_20260914_192049`。
 
 ### 2026-09-14: 到位净空、M1 请求归属与深度投影回归
 
 - `candidate.navigation_clearance_enabled`：full MLLM 配置启用候选发布前净空检查；过滤发生在生成索引对齐的 capture/action 列表之前，不修改已执行中的锚点编号。
 - 当前候选筛选、替代探索点搜索及门/容器执行净空只检查机器人半径 + 安全余量 + 栅格半对角线，不再叠加到位容差；进入位置容差后不再检查 XY 容差，只检查实际位置的碰撞净空。探索模块原有的 0.40 m 足迹筛选、各类站位档位与到达容差保持不变。
-- 去掉到位容差后的定向回归 434 项通过，覆盖净空、候选生成、导航执行、到位锁定、门前姿态和探索恢复；该修改尚未重跑仿真，下方批次数据仍来自修改前版本。
+- 去掉到位容差后的定向回归 434 项通过，覆盖净空、候选生成、导航执行、到位锁定、门前姿态和探索恢复；该修改已作为上方时间优化的 R0 对照重跑。下方保留修改前的历史批次。
 - `executor.drawer_fallback_bbox_wait_task_steps: 8`：M1 失败后的抽屉 bbox 延迟可原地等待新帧，30 秒为失活保护；超出预算可重试，不永久排除对象。
 - 当前物体表面距离：抽屉按后续要求改为 `0.50/0.85/1.00 m`，冰箱 `1.15/1.35/1.55 m`，其他容器 `0.50 m`，门交互 `0.95/1.20/1.45 m`，门复观测 `0.85/1.10/1.35 m`。
 - 重点测试：`test_navigation_clearance.py`、`test_behavior_candidates.py`、`test_semantic_behavior_executor_static.py`、`test_attribute_inference_request_state.py`、`mlspaces_tests/test_depth_continuity_equivalence.py`。
 - 原始 H10 地图回放和投影微基准：`outputs/analysis_runtime500_20260914/verify_clearance_runtime_fixes.py`。结果与命令约束见同目录 `clearance_runtime_fixes.md`；不启动仿真，不改原始 batch。
 - 深度投影优化保留图像尺寸、深度阈值、物理步数和录制精度。微基准的阶段加速不等于 10 worker 的整场加速。
 
-最新实测：`/home/ldl/outputs/interactive-nav/batch_minimalfix_h1_h10_500_20260914_155635`，最小导航修复后 H1-H10、10 worker、500-step 上限，总墙钟 1286.160 秒（含启动、仿真、清理、离线视频和分析）。实际 4529 step，实测加权平均 1.576 秒/step，P95 2.544 秒（不含启动和后处理）；H2/H3/H5 分别在 421/151/457 step 因有界恢复后仍无可执行候选而提前结束，其他 7 场达到 500 step。门交互调用/成功为 5/3，容器为 6/6；平均覆盖率 66.54%。10 个视频 exact-step 对齐且可解码，无悬而未决的交互命令，运行期间源文件未变化。启动前相关测试 623 项通过。
+优化前实测：`/home/ldl/outputs/interactive-nav/batch_minimalfix_h1_h10_500_20260914_155635`，最小导航修复后 H1-H10、10 worker、500-step 上限，总墙钟 1286.160 秒（含启动、仿真、清理、离线视频和分析）。实际 4529 step，实测加权平均 1.576 秒/step，P95 2.544 秒（不含启动和后处理）；H2/H3/H5 分别在 421/151/457 step 因有界恢复后仍无可执行候选而提前结束，其他 7 场达到 500 step。门交互调用/成功为 5/3，容器为 6/6；平均覆盖率 66.54%。10 个视频 exact-step 对齐且可解码，无悬而未决的交互命令，运行期间源文件未变化。启动前相关测试 623 项通过。
 
 本轮不代表性能验收通过：相对上一轮，平均覆盖率从 68.60% 降至 66.54%，H7/H8 分别从 99.60%/36.22% 降至 83.40%/20.52%，门成功数从 6 降至 3，H3 仍有导航停滞。日志审计未发现关闭前崩溃；各场关闭阶段存在内存释放错误，H7/H9 另有向已关闭 ROS topic 发布的异常。明细、视频入口和原始审计见最新目录的 `results_500.md`、`results_500.json`、`interaction_audit_500.json`、`step_timing_summary.csv` 和 `step_phase_timing.csv`。复现入口：`outputs/analysis_minimalfix_500_20260914/run_timed_batch.py`；汇总入口：同目录 `report_batch.py RUN_DIR`。
 

@@ -17,7 +17,9 @@ DWAPlannerROS:
   min_vel_theta: 0.18
 
   acc_lim_x: 2.5
-  acc_lim_y: 0.0
+  # Zero lateral acceleration traps measured drift in an inverted DWA window.
+  # Permit braking to zero; min/max_vel_y still prohibit lateral navigation.
+  acc_lim_y: 2.5
   acc_lim_theta: 1.2
 
   # Goal Tolerance Parameters
@@ -30,7 +32,7 @@ DWAPlannerROS:
   # Forward Simulation Parameters
   sim_time: 2.0
   vx_samples: 20
-  vy_samples: 0
+  vy_samples: 1
   vth_samples: 40
   controller_frequency: 5.0
 

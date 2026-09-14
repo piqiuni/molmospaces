@@ -106,6 +106,7 @@ class RosBridgePolicy(BasePolicy):
         step_ready_bootstrap_timeout_s: float | None = None,
         step_ready_bootstrap_republish_period_s: float = 0.5,
         tf_keepalive_period_s: float = 0.25,
+        allow_lateral_cmd_vel: bool = True,
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -162,6 +163,9 @@ class RosBridgePolicy(BasePolicy):
         self.cmd_vel_topic = cmd_vel_topic
         self.cmd_vel_timeout_s = float(cmd_vel_timeout_s)
         self.cmd_vel_linear_gain = max(0.0, float(cmd_vel_linear_gain))
+        self.allow_lateral_cmd_vel = bool(allow_lateral_cmd_vel)
+        self.last_cmd_vel_lateral_rejected = False
+        self.lateral_cmd_vel_rejection_count = 0
         self.require_fresh_cmd_vel = bool(require_fresh_cmd_vel)
         self.require_move_base_active_for_cmd_vel = bool(require_move_base_active_for_cmd_vel)
         self.move_base_status_topic = move_base_status_topic
@@ -1106,6 +1110,21 @@ class RosBridgePolicy(BasePolicy):
         )
         yaw = self._quat_wxyz_to_yaw(qw, qx, qy, qz)
         vx, vy, wz = float(cmd_vel[0]), float(cmd_vel[1]), float(cmd_vel[2])
+        self.last_cmd_vel_lateral_rejected = False
+        if not getattr(self, "allow_lateral_cmd_vel", True):
+            if not np.isfinite(vy) or abs(vy) > 1e-6:
+                # Reject the whole trajectory, not just its lateral component:
+                # the remaining forward/turn motion has not been collision checked.
+                self.last_cmd_vel_lateral_rejected = True
+                self.lateral_cmd_vel_rejection_count += 1
+                self._rospy.logwarn_throttle(
+                    2.0,
+                    "RosBridgePolicy: rejecting lateral cmd_vel in nonholonomic mode "
+                    "(vx=%.6f vy=%.6f wz=%.6f, rejected=%d); holding pose.",
+                    vx, vy, wz, self.lateral_cmd_vel_rejection_count,
+                )
+                vx = wz = 0.0
+            vy = 0.0
         vx *= self.cmd_vel_linear_gain
         vy *= self.cmd_vel_linear_gain
         dt = self.cmd_vel_control_dt_s
@@ -2018,7 +2037,7 @@ class RosBridgePolicy(BasePolicy):
             finally:
                 self._step_frame_queue.task_done()
 
-    def get_action(self, observation):
+    def get_action(self, observation, *, hold_navigation: bool = False):
         self.last_action_timed_out = False
         self.last_action_source = ""
         frame_t0 = time.perf_counter()
@@ -2334,7 +2353,18 @@ class RosBridgePolicy(BasePolicy):
             else None
         )
         chosen_action = None
-        while not self._rospy.is_shutdown():
+        if (
+            hold_navigation
+            and (
+                not self.step_ready_barrier_enabled
+                or self.last_step_ready_diagnostics.get("ready_satisfied", False)
+            )
+            and not self._rospy.is_shutdown()
+        ):
+            # The caller owns navigation for this step; retain ready/capture barriers.
+            chosen_action = self._build_noop_action()
+            self.last_action_source = "navigation_hold"
+        while chosen_action is None and not self._rospy.is_shutdown():
             now_mono = time.monotonic()
             if deadline is not None and now_mono >= deadline:
                 break
@@ -2380,7 +2410,10 @@ class RosBridgePolicy(BasePolicy):
                 cmd_action = self._cmd_vel_to_base_action(cmd_vel, observation)
                 if cmd_action is not None:
                     chosen_action = cmd_action
-                    self.last_action_source = "cmd_vel"
+                    self.last_action_source = (
+                        "lateral_cmd_vel_rejected"
+                        if self.last_cmd_vel_lateral_rejected else "cmd_vel"
+                    )
                     stage_ms["fresh_cmd_after_gate"] = max(
                         0.0, (cmd_vel_ts - wait_start_mono) * 1000.0
                     )

@@ -307,7 +307,10 @@ class SemanticOccupancyOverlay:
         width = int(grid_info.width)
         height = int(grid_info.height)
         cell_count = width * height
-        result = [int(value) for value in raw_data]
+        if isinstance(raw_data, np.ndarray) and raw_data.ndim == 1 and raw_data.dtype.kind in "iu":
+            result = raw_data.tolist()
+        else:
+            result = list(map(int, raw_data))
         mask = [0] * cell_count
         if len(result) != cell_count:
             return result, mask, {

@@ -77,6 +77,7 @@ def _capture_robot_lock(task_env) -> dict[str, Any] | None:
         robot_view = task_env.current_robot.robot_view
         base = robot_view.base
         groups: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        group_views = []
         for name in ("left_arm", "right_arm", "left_gripper", "right_gripper"):
             try:
                 group = robot_view.get_move_group(name)
@@ -87,18 +88,29 @@ def _capture_robot_lock(task_env) -> dict[str, Any] | None:
                 np.zeros_like(np.asarray(group.joint_vel, dtype=float)),
                 np.asarray(group.noop_ctrl, dtype=float).copy(),
             )
+            group_views.append((name, group))
+        base_pose = np.asarray(base.pose, dtype=float).copy()
+        base_ctrl = np.asarray(base.ctrl, dtype=float).copy()
+        base_hold_target = np.asarray(
+            [
+                float(base_pose[0, 3]),
+                float(base_pose[1, 3]),
+                math.atan2(float(base_pose[1, 0]), float(base_pose[0, 0])),
+            ],
+            dtype=float,
+        )
         return {
-            "base_pose": np.asarray(base.pose, dtype=float).copy(),
-            "base_ctrl": np.asarray(base.ctrl, dtype=float).copy(),
-            "base_hold_target": np.asarray(
-                [
-                    float(base.pose[0, 3]),
-                    float(base.pose[1, 3]),
-                    math.atan2(float(base.pose[1, 0]), float(base.pose[0, 0])),
-                ],
-                dtype=float,
-            ),
+            "base_pose": base_pose,
+            "base_ctrl": base_ctrl,
+            "base_hold_target": base_hold_target,
             "groups": groups,
+            # Private to this macro; never reuse robot views across model/data resets.
+            "_view_cache": (
+                getattr(task_env, "current_model", None),
+                getattr(task_env, "current_data", None), robot_view, base,
+                tuple(group_views), np.zeros_like(base.joint_vel),
+                base_ctrl.shape == base_hold_target.shape,
+            ),
         }
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
@@ -111,21 +123,32 @@ def _apply_robot_lock(task_env, snapshot: dict[str, Any] | None) -> None:
         return
     try:
         robot_view = task_env.current_robot.robot_view
-        base = robot_view.base
+        cached = snapshot.get("_view_cache")
+        cache_valid = (
+            cached is not None
+            and cached[0] is not None and cached[1] is not None
+            and cached[0] is task_env.current_model
+            and cached[1] is task_env.current_data
+            and cached[2] is robot_view
+        )
+        base = cached[3] if cache_valid else robot_view.base
         base.pose = np.asarray(snapshot["base_pose"], dtype=float).copy()
-        base.joint_vel = np.zeros_like(base.joint_vel)
+        base.joint_vel = cached[5].copy() if cache_valid else np.zeros_like(base.joint_vel)
         base_hold_target = np.asarray(snapshot["base_hold_target"], dtype=float)
         base_ctrl = np.asarray(snapshot["base_ctrl"], dtype=float)
         try:
             base.ctrl = (
                 base_hold_target.copy()
-                if np.asarray(base.ctrl).shape == base_hold_target.shape
+                if (cached[6] if cache_valid else np.asarray(base.ctrl).shape == base_hold_target.shape)
                 else base_ctrl.copy()
             )
         except (AttributeError, ValueError):
             pass
-        for name, (qpos, qvel, ctrl) in dict(snapshot["groups"]).items():
-            group = robot_view.get_move_group(name)
+        group_views = cached[4] if cache_valid else (
+            (name, robot_view.get_move_group(name)) for name in dict(snapshot["groups"])
+        )
+        for name, group in group_views:
+            qpos, qvel, ctrl = snapshot["groups"][name]
             group.joint_pos = qpos.copy()
             group.joint_vel = qvel.copy()
             try:

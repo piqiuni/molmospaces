@@ -140,7 +140,12 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
 
     # This portal is outside the tiny map, so its effective planning data stays
     # unchanged. Publication must still precede portal hints and room work.
-    assert events == [("publish", fresh_raw), ("room_refresh", True)]
+    assert len(events) == 2 and events[0][0] == "publish"
+    assert events[1] == ("room_refresh", True)
+    published = events[0][1]
+    assert published.header == fresh_raw.header
+    assert published.info == fresh_raw.info
+    assert list(published.data) == list(fresh_raw.data)
     assert len(node.door_clear_mask_pub.messages) == 1
     assert list(node.door_clear_mask_pub.messages[0].data) == [0, 0, 0, 0]
     assert node._post_open_room_refresh_result is None

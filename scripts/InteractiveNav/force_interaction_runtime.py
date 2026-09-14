@@ -778,41 +778,65 @@ def apply_articulation_force_once(
     plan["force_specs"] = specs
 
 
+@dataclass(frozen=True)
+class _RobotContactLookup:
+    root_ids: np.ndarray
+    robot_geoms: np.ndarray
+    geom_names: tuple[str, ...]
+
+
+def _build_robot_contact_lookup(model: mujoco.MjModel) -> _RobotContactLookup:
+    names = tuple(str(model.body(body_id).name or "") for body_id in range(model.nbody))
+    body_ids = np.asarray(model.geom_bodyid)
+    root_ids = np.array(model.body_rootid[body_ids], copy=True)
+    robot_geoms = np.array([name.startswith("robot") for name in names], dtype=bool)[body_ids]
+    root_ids.flags.writeable = robot_geoms.flags.writeable = False
+    return _RobotContactLookup(
+        root_ids, robot_geoms,
+        tuple(names[body_id] or str(body_id) for body_id in body_ids),
+    )
+
+
 def _robot_articulation_contact_stats(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     root_body_id: int,
+    *,
+    lookup: _RobotContactLookup | None = None,
 ) -> dict[str, Any]:
+    root_body_id = int(root_body_id)
     count = 0
     minimum_distance = None
     pairs = set()
-    for contact_index in range(int(data.ncon)):
+    indexes = range(int(data.ncon))
+    if lookup is not None:
+        # Cache model topology only. Contact membership/distances are read again
+        # after every physics step, in their original order.
+        geoms = np.asarray(data.contact.geom)[:int(data.ncon)]
+        roots = lookup.root_ids[geoms]
+        robot = lookup.robot_geoms[geoms]
+        indexes = np.flatnonzero(
+            ((roots[:, 0] == root_body_id) | (roots[:, 1] == root_body_id))
+            & (robot[:, 0] | robot[:, 1])
+        )
+    for contact_index in indexes:
         contact = data.contact[contact_index]
-        body_ids = [
-            int(model.geom_bodyid[int(contact.geom1)]),
-            int(model.geom_bodyid[int(contact.geom2)]),
-        ]
-        root_matches = [
-            body_id
-            for body_id in body_ids
-            if int(model.body_rootid[body_id]) == int(root_body_id)
-        ]
-        robot_matches = [
-            body_id
-            for body_id in body_ids
-            if str(model.body(body_id).name or "").startswith("robot")
-        ]
-        if not root_matches or not robot_matches:
-            continue
+        if lookup is None:
+            body_ids = [
+                int(model.geom_bodyid[int(contact.geom1)]),
+                int(model.geom_bodyid[int(contact.geom2)]),
+            ]
+            if not any(int(model.body_rootid[body_id]) == int(root_body_id) for body_id in body_ids):
+                continue
+            if not any(str(model.body(body_id).name or "").startswith("robot") for body_id in body_ids):
+                continue
+            names = tuple(str(model.body(body_id).name or body_id) for body_id in body_ids)
+        else:
+            names = (lookup.geom_names[int(contact.geom1)], lookup.geom_names[int(contact.geom2)])
         count += 1
         distance = float(contact.dist)
         minimum_distance = distance if minimum_distance is None else min(minimum_distance, distance)
-        pairs.add(
-            tuple(sorted(
-                str(model.body(body_id).name or body_id)
-                for body_id in body_ids
-            ))
-        )
+        pairs.add(tuple(sorted(names)))
     return {
         "count": int(count),
         "minimum_distance": minimum_distance,
@@ -1406,7 +1430,8 @@ def drive_joint_group_to_targets(
     completed_substeps = 0
     reached = False
     root_body_id = int(model.body_rootid[specs[0]["body_id"]])
-    initial_contacts = _robot_articulation_contact_stats(model, data, root_body_id)
+    contact_lookup = _build_robot_contact_lookup(model)
+    initial_contacts = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
     max_contact_count = int(initial_contacts["count"])
     minimum_contact_distance = initial_contacts["minimum_distance"]
     try:
@@ -1437,7 +1462,7 @@ def drive_joint_group_to_targets(
             if robot_lock_callback is not None:
                 robot_lock_callback()
             completed_substeps = substep + 1
-            contact_stats = _robot_articulation_contact_stats(model, data, root_body_id)
+            contact_stats = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
             max_contact_count = max(max_contact_count, int(contact_stats["count"]))
             contact_distance = contact_stats["minimum_distance"]
             if contact_distance is not None:
@@ -1478,7 +1503,7 @@ def drive_joint_group_to_targets(
             }
         )
     reached = reached or all(joint["reached_target"] for joint in joints)
-    final_contacts = _robot_articulation_contact_stats(model, data, root_body_id)
+    final_contacts = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
     return {
         "method": "xfrc_applied_group_pd",
         "success": bool(reached),

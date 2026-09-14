@@ -108,6 +108,7 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid, Path
+from rospy.numpy_msg import numpy_msg
 from nav_msgs.srv import GetPlan
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -1528,7 +1529,7 @@ class SemanticBehaviorExecutor:
         )
         rospy.Subscriber(
             topics.get("occupancy", "/move_base/local_costmap/costmap"),
-            OccupancyGrid,
+            numpy_msg(OccupancyGrid),
             self._occupancy_callback,
             queue_size=1,
         )
@@ -1544,7 +1545,7 @@ class SemanticBehaviorExecutor:
         )
         rospy.Subscriber(
             topics.get("raw_occupancy_grid", "/struct_mapping/occ_map"),
-            OccupancyGrid,
+            numpy_msg(OccupancyGrid),
             self._raw_occupancy_callback,
             queue_size=1,
         )
@@ -1553,13 +1554,13 @@ class SemanticBehaviorExecutor:
                 "planning_occupancy_grid",
                 "/semantic_mapping/planning_occ_map",
             ),
-            OccupancyGrid,
+            numpy_msg(OccupancyGrid),
             self._planning_occupancy_callback,
             queue_size=1,
         )
         rospy.Subscriber(
             topics.get("global_costmap", "/move_base/global_costmap/costmap"),
-            OccupancyGrid,
+            numpy_msg(OccupancyGrid),
             self._global_costmap_callback,
             queue_size=1,
         )
@@ -1568,7 +1569,7 @@ class SemanticBehaviorExecutor:
                 "global_costmap_updates",
                 "/move_base/global_costmap/costmap_updates",
             ),
-            OccupancyGridUpdate,
+            numpy_msg(OccupancyGridUpdate),
             self._global_costmap_update_callback,
             queue_size=8,
         )
@@ -4255,7 +4256,11 @@ class SemanticBehaviorExecutor:
             self._latest_global_costmap_received_at = time.monotonic()
             if getattr(self, "container_anchor_clearance_enabled", False):
                 try:
-                    grid = ArrivalClearanceGrid.from_message(message, costmap=True)
+                    previous = getattr(self, "_global_clearance_snapshot", None)
+                    grid = ArrivalClearanceGrid.from_message(
+                        message, costmap=True,
+                        previous=previous[0] if previous is not None else None,
+                    )
                     self._global_clearance_snapshot = (grid, time.monotonic())
                 except (AttributeError, TypeError, ValueError):
                     self._global_clearance_snapshot = None
@@ -6791,7 +6796,8 @@ class SemanticBehaviorExecutor:
         with self.lock:
             occupancy = getattr(self, "_latest_occupancy", None)
             received_at = float(getattr(self, "_latest_occupancy_received_at", 0.0))
-        if occupancy is None or not getattr(occupancy, "data", None):
+        if (occupancy is None or getattr(occupancy, "data", None) is None
+                or len(occupancy.data) == 0):
             return None, {
                 "reason": "rear_goal_local_costmap_unavailable",
                 "costmap_age_s": None,
@@ -6990,7 +6996,10 @@ class SemanticBehaviorExecutor:
             cache = getattr(self, "_arrival_clearance_grid_cache", {})
             cached = cache.get(costmap)
             if cached is None or cached[0] is not occupancy:
-                grid = ArrivalClearanceGrid.from_message(occupancy, costmap=costmap)
+                grid = ArrivalClearanceGrid.from_message(
+                    occupancy, costmap=costmap,
+                    previous=cached[1] if cached is not None else None,
+                )
                 cache[costmap] = (occupancy, grid)
                 self._arrival_clearance_grid_cache = cache
             else:
@@ -13847,7 +13856,7 @@ class SemanticBehaviorExecutor:
     ) -> float:
         with self.lock:
             occupancy = self._latest_occupancy
-        if occupancy is None or not occupancy.data:
+        if occupancy is None or len(occupancy.data) == 0:
             return 0.0
         info = occupancy.info
         return safe_grid_motion_distance(
@@ -13868,7 +13877,7 @@ class SemanticBehaviorExecutor:
         pose = self._current_pose(self.map_frame)
         with self.lock:
             occupancy = self._latest_occupancy
-        if pose is None or occupancy is None or not occupancy.data:
+        if pose is None or occupancy is None or len(occupancy.data) == 0:
             return False
         info = occupancy.info
         resolution = float(info.resolution)

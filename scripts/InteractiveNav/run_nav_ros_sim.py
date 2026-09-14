@@ -553,7 +553,13 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             debug_snapshot_ms = (time.perf_counter() - snapshot_t0) * 1000.0
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
-            action_cmd = policy.get_action(observation)
+            if (
+                force_interaction_controller is not None
+                and force_interaction_controller.should_pause_navigation()
+            ):
+                action_cmd = policy.get_action(observation, hold_navigation=True)
+            else:
+                action_cmd = policy.get_action(observation)
             policy_ms = (time.perf_counter() - policy_t0) * 1000.0
             if getattr(policy, "last_action_timed_out", False):
                 consecutive_action_timeouts += 1
@@ -1275,6 +1281,14 @@ def parse_args():
         help="Linear velocity gain applied to incoming /cmd_vel_stamped before stepping base.",
     )
     parser.add_argument(
+        "--allow_lateral_cmd_vel",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Allow holonomic cmd_vel; default DWA navigation rejects lateral commands.",
+    )
+    parser.add_argument(
         "--initial_arm_qpos",
         type=str,
         default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04",
@@ -1408,6 +1422,7 @@ def main():
             depth_max_m=args.depth_max_m,
             cmd_vel_control_dt_s=args.policy_dt_ms / 1000.0,
             cmd_vel_linear_gain=args.cmd_vel_linear_gain,
+            allow_lateral_cmd_vel=args.allow_lateral_cmd_vel,
             require_fresh_cmd_vel=args.require_fresh_cmd_vel,
             require_move_base_active_for_cmd_vel=args.require_move_base_active_for_cmd_vel,
             map_warmup_skip_frames=args.map_warmup_skip_frames,

@@ -25,6 +25,7 @@ patch_roslogging_findcaller_for_py311()
 import rospy
 import tf
 from nav_msgs.msg import OccupancyGrid, Odometry
+from rospy.numpy_msg import numpy_msg
 from map_msgs.msg import OccupancyGridUpdate
 from std_msgs.msg import String
 
@@ -456,14 +457,19 @@ class SemanticCandidateNode:
                 ("planning", topics.get("planning_occupancy_grid", "/semantic_mapping/planning_occ_map")),
                 ("global", topics.get("global_costmap", "/move_base/global_costmap/costmap")),
             ):
-                rospy.Subscriber(topic, OccupancyGrid, self._clearance_map_callback,
+                rospy.Subscriber(topic, numpy_msg(OccupancyGrid), self._clearance_map_callback,
                                  callback_args=name, queue_size=1)
             rospy.Subscriber(topics.get("global_costmap_updates", "/move_base/global_costmap/costmap_updates"),
-                             OccupancyGridUpdate, self._clearance_global_update, queue_size=20)
+                             numpy_msg(OccupancyGridUpdate), self._clearance_global_update, queue_size=20)
 
     def _clearance_map_callback(self, message, name):
         try:
-            grid = ArrivalClearanceGrid.from_message(message, costmap=name in {"local", "global"})
+            with self.clearance_lock:
+                previous = self.clearance_maps.get(name)
+            grid = ArrivalClearanceGrid.from_message(
+                message, costmap=name in {"local", "global"},
+                previous=previous[0] if previous is not None else None,
+            )
         except (AttributeError, TypeError, ValueError):
             with self.clearance_lock:
                 self.clearance_maps.pop(name, None)

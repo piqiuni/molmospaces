@@ -29,7 +29,34 @@ class ArrivalClearanceGrid:
     @cached_property
     def components(self):
         # Four-connected free space cannot cross a diagonal obstacle corner.
-        return label((self.values >= 0) & (self.values < (self.inscribed_threshold or self.occupied_threshold)))[0]
+        result = label((self.values >= 0) & (self.values < (self.inscribed_threshold or self.occupied_threshold)))[0]
+        result.flags.writeable = False
+        return result
+
+    def _reuse_preprocessing(self, previous):
+        if previous is None or self.values.flags.writeable or previous.values.flags.writeable:
+            return self
+        geometry = ("resolution", "origin_x", "origin_y", "origin_yaw", "frame_id",
+                    "occupied_threshold", "inscribed_threshold")
+        if (self.values.shape != previous.values.shape
+                or any(getattr(self, key) != getattr(previous, key) for key in geometry)):
+            return self
+        cached = {key: previous.__dict__[key] for key in ("components", "obstacle_distance")
+                  if key in previous.__dict__}
+        if not cached:
+            return self
+        equal_values = np.array_equal(self.values, previous.values)
+        for key, result in cached.items():
+            threshold = ((self.inscribed_threshold or self.occupied_threshold)
+                         if key == "components" else self.occupied_threshold)
+            if equal_values or np.array_equal(
+                (self.values >= 0) & (self.values < threshold),
+                (previous.values >= 0) & (previous.values < threshold),
+            ):
+                # A new snapshot still owns current costs; only immutable mask
+                # products are shared, never the mutable ROS message or its age.
+                self.__dict__[key] = result
+        return self
 
     def reachable(self, start, goal):
         a, b = self.cell(start), self.cell(goal)
@@ -50,12 +77,15 @@ class ArrivalClearanceGrid:
         values[y:y+h, x:x+w] = np.asarray(message.data).reshape(h, w)
         values.flags.writeable = False
         return ArrivalClearanceGrid(values, self.resolution, self.origin_x, self.origin_y,
-                                    self.origin_yaw, self.frame_id, self.occupied_threshold, self.inscribed_threshold)
+                                    self.origin_yaw, self.frame_id, self.occupied_threshold,
+                                    self.inscribed_threshold)._reuse_preprocessing(self)
 
     @cached_property
     def obstacle_distance(self):
         free = (self.values >= 0) & (self.values < self.occupied_threshold)
-        return distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1] * self.resolution
+        result = distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1] * self.resolution
+        result.flags.writeable = False
+        return result
 
     def visible(self, start, end):
         steps = max(1, int(math.ceil(math.dist(start[:2], end[:2]) / (self.resolution * .5))))
@@ -94,7 +124,7 @@ class ArrivalClearanceGrid:
         return goals
 
     @classmethod
-    def from_message(cls, message, *, costmap=False):
+    def from_message(cls, message, *, costmap=False, previous=None):
         info = message.info
         if (int(info.width) <= 0 or int(info.height) <= 0
                 or not math.isfinite(float(info.resolution)) or float(info.resolution) <= 0
@@ -106,7 +136,7 @@ class ArrivalClearanceGrid:
         yaw = math.atan2(2.0 * (q.w*q.z + q.x*q.y), 1.0 - 2.0 * (q.y*q.y + q.z*q.z))
         return cls(values, float(info.resolution), float(info.origin.position.x),
                    float(info.origin.position.y), yaw, str(message.header.frame_id),
-                   100 if costmap else 50, 99 if costmap else None)
+                   100 if costmap else 50, 99 if costmap else None)._reuse_preprocessing(previous)
 
     def check(self, goal_xy, arrival_tolerance_m, *, robot_radius_m=0.25, safety_margin_m=0.05):
         # Arrival tolerance controls stopping, not obstacle clearance.
