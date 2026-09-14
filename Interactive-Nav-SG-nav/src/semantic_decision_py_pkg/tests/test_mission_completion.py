@@ -462,6 +462,17 @@ def test_completion_is_blocked_while_interaction_target_is_on_cooldown() -> None
     assert tracker.complete is False
 
 
+def test_terminal_interaction_failure_leaves_material_frontiers_for_bounded_recovery():
+    tracker = TerminalInteractionNoPlanExitTracker(TerminalInteractionNoPlanExitConfig(enabled=True))
+    assert tracker.note_feedback(_terminal_interaction_no_plan_feedback(), observation_step=100)
+    snapshot = _no_executable_snapshot(4, 120)
+    snapshot["exploration_context"]["raw_frontier_material_cluster_count"] = 2
+    assert not tracker.update(snapshot, has_active_behavior=False, has_executable_candidate=False,
+                              startup_scan_pending=False, eligible_candidate_count=0)
+    assert not tracker.complete
+    assert not tracker.terminal_failure
+
+
 def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> None:
     tracker = TerminalInteractionNoPlanExitTracker(
         TerminalInteractionNoPlanExitConfig(enabled=True)

@@ -105,6 +105,128 @@ def extend_container_step_cooldown(
     return deadline
 
 
+def container_approach_navigation_failed(detail: dict) -> bool:
+    """Accept the navigation contract and older pre-capture M1 deferrals."""
+
+    if detail.get("action_executed") is True:
+        return False
+    reasons = {
+        str(detail.get(key) or "").strip().casefold()
+        for key in ("reason", "failure_reason")
+    }
+    if "container_approach_navigation_unreachable" in reasons:
+        return True
+    if any(
+        reason.endswith("_m1_evidence_inconclusive_viewpoint_navigation")
+        for reason in reasons
+    ):
+        return True
+    if bool(detail.get("all_container_anchors_unreachable")):
+        return True
+    try:
+        attempts = int(detail.get("observation_attempts", -1))
+    except (TypeError, ValueError):
+        attempts = -1
+    return bool(
+        (
+            detail.get("m1_viewpoint_navigation_inconclusive")
+            or detail.get("failure_stage") == "interaction_approach_navigation"
+        )
+        and (detail.get("m1_capture_not_reached") or attempts == 0)
+    )
+
+
+class NoEligibleCandidateTracker:
+    """Bound waiting for safe candidates without declaring the map exhausted."""
+
+    def __init__(self, min_steps: int = 120, confirmations: int = 3) -> None:
+        self.min_steps = max(1, int(min_steps))
+        self.required_confirmations = max(2, int(confirmations))
+        self.reset()
+
+    def reset(self) -> None:
+        self.since_step: int | None = None
+        self.last_step: int | None = None
+        self.confirmations = 0
+        self.recovery_count = 0
+
+    @staticmethod
+    def has_frontiers(snapshot: dict) -> bool:
+        context = snapshot.get("exploration_context") or {}
+        return bool(context.get("connected_unknown_area_present")
+                    or context.get("filtered_frontier_retryable")
+                    or int(context.get("raw_frontier_material_cluster_count", 0) or 0) > 0)
+
+    def recovery_candidate(self, snapshot: dict) -> BehaviorCandidate | None:
+        if self.since_step is None or self.recovery_count >= 2 or not self.has_frontiers(snapshot):
+            return None
+        elapsed = (self.last_step or self.since_step) - self.since_step
+        due = max(1, self.min_steps // (6 if self.recovery_count == 0 else 2))
+        if elapsed < due or elapsed >= self.min_steps:
+            return None
+        self.recovery_count += 1
+        return BehaviorCandidate(
+            candidate_id=f"frontier_recovery_scan:{self.since_step}:{self.recovery_count}",
+            behavior_type=BEHAVIOR_SCAN,
+            source="frontier_recovery",
+            target_id="frontier_recovery",
+            target_name="Frontier recovery scan",
+            metadata={"frontier_recovery_scan": True},
+        )
+
+    def update(
+        self,
+        snapshot: dict,
+        *,
+        eligible_candidate_count: int,
+        has_active_behavior: bool,
+    ) -> dict:
+        context = snapshot.get("exploration_context") or {}
+        if (
+            eligible_candidate_count > 0
+            or has_active_behavior
+            or not bool(context.get("initial_scan_complete", True))
+        ):
+            self.reset()
+            return {}
+        try:
+            step = int(context.get("observation_step"))
+        except (TypeError, ValueError):
+            step = -1
+        if step < 0:
+            return {
+                "reason": "no_eligible_candidates_missing_observation_step",
+                "blocked": False,
+            }
+        if self.last_step is not None and step < self.last_step:
+            self.reset()
+        if self.since_step is None:
+            self.since_step = step
+        if step != self.last_step:
+            self.confirmations += 1
+            self.last_step = step
+        elapsed = step - self.since_step
+        blocked = (
+            elapsed >= self.min_steps
+            and self.confirmations >= self.required_confirmations
+        )
+        return {
+            "reason": (
+                "no_eligible_candidates_after_bounded_recovery"
+                if blocked else "no_eligible_candidates_waiting_for_recovery"
+            ),
+            "blocked": blocked,
+            "eligible_candidate_count": 0,
+            "observation_step": step,
+            "no_eligible_since_step": self.since_step,
+            "no_eligible_elapsed_steps": elapsed,
+            "no_eligible_confirmations": self.confirmations,
+            "no_eligible_min_steps": self.min_steps,
+            "no_eligible_confirmations_required": self.required_confirmations,
+            "recovery_scan_count": self.recovery_count,
+        }
+
+
 def container_candidate_with_rejected_faces(
     payload: dict,
     rejected_indices: set[int] | frozenset[int] | list[int] | tuple[int, ...],
@@ -374,6 +496,12 @@ class SemanticRuleDecisionNode:
             0,
             int(config.get("container_anchor_unreachable_cooldown_steps", 300)),
         )
+        self.container_navigation_cooldown_steps = max(
+            1, int(config.get("container_navigation_cooldown_steps", 20))
+        )
+        self.container_navigation_cooldown_s = max(
+            0.0, float(config.get("container_navigation_cooldown_s", 15.0))
+        )
         configured_m1_cooldown_schedule = config.get(
             "container_m1_inconclusive_cooldown_schedule_s",
             [15.0, 60.0, 180.0],
@@ -637,6 +765,10 @@ class SemanticRuleDecisionNode:
         self.container_m1_inconclusive_counts: dict[str, int] = {}
         self.container_anchor_unreachable_until_step: dict[str, int] = {}
         self.container_rejected_face_indices_by_target: dict[str, set[int]] = {}
+        self.no_eligible_candidate_tracker = NoEligibleCandidateTracker(
+            min_steps=completion_config.get("no_eligible_candidate_min_steps", 120),
+            confirmations=completion_config.get("no_eligible_candidate_confirmations", 3),
+        )
         # Count-bounded executor approach attempts are not object failures.
         # Suppress only the identical candidate fingerprint so another
         # interaction subgoal can be selected immediately, without a timer.
@@ -759,6 +891,7 @@ class SemanticRuleDecisionNode:
                 )
                 self.completion_tracker.reset()
                 self.terminal_no_plan_exit_tracker.reset()
+                self.no_eligible_candidate_tracker.reset()
                 self.global_navigation_progress.reset()
                 self.active_frontier_missing_count = 0
             target_context = payload.get("target_context") or {}
@@ -768,6 +901,7 @@ class SemanticRuleDecisionNode:
             )
             if target_key != previous_target_key:
                 self.target_context = dict(target_context)
+                self.no_eligible_candidate_tracker.reset()
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.priority_target_candidate_id = ""
@@ -880,6 +1014,22 @@ class SemanticRuleDecisionNode:
             rejected_by_target.setdefault(feedback_target_id, set()).update(
                 rejected_face_indices
             )
+        container_navigation_failure = bool(
+            status in {"FAILED", "REJECTED"}
+            and self.active_behavior_type == "INTERACT"
+            and container_approach_navigation_failed(detail)
+        )
+        if container_navigation_failure:
+            # Keep executor diagnostics, but never charge a navigation-only
+            # attempt to the M1 evidence budget or its long object cooldown.
+            detail.setdefault("failure_reason", detail.get("reason") or "")
+            detail.update(
+                reason="container_approach_navigation_unreachable",
+                failure_stage="interaction_approach_navigation",
+                m1_evidence_inconclusive=False,
+                observation_outcome="navigation_unreachable",
+            )
+            payload = {**payload, "detail": detail}
         # A bounded M1 evidence plan may run out of clean views without any
         # physical action or reachability proof.  That is retryable visual
         # uncertainty, not an object/candidate exclusion or target-wide
@@ -888,10 +1038,10 @@ class SemanticRuleDecisionNode:
         m1_evidence_inconclusive = bool(
             detail.get("m1_evidence_inconclusive", False)
             and detail.get("retryable", False)
+            and not container_navigation_failure
         )
         all_container_anchors_unreachable = bool(
-            m1_evidence_inconclusive
-            and detail.get("all_container_anchors_unreachable", False)
+            detail.get("all_container_anchors_unreachable", False)
         )
         failure_reason = str(
             detail.get("failure_reason") or detail.get("reason") or ""
@@ -908,6 +1058,7 @@ class SemanticRuleDecisionNode:
                 or "successor_quiescence" in failure_reason
                 or "service_unavailable" in failure_reason
                 or "transport" in failure_reason
+                or failure_reason == "navigation_costmap_not_fresh"
             )
         )
         # The executor has a finite set of preserved approach poses. Once that
@@ -964,6 +1115,7 @@ class SemanticRuleDecisionNode:
                 status == "SUCCEEDED"
                 or not approach_precondition_failed
                 or approach_options_exhausted
+                or container_navigation_failure
             )
         ):
             terminal_interaction_failure = (
@@ -987,7 +1139,35 @@ class SemanticRuleDecisionNode:
                     self.latest_candidates_payload
                 ),
             )
-        if candidate_id and m1_evidence_inconclusive and not preempted_by_target:
+        if (
+            candidate_id
+            and container_navigation_failure
+            and not executor_transport_defer
+            and not terminal_interaction_failure
+        ):
+            target_id = self._interaction_target_id(candidate_id) or candidate_id
+            raw_step = (self.latest_candidates_payload.get("exploration_context") or {}).get(
+                "observation_step"
+            )
+            try:
+                current_step = int(raw_step)
+            except (TypeError, ValueError):
+                current_step = -1
+            if current_step >= 0:
+                extend_container_step_cooldown(
+                    target_id,
+                    current_step,
+                    max(1, int(getattr(self, "container_navigation_cooldown_steps", 20))),
+                    self.container_anchor_unreachable_until_step,
+                )
+                self.cooldown_until.pop(candidate_id, None)
+                self.cooldown_until.pop(target_id, None)
+            else:
+                # Non-evaluator callers retain a finite wall-clock fallback.
+                self.cooldown_until[target_id] = time.monotonic() + max(
+                    0.0, float(getattr(self, "container_navigation_cooldown_s", 15.0))
+                )
+        elif candidate_id and m1_evidence_inconclusive and not preempted_by_target:
             target_id = self._interaction_target_id(candidate_id)
             count_key = target_id or candidate_id
             inconclusive_count = (
@@ -998,11 +1178,6 @@ class SemanticRuleDecisionNode:
                 self.container_m1_inconclusive_cooldown_schedule_s,
                 inconclusive_count,
             )
-            if all_container_anchors_unreachable:
-                cooldown_s = max(
-                    cooldown_s,
-                    self.container_anchor_unreachable_cooldown_s,
-                )
             cooldown_deadline = time.monotonic() + max(0.0, cooldown_s)
             self.cooldown_until[candidate_id] = cooldown_deadline
             # Evidence plans are rebuilt with new candidate fingerprints as the
@@ -1056,6 +1231,7 @@ class SemanticRuleDecisionNode:
             candidate_id
             and approach_precondition_failed
             and not approach_options_exhausted
+            and not container_navigation_failure
         ):
             fingerprint = self._candidate_fingerprint_for_id(candidate_id)
             if fingerprint:
@@ -1067,6 +1243,7 @@ class SemanticRuleDecisionNode:
             and not approach_precondition_failed
             and not terminal_interaction_failure
             and not m1_evidence_inconclusive
+            and not container_navigation_failure
             and not executor_transport_defer
         ):
             target_id = self._interaction_target_id(candidate_id)
@@ -1090,6 +1267,7 @@ class SemanticRuleDecisionNode:
         # can be selected again immediately and burn the whole horizon.
         container_approach_retryable = bool(
             approach_precondition_failed
+            and not container_navigation_failure
             and self.active_behavior_type == "INTERACT"
             and isinstance(self.active_interaction_candidate, dict)
             and str(
@@ -1133,6 +1311,8 @@ class SemanticRuleDecisionNode:
                     )
                     or 0
                 )
+                if failure_reason == "navigation_costmap_not_fresh":
+                    cooldown_steps = max(1, int(self.container_navigation_cooldown_steps))
                 step_cooldowns = getattr(
                     self, "container_anchor_unreachable_until_step", None
                 )
@@ -1147,7 +1327,7 @@ class SemanticRuleDecisionNode:
                 )
         if executor_transport_defer:
             self.next_decision_time = 0.0
-        elif all_container_anchors_unreachable:
+        elif container_navigation_failure or all_container_anchors_unreachable:
             # Skip immediately to another candidate while this target cools
             # down.  The cooldown is retryable map-generation memory, not a
             # terminal exclusion and not a blank period with no subgoal.
@@ -1335,7 +1515,10 @@ class SemanticRuleDecisionNode:
         # Drawer/container physical macros intentionally hold the base.  Their
         # own finite evaluator-step lease is authoritative, so pause rather
         # than reset the global navigation clock while INTERACT owns execution.
-        if self.active_behavior_type == "INTERACT":
+        if self.active_behavior_type in {"INTERACT", BEHAVIOR_SCAN} or (
+            not self.active_candidate_id
+            and self.no_eligible_candidate_tracker.since_step is not None
+        ):
             self.global_navigation_progress.pause(step)
             return
         detail = self.global_navigation_progress.observe(
@@ -1714,17 +1897,17 @@ class SemanticRuleDecisionNode:
         ) = self._completion_snapshot_without_terminal_interactions(
             candidate_snapshot
         )
-        # A zero eligible-candidate list can be a transient target cooldown,
-        # not mission exhaustion.  Publish the live interaction cooldown count
-        # into the completion contract so the tracker waits for it to expire.
+        # Include step-only cooldowns in the completion contract: a paused
+        # target is unresolved, not an exhausted interaction frontier.
         now_monotonic = time.monotonic()
         candidate_ids = {
             str(item.get("candidate_id") or "")
             for item in candidate_snapshot.get("candidates") or []
         }
+        observation_step = self._observation_step(candidate_snapshot)
         with self.state_lock:
-            live_interaction_cooldowns = sum(
-                1
+            live_cooldown_keys = {
+                key
                 for key, until in self.cooldown_until.items()
                 if float(until or 0.0) > now_monotonic
                 and (
@@ -1735,12 +1918,17 @@ class SemanticRuleDecisionNode:
                     or "fridge" in str(key).casefold()
                     or "door" in str(key).casefold()
                 )
+            }
+            live_cooldown_keys.update(
+                key
+                for key, until in self.container_anchor_unreachable_until_step.items()
+                if int(until) > observation_step
             )
         completion_context = dict(
             completion_snapshot.get("exploration_context") or {}
         )
         completion_context["interaction_cooldown_target_count"] = (
-            live_interaction_cooldowns
+            len(live_cooldown_keys)
         )
         completion_snapshot["exploration_context"] = completion_context
         candidate_sequence = int(candidate_snapshot.get("sequence", 0) or 0)
@@ -1804,11 +1992,14 @@ class SemanticRuleDecisionNode:
             )
             return
         if self.completion_tracker.terminal_stalled:
-            self.goal_complete = True
-            detail = dict(self.completion_tracker.last_retryable_frontier_detail)
-            detail["candidate_sequence"] = candidate_sequence
-            self._publish_goal_status("EXPLORATION_STALLED", detail=detail)
-            return
+            if self.no_eligible_candidate_tracker.has_frontiers(candidate_snapshot):
+                self.completion_tracker.reset()
+            else:
+                self.goal_complete = True
+                detail = dict(self.completion_tracker.last_retryable_frontier_detail)
+                detail["candidate_sequence"] = candidate_sequence
+                self._publish_goal_status("EXPLORATION_STALLED", detail=detail)
+                return
         now = time.monotonic()
         decision_history, group_history = self._history_context(candidate_snapshot)
         region_history = self._region_history_context(candidate_snapshot)
@@ -2073,7 +2264,7 @@ class SemanticRuleDecisionNode:
                 candidate_validation_reason = "episode_changed"
             else:
                 latest_region_history = self._region_history_context(latest_snapshot)
-                latest_eligible, _ = self._eligible_candidates_from_snapshot(
+                latest_eligible, eligibility_rejections = self._eligible_candidates_from_snapshot(
                     latest_snapshot,
                     now=time.monotonic(),
                     region_history=latest_region_history,
@@ -2173,6 +2364,18 @@ class SemanticRuleDecisionNode:
             ),
             eligible_candidate_count=execution_eligible_candidate_count,
         )
+        no_eligible_recovery = self.no_eligible_candidate_tracker.update(
+            execution_snapshot,
+            eligible_candidate_count=max(
+                execution_eligible_candidate_count, int(selected is not None)
+            ),
+            has_active_behavior=bool(self.active_candidate_id),
+        )
+        if selected is None and not self.active_candidate_id:
+            selected = self.no_eligible_candidate_tracker.recovery_candidate(execution_snapshot)
+            if selected is not None:
+                selection_override_reason = "bounded_frontier_recovery_scan"
+                no_eligible_recovery["recovery_scan_count"] = self.no_eligible_candidate_tracker.recovery_count
         executed_group_id = (
             candidate_group_id(
                 selected,
@@ -2234,6 +2437,8 @@ class SemanticRuleDecisionNode:
             "curation_empty_fallback_used": curation_empty_fallback_used,
             "entered_room_ids": list(curation.entered_room_ids),
             "eligibility_rejections": eligibility_rejections,
+            "execution_eligible_candidate_count": execution_eligible_candidate_count,
+            "no_eligible_candidate_recovery": no_eligible_recovery,
             "terminal_interaction_completion_excluded_candidate_ids": (
                 terminal_completion_excluded_candidate_ids
             ),
@@ -2270,6 +2475,18 @@ class SemanticRuleDecisionNode:
             detail = dict(self.terminal_no_plan_exit_tracker.last_detail)
             detail["eligibility_rejections"] = dict(eligibility_rejections)
             self._publish_goal_status("EXPLORATION_STALLED", detail=detail)
+            return
+        if no_eligible_recovery.get("blocked"):
+            self.goal_complete = True
+            self._publish_goal_status(
+                "EXPLORATION_STALLED",
+                detail={
+                    **no_eligible_recovery,
+                    "eligibility_rejections": dict(eligibility_rejections),
+                    "candidate_sequence": execution_snapshot.get("sequence", 0),
+                    "exploration_context": dict(execution_exploration_context),
+                },
+            )
             return
         if selected is None:
             return

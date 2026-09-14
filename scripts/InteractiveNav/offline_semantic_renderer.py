@@ -32,6 +32,7 @@ if str(_HELPER_DIR) not in sys.path:
 
 from explore_py_pkg.debug_semantic_viz import (  # noqa: E402
     candidate_color,
+    semantic_node_display_label,
     portal_room_node_ids,
     topology_edge_style,
     topology_edge_visible,
@@ -39,6 +40,7 @@ from explore_py_pkg.debug_semantic_viz import (  # noqa: E402
     topology_node_style,
 )
 from explore_py_pkg.subgoal_overlay import SubgoalOverlay  # noqa: E402
+from explore_py_pkg.room_colors import room_color  # noqa: E402
 
 
 def _frame_name(value: object) -> str:
@@ -397,19 +399,9 @@ def _costmap_base(grid: RawGrid) -> np.ndarray:
 def _room_base(grid: RawGrid) -> np.ndarray:
     values = grid.image_values
     image = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
-    palette = (
-        (255, 185, 185),
-        (185, 220, 255),
-        (195, 245, 195),
-        (245, 220, 170),
-        (225, 195, 245),
-        (175, 235, 230),
-        (245, 195, 225),
-        (220, 220, 170),
-    )
     valid = values >= 0
     for room_id in np.unique(values[valid]) if np.any(valid) else []:
-        image[values == int(room_id)] = palette[int(room_id) % len(palette)]
+        image[values == int(room_id)] = room_color(int(room_id))
     return image
 
 
@@ -1143,6 +1135,19 @@ def active_semantic_selection(step: dict) -> dict:
     if raw_selection.get("active") is False:
         return {}
     selection = dict(raw_selection)
+    # Older recorder snapshots occasionally persisted the physical action
+    # verb (``open``/``close``) in ``behavior_type``.  The map renderer treats
+    # unknown behavior types as NAVIGATE, which made an interaction marker
+    # turn green during offline replay.  Recover the semantic type from the
+    # nested command (or the canonical candidate-id prefix) before any panel
+    # consumes the selection.
+    behavior = str(selection.get("behavior_type") or "").upper()
+    if behavior not in {"EXPLORE", "NAVIGATE", "INTERACT"}:
+        command = selection.get("interaction_command") or {}
+        action = str(command.get("action") or "").strip()
+        candidate_id = str(selection.get("candidate_id") or "").casefold()
+        if action or candidate_id.startswith("interaction:"):
+            selection["behavior_type"] = "INTERACT"
     execution = step.get("semantic_execution_state") or {}
     if (
         str(execution.get("candidate_id") or "")
@@ -1196,12 +1201,7 @@ def _short_node_id(node: dict) -> str:
 
 
 def _node_label(node: dict) -> str:
-    if str(node.get("type") or "") != "room":
-        return str(node.get("label") or node.get("type") or "object")
-    value = str((node.get("attributes") or {}).get("room_attribute") or "unknown").strip()
-    if value == "livingroom":
-        return "living room"
-    return f"{value} room" if value != "unknown" else "unknown room"
+    return semantic_node_display_label(node)
 
 
 def _node_color(node: dict) -> tuple[int, int, int]:

@@ -13,6 +13,7 @@ target:
   enabled: false
 
 candidate:
+  navigation_clearance_enabled: true
   interaction_types: ["portal", "container"]
   # Do not let the label-derived Door prior issue an interaction before the
   # visual attribute module has returned a ready result.
@@ -34,6 +35,7 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   portal_standoff_m: 0.85
+  portal_tangent_offsets_m: [0.10, -0.10, 0.15, -0.15]
   # Opposite-side poses are reserved for traversal; interaction stays on the
   # currently observed doorway side.
   portal_allow_opposite_side_interaction: false
@@ -43,9 +45,7 @@ candidate:
   # model lane; the bridge still performs its independent collision/sweep gate.
   container_action_standoff_m: 0.50
   drawer_action_standoff_m: 0.50
-  # The closed-AABB clearance alone did not cover the hinged leaf sweep in H4
-  # and H10.  Keep M1 at its useful 0.90 m image distance, then retreat to a
-  # 1.15 m physical stance before force.
+  # The shared anchor keeps M1 and physical action at the selected fan distance.
   fridge_action_standoff_m: 1.15
   # AABB supplies four cardinal candidate faces only.  Targeted M1 decides
   # which face is the real usable front before the shared anchor may act.
@@ -67,7 +67,7 @@ candidate:
   # Drawer outer navigation uses the real AABB surface, centred on the
   # robot-visible face normal.  This replaces the four tilted radial rings.
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   # Refrigerators use the same four-face M1 authorization, but their physical
   # fan is narrower and remains farther away to preserve leaf/interior space.
@@ -120,6 +120,8 @@ policy:
   interaction_target_failure_cooldown_s: 60.0
   container_anchor_unreachable_cooldown_s: 60.0
   container_anchor_unreachable_cooldown_steps: 300
+  container_navigation_cooldown_steps: 20
+  container_navigation_cooldown_s: 15.0
   container_m1_inconclusive_cooldown_schedule_s: [15.0, 60.0, 180.0]
   failure_retry_delay_s: 1.0
   repeat_guard_enabled: true
@@ -149,11 +151,14 @@ completion:
   stagnation_failure_limit: 8
 
 executor:
+  interaction_timeout_task_steps: 120
+  interaction_step_stall_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
   # A negative M1 view must advance to a materially different anchor.  Never
   # spend another request at the same pose after a transient/front flip.
   container_m1_same_pose_flip_retry_count: 0
   interaction_observation_timeout_s: 12.0
+  interaction_fallback_on_m1_failure: true
   interaction_observation_same_pose_samples_per_view: 1
   interaction_observation_max_viewpoints: 3
   interaction_observation_max_total_requests: 3
@@ -172,7 +177,7 @@ executor:
   container_m1_capture_dwa_reconfigure_timeout_s: 1.0
   # Any remaining terminal-yaw settlement is bounded by public simulator steps,
   # independent of host load and VLM wall latency.
-  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 100
   # A capture timeout cancels move_base before the next outer viewpoint.  Wait
   # for a newer server status with no ACTIVE/PREEMPTING goal so make_plan cannot
   # observe the action client's brief local-DONE/server-PREEMPTING mismatch.
@@ -240,7 +245,7 @@ executor:
   semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
-  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_step_sync_stall_timeout_s: 30.0
   # A completed rear-safe turn is followed by a bounded DWA yaw-settle phase.
   # Rebase the translation watchdog during it, then grant a fresh normal
   # stagnation window instead of counting the turn against forward progress.
@@ -255,7 +260,7 @@ executor:
   # While move_base is still ACTIVE at a position-ready interaction pose, DWA
   # owns terminal rotation. Bound the wait in public simulator steps so a busy
   # host cannot make the same trajectory time out earlier.
-  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 100
   interaction_final_align_step_sync_enabled: true
   interaction_final_align_control_dt_s: 0.2
   # Hard cap only; the actual count is derived from yaw error, .30 rad/s,

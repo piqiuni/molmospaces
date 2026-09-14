@@ -97,7 +97,16 @@ class SubgoalOverlay:
             cv2.rectangle(panel, (3, y1), (width - 4, y2), (15, 15, 15), 2 if selected else 1)
             cv2.rectangle(panel, (4, y1 + 1), (10, max(y1 + 1, y2 - 1)), color, -1)
             target = str(item.get("target_name") or item.get("target_id") or cid or "-")
-            label = f"{'>' if selected else ' '}{behavior[:3]} {target}"
+            # Re-observation rows are NAVIGATE candidates used only as a
+            # fallback to refresh a portal view.  Keep their NAVIGATE color
+            # (the behavior type is still navigation), but label them
+            # explicitly so the sidebar cannot be mistaken for a second
+            # physical interaction or an interaction preemption.
+            is_reobserve = bool(
+                (item.get("metadata") or {}).get("reobserve_interaction_target")
+            )
+            behavior_label = "REOBS" if is_reobserve else behavior[:3]
+            label = f"{'>' if selected else ' '}{behavior_label} {target}"
             max_chars = max(5, int((width - 17) / max(3.5, 7.0 * font_scale)))
             cv2.putText(panel, label[:max_chars], (13, min(y2 - 2, y1 + max(7, row_h - 5))), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (25, 25, 25), 1, cv2.LINE_AA)
         return panel

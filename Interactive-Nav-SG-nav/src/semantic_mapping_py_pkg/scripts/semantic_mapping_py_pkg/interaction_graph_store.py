@@ -282,10 +282,16 @@ def _portal_visual_state_gate(
     """
 
     requested = str(state or "unknown").strip().casefold()
+    if (
+        node.type == "portal"
+        and requested in {"open", "ajar", "static_open", "closed"}
+        and bool(visual_evidence_truncated)
+    ):
+        # Border-clipped evidence is incomplete in both directions: it cannot
+        # prove an aperture and it cannot prove that the whole leaf is closed.
+        return False, "truncated_visual_evidence"
     if node.type != "portal" or requested not in {"open", "ajar", "static_open"}:
         return True, "not_applicable"
-    if bool(visual_evidence_truncated):
-        return False, "truncated_visual_evidence"
     aperture_visible = bool(
         isinstance(aperture_evidence, dict)
         and aperture_evidence.get("open_aperture") == "visible"
@@ -368,6 +374,15 @@ def _portal_result_state_gate(node, result, resolved_state):
         "static_open",
     }:
         return True, "not_applicable"
+    if bool(
+        result.get("visual_evidence_truncated")
+        or result.get("visual_evidence_truncated_edges")
+    ):
+        # A result may be correlated with a real observation, but an image
+        # clipped at the frame boundary cannot establish either an open gap or
+        # a closed leaf.  Preserve the prior graph state until a complete view
+        # or an authoritative simulator result arrives.
+        return False, "truncated_visual_evidence"
     action = str(result.get("action") or "").strip().casefold()
     capability = _interaction_result_capability(result)
     source = str(result.get("source") or "").strip().casefold()
@@ -393,7 +408,10 @@ def _portal_result_state_gate(node, result, resolved_state):
             observation_only
             and requested == "static_open"
             and capability in {"unknown", "unavailable"}
-            and bool(result.get("portal_aperture_evidence"))
+            and _portal_has_visual_and_map_open_evidence(
+                node,
+                result.get("portal_aperture_evidence"),
+            )
         )
         or trusted_verified_state
         or (
@@ -851,7 +869,12 @@ class InteractionGraphStore:
                 # gated graph state, M1+OCC agreement below, or a separately
                 # successful force result handled by the success lane.
                 observed_pre_state = graph_pre_state
-                if observation_only_open:
+                observation_only_open_confirmed = bool(
+                    observation_only_open
+                    and result_state_allowed
+                    and str(resolved_state or "").casefold() == "static_open"
+                )
+                if observation_only_open_confirmed:
                     # The M1 observation itself is the authoritative aperture
                     # result for a non-articulated/already-open portal.  Keep
                     # executor capability unavailable while exposing the
@@ -875,7 +898,7 @@ class InteractionGraphStore:
                     terminal_state = "static_open"
                     terminal_state_source = "mllm_aperture+occupancy_connectivity"
                     terminal_state_evidence = "m1_open_aperture_and_occ_connectivity"
-                elif observation_only_open:
+                elif observation_only_open_confirmed:
                     pass
                 elif observed_pre_state in {"open", "opened", "ajar", "static_open"}:
                     terminal_state = "static_open"

@@ -1,0 +1,345 @@
+from __future__ import annotations
+
+import copy
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+PACKAGE_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+MLLM_SCRIPTS = PACKAGE_SCRIPTS.parents[1] / "semantic_mllm_py_pkg" / "scripts"
+for scripts in (PACKAGE_SCRIPTS, MLLM_SCRIPTS):
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+
+pytest.importorskip("rospy")
+
+import semantic_rule_decision_node as decision
+from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
+
+
+CANDIDATE_ID = "interaction:fridge_1:open"
+TARGET_KEY = "interaction_target:fridge_1"
+NAVIGATION_DETAIL = {
+    "reason": "container_approach_navigation_unreachable",
+    "failure_reason": "container_anchor_footprint_blocked",
+    "failure_stage": "interaction_approach_navigation",
+    "retryable": True,
+    "action_executed": False,
+    "all_container_anchors_unreachable": True,
+    "observation_attempts": 0,
+}
+
+
+class Publisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(json.loads(message.data))
+
+
+@pytest.fixture
+def node(monkeypatch):
+    monkeypatch.setattr(decision.rospy, "init_node", lambda *_a, **_k: None)
+    monkeypatch.setattr(decision.rospy, "get_param", lambda _key, default=None: default)
+    monkeypatch.setattr(decision.rospy, "Publisher", lambda *_a, **_k: Publisher())
+    monkeypatch.setattr(decision.rospy, "Subscriber", lambda *_a, **_k: None)
+    monkeypatch.setattr(decision.rospy, "Timer", lambda *_a, **_k: None)
+    monkeypatch.setattr(decision, "load_env_file", lambda *_a, **_k: None)
+    monkeypatch.setattr(decision, "apply_model_env_overrides", lambda config: config)
+    return decision.SemanticRuleDecisionNode()
+
+
+def candidate(**metadata):
+    return BehaviorCandidate(
+        candidate_id=CANDIDATE_ID,
+        behavior_type="INTERACT",
+        source="interaction_graph",
+        target_id="fridge_1",
+        target_name="fridge",
+        goal_xyyaw=[2.24, 0.65, 3.14],
+        interaction_command={"container_kind": "fridge", "action": "open"},
+        metadata=metadata,
+    ).to_dict()
+
+
+def snapshot(step, candidates=None, **context):
+    candidates = [candidate()] if candidates is None else candidates
+    return {
+        "episode_id": "h5",
+        "sequence": step + 1,
+        "candidates": copy.deepcopy(candidates),
+        "candidate_count": len(candidates),
+        "robot_xy": [1.65, 3.04],
+        "exploration_context": {
+            "observation_step": step,
+            "initial_scan_complete": True,
+            "navigation_frontier_count": 0,
+            "interaction_frontier_count": 1,
+            "frontier_exhausted": False,
+            "unresolved_interaction_target_count": 1,
+            "connected_unknown_area_present": True,
+            "raw_frontier_material_cluster_count": 2,
+            "filtered_frontier_retryable": True,
+            **context,
+        },
+    }
+
+
+def fail(node, detail, step=426):
+    node.latest_candidates_payload = snapshot(step)
+    node.active_candidate_id = CANDIDATE_ID
+    node.active_decision_id = f"decision_{step}"
+    node.active_behavior_type = "INTERACT"
+    node.active_interaction_candidate = candidate()
+    node._handle_feedback({
+        "status": "FAILED",
+        "candidate_id": CANDIDATE_ID,
+        "decision_id": node.active_decision_id,
+        "detail": copy.deepcopy(detail),
+    })
+
+
+@pytest.mark.parametrize("detail", [
+    NAVIGATION_DETAIL,
+    {
+        "reason": "container_m1_evidence_inconclusive_viewpoint_navigation",
+        "failure_reason": "container_anchor_center_blocked",
+        "failure_stage": "interaction_visual_precondition",
+        "m1_evidence_inconclusive": True,
+        "retryable": True,
+    },
+    {"reason": "drawer_m1_evidence_inconclusive_viewpoint_navigation"},
+    {"all_container_anchors_unreachable": True},
+    {"m1_viewpoint_navigation_inconclusive": True, "observation_attempts": 0},
+    {"m1_viewpoint_navigation_inconclusive": True, "m1_capture_not_reached": True},
+    {"failure_stage": "interaction_approach_navigation", "observation_attempts": 0},
+])
+def test_navigation_feedback_uses_short_step_cooldown_without_m1_count(node, detail, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(node, "_record_decision_result", recorded.append)
+    fail(node, detail)
+
+    assert node.container_anchor_unreachable_until_step == {TARGET_KEY: 446}
+    assert not node.cooldown_until
+    assert not node.container_m1_inconclusive_counts
+    assert not node.failure_counts
+    assert node.interaction_failure_tracker.failure_counts == {CANDIDATE_ID: 1}
+    assert not node.interaction_failure_tracker.terminal_candidate_ids
+    assert not node.approach_exhausted_fingerprints
+    assert node.next_decision_time == 0.0
+    result = recorded[-1]["detail"]
+    assert result["reason"] == "container_approach_navigation_unreachable"
+    assert result["failure_stage"] == "interaction_approach_navigation"
+    assert result["m1_evidence_inconclusive"] is False
+    if "failure_reason" in detail:
+        assert result["failure_reason"] == detail["failure_reason"]
+
+
+@pytest.mark.parametrize("detail", [
+    {"reason": "container_m1_evidence_inconclusive", "observation_attempts": 2},
+    {"m1_viewpoint_navigation_inconclusive": True, "observation_attempts": 2},
+    {"observation_attempts": 0},
+    {"m1_viewpoint_navigation_inconclusive": True, "observation_attempts": "invalid"},
+    {**NAVIGATION_DETAIL, "action_executed": True},
+])
+def test_visual_uncertainty_is_not_navigation_failure(detail):
+    assert not decision.container_approach_navigation_failed(detail)
+
+
+def test_genuine_m1_failure_keeps_existing_visual_retry_policy(node):
+    fail(node, {
+        "reason": "container_m1_evidence_inconclusive",
+        "failure_stage": "interaction_visual_precondition",
+        "m1_evidence_inconclusive": True,
+        "retryable": True,
+        "observation_attempts": 2,
+    })
+    assert node.container_m1_inconclusive_counts == {TARGET_KEY: 1}
+    assert node.container_anchor_unreachable_until_step == {TARGET_KEY: 726}
+    assert TARGET_KEY in node.cooldown_until
+    assert not node.interaction_failure_tracker.terminal_candidate_ids
+
+
+def test_navigation_retry_cooldown_is_step_based_and_rechecks_safety(node):
+    fail(node, NAVIGATION_DETAIL)
+    before = node._eligible_candidates_from_snapshot(
+        snapshot(445), now=1e20, region_history={}
+    )
+    assert before == ([], {CANDIDATE_ID: "container_anchor_step_cooldown"})
+
+    eligible, rejected = node._eligible_candidates_from_snapshot(
+        snapshot(446), now=0.0, region_history={}
+    )
+    assert [item.candidate_id for item in eligible] == [CANDIDATE_ID]
+    assert not rejected
+    unsafe = snapshot(446, [candidate(path_reachable=False)])
+    original = copy.deepcopy(unsafe)
+    assert node._eligible_candidates_from_snapshot(
+        unsafe, now=1e20, region_history={}
+    ) == ([], {CANDIDATE_ID: "path_reachable_false"})
+    assert unsafe == original
+
+
+def test_navigation_retry_survives_fingerprint_and_candidate_action_change(node):
+    fail(node, NAVIGATION_DETAIL)
+    rebuilt = candidate()
+    rebuilt["goal_xyyaw"] = [2.2, 0.9, 2.1]
+    rebuilt["candidate_id"] = "interaction:fridge_1:reobserve"
+    assert node._eligible_candidates_from_snapshot(
+        snapshot(445, [rebuilt]), now=1e20, region_history={}
+    ) == ([], {rebuilt["candidate_id"]: "container_anchor_step_cooldown"})
+
+
+def test_three_navigation_failures_use_existing_terminal_limit(node):
+    for step in (426, 446, 466):
+        fail(node, NAVIGATION_DETAIL, step)
+    assert node.interaction_failure_tracker.terminal_candidate_ids == {CANDIDATE_ID}
+    assert not node.container_m1_inconclusive_counts
+    assert node._eligible_candidates_from_snapshot(
+        snapshot(500), now=1e20, region_history={}
+    ) == ([], {CANDIDATE_ID: "interaction_approach_terminal_unreachable"})
+
+
+def test_no_step_navigation_feedback_uses_finite_wall_fallback(node, monkeypatch):
+    node.latest_candidates_payload = snapshot(426)
+    node.latest_candidates_payload["exploration_context"].pop("observation_step")
+    node.active_candidate_id = CANDIDATE_ID
+    node.active_behavior_type = "INTERACT"
+    node.active_interaction_candidate = candidate()
+    monkeypatch.setattr(decision.time, "monotonic", lambda: 100.0)
+    node._handle_feedback({
+        "status": "FAILED", "candidate_id": CANDIDATE_ID, "detail": NAVIGATION_DETAIL,
+    })
+    assert node.cooldown_until[TARGET_KEY] == 115.0
+    assert not node.container_anchor_unreachable_until_step
+
+
+def observe(tracker, step, **kwargs):
+    return tracker.update(
+        snapshot(step), eligible_candidate_count=0, has_active_behavior=False, **kwargs
+    )
+
+
+def test_no_eligible_wait_is_bounded_by_unique_observation_steps():
+    tracker = decision.NoEligibleCandidateTracker()
+    for _ in range(100):
+        detail = observe(tracker, 426)
+        assert not detail["blocked"]
+    assert detail["no_eligible_confirmations"] == 1
+    assert not observe(tracker, 545)["blocked"]
+    detail = observe(tracker, 546)
+    assert detail["blocked"]
+    assert detail["reason"] == "no_eligible_candidates_after_bounded_recovery"
+
+
+@pytest.mark.parametrize("eligible,active,scan_complete", [
+    (1, False, True), (0, True, True), (0, False, False),
+])
+def test_no_eligible_streak_resets_for_safe_recovery_or_startup(eligible, active, scan_complete):
+    tracker = decision.NoEligibleCandidateTracker()
+    observe(tracker, 426)
+    assert not tracker.update(
+        snapshot(485, initial_scan_complete=scan_complete),
+        eligible_candidate_count=eligible,
+        has_active_behavior=active,
+    )
+    assert not observe(tracker, 486)["blocked"]
+    assert tracker.since_step == 486
+
+
+def test_no_eligible_tracker_handles_step_reset_and_missing_step():
+    tracker = decision.NoEligibleCandidateTracker()
+    observe(tracker, 426)
+    assert observe(tracker, 0)["no_eligible_since_step"] == 0
+    detail = tracker.update({}, eligible_candidate_count=0, has_active_behavior=False)
+    assert not detail["blocked"]
+    assert detail["reason"] == "no_eligible_candidates_missing_observation_step"
+
+
+def decide(node, payload):
+    node.latest_candidates_payload = copy.deepcopy(payload)
+    node._decide_from_snapshot(copy.deepcopy(payload))
+
+
+def test_node_retries_at_20_steps_without_silent_long_idle(node):
+    fail(node, NAVIGATION_DETAIL)
+    decide(node, snapshot(426))
+    assert not node.active_candidate_id
+    assert not node.goal_complete
+    assert node.trace_pub.messages[-1]["no_eligible_candidate_recovery"]["reason"] == (
+        "no_eligible_candidates_waiting_for_recovery"
+    )
+    decide(node, snapshot(446))
+    assert node.active_candidate_id == CANDIDATE_ID
+    assert not node.goal_complete
+    assert not node.trace_pub.messages[-1]["no_eligible_candidate_recovery"]
+
+
+def test_node_reports_blocked_even_with_unresolved_frontier_counters(node):
+    node.container_anchor_unreachable_until_step[TARGET_KEY] = 726
+    original = snapshot(426)
+    for step in (426, 446, 486, 546):
+        decide(node, snapshot(step))
+        if node.active_behavior_type == "SCAN":
+            node._handle_feedback({"candidate_id": node.active_candidate_id,
+                                   "decision_id": node.active_decision_id,
+                                   "status": "SUCCEEDED", "detail": {}})
+    assert node.goal_complete
+    status = node.goal_status_pub.messages[-1]
+    assert status["status"] == "EXPLORATION_STALLED"
+    assert status["detail"]["reason"] == "no_eligible_candidates_after_bounded_recovery"
+    assert status["detail"]["eligibility_rejections"] == {
+        CANDIDATE_ID: "container_anchor_step_cooldown",
+    }
+    assert status["detail"]["exploration_context"]["unresolved_interaction_target_count"] == 1
+    assert node.container_anchor_unreachable_until_step[TARGET_KEY] == 726
+    assert original["exploration_context"]["interaction_frontier_count"] == 1
+    assert status["detail"]["recovery_scan_count"] == 2
+
+
+def test_node_reports_blocked_for_material_frontiers_without_safe_viewpoints(node):
+    for step in (426, 446, 486, 546):
+        decide(node, snapshot(step, []))
+        if node.active_behavior_type == "SCAN":
+            node._handle_feedback({"candidate_id": node.active_candidate_id,
+                                   "decision_id": node.active_decision_id,
+                                   "status": "FAILED", "detail": {"reason": "frontier_recovery_scan_unsafe"}})
+    assert node.goal_status_pub.messages[-1]["status"] == "EXPLORATION_STALLED"
+    assert node.trace_pub.messages[-1]["execution_eligible_candidate_count"] == 0
+
+
+def test_recovery_scan_has_two_attempts_inside_one_step_budget():
+    tracker = decision.NoEligibleCandidateTracker()
+    observe(tracker, 0)
+    assert tracker.recovery_candidate(snapshot(0)) is None
+    observe(tracker, 20)
+    assert tracker.recovery_candidate(snapshot(20)).metadata["frontier_recovery_scan"]
+    assert tracker.recovery_candidate(snapshot(20)) is None
+    observe(tracker, 60)
+    assert tracker.recovery_candidate(snapshot(60)).behavior_type == "SCAN"
+    assert tracker.recovery_candidate(snapshot(60)) is None
+    assert observe(tracker, 120)["blocked"]
+
+
+def test_stale_costmap_feedback_does_not_consume_interaction_failure_budget(node):
+    fail(node, {"reason": "navigation_costmap_not_fresh", "retryable": True})
+    assert not node.interaction_failure_tracker.failure_counts
+    assert not node.container_m1_inconclusive_counts
+    assert node.container_anchor_unreachable_until_step == {TARGET_KEY: 446}
+
+
+def test_step_only_cooldown_is_visible_to_completion_tracker(node, monkeypatch):
+    node.container_anchor_unreachable_until_step[TARGET_KEY] = 446
+    captured = []
+
+    def update(payload, **_kwargs):
+        captured.append(copy.deepcopy(payload))
+        return False
+
+    monkeypatch.setattr(node.completion_tracker, "update", update)
+    decide(node, snapshot(426))
+    assert captured[-1]["exploration_context"]["interaction_cooldown_target_count"] == 1

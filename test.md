@@ -1,6 +1,25 @@
 # 交互导航开发测试手册
 
-最后更新：2026-08-03
+最后更新：2026-09-14
+
+### 2026-09-14: 到位净空、M1 请求归属与深度投影回归
+
+- `candidate.navigation_clearance_enabled`：full MLLM 配置启用候选发布前净空检查；过滤发生在生成索引对齐的 capture/action 列表之前，不修改已执行中的锚点编号。
+- 当前候选筛选、替代探索点搜索及门/容器执行净空只检查机器人半径 + 安全余量 + 栅格半对角线，不再叠加到位容差；进入位置容差后不再检查 XY 容差，只检查实际位置的碰撞净空。探索模块原有的 0.40 m 足迹筛选、各类站位档位与到达容差保持不变。
+- 去掉到位容差后的定向回归 434 项通过，覆盖净空、候选生成、导航执行、到位锁定、门前姿态和探索恢复；该修改尚未重跑仿真，下方批次数据仍来自修改前版本。
+- `executor.drawer_fallback_bbox_wait_task_steps: 8`：M1 失败后的抽屉 bbox 延迟可原地等待新帧，30 秒为失活保护；超出预算可重试，不永久排除对象。
+- 当前物体表面距离：抽屉按后续要求改为 `0.50/0.85/1.00 m`，冰箱 `1.15/1.35/1.55 m`，其他容器 `0.50 m`，门交互 `0.95/1.20/1.45 m`，门复观测 `0.85/1.10/1.35 m`。
+- 重点测试：`test_navigation_clearance.py`、`test_behavior_candidates.py`、`test_semantic_behavior_executor_static.py`、`test_attribute_inference_request_state.py`、`mlspaces_tests/test_depth_continuity_equivalence.py`。
+- 原始 H10 地图回放和投影微基准：`outputs/analysis_runtime500_20260914/verify_clearance_runtime_fixes.py`。结果与命令约束见同目录 `clearance_runtime_fixes.md`；不启动仿真，不改原始 batch。
+- 深度投影优化保留图像尺寸、深度阈值、物理步数和录制精度。微基准的阶段加速不等于 10 worker 的整场加速。
+
+最新实测：`/home/ldl/outputs/interactive-nav/batch_minimalfix_h1_h10_500_20260914_155635`，最小导航修复后 H1-H10、10 worker、500-step 上限，总墙钟 1286.160 秒（含启动、仿真、清理、离线视频和分析）。实际 4529 step，实测加权平均 1.576 秒/step，P95 2.544 秒（不含启动和后处理）；H2/H3/H5 分别在 421/151/457 step 因有界恢复后仍无可执行候选而提前结束，其他 7 场达到 500 step。门交互调用/成功为 5/3，容器为 6/6；平均覆盖率 66.54%。10 个视频 exact-step 对齐且可解码，无悬而未决的交互命令，运行期间源文件未变化。启动前相关测试 623 项通过。
+
+本轮不代表性能验收通过：相对上一轮，平均覆盖率从 68.60% 降至 66.54%，H7/H8 分别从 99.60%/36.22% 降至 83.40%/20.52%，门成功数从 6 降至 3，H3 仍有导航停滞。日志审计未发现关闭前崩溃；各场关闭阶段存在内存释放错误，H7/H9 另有向已关闭 ROS topic 发布的异常。明细、视频入口和原始审计见最新目录的 `results_500.md`、`results_500.json`、`interaction_audit_500.json`、`step_timing_summary.csv` 和 `step_phase_timing.csv`。复现入口：`outputs/analysis_minimalfix_500_20260914/run_timed_batch.py`；汇总入口：同目录 `report_batch.py RUN_DIR`。
+
+上一轮实测：`/home/ldl/outputs/interactive-nav/batch_clearance100_h1_h10_500_20260914_112848`，H1-H10、10 worker、500-step 上限，总墙钟 1172.989 秒。实际 4018 step，加权平均 1.428 秒/step，P95 2.194 秒；H2/H3/H4/H5/H10 分别提前结束于 319/106/217/430/446 step，因此不算完整的 5000-step 回归。10 个视频 exact-step 对齐，运行中源文件未变化。明细为该目录的 `step_timing_summary.csv`、`step_phase_timing.csv`、`step_timing_report.md` 和 `results_500.json`。原始计时保留在各场 `sim/step_timing.jsonl`。
+
+上一轮距离/净空定向测试 94 项通过；额外的 `test_nav_goal_orientation_config.py` 有 3 项既有配置契约不匹配（orientation 0 对旧断言 3、DWA path bias 30 对旧断言 18、V3 的冰箱角度/净空开关与探索配置不同），未为此次运行改动这些无关参数。复现入口：`outputs/analysis_clearance100_500_20260914/run_timed_batch.py`；耗时汇总入口：同目录 `report_step_timing.py RUN_DIR`。
 
 ## 1. 文档定位
 
@@ -36,6 +55,54 @@
 ---
 
 ## 3. 环境与路径
+
+### 2026-09-14 执行与感知回归
+
+- 原始仿真入口启用 `publish_odom_twist=True, odom_twist_source="step_delta"`，按仿真控制 dt 计算实际位姿差分，同一步重复发布保持同一速度。离散位置控制动作结束时 qvel 接近零，不能把该瞬时停车速度当作上一控制步的运动，也不能使用墙钟 step 耗时估计速度。其他入口的瞬时速度模式保持兼容。
+- 已发出的物理命令持有执行所有权直到匹配的 backend result。后台每秒在 `interaction_action_feedback` 发布带 command ID 的 RUNNING 进度，不携带私有资产名。
+- `interaction_execution_stall_timeout_s=60`、`interaction_execution_wall_cap_s=600` 为失联/硬上限保护；drawer scan 仍受任务步预算约束。超限发布 EXPLORATION_STALLED 并保留所有权，结束本场，不在后台仍忙时派发新目标。
+- M1 targeted refresh 区分 waiting_for_view / pending / in_flight；无有效视图最多等 `interaction_observation_view_wait_task_steps=6`，已入队请求仍使用原观测预算。过期未入队请求被撤销，晚到状态不能把 in_flight 降为 waiting_for_view。
+- 门共识的补充视角不再受普通物体成功缓存抑制；仍保留不同视角、完整画面和三次状态确认。门框检测以可见范围而非实心面积衡量投影覆盖，保留连通分量、像素数量和短边阈值。
+- 交互导航偏离同一 global path 超过 0.35 m 时，每隔至少 20 个任务步重规划一次，最多 3 次；进入位置容差后不触发这类重规划。local inflation 保持 0.45 m。
+- 导航无步进兜底从 5 s 调整为 30 s，任务步超时预算不变；房间颜色在线/离线共享稳定 ID 配色，不再每 8 个 ID 重复。
+
+按下节 PYTHONPATH 配置运行两个 ROS Python 包的完整 tests，并加上
+`mlspaces_tests/test_force_interaction_bridge.py`、
+`mlspaces_tests/test_semantic_video_offline.py`、
+`mlspaces_tests/test_interactive_nav_runtime_regressions.py`、
+`mlspaces_tests/test_organized_depth_scan.py`。
+
+本次端到端为 H1-H10、seed=house、10 worker、horizon=500、录制开启，
+每场独立 master 端口 16001-16010；输出使用新的 runtimefix 批次目录，
+不能用 500 步结果直接与上一轮 1000 步的最终覆盖率作等价比较。
+
+### 2026-09-13 批次故障回归
+
+轻量测试覆盖真实 rospy 序列化、M1 配帧与入队、房间分裂/合并确认、
+交互失败兜底、视角去重、导航客户端恢复、局部净空及视频因果时序。
+无需启动仿真或 ROS master；使用已有 mlspaces 的 pytest 加载 Conda ROS 库，
+避免因 rospy 缺失而跳过关键测试。
+
+```bash
+cd /home/ldl/molmospaces-exp-setting
+export TMPDIR=/home/ldl/.cache/interactive-nav-regression/tmp
+export XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-regression
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$PWD:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages"
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_semantic_video_offline.py
+```
+
+执行真实仿真前，应先检查 M1 `image_pairing.stage=paired` 以及对象请求
+`enqueued/started` 计数。`interaction_observation_timeout` 不等于 HTTP 请求超时；
+`header.seq` 不等于 task step。动作兜底不会伪造 M1 ready 或 open 状态，
+仍须通过物理位姿检查；抽屉扫描仍要求同帧有效的公开检测框。
+
+长时间仿真需另行确认。单元测试和保存候选回放通过不代表物理交互成功率已恢复，
+也不能证明 move_base 原生崩溃的内部原因已消除。
 
 ## 3.1 常用环境
 
@@ -2071,3 +2138,96 @@ env EGL_PLATFORM=surfaceless \
 模型实际选中、1,104/1,104 次 MLLM 请求成功，但 SR=0、SPL=0。该数值证明
 外部接口和官方 v2 评测链路可运行，不可表述为导航性能提升；后续模型改动应
 先在相同 manifest 上重新报告官方 `success` / `spl`。
+
+### 2026-09-14 位置锁定与交互恢复回归
+
+本轮到位契约：当前接近位首次进入XY容差后锁定位置完成，后续只判断yaw；
+同位姿停车重发保留锁定，新目标或新阶段重新建立锁定。碰撞与物理交互面检查仍保留。
+Noetic实际读取 `/move_base/latch_xy_goal_tolerance`，不能仅配置DWA插件子命名空间。
+逐步执行状态的 `navigation_arrival` 记录锁定步数、位置和 `rotation_only` 模式。
+
+- 动态占据先停车，最多复核3个任务步；短暂恢复后同点重试有次数上限，持续阻塞才换位。
+- 同面yaw偏差允许一次公开TF/M1正面信息驱动的原位修正，不能排除整面。
+- 物理交互预算为120步，step停止180秒后触发停流兜底；缺少step时才使用墙钟超时。
+- 导航不可达与M1失败分开反馈；导航冷却20步，持续60步无可执行候选则明确报告受阻。
+
+完整决策/执行/交互桥回归使用Conda ROS模块：554 passed；感知、房间分割和离线视频补充回归186 passed。
+端到端结果独立验收，不能由静态测试推断性能提升。
+
+`nav.launch` 在加载override后显式设置委托 `GlobalPlanner/orientation_mode=0`，
+由 `OrientedGlobalPlanner` 负责路径切线与末端yaw。Noetic模式3在两点短路径上存在负索引，
+仅改YAML不足以保证实际启动值；启动前用 `roslaunch --dump-params` 验证，启动后查询参数服务器。
+同面原位yaw恢复使用独占step控制，不调用 `make_plan`、移动走廊或平移目标。
+
+```bash
+env TMPDIR=/home/ldl/.cache/interactive-nav-latch-500 \
+  XDG_CACHE_HOME=/home/ldl/.cache HF_HOME=/home/ldl/.cache/huggingface \
+  TORCH_HOME=/home/ldl/.cache/torch \
+  MPLCONFIGDIR=/home/ldl/.cache/interactive-nav-latch-500/matplotlib \
+  CONDA_SH=/home/ldl/miniconda3/etc/profile.d/conda.sh \
+  CONDA_ENV=/home/ldl/conda_envs/mlspaces \
+  PYTHON_BIN=/home/ldl/conda_envs/mlspaces/bin/python \
+  ROS_SETUP=/home/ldl/molmospaces-exp-setting/Interactive-Nav-SG-nav/devel/setup.bash \
+  MAPPING_SCAN_SOURCE=organized_depth POINTCLOUD_STRIDE=1 CLEAN_INTERMEDIATE=false \
+  /home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
+  --output-dir /home/ldl/outputs/interactive-nav/batch_latched_v4_h1_h10_500_20260914_014500 \
+  --house-inds 1 2 3 4 5 6 7 8 9 10 --workers 10 --base-master-port 15801 \
+  --task-horizon 500 --method full_mllm_exploration --scene-timeout-s 3600 \
+  --semantic-model-env-file /home/ldl/molmospaces-exp-setting/.env
+```
+
+重跑必须使用新输出目录及未占用端口，不覆盖既有数据。完成后核对 `summary.json`、
+`force_interaction_events.json`、`debug/raw/step_boundaries.jsonl` 和 `offline_video_summary.json`。
+
+### 2026-09-14 门净空与切向候选回归
+
+- 范围：portal完整到位区域净空、同面小切向候选及正面角预算、按净空选择可达候选。
+- candidate.portal_tangent_offsets_m默认[0.10,-0.10,0.15,-0.15]；空列表关闭切向选点。
+- 验证：完整决策执行与交互桥574 passed。H2原始costmap离线筛选13个候选、5个通过，
+  原点净空不足被拒绝；优选点净空0.591m、中心cost0。未执行新500step仿真。
+- 第3项semantic_subgoal_no_progress重试缺口本次保持未改，不能将离线选点通过解释为整场问题已解决。
+
+```bash
+env TMPDIR=/home/ldl/.cache XDG_CACHE_HOME=/home/ldl/.cache \
+  PYTHONPATH="$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:$PWD:/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages" \
+  /home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_force_interaction_bridge.py -q
+```
+
+离线加载真实ROS执行器和OpenCV时使用`/home/ldl/conda_envs/ros-noetic/bin/python`，
+不要在MolmoSpaces解释器中优先导入ROS环境的OpenCV二进制，两套OpenSSL版本并不兼容。
+
+### 2026-09-14 最小导航修复回归
+
+- 探索/穿门位置容差保持 0.25 m，不增加 0.10/0.05 m 降级档位；抽屉净空仍为 0.50/0.85/1.00 m。
+- 净空不合格的探索点在原点 0.8 m 内寻找替代位置，仍需满足完整到位区域净空、同一 frontier 可见性和全局膨胀地图连通性；穿门替代点必须留在门的目标侧。找不到时保留 deferred 诊断，不标记为已探索。
+- 全局 costmap 的完整图和增量更新共同维护四连通可达域；candidate 和 executor 都可拒绝新鲜地图中不连通的目标。过期地图不作为确定的不可达证据，执行器仍保留 make_plan 验证。
+- 临时障碍需在不同地图回执和不同 step 上连续确认 3 次；恢复后只重发原锚点，保持原导航尝试计数，不重排全部锚点。20 step 内无法确认时返回可重试的 costmap 未更新，不记为 M1 失败。
+- AABB 选面后的独立物理正面复核放宽到 25 度；公开选面 15 度、导航到位距离/朝向、错误面拒绝均不变，不向规划器输出 GT 法向或纠偏角。
+- 仍有 frontier 但无可执行候选时，第 20/60 step 最多各尝试一次已有扫描动作。旋转需通过当前局部地图安全检查；无候选总预算为 120 step，最终报告 stalled 而非探索完成。
+
+无仿真回归：623 passed；`git diff --check` 通过。测试入口：
+
+```bash
+env TMPDIR=/home/ldl/.cache XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+  /home/ldl/conda_envs/mlspaces/bin/python -c '
+import sys, cv2
+from pathlib import Path
+root = Path("/home/ldl/molmospaces-exp-setting")
+sys.path[:0] = [str(root), *[str(root/"Interactive-Nav-SG-nav/src"/p/"scripts") for p in ("semantic_decision_py_pkg", "semantic_mapping_py_pkg", "semantic_mllm_py_pkg", "explore_py_pkg")]]
+sys.path.append("/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages")
+import pytest
+raise SystemExit(pytest.main(sys.argv[1:]))
+' -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_force_interaction_bridge.py
+```
+
+该入口先加载 MolmoSpaces 的 OpenCV，再将 ROS 库追加到搜索路径，避免 OpenCV 二进制混用。
+原始批次 `batch_clearance100_h1_h10_500_20260914_112848` 的离线地图回放结果在
+`outputs/analysis_clearance100_500_20260914/minimal_fix_replay.json`：H4 step 100/216 各恢复 2 个安全点；
+H10 step 307 恢复 1 个、step 445 恢复 2 个；H3 step 33/57 的 7 个交互锚点均不连通，
+0.8 m 搜索范围内仍无安全探索替代点。H9 step 250 的原位姿通过新角度复核单测。
+这些结果仅验证控制逻辑和已记录几何，不代表新一轮仿真或覆盖率验收通过。

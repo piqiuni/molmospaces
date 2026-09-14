@@ -6,6 +6,7 @@ import sys
 
 import mujoco
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
@@ -229,6 +230,29 @@ def test_visible_fraction_rejects_small_observed_extent():
     assert small_fraction < 0.2
 
 
+@pytest.mark.parametrize("visible_pixels", [21, 22])
+def test_visible_fraction_uses_mask_area_instead_of_sparse_bbox(visible_pixels):
+    args = (
+        np.asarray([0.0, 0.0, 0.0]),
+        np.asarray([1.0, 0.0, 0.0]),
+        np.asarray([0.0, 0.0, 1.0]),
+        70.0,
+        [100, 100],
+        np.asarray([3.0, 0.0, 0.0]),
+        np.asarray([1.0, 1.0, 1.0]),
+    )
+    projected = realtime_gt._project_aabb_bbox(*args)
+    bbox = [int(value) for value in projected]
+    fraction, _ = realtime_gt._visible_fraction(
+        bbox, *args, visible_pixels=visible_pixels
+    )
+    assert fraction < 0.2
+    outside, _ = realtime_gt._visible_fraction(
+        [0, 0, 20, 20], *args, visible_pixels=441
+    )
+    assert outside == 0.0
+
+
 def test_articulated_doorway_root_is_the_canonical_gt_spec():
     model = type("DoorModel", (), {"body_rootid": np.asarray([0, 1, 1, 3])})()
     specs = [
@@ -374,6 +398,80 @@ def test_visible_instances_does_not_sum_disconnected_fragments_to_pass_threshold
     assert publisher._visible_instances(segmentation) == []
 
 
+@pytest.mark.parametrize("vertical", [False, True])
+def test_visible_instances_rejects_473_pixel_object_sliver(vertical):
+    publisher = _visible_instance_publisher(
+        min_visible_pixels=16, min_visible_bbox_short_side_px=1
+    )
+    pixels = [(index, 2) if vertical else (2, index) for index in range(473)]
+    shape = (480, 8) if vertical else (8, 480)
+    assert publisher._visible_instances(_segmentation_for_geom_pixels(shape, pixels)) == []
+
+
+@pytest.mark.parametrize("pixel_count", [21, 22])
+def test_visible_instances_rejects_sparse_object_mask_with_large_bbox(pixel_count):
+    publisher = _visible_instance_publisher(
+        min_visible_pixels=16, min_visible_bbox_short_side_px=1
+    )
+    # One 8-connected diagonal has a wide bbox despite having no visible surface.
+    pixels = [(index, index) for index in range(pixel_count)]
+    segmentation = _segmentation_for_geom_pixels((32, 32), pixels)
+    assert publisher._visible_instances(segmentation) == []
+
+
+@pytest.mark.parametrize("height,width", [(3, 7), (2, 11), (12, 16)])
+def test_visible_instances_keeps_compact_small_and_normal_objects(height, width):
+    publisher = _visible_instance_publisher(min_visible_pixels=16)
+    pixels = [(y, x) for y in range(height) for x in range(width)]
+    visible = publisher._visible_instances(
+        _segmentation_for_geom_pixels((24, 24), pixels)
+    )
+    assert len(visible) == 1
+    assert visible[0][1] == height * width
+
+
+@pytest.mark.parametrize("mask_kind", ["sliver", "noise21", "noise22", "resolved"])
+def test_publisher_requires_resolved_pixels_before_revealing_content_identity(
+    monkeypatch, mask_kind
+):
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        FakeRospy(), FakeString, min_visible_bbox_short_side_px=1,
+        min_visible_fraction=0.0, async_processing=False,
+    )
+    publisher._specs = [
+        realtime_gt._ObjectSpec(
+            "food_body", {"category": "Tomato"}, 1, (),
+            False, False, False, True, parent_source_name="closed_fridge",
+        )
+    ]
+    publisher._geom_to_spec = np.asarray([0], dtype=np.int32)
+    monkeypatch.setattr(publisher, "_ensure_cache", lambda _env: None)
+    monkeypatch.setattr(
+        realtime_gt, "body_aabb",
+        lambda _model, data, body_id, visible_only=True: (
+            data.xpos[body_id].copy(), np.asarray([0.1, 0.1, 0.1])
+        ),
+    )
+    if mask_kind == "sliver":
+        pixels = [(2, index) for index in range(473)]
+    elif mask_kind.startswith("noise"):
+        pixels = [(index, index) for index in range(int(mask_kind[5:]))]
+    else:
+        pixels = [(y, x) for y in range(3) for x in range(7)]
+    monkeypatch.setattr(
+        FakeEnv, "segmentation", _segmentation_for_geom_pixels((32, 480), pixels)
+    )
+
+    payload = publisher.publish(FakeTask(), step_index=0)
+
+    if mask_kind == "resolved":
+        assert [item["id"] for item in payload["observations"]] == ["food_body"]
+        assert payload["observations"][0]["visible_pixels"] == 21
+    else:
+        assert payload["observations"] == []
+        assert "food_body" not in json.dumps(payload)
+
+
 def test_realtime_gt_rejects_one_pixel_portal_sliver_before_publication():
     publisher = _visible_instance_publisher(
         min_visible_pixels=16,
@@ -458,7 +556,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     realtime_gt.body_aabb = fake_aabb
     try:
         publisher.reset()
-        _set_geom_pixels([0] * 3 + [1] * 3 + [2] * 5)
+        _set_geom_pixels([0] * 5 + [1] * 10 + [2] * 5)
         first = publisher.publish(FakeTask(), step_index=0)
         assert first["episode_reset"] is True
         assert first["capture_step"] == 0
@@ -475,11 +573,11 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         }
         assert observation["id"] == "chair_body"
         assert observation["name"] == "Chair"
-        assert observation["bbox_2d"] == [0, 0, 4, 1]
-        assert observation["visible_pixels"] == 6
+        assert observation["bbox_2d"] == [0, 0, 4, 2]
+        assert observation["visible_pixels"] == 15
         assert "segmentation" not in observation
-        assert sum(observation["mask_rle"]["counts"][1::2]) == 6
-        assert observation["visible_fraction"] == 0.6
+        assert sum(observation["mask_rle"]["counts"][1::2]) == 15
+        assert observation["visible_fraction"] == 1.0
         assert observation["box_3d"] == {
             "center": [2.0, 0.0, 0.5],
             "size": [0.5, 0.5, 1.0],
@@ -501,7 +599,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert publisher.publish(FakeTask(), step_index=1) is None
         assert publisher.publish(FakeTask(), step_index=2) is None
 
-        _set_geom_pixels([2] * 5 + [0] * 4)
+        _set_geom_pixels([2] * 5 + [0] * 15)
         second = publisher.publish(FakeTask(), step_index=3)
         assert [item["id"] for item in second["observations"]] == ["chair_body"]
         assert len(fake_rospy.publisher.messages) == 2
@@ -538,17 +636,17 @@ def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
     realtime_gt.body_aabb = fake_aabb
     try:
         publisher.reset()
-        _set_geom_pixels([0] * 6)
+        _set_geom_pixels([0] * 15)
         first = publisher.publish(FakeTask(), step_index=0)
         second = publisher.publish(FakeTask(), step_index=3)
         assert len(first["observations"]) == 1
         assert len(second["observations"]) == 1
         assert "consecutive_observations" not in first["observations"][0]
-        assert first["observations"][0]["visible_fraction"] == 0.6
+        assert first["observations"][0]["visible_fraction"] == 1.0
 
         _set_geom_pixels([])
         publisher.publish(FakeTask(), step_index=6)
-        _set_geom_pixels([0] * 6)
+        _set_geom_pixels([0] * 15)
         after_gap = publisher.publish(FakeTask(), step_index=9)
         assert len(after_gap["observations"]) == 1
     finally:
@@ -609,7 +707,7 @@ def test_realtime_gt_reuses_private_snapshot_but_force_always_renders_fresh():
 
     realtime_gt.body_aabb = fake_aabb
     try:
-        _set_geom_pixels([0] * 6)
+        _set_geom_pixels([0] * 15)
         SnapshotEnv.render_calls = 0
         task = SnapshotTask(FakeEnv.segmentation.copy())
 
@@ -633,3 +731,45 @@ def test_realtime_gt_reuses_private_snapshot_but_force_always_renders_fresh():
     finally:
         realtime_gt.body_aabb = original_aabb
         publisher.close()
+
+
+def test_publisher_preserves_exact_source_stamp_and_float_capture_time(monkeypatch):
+    class Stamp:
+        secs = 1789302669
+        nsecs = 521682123
+
+        def to_sec(self):
+            return self.secs + self.nsecs * 1e-9
+
+    stamp = Stamp()
+    fake_rospy = FakeRospy()
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        fake_rospy, FakeString, async_processing=False
+    )
+    _set_geom_pixels([])
+    monkeypatch.setattr(realtime_gt.time, "time", lambda: stamp.to_sec() + 0.125)
+    payload = publisher.publish(FakeTask(), stamp=stamp, step_index=37)
+    wire = json.loads(fake_rospy.publisher.messages[-1].data)
+    assert wire["stamp_sec"] == stamp.secs
+    assert wire["stamp_nsec"] == stamp.nsecs
+    assert type(wire["stamp_sec"]) is int
+    assert type(wire["stamp_nsec"]) is int
+    assert wire["capture_stamp_sec"] == stamp.to_sec()
+    assert wire["capture_step"] == 37
+    assert payload["capture_stamp_sec"] == stamp.to_sec()
+    assert round(wire["capture_stamp_sec"] * 1e9) != stamp.secs * 10**9 + stamp.nsecs
+    assert wire["processing_latency_ms"] == pytest.approx(125.0)
+
+
+def test_publisher_does_not_claim_exact_source_stamp_from_float_only_clock():
+    class Stamp:
+        def to_sec(self):
+            return 1789302669.521682
+
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        FakeRospy(), FakeString, async_processing=False
+    )
+    _set_geom_pixels([])
+    payload = publisher.publish(FakeTask(), stamp=Stamp(), step_index=0)
+    assert payload["stamp_sec"] == Stamp().to_sec()
+    assert "stamp_nsec" not in payload

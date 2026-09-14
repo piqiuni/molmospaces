@@ -720,7 +720,7 @@ def public_gt_payload_for_sim_frame(
     candidate = raw_step["gt_observations"]
     try:
         sim_stamp = float(sim_record.get("stamp_sec") or 0.0)
-        gt_stamp = float(candidate.get("stamp_sec") or 0.0)
+        gt_stamp = float(candidate.get("capture_stamp_sec", candidate.get("stamp_sec")) or 0.0)
     except (TypeError, ValueError):
         return None
     if sim_stamp > 0.0 and gt_stamp > sim_stamp + _CAUSAL_RECEIPT_EPSILON_SEC:

@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 from semantic_decision_py_pkg.step_command_gate import StepCommandGate
 from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
 from semantic_decision_py_pkg.startup_scan_timing import (
@@ -145,7 +147,11 @@ def test_pre_m1_empty_anchor_batch_defers_without_candidate_exclusion() -> None:
 
     assert [command["kind"] for command in commands] == ["terminal"]
     detail = commands[0]["detail"]
-    assert detail["m1_evidence_inconclusive"] is True
+    assert detail["m1_evidence_inconclusive"] is False
+    assert detail["reason"] == "container_approach_navigation_unreachable"
+    assert detail["failure_stage"] == "interaction_approach_navigation"
+    assert detail["failure_reason"] == "make_plan_unreachable"
+    assert detail["observation_attempts"] == 0
     assert detail["retryable"] is True
     assert detail["terminal_candidate_exclusion"] is False
     assert detail["m1_capture_not_reached"] is True
@@ -493,6 +499,34 @@ def test_pose_precondition_failure_is_not_an_object_failure() -> None:
     )
 
 
+@pytest.mark.parametrize("reason", [
+    "interaction_orientation_misaligned",
+    "interaction_position_misaligned",
+])
+@pytest.mark.parametrize("reason_field", ["reason", "failure_reason"])
+def test_same_face_misalignment_is_an_approach_precondition(reason, reason_field) -> None:
+    # No verification_source is needed to recognize either backend spelling.
+    detail = {reason_field: reason, "action_executed": False}
+    assert is_interaction_pose_precondition_failure(detail)
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(False), now=0.0)
+    commands = machine.retry_interaction_approach(
+        start_goal_option_index=0,
+        interaction_approach_attempts=[],
+        detail=detail,
+        now=1.0,
+    )
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert commands[0]["kind"] == "navigate"
+
+    machine.on_navigation_result(True, now=2.0)
+    terminal = machine.on_interaction_result(False, detail, now=3.0)
+    assert machine.state == "FAILED"
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["detail"] == detail
+    assert "interaction_backend_success" not in machine.candidate["metadata"]
+
+
 def test_safe_grid_motion_distance_stops_before_rear_obstacle() -> None:
     width = height = 20
     resolution = 0.1
@@ -723,6 +757,80 @@ def direct_capture_two_stage_container_candidate():
     # The primary public goal remains the navigation anchor, not the M1 pose.
     candidate["goal_xyyaw"] = list(staging[0])
     return candidate
+
+
+def test_container_m1_failure_navigates_physical_pose_without_fabricated_evidence():
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"].pop("accepted_container_m1_evidence")
+    machine.start(candidate, now=0.0, task_step_index=537)
+    machine.on_navigation_result(True, now=1.0, task_step_index=731)
+    assert machine.candidate["metadata"]["interaction_position_reached"] is False
+    commands = machine.fail_timeout("interaction_observation_timeout", task_step_index=779)
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert commands[0]["kind"] == "navigate"
+    assert commands[0]["reason"] == "container_m1_failed_navigate_planned_action_pose"
+    assert machine.candidate["goal_xyyaw"] == [1.30, 2.0, 0.0]
+    assert "accepted_container_m1_evidence" not in machine.candidate["metadata"]
+    assert machine.candidate["metadata"]["interaction_observation_resolved"] is False
+    commands = machine.on_navigation_result(True, now=2.0, task_step_index=800)
+    assert machine.state == STATE_INTERACTING
+    assert commands[0]["kind"] == "interact"
+    assert machine.candidate["metadata"]["interaction_position_reached"] is True
+    assert machine.candidate["metadata"]["interaction_observation_fallback_used"] is True
+
+
+def test_m1_failure_without_action_mapping_does_not_interact():
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"]["container_two_stage_mapping_ready"] = False
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, now=1.0, task_step_index=10)
+    commands = machine.fail_timeout("interaction_observation_timeout", task_step_index=58)
+    assert machine.state == "FAILED"
+    assert commands[0]["detail"]["reason"] == "m1_fallback_action_geometry_unavailable"
+    assert commands[0]["detail"]["action_executed"] is False
+
+
+def test_container_shared_anchor_timeout_still_checks_physical_arrival():
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"]["container_anchor_shared_pose"] = True
+    candidate["metadata"].pop("accepted_container_m1_evidence")
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, now=1.0, task_step_index=179)
+    commands = machine.fail_timeout("interaction_observation_timeout", task_step_index=227)
+    assert commands[0]["kind"] == "navigate"
+    assert machine.candidate["interaction_command"]["interaction_ready_distance_m"] == 0.18
+    assert machine.candidate["metadata"]["interaction_position_reached"] is False
+
+
+def test_shared_anchor_observation_retries_do_not_reselect_nearby_view_alias():
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_fallback_on_m1_failure=False))
+    candidate = two_stage_container_pre_action_candidate()
+    metadata = candidate["metadata"]
+    metadata["container_anchor_shared_pose"] = True
+    metadata["interaction_observation_same_pose_samples_per_view"] = 1
+    metadata["container_staging_goal_xyyaw_candidates"][1] = [1.05, 2.0, 0.10]
+    metadata["goal_xyyaw_candidates"] = metadata["container_staging_goal_xyyaw_candidates"]
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, now=1.0, task_step_index=662)
+    commands = machine.on_interaction_observation_result(
+        {"attribute_status": "ready", "view_state": "unknown"}, now=2.0,
+        task_step_index=710,
+    )
+    assert commands[0]["kind"] == "navigate"
+    assert commands[0]["start_goal_option_index"] == 2
+    assert machine.candidate["metadata"]["interaction_observation_viewpoint_staging_indices"] == [0]
+    assert container_two_stage_m1_preflight_batch_indices(machine.candidate, 2) == [2, 3]
+
+
+def test_timeout_does_not_invent_invisible_perception():
+    machine = BehaviorExecutionStateMachine()
+    machine.start(observation_required_interaction_candidate(), now=0.0)
+    machine.on_navigation_result(True, now=1.0, task_step_index=220)
+    commands = machine.fail_timeout("interaction_observation_timeout", task_step_index=268)
+    assert "is_currently_visible" not in commands[0]["observation"]
 
 
 def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
@@ -1090,6 +1198,60 @@ def test_unknown_portal_reobserves_after_approach_before_physical_action() -> No
     assert machine.candidate["metadata"]["observation_required"] is False
 
 
+def test_remembered_portal_reobserve_waits_for_m1_without_physical_action() -> None:
+    candidate = {
+        "decision_id": "decision-reobserve-only",
+        "candidate_id": "reobserve_portal:portal_1",
+        "behavior_type": "NAVIGATE",
+        "target_id": "portal_1",
+        "target_name": "door_0001",
+        "goal_xyyaw": [1.0, 2.0, 0.5],
+        "metadata": {
+            "reobserve_interaction_target": True,
+            "interaction_observation_same_pose_samples_per_view": 1,
+        },
+    }
+    machine = BehaviorExecutionStateMachine()
+    assert machine.start(candidate, now=0.0, task_step_index=10)[0]["kind"] == (
+        "navigate"
+    )
+
+    request = machine.on_remembered_portal_navigation_result(
+        True,
+        {"status": "SUCCEEDED"},
+        now=1.0,
+        object_id="door_0001",
+        task_step_index=20,
+    )
+
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert [command["kind"] for command in request] == [
+        "request_interaction_observation"
+    ]
+    assert request[0]["object_id"] == "door_0001"
+    assert machine.candidate["metadata"]["observation_only_reobserve"] is True
+    assert machine.candidate["metadata"]["reobserve_object_id"] == "door_0001"
+
+    terminal = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "attribute_capture_step": 21,
+        },
+        now=2.0,
+        task_step_index=21,
+    )
+
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is True
+    assert terminal[0]["detail"]["observation_outcome"] == "finish_without_action"
+    assert terminal[0]["detail"]["reobserve_only"] is True
+    assert terminal[0]["detail"]["action_executed"] is False
+
+
 def test_unknown_portal_open_observation_finishes_without_action() -> None:
     machine = BehaviorExecutionStateMachine()
     commands = machine.start(
@@ -1169,6 +1331,104 @@ def test_unknown_portal_observation_retries_then_terminates_unresolved() -> None
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is False
     assert terminal[0]["detail"]["reason"] == "interaction_observation_unresolved"
+
+
+def test_failed_m1_after_arrival_falls_back_to_physical_interaction() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = observation_required_interaction_candidate(requires_approach=True)
+
+    assert machine.start(candidate, now=0.0)[0]["kind"] == "navigate"
+    request = machine.on_navigation_result(
+        True, {"capture_step": 10}, now=0.5, task_step_index=10
+    )
+    assert request[0]["kind"] == "request_interaction_observation"
+    assert machine.candidate["metadata"]["interaction_position_reached"] is True
+
+    command = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "failed",
+            "error": "portal_visual_evidence_truncated:bottom",
+            "is_currently_visible": False,
+        },
+        now=1.0,
+        task_step_index=11,
+    )
+
+    assert machine.state == STATE_INTERACTING
+    assert command[0]["kind"] == "interact"
+    assert command[0]["observation"]["m1_fallback_to_interaction"] is True
+    assert (
+        command[0]["observation"]["m1_fallback_reason"]
+        == "portal_visual_evidence_truncated:bottom"
+    )
+    assert (
+        machine.candidate["metadata"]["interaction_observation_fallback_used"]
+        is True
+    )
+
+
+def test_m1_timeout_after_arrival_falls_back_to_physical_interaction() -> None:
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(interaction_observation_timeout_task_steps=2)
+    )
+    machine.start(
+        observation_required_interaction_candidate(requires_approach=False),
+        now=0.0,
+        task_step_index=10,
+    )
+
+    command = machine.fail_timeout(
+        "interaction_observation_timeout", now=100.0, task_step_index=12
+    )
+
+    assert machine.state == STATE_INTERACTING
+    assert command[0]["kind"] == "interact"
+    assert command[0]["observation"]["attribute_status"] == "timeout"
+    assert command[0]["observation"]["m1_fallback_to_interaction"] is True
+
+
+def test_container_m1_staging_failure_does_not_execute_from_outer_pose() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = container_pre_action_candidate()
+    candidate["metadata"]["m1_observation_staging_required"] = True
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+
+    result = machine.on_interaction_observation_result(
+        {"attribute_status": "failed", "reason": "m1_request_timeout"},
+        now=1.0,
+    )
+
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert result[0]["kind"] == "request_interaction_observation"
+
+
+def test_portal_observation_timeout_falls_back_to_interaction_after_arrival() -> None:
+    """A missing M1 reply must not block an already reached portal pose."""
+
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(
+            interaction_observation_timeout_s=1.0,
+            interaction_observation_timeout_task_steps=2,
+        )
+    )
+    candidate = observation_required_interaction_candidate(requires_approach=False)
+    machine.start(candidate, now=0.0, task_step_index=10)
+
+    assert (
+        machine.timeout_reason(now=100.0, task_step_index=12)
+        == "interaction_observation_timeout"
+    )
+    retry = machine.fail_timeout(
+        "interaction_observation_timeout",
+        now=100.0,
+        task_step_index=12,
+    )
+
+    assert machine.state == STATE_INTERACTING
+    assert retry[0]["kind"] == "interact"
+    assert retry[0]["observation"]["attribute_status"] == "timeout"
+    assert retry[0]["observation"]["m1_fallback_to_interaction"] is True
 
 
 def test_container_pre_action_confirms_one_negative_before_moving_to_next_view() -> None:
@@ -2100,6 +2360,273 @@ def test_interaction_approach_uses_short_navigation_timeout() -> None:
     machine.start(interaction_candidate(), now=0.0)
     assert machine.state == STATE_APPROACH_INTERACTION
     assert machine.timeout_reason(now=2.1) == "interaction_navigation_timeout"
+
+
+def test_interaction_approach_timeout_uses_task_steps_when_available() -> None:
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(
+            interaction_navigation_timeout_s=1.0,
+            interaction_navigation_timeout_task_steps=4,
+        )
+    )
+    machine.start(interaction_candidate(), now=0.0, task_step_index=100)
+
+    # A loaded host may spend much longer than one wall second while the
+    # evaluator has advanced only two public task steps.
+    assert (
+        machine.timeout_reason(now=100.0, task_step_index=102)
+        == ""
+    )
+    assert (
+        machine.timeout_reason(now=100.0, task_step_index=104)
+        == "interaction_navigation_timeout"
+    )
+    terminal = machine.fail_timeout(
+        "interaction_navigation_timeout",
+        now=100.0,
+        task_step_index=104,
+    )
+    assert terminal[0]["detail"]["timeout_clock"] == "task_steps"
+    assert terminal[0]["detail"]["elapsed_task_steps"] == 4
+    assert terminal[0]["detail"]["state_started_task_step_index"] == 100
+
+
+def test_interaction_observation_timeout_uses_task_steps_when_available() -> None:
+    candidate = observation_required_interaction_candidate(requires_approach=False)
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(
+            interaction_observation_timeout_s=1.0,
+            interaction_observation_timeout_task_steps=6,
+        )
+    )
+    machine.start(candidate, now=0.0, task_step_index=20)
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert machine.timeout_reason(now=100.0, task_step_index=25) == ""
+    assert (
+        machine.timeout_reason(now=100.0, task_step_index=26)
+        == "interaction_observation_timeout"
+    )
+
+
+def test_physical_interaction_budget_starts_after_approach_not_selection() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=8))
+    machine.start(interaction_candidate(), now=0.0, task_step_index=10)
+    machine.on_navigation_result(True, now=100.0, task_step_index=77)
+
+    # H10 advanced only three steps while exceeding the old 30-second limit.
+    assert machine.timeout_reason(now=145.0, task_step_index=80) == ""
+    assert machine.timeout_reason(now=200.0, task_step_index=84) == ""
+    assert machine.timeout_reason(now=205.0, task_step_index=85) == "interaction_timeout"
+    terminal = machine.fail_timeout("interaction_timeout", now=205.0, task_step_index=85)
+    detail = terminal[0]["detail"]
+    assert terminal[0]["success"] is False
+    assert detail["timeout_clock"] == "task_steps"
+    assert detail["timeout_state"] == STATE_INTERACTING
+    assert detail["timeout_task_steps"] == 8
+    assert detail["state_started_task_step_index"] == 77
+    assert detail["latest_task_step_index"] == 85
+    assert detail["elapsed_task_steps"] == 8
+    assert "timeout_s" not in detail
+
+
+def test_default_physical_budget_allows_slow_multidrawer_scan() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=226)
+    for elapsed in range(1, 42):
+        assert machine.timeout_reason(now=elapsed * 12.0, task_step_index=226 + elapsed) == ""
+    assert machine.config.interaction_timeout_task_steps == 120
+    assert machine.on_interaction_result(True, now=505.0, task_step_index=267)[0]["kind"] == "verify_interaction"
+    assert machine.on_backend_result(True, now=506.0)[0]["success"] is True
+
+
+def test_physical_timeout_without_step_stream_uses_wall_fallback() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(False), now=10.0)
+    assert machine.timeout_reason(now=40.0) == ""
+    assert machine.timeout_reason(now=40.1) == "interaction_timeout"
+    detail = machine.fail_timeout("interaction_timeout", now=40.1)[0]["detail"]
+    assert detail["timeout_clock"] == "wall_time_fallback"
+    assert detail["timeout_fallback_reason"] == "no_task_steps"
+    assert detail["timeout_s"] == 30.0
+    assert detail["elapsed_task_steps"] is None
+    assert "timeout_task_steps" not in detail
+
+
+@pytest.mark.parametrize("supplied_step", [None, 10, 9, -1])
+def test_frozen_physical_step_stream_cannot_disable_safety_timeout(supplied_step) -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_step_stall_timeout_s=180.0))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    assert machine.timeout_reason(now=179.0, task_step_index=supplied_step) == ""
+    assert machine.timeout_reason(now=181.0, task_step_index=supplied_step) == "interaction_timeout"
+    detail = machine.fail_timeout("interaction_timeout", now=181.0, task_step_index=supplied_step)[0]["detail"]
+    assert detail["timeout_clock"] == "wall_time_fallback"
+    assert detail["timeout_fallback_reason"] == "task_step_stream_stalled"
+    assert detail["timeout_s"] == 180.0
+    assert detail["elapsed_s"] == 181.0
+    assert detail["elapsed_task_steps"] == 0
+    assert "timeout_task_steps" not in detail
+
+
+def test_only_advancing_steps_refresh_physical_stall_deadline() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_step_stall_timeout_s=180.0))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    assert machine.timeout_reason(now=100.0, task_step_index=11) == ""
+    assert machine.timeout_reason(now=200.0, task_step_index=11) == ""
+    assert machine.timeout_reason(now=270.0, task_step_index=10) == ""
+    assert machine.timeout_reason(now=281.0, task_step_index=11) == "interaction_timeout"
+    detail = machine.fail_timeout("interaction_timeout", now=281.0)[0]["detail"]
+    assert detail["elapsed_s"] == 181.0
+    assert detail["elapsed_wall_time_s"] == 281.0
+
+
+def test_physical_step_budget_owns_timeout_when_both_clocks_expire() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=2))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    assert machine.timeout_reason(now=1.0, task_step_index=12) == "interaction_timeout"
+    detail = machine.fail_timeout("interaction_timeout", now=1000.0, task_step_index=12)[0]["detail"]
+    assert detail["timeout_clock"] == "task_steps"
+    assert detail["timeout_task_steps"] == 2
+
+
+def test_late_step_stream_begins_physical_budget_at_first_observed_step() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=4))
+    machine.start(interaction_candidate(False), now=0.0)
+    assert machine.timeout_reason(now=10.0, task_step_index=1000) == ""
+    assert machine.timeout_reason(now=90.0, task_step_index=1003) == ""
+    detail = machine.fail_timeout("interaction_timeout", now=100.0, task_step_index=1004)[0]["detail"]
+    assert detail["state_started_task_step_index"] == 1000
+    assert detail["elapsed_task_steps"] == 4
+
+
+def test_physical_result_after_timeout_cannot_resurrect_or_duplicate_terminal() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=2))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    terminal = machine.fail_timeout("interaction_timeout", now=10.0, task_step_index=12)
+    assert len(terminal) == 1
+    assert machine.on_interaction_result(True, now=11.0, task_step_index=13) == []
+    assert machine.on_backend_result(True, now=12.0) == []
+    assert machine.on_graph_state("open", now=13.0) == []
+    assert machine.fail_timeout("interaction_timeout", now=14.0, task_step_index=14) == []
+    assert machine.state == "FAILED"
+    assert machine.error == "interaction_timeout"
+    assert machine.candidate["metadata"].get("interaction_backend_success") is None
+
+
+def test_backend_result_winning_race_is_not_failed_by_stale_physical_timeout() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=2))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    reason = machine.timeout_reason(now=10.0, task_step_index=12)
+    machine.on_interaction_result(True, now=10.1, task_step_index=12)
+    assert machine.state == STATE_VERIFYING
+    assert machine.fail_timeout(reason, now=10.2, task_step_index=12) == []
+    assert machine.on_backend_result(True, now=10.3)[0]["success"] is True
+    assert machine.fail_timeout(reason, now=11.0, task_step_index=13) == []
+    assert machine.state == STATE_SUCCEEDED
+
+
+def test_physical_timeout_callback_does_not_apply_previous_attempt_budget() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=4))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    machine.on_interaction_result(True, now=1.0, task_step_index=13)
+    machine.on_verification_result(False, retry=True, now=2.0, task_step_index=20)
+    assert machine.state == STATE_INTERACTING
+    assert machine.fail_timeout("interaction_timeout", now=3.0, task_step_index=21) == []
+    detail = machine.fail_timeout("interaction_timeout", now=4.0, task_step_index=24)[0]["detail"]
+    assert detail["state_started_task_step_index"] == 20
+    machine.reset()
+    machine.start(interaction_candidate(False), now=100.0, task_step_index=0)
+    assert machine.timeout_reason(now=101.0, task_step_index=3) == ""
+    assert machine.timeout_reason(now=102.0, task_step_index=4) == "interaction_timeout"
+
+
+def test_drawer_dispatch_and_m1_fallback_get_new_physical_step_budgets() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(interaction_timeout_task_steps=4))
+    candidate = interaction_candidate()
+    machine.start(candidate, now=0.0, task_step_index=10)
+    machine.on_navigation_result(True, now=1.0, task_step_index=20, wait_for_drawer_scan=True)
+    machine.on_drawer_scan_ready(candidate, now=2.0, task_step_index=25)
+    assert machine.timeout_reason(now=100.0, task_step_index=28) == ""
+    assert machine.timeout_reason(now=101.0, task_step_index=29) == "interaction_timeout"
+    machine.reset()
+    machine.start(observation_required_interaction_candidate(False), now=0.0, task_step_index=10)
+    machine.fail_timeout("interaction_observation_timeout", now=50.0, task_step_index=58)
+    assert machine.state == STATE_INTERACTING
+    assert machine.timeout_reason(now=100.0, task_step_index=61) == ""
+    assert machine.timeout_reason(now=101.0, task_step_index=62) == "interaction_timeout"
+
+
+@pytest.mark.parametrize("phase", ["physical", "approach", "observation"])
+def test_disabled_task_budget_is_never_reported_as_step_timeout(phase) -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(
+        interaction_timeout_task_steps=0,
+        interaction_navigation_timeout_task_steps=0,
+        interaction_observation_timeout_task_steps=0,
+        interaction_fallback_on_m1_failure=False,
+    ))
+    candidate = (
+        observation_required_interaction_candidate(False)
+        if phase == "observation" else interaction_candidate(phase == "approach")
+    )
+    machine.start(candidate, now=0.0, task_step_index=10)
+    reason = machine.timeout_reason(now=1000.0, task_step_index=11)
+    assert reason
+    commands = machine.fail_timeout(reason, now=1000.0, task_step_index=11)
+    detail = (commands[0]["candidate"]["metadata"]["last_interaction_observation"]
+              if phase == "observation" else commands[0]["detail"])
+    assert detail["timeout_clock"] == "wall_time_fallback"
+    assert detail["timeout_s"] > 0
+    assert "timeout_task_steps" not in detail
+
+
+def test_verification_wall_timeout_is_not_attributed_to_physical_step_budget() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(verification_timeout_s=5.0))
+    machine.start(interaction_candidate(False), now=0.0, task_step_index=10)
+    machine.on_interaction_result(True, now=1.0, task_step_index=11)
+    reason = machine.timeout_reason(now=7.0, task_step_index=12)
+    assert reason == "verification_timeout"
+    detail = machine.fail_timeout(reason, now=7.0, task_step_index=12)[0]["detail"]
+    assert detail["timeout_state"] == STATE_VERIFYING
+    assert detail["timeout_clock"] == "wall_time_fallback"
+    assert detail["timeout_s"] == 5.0
+    assert detail["elapsed_s"] == 6.0
+    assert "timeout_task_steps" not in detail
+
+
+@pytest.mark.parametrize("attempts", [0, 3])
+@pytest.mark.parametrize("failure", [
+    {"reason": "make_plan_unreachable"},
+    {"reason": "all_anchors_failed", "failure_reason": "container_anchor_center_blocked"},
+])
+def test_container_navigation_failure_preserves_samples_and_original_diagnostic(attempts, failure) -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"]["interaction_observation_attempts"] = attempts
+    candidate["metadata"]["container_m1_unavailable_staging_indices"] = [0, 1, 2, 3]
+    machine.start(candidate, now=0.0)
+    detail = machine.defer_container_m1_viewpoint_navigation(failure, now=1.0)[0]["detail"]
+    assert machine.error == "container_approach_navigation_unreachable"
+    assert detail["failure_stage"] == "interaction_approach_navigation"
+    assert detail["failure_reason"] == failure.get("failure_reason", failure["reason"])
+    assert detail["observation_attempts"] == attempts
+    assert detail["m1_evidence_inconclusive"] is False
+    assert detail["all_container_anchors_unreachable"] is True
+    assert detail["retryable"] is True
+    assert detail["terminal_candidate_exclusion"] is False
+
+
+def test_true_container_visual_failure_keeps_visual_classification() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"]["interaction_observation_attempts"] = 3
+    machine.start(candidate, now=0.0)
+    detail = machine._defer_container_m1_evidence(
+        {"failure_reason": "view_is_back"}, 1.0,
+        drawer_pre_action=False, reason="container_m1_evidence_inconclusive",
+    )[0]["detail"]
+    assert detail["reason"] == "container_m1_evidence_inconclusive"
+    assert detail["failure_stage"] == "interaction_visual_precondition"
+    assert detail["m1_evidence_inconclusive"] is True
+    assert detail["observation_attempts"] == 3
 
 
 def test_target_navigation_waits_for_visibility_verification() -> None:

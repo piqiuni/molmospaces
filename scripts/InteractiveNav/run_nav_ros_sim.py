@@ -1375,6 +1375,8 @@ def main():
             args.action_timeout_s, args.scene_timeout_s
         )
         policy = RosBridgePolicy(
+            publish_odom_twist=True,
+            odom_twist_source="step_delta",
             config=exp_config,
             task=None,
             observation_topic=args.observation_topic,

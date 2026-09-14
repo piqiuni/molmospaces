@@ -1762,6 +1762,43 @@ def test_finish_without_action_latches_already_open_unavailable_portal() -> None
     assert interaction["traversable"] is True
 
 
+def test_finish_without_action_without_map_connectivity_stays_unavailable() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_finish_open_without_map_1",
+        semantic_name="door",
+        is_door=True,
+        frame_index=4,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_finish_open_without_map_1",
+            "object_id": "door_finish_open_without_map_1",
+            "event_id": "m1_already_open_without_map",
+            "success": True,
+            "state": "open",
+            "observation_outcome": "finish_without_action",
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=2.0)["nodes"]
+        if node["id"] == "portal_door_finish_open_without_map_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "unavailable"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["traversable"] is False
+    assert interaction["requires_interaction"] is False
+
+
 def test_known_portal_blocks_occupancy_room_merge() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -2627,6 +2664,45 @@ def test_clipped_portal_visual_open_does_not_override_closed_state() -> None:
     assert portal["attributes"]["visual_evidence_truncated"] is True
     assert portal["attributes"]["visual_evidence_truncated_edges"] == ["right"]
     assert portal["attributes"]["portal_state_gate"]["reason"] == "truncated_visual_evidence"
+
+
+def test_clipped_portal_visual_closed_does_not_create_closed_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_clipped_closed_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([door], stamp=1.0, source_mode="gt_replay")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_clipped_closed_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["left"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        item
+        for item in store.as_graph_dict(stamp=2.0)["nodes"]
+        if item["id"] == "portal_door_clipped_closed_1"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["attributes"]["portal_state_gate"] == {
+        "accepted": False,
+        "requested_state": "closed",
+        "reason": "truncated_visual_evidence",
+        "observation_capture_step": 8,
+    }
 
 
 def test_portal_open_without_visible_aperture_does_not_override_closed_state():

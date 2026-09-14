@@ -87,13 +87,22 @@ class OrganizedDepthScanProjector:
         if length < window:
             return support.astype(bool)
 
-        windows = np.lib.stride_tricks.sliding_window_view(depth, window, axis=axis)
-        valid_windows = np.lib.stride_tricks.sliding_window_view(valid, window, axis=axis)
-        # ``sliding_window_view(..., axis)`` places the window dimension last.
-        adjacent = np.abs(np.diff(windows, axis=-1))
-        local_scale = np.minimum(windows[..., :-1], windows[..., 1:])
-        gap = np.maximum(gap_abs_m, gap_rel * local_scale)
-        good = np.all(valid_windows, axis=-1) & np.all(adjacent <= gap, axis=-1)
+        def section(start, stop):
+            slices = [slice(None)] * depth.ndim
+            slices[axis] = slice(start, stop)
+            return tuple(slices)
+
+        count = length - window + 1
+        good = valid[section(0, count)].copy()
+        # Compute each adjacent-pixel comparison once instead of materializing
+        # overlapping HxWx(window-1) difference/scale/gap arrays.
+        if window > 1:
+            left, right = depth[section(0, -1)], depth[section(1, None)]
+            gap = np.maximum(gap_abs_m, gap_rel * np.minimum(left, right))
+            adjacent = (valid[section(0, -1)] & valid[section(1, None)]
+                        & (np.abs(right - left) <= gap))
+            for offset in range(window - 1):
+                good &= adjacent[section(offset, offset + count)]
 
         for offset in range(window):
             if axis == 0:

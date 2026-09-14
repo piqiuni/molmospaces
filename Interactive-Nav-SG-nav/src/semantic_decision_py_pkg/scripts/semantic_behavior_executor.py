@@ -6,11 +6,15 @@ import math
 import os
 import threading
 import time
+import socket
+import xmlrpc.client
+from urllib.parse import urlsplit
 from collections import deque
 
 import base64
 import cv2
 import numpy as np
+from semantic_decision_py_pkg.portal_approach import is_clearance_aware_portal, portal_approach_profile
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
@@ -62,6 +66,8 @@ from semantic_decision_py_pkg.behavior_execution import (
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.step_command_gate import StepCommandGate
+from semantic_decision_py_pkg.navigation_arrival import PositionToleranceLatch, path_deviation_m
+from semantic_decision_py_pkg.navigation_clearance import ArrivalClearanceGrid
 from semantic_decision_py_pkg.external_recovery import (
     normalize_recovery_request,
     recovery_request_matches_selection,
@@ -418,14 +424,17 @@ class SemanticBehaviorExecutor:
         self.drawer_scan_wait_timeout_s = max(
             0.1, float(config.get("drawer_scan_wait_timeout_s", 8.0))
         )
+        self.drawer_fallback_bbox_wait_task_steps = max(
+            1, int(config.get("drawer_fallback_bbox_wait_task_steps", 8))
+        )
         self.drawer_scan_wait_poll_interval_s = max(
             0.01, float(config.get("drawer_scan_wait_poll_interval_s", 0.10))
         )
         # A grounded drawer scan is a finite simulator macro (open -> observe
         # -> close per selected front, then restore the view).  Its completion
         # must not depend on host/render wall time.  Keep a hard step budget and
-        # a no-step liveness guard; ordinary portal/fridge interactions retain
-        # the generic wall-clock timeout below.
+        # a no-step liveness guard; only the physical bridge result retains the
+        # generic wall-clock timeout below.
         self.drawer_scan_execution_step_budget_authoritative = bool(
             config.get("drawer_scan_execution_step_budget_authoritative", True)
         )
@@ -452,6 +461,25 @@ class SemanticBehaviorExecutor:
         # gated elsewhere.
         self.interaction_observation_timeout_s = max(
             0.1, float(config.get("interaction_observation_timeout_s", 30.0))
+        )
+        self.interaction_observation_timeout_task_steps = max(
+            1,
+            int(config.get("interaction_observation_timeout_task_steps", 48)),
+        )
+        self.interaction_observation_view_wait_task_steps = max(
+            1, int(config.get("interaction_observation_view_wait_task_steps", 6))
+        )
+        self.interaction_fallback_on_m1_failure = bool(
+            config.get("interaction_fallback_on_m1_failure", True)
+        )
+        self.interaction_navigation_timeout_task_steps = max(
+            1,
+            int(
+                config.get(
+                    "interaction_navigation_timeout_task_steps",
+                    config.get("interaction_navigation_max_task_steps", 360),
+                )
+            ),
         )
         self.interaction_observation_poll_interval_s = max(
             0.01, float(config.get("interaction_observation_poll_interval_s", 0.05))
@@ -549,22 +577,22 @@ class SemanticBehaviorExecutor:
             capture_terminal_yaw_settle_max_task_steps = int(
                 config.get(
                     "container_m1_capture_dwa_terminal_yaw_settle_max_task_steps",
-                    75,
+                    100,
                 )
             )
         except (TypeError, ValueError):
-            capture_terminal_yaw_settle_max_task_steps = 75
+            capture_terminal_yaw_settle_max_task_steps = 100
         self.container_m1_capture_dwa_terminal_yaw_settle_max_task_steps = max(
             1, capture_terminal_yaw_settle_max_task_steps
         )
         try:
             interaction_terminal_yaw_settle_max_task_steps = int(
                 config.get(
-                    "interaction_dwa_terminal_yaw_settle_max_task_steps", 75
+                    "interaction_dwa_terminal_yaw_settle_max_task_steps", 100
                 )
             )
         except (TypeError, ValueError):
-            interaction_terminal_yaw_settle_max_task_steps = 75
+            interaction_terminal_yaw_settle_max_task_steps = 100
         self.interaction_dwa_terminal_yaw_settle_max_task_steps = max(
             1, interaction_terminal_yaw_settle_max_task_steps
         )
@@ -618,9 +646,20 @@ class SemanticBehaviorExecutor:
                 interaction_navigation_timeout_s=float(
                     config.get("interaction_navigation_timeout_s", 180.0)
                 ),
+                interaction_navigation_timeout_task_steps=(
+                    self.interaction_navigation_timeout_task_steps
+                ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
+                interaction_timeout_task_steps=int(config.get("interaction_timeout_task_steps", 120)),
+                interaction_step_stall_timeout_s=float(config.get("interaction_step_stall_timeout_s", 180.0)),
                 drawer_scan_wait_timeout_s=self.drawer_scan_wait_timeout_s,
                 interaction_observation_timeout_s=self.interaction_observation_timeout_s,
+                interaction_observation_timeout_task_steps=(
+                    self.interaction_observation_timeout_task_steps
+                ),
+                interaction_fallback_on_m1_failure=(
+                    self.interaction_fallback_on_m1_failure
+                ),
                 interaction_observation_same_pose_samples_per_view=max(
                     1,
                     int(
@@ -1128,11 +1167,16 @@ class SemanticBehaviorExecutor:
         )
         self.interaction_navigation_max_task_steps = max(
             1,
-            int(config.get("interaction_navigation_max_task_steps", 240)),
+            int(
+                config.get(
+                    "interaction_navigation_max_task_steps",
+                    self.interaction_navigation_timeout_task_steps,
+                )
+            ),
         )
         self.navigation_step_sync_stall_timeout_s = max(
             0.1,
-            float(config.get("navigation_step_sync_stall_timeout_s", 5.0)),
+            float(config.get("navigation_step_sync_stall_timeout_s", 30.0)),
         )
         self.semantic_progress_supervisor_enabled = bool(
             config.get("semantic_progress_supervisor_enabled", True)
@@ -1246,6 +1290,15 @@ class SemanticBehaviorExecutor:
         self._move_base_active_goal_statuses: tuple[tuple[str, int], ...] = ()
         self._move_base_owned_goal_id = ""
         self._move_base_goal_generation = 0
+        self._move_base_worker_lock = threading.RLock()
+        self._move_base_client_generation = 0
+        self._move_base_reconnect_attempts = 0
+        self._move_base_reconnect_limit = 3
+        self._move_base_transport_terminal = {}
+        self._move_base_lifecycle_audit = deque(maxlen=64)
+        self._move_base_server_identity = None
+        self._move_base_status_received_at = 0.0
+        self.container_anchor_clearance_enabled = True
         self.selection: dict | None = None
         self.latest_graph: dict = {}
         self._interaction_observation_requests: dict[str, dict] = {}
@@ -1344,6 +1397,7 @@ class SemanticBehaviorExecutor:
         self.model_events: list[dict] = []
         self._post_interaction_visual_audits: deque[dict] = deque(maxlen=128)
         self._post_interaction_visual_audit_reobserve_counts: dict[str, int] = {}
+        self._late_interaction_observations: deque[dict] = deque(maxlen=64)
         self.feedback_pub = rospy.Publisher(
             topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
             String,
@@ -1373,8 +1427,25 @@ class SemanticBehaviorExecutor:
             queue_size=4,
             latch=True,
         )
+        # Observation-only portal outcomes use the same public result contract
+        # as bridge results.  The mapping node owns graph mutation, so this
+        # publisher closes the executor-to-graph writeback path.
+        self.interaction_result_pub = rospy.Publisher(
+            topics.get("interaction_result", "/semantic_mapping/interaction_result"),
+            String,
+            queue_size=8,
+        )
         self._interaction_command_sent_at = 0.0
         self._interaction_command_sent_id = ""
+        self._interaction_execution_progress = {}
+        self._interaction_execution_terminal = {}
+        self.interaction_execution_stall_timeout_s = max(
+            30.0, float(config.get("interaction_execution_stall_timeout_s", 60.0))
+        )
+        self.interaction_execution_wall_cap_s = max(
+            self.interaction_execution_stall_timeout_s,
+            float(config.get("interaction_execution_wall_cap_s", 600.0)),
+        )
         # ExplorePy and the semantic executor share one display seam.  Publishing
         # every actually dispatched fallback goal keeps the video overlay bound
         # to actionlib state instead of to the higher-level selection cadence.
@@ -1396,8 +1467,11 @@ class SemanticBehaviorExecutor:
             topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=2
         )
         self.tf_listener = tf.TransformListener()
-        self.move_base = actionlib.SimpleActionClient(
-            topics.get("move_base", "/move_base"), MoveBaseAction
+        self._move_base_action_name = topics.get("move_base", "/move_base")
+        self.move_base = actionlib.SimpleActionClient(self._move_base_action_name, MoveBaseAction)
+        self._navigation_terminal_pub = rospy.Publisher(
+            topics.get("goal_status", "/semantic_decision/goal_status"),
+            String, queue_size=1, latch=True,
         )
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
         rospy.Subscriber(
@@ -1435,6 +1509,10 @@ class SemanticBehaviorExecutor:
             String,
             self._interaction_result_callback,
             queue_size=10,
+        )
+        rospy.Subscriber(
+            topics.get("interaction_action_feedback", "/semantic_decision/interaction_action_feedback"),
+            String, self._interaction_execution_progress_callback, queue_size=8,
         )
         rospy.Subscriber(
             topics.get("attribute_updates", "/semantic_mapping/attribute_updates"),
@@ -1500,6 +1578,12 @@ class SemanticBehaviorExecutor:
             self._local_plan_callback,
             queue_size=1,
         )
+        self._global_plan_points = ()
+        self._global_plan_frame = ""
+        rospy.Subscriber(
+            topics.get("global_plan", "/move_base/GlobalPlanner/plan"),
+            Path, self._global_plan_callback, queue_size=1,
+        )
         rospy.Subscriber(
             topics.get("rgb_image", "/molmo_spaces/head_camera/image"),
             Image,
@@ -1543,6 +1627,8 @@ class SemanticBehaviorExecutor:
             selection = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        if getattr(self, "_move_base_transport_terminal", {}):
+            return
         # The decision node publishes an explicit inactive selection at every
         # terminal boundary so recorders cannot retain a stale subgoal.  It is
         # a display/state reset, never a new executable behavior.
@@ -1570,7 +1656,12 @@ class SemanticBehaviorExecutor:
                 self._drawer_scan_wait_records.pop(decision_id, None)
                 self._interaction_observation_requests.pop(decision_id, None)
                 self._container_m1_last_accepted_evidence.pop(decision_id, None)
-            commands = self.machine.start(selection)
+            commands = self.machine.start(
+                selection,
+                task_step_index=self._public_step_or_none(
+                    getattr(self, "_latest_step_sync_index", None)
+                ),
+            )
             if self.machine.state == STATE_VERIFYING and requires_graph_verification(
                 self.ablation.module3, selection
             ):
@@ -2175,6 +2266,17 @@ class SemanticBehaviorExecutor:
 
         metadata = candidate.get("metadata") or {}
         phase = str(metadata.get("container_two_stage_phase") or "").casefold()
+        arrival = detail.get("interaction_pose_validation") or {}
+        if arrival.get("position_tolerance_latched") and list(arrival.get("expected_pose_xyyaw") or []) == list(expected_pose_xyyaw):
+            latch = PositionToleranceLatch(tuple(expected_pose_xyyaw), float(arrival.get("distance_tolerance_m", 0.0)))
+            latch.observe(arrival.get("position_latch_pose_xyyaw"), arrival.get("position_latch_step_index"))
+            validation = latch.apply(interaction_pose_validation(
+                list(expected_pose_xyyaw), arrival.get("actual_pose_xyyaw"),
+                distance_tolerance_m=latch.distance_tolerance_m,
+                yaw_tolerance_rad=self._interaction_navigation_yaw_tolerance_rad(candidate),
+            ))
+            if validation.get("valid"):
+                return {**validation, "sample_source": "position_latched_navigation_arrival"}
         if phase and phase != "staging":
             return None
         if not bool(metadata.get("m1_observation_staging_required", False)):
@@ -2275,6 +2377,11 @@ class SemanticBehaviorExecutor:
             distance_tolerance_m=distance_tolerance_m,
             yaw_tolerance_rad=yaw_tolerance_rad,
         )
+        arrival = metadata.get("navigation_arrival_validation") or {}
+        if arrival.get("position_tolerance_latched") and list(arrival.get("expected_pose_xyyaw") or []) == expected:
+            latch = PositionToleranceLatch(tuple(expected), float(arrival.get("distance_tolerance_m", 0.0)))
+            latch.observe(arrival.get("position_latch_pose_xyyaw"), arrival.get("position_latch_step_index"))
+            validation = latch.apply(validation)
         if not bool(validation.get("valid")):
             return None, "m1_capture_pose_mismatch"
         capture_step = self._public_step_or_none(
@@ -2556,6 +2663,38 @@ class SemanticBehaviorExecutor:
                 self.selection is None
                 or self.machine.state != STATE_WAITING_FOR_INTERACTION_OBSERVATION
             ):
+                for raw_update in updates:
+                    if not isinstance(raw_update, dict):
+                        continue
+                    object_id = str(raw_update.get("object_id") or "")
+                    if object_id:
+                        self._latest_attribute_updates[object_id] = dict(raw_update)
+                    status = str(
+                        raw_update.get("attribute_status") or ""
+                    ).casefold()
+                    if not bool(raw_update.get("targeted_refresh")) or status not in {
+                        "ready",
+                        "failed",
+                        "stale",
+                        "expired",
+                    }:
+                        continue
+                    self._late_interaction_observations.append(
+                        {
+                            "object_id": str(raw_update.get("object_id") or ""),
+                            "request_id": str(
+                                raw_update.get("targeted_refresh_request_id") or ""
+                            ),
+                            "status": status,
+                            "capture_step": raw_update.get(
+                                "observation_capture_step"
+                            ),
+                            "reason": (
+                                "no_active_interaction_observation_barrier"
+                            ),
+                            "received_at": time.time(),
+                        }
+                    )
                 return
             decision_id = str(self.selection.get("decision_id") or "")
             request = dict(self._interaction_observation_requests.get(decision_id) or {})
@@ -2588,7 +2727,11 @@ class SemanticBehaviorExecutor:
                 # pending is an acknowledgement that the fresh pair was
                 # queued, not a new visual judgement. Wait for ready/failed.
                 status = str(update.get("attribute_status") or "").casefold()
-                if status == "pending":
+                if status in {"waiting_for_view", "pending", "in_flight"}:
+                    order = {"waiting_for_view": 0, "pending": 1, "in_flight": 2}
+                    current = self._interaction_observation_requests[decision_id].get("request_status", "waiting_for_view")
+                    if order[status] >= order.get(current, 0):
+                        self._interaction_observation_requests[decision_id]["request_status"] = status
                     return
                 update.setdefault("attribute_source", update.get("source") or "")
                 update.setdefault("attribute_capture_step", update.get("observation_capture_step"))
@@ -2773,7 +2916,12 @@ class SemanticBehaviorExecutor:
                         ]
                         self._interaction_observation_requests.pop(decision_id, None)
                         break
-                commands = self.machine.on_interaction_observation_result(update)
+                commands = self.machine.on_interaction_observation_result(
+                    update,
+                    task_step_index=self._public_step_or_none(
+                        getattr(self, "_latest_step_sync_index", None)
+                    ),
+                )
                 self._interaction_observation_requests.pop(decision_id, None)
                 break
         self._dispatch(commands)
@@ -2990,7 +3138,43 @@ class SemanticBehaviorExecutor:
         selected_option_index = max(
             0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
         )
-        if failure_reason == "interaction_wrong_face" and two_stage_inner:
+        if failure_reason == "interaction_orientation_misaligned" and not metadata.get("interaction_same_face_yaw_retry_attempted"):
+            pose = self._current_pose(str(metadata.get("frame_id") or self.map_frame))
+            target_yaw = metadata.get("m1_front_yaw")
+            anchor = list(metadata.get("container_geometry_anchor_xy") or [])
+            if target_yaw is None and pose is not None and len(anchor) >= 2:
+                target_yaw = math.atan2(float(anchor[1]) - pose[1], float(anchor[0]) - pose[0])
+            if pose is not None and target_yaw is not None and math.isfinite(float(target_yaw)):
+                # Use only public TF and the M1-confirmed face, never backend GT axes.
+                retry_goal = [float(pose[0]), float(pose[1]), normalize_angle(float(target_yaw))]
+                metadata = dict(metadata)
+                metadata.update({
+                    "interaction_same_face_yaw_retry_attempted": True,
+                    "interaction_same_face_yaw_retry_pending": True,
+                    "effective_interaction_approach_pose_xyyaw": retry_goal,
+                    "interaction_approach_goal_option_index": 0,
+                    "container_two_stage_action_goal_option_index": 0,
+                    "container_two_stage_action_goal_xyyaw": retry_goal,
+                    "container_two_stage_action_goal_xyyaw_options": [retry_goal],
+                    "container_two_stage_action_pose_option_labels": ["same_face_yaw_recovery"],
+                })
+                metadata.pop("navigation_arrival_validation", None)
+                interaction = dict(candidate.get("interaction_command") or {})
+                interaction["interaction_approach_pose_xyyaw"] = retry_goal
+                interaction["interaction_ready_yaw_tolerance_rad"] = min(float(interaction.get("interaction_ready_yaw_tolerance_rad", 0.2)), 0.08)
+                interaction["navigation_goal_yaw_tolerance_rad"] = interaction["interaction_ready_yaw_tolerance_rad"]
+                interaction["navigation_goal_tolerance_contract_explicit"] = True
+                candidate.update(goal_xyyaw=retry_goal, goal_xyyaw_candidates=[], metadata=metadata, interaction_command=interaction)
+                self.machine.candidate = candidate
+                self.selection = dict(candidate)
+                commands = self.machine.retry_interaction_approach(
+                    start_goal_option_index=0, interaction_approach_attempts=attempts,
+                    detail={"reason": "interaction_same_face_yaw_recovery", "recovery_goal_xyyaw": retry_goal},
+                )
+                if commands:
+                    self.selection = dict(self.machine.candidate or candidate)
+                    return commands
+        if failure_reason == "interaction_wrong_face" and two_stage_inner and payload.get("reject_selected_face", True):
             try:
                 completed_staging_index = max(
                     0,
@@ -3498,12 +3682,95 @@ class SemanticBehaviorExecutor:
         return ""
 
     def _effective_timeout_reason_locked(self, now: float | None = None) -> str:
-        reason = self.machine.timeout_reason(now=now)
+        if (
+            self.machine.state == STATE_INTERACTING
+            and getattr(self, "_interaction_command_sent_id", "")
+        ):
+            self._guard_interaction_execution_locked(now)
+            # Only a matching backend result releases a sent command. On a
+            # dead executor, end the episode instead of dispatching over it.
+            return ""
+        if self.machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION:
+            decision_id = str((self.selection or {}).get("decision_id") or "")
+            request = getattr(self, "_interaction_observation_requests", {}).get(decision_id, {})
+            started = self._public_step_or_none(request.get("minimum_capture_step"))
+            latest = self._public_step_or_none(getattr(self, "_latest_step_sync_index", None))
+            if (
+                request and request.get("request_status", "waiting_for_view") == "waiting_for_view"
+                and started is not None and latest is not None
+                and latest - started >= getattr(self, "interaction_observation_view_wait_task_steps", 6)
+            ):
+                return "interaction_observation_timeout"
+        reason = self.machine.timeout_reason(
+            now=now,
+            task_step_index=self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            ),
+        )
+        if self.machine.state == STATE_INTERACTING and getattr(self, "_drawer_scan_execution_wait", None):
+            return self._drawer_scan_execution_timeout_reason_locked(now=now)
         if reason != "interaction_timeout":
             return reason
         # A finite, advancing drawer macro owns its timeout in simulator steps.
-        # Every other interaction retains the existing wall-clock behavior.
+        # Navigation and observation barriers have already been handled by the
+        # state machine's public-step clocks; this branch covers the physical
+        # bridge result wait and its drawer-specific override.
         return self._drawer_scan_execution_timeout_reason_locked(now=now)
+
+    def _interaction_execution_progress_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or not payload.get("execution_active"):
+            return
+        with self.lock:
+            command_id = str(getattr(self, "_interaction_command_sent_id", "") or "")
+            if command_id and str(payload.get("command_id") or "") == command_id:
+                self._interaction_execution_progress = {
+                    **payload, "received_at": time.monotonic(),
+                }
+
+    def _guard_interaction_execution_locked(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else float(now)
+        if getattr(self, "_interaction_execution_terminal", {}):
+            return
+        command_id = str(self._interaction_command_sent_id)
+        progress = getattr(self, "_interaction_execution_progress", {})
+        started = float(self._interaction_command_sent_at)
+        stall_limit = getattr(self, "interaction_execution_stall_timeout_s", 60.0)
+        reason = ""
+        if progress.get("command_id") == command_id:
+            receipt_age = max(0.0, now - float(progress["received_at"]))
+            progress_age = max(0.0, float(progress.get("progress_age_s", 0.0))) + receipt_age
+            if max(receipt_age, progress_age) > stall_limit:
+                reason = "interaction_backend_progress_stalled"
+        elif now - started > stall_limit:
+            reason = "interaction_backend_ack_missing"
+        if now - started > getattr(self, "interaction_execution_wall_cap_s", 600.0):
+            reason = "interaction_backend_wall_cap"
+        context = getattr(self, "_drawer_scan_execution_wait", {}) or {}
+        first = self._public_step_or_none(context.get("started_step_index"))
+        latest = self._public_step_or_none(getattr(self, "_latest_step_sync_index", None))
+        if first is not None and latest is not None and latest - first > (
+            int(context.get("max_task_steps", 120)) + int(context.get("step_budget_margin", 8))
+        ):
+            reason = "drawer_scan_execution_step_budget_exhausted"
+        if not reason:
+            return
+        terminal = {
+            "reason": reason, "failure_stage": "interaction_execution",
+            "interaction_command_id": command_id, "backend_ownership_retained": True,
+            "elapsed_s": max(0.0, now - started),
+        }
+        self._interaction_execution_terminal = terminal
+        publisher = getattr(self, "_navigation_terminal_pub", None)
+        if publisher is not None:
+            publisher.publish(String(data=json.dumps({
+                "status": "EXPLORATION_STALLED", "timestamp": time.time(),
+                "decision_id": (self.selection or {}).get("decision_id", ""),
+                "detail": terminal,
+            })))
 
     def _drawer_scan_execution_wait_active_locked(self) -> bool:
         """Return whether the sent command still owns a drawer-scan wait."""
@@ -3637,12 +3904,21 @@ class SemanticBehaviorExecutor:
         if condition is None:
             return
         with condition:
+            self._move_base_status_received_at = time.monotonic()
             self._move_base_status_received_count = (
                 int(getattr(self, "_move_base_status_received_count", 0) or 0) + 1
             )
             self._move_base_active_goal_statuses = active_statuses
+            owned = str(getattr(self, "_move_base_owned_goal_id", "") or "")
+            for item in list(getattr(message, "status_list", ()) or ()):
+                if str(item.goal_id.id) == owned and int(item.status) in {2, 3, 4, 5, 8, 9}:
+                    terminal = (owned, int(item.status))
+                    if terminal != getattr(self, "_move_base_last_terminal", None):
+                        self._move_base_last_terminal = terminal
+                        self._audit_move_base_lifecycle("server_terminal", goal_id=owned, status=int(item.status))
             if (
-                not str(getattr(self, "_move_base_owned_goal_id", "") or "")
+                not hasattr(self, "_move_base_action_name")
+                and not str(getattr(self, "_move_base_owned_goal_id", "") or "")
                 and int(getattr(self, "_move_base_goal_generation", 0) or 0) > 0
                 and len(active_statuses) == 1
             ):
@@ -3670,20 +3946,204 @@ class SemanticBehaviorExecutor:
 
     def _record_move_base_goal_dispatch(self) -> str:
         goal_id = self._current_move_base_goal_id()
+        if hasattr(self, "_move_base_action_name"):
+            identity = self._probe_move_base_server_identity()
+            if identity is not None:
+                self._move_base_server_identity = identity
         condition = getattr(self, "_move_base_status_condition", None)
         if condition is None:
             self._move_base_owned_goal_id = goal_id
             self._move_base_goal_generation = int(
                 getattr(self, "_move_base_goal_generation", 0) or 0
             ) + 1
+            self._audit_move_base_lifecycle("goal_dispatched", goal_id=goal_id)
             return goal_id
         with condition:
             self._move_base_owned_goal_id = goal_id
             self._move_base_goal_generation = int(
                 getattr(self, "_move_base_goal_generation", 0) or 0
             ) + 1
+            self._audit_move_base_lifecycle("goal_dispatched", goal_id=goal_id)
             condition.notify_all()
         return goal_id
+
+    def _audit_move_base_lifecycle(self, event: str, **detail) -> None:
+        audit = getattr(self, "_move_base_lifecycle_audit", None)
+        if audit is None:
+            audit = self._move_base_lifecycle_audit = deque(maxlen=64)
+        audit.append({
+            "event": event, "timestamp": time.time(),
+            "step": getattr(self, "_latest_step_sync_index", None),
+            "client_generation": getattr(self, "_move_base_client_generation", 0),
+            "goal_generation": getattr(self, "_move_base_goal_generation", 0),
+            **detail,
+        })
+
+    def _probe_move_base_server_identity(self):
+        class BoundedTransport(xmlrpc.client.Transport):
+            def make_connection(self, host):
+                connection = super().make_connection(host)
+                connection.timeout = 0.5
+                return connection
+
+        try:
+            caller = rospy.get_name()
+            with xmlrpc.client.ServerProxy(
+                os.environ.get("ROS_MASTER_URI", "http://localhost:11311"),
+                transport=BoundedTransport(),
+            ) as master:
+                code, _, uri = master.lookupNode(caller, rospy.resolve_name(self._move_base_action_name))
+            if code != 1:
+                return None
+            with xmlrpc.client.ServerProxy(uri, transport=BoundedTransport()) as server:
+                code, _, pid = server.getPid(caller)
+            return (str(uri), int(pid)) if code == 1 else None
+        except (OSError, ValueError, xmlrpc.client.Error):
+            return None
+
+    @staticmethod
+    def _move_base_previous_process_exited(identity) -> bool:
+        local_hosts = {"127.0.0.1", "localhost", "::1", socket.gethostname()}
+        try:
+            local_hosts.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+        if not identity or urlsplit(identity[0]).hostname not in local_hosts:
+            return False
+        try:
+            os.kill(int(identity[1]), 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    def _latch_move_base_transport_terminal(self, detail: dict) -> dict:
+        if getattr(self, "_move_base_transport_terminal", {}):
+            return dict(self._move_base_transport_terminal)
+        terminal = {
+            **detail, "reason": "move_base_recovery_exhausted",
+            "failure_stage": "navigation_transport", "retryable": False,
+            "navigation_transport_terminal": True,
+        }
+        self._move_base_transport_terminal = terminal
+        try:
+            self.move_base.cancel_goal()
+        except Exception as exc:
+            terminal["terminal_cancel_error"] = str(exc)
+        self._audit_move_base_lifecycle("run_terminal", **terminal)
+        publisher = getattr(self, "_navigation_terminal_pub", None)
+        if publisher is not None:
+            publisher.publish(String(data=json.dumps({
+                "status": "EXPLORATION_STALLED", "timestamp": time.time(),
+                "decision_id": (getattr(self, "selection", None) or {}).get("decision_id", ""),
+                "detail": terminal,
+            })))
+        return terminal
+
+    def _recover_move_base_client(self, failure: dict) -> tuple[bool, dict]:
+        """Reconnect without sending goals; require a fresh idle server first."""
+        if not hasattr(self, "_move_base_action_name"):
+            return False, failure
+        worker_lock = getattr(self, "_move_base_worker_lock", None)
+        if worker_lock is None or not worker_lock.acquire(blocking=False):
+            return False, failure
+        try:
+            if self._move_base_transport_terminal:
+                return False, dict(self._move_base_transport_terminal)
+            if self._move_base_reconnect_attempts >= self._move_base_reconnect_limit:
+                return False, self._latch_move_base_transport_terminal(failure)
+            self._move_base_reconnect_attempts += 1
+            old_client = self.move_base
+            old_identity = self._move_base_server_identity
+            owned = str(self._move_base_owned_goal_id or self._current_move_base_goal_id())
+            new_identity = self._probe_move_base_server_identity()
+            if new_identity is None or (owned and old_identity is None):
+                return False, {**failure, "recovery_reason": "server_identity_unavailable"}
+            instance_changed = bool(old_identity and new_identity and old_identity != new_identity)
+            old_exited = self._move_base_previous_process_exited(old_identity)
+            # A second server registration is not proof the first one stopped.
+            if instance_changed and not old_exited:
+                return False, self._latch_move_base_transport_terminal({
+                    **failure, "recovery_reason": "previous_server_not_proven_exited",
+                })
+            replacement = actionlib.SimpleActionClient(self._move_base_action_name, MoveBaseAction)
+            ready = False
+            try:
+                if not self._wait_for_move_base_server(replacement, 2.0):
+                    return False, {**failure, "recovery_reason": "replacement_server_unavailable"}
+                if owned and not old_exited:
+                    from actionlib_msgs.msg import GoalID
+                    cancel = GoalID()
+                    cancel.id = owned
+                    replacement.action_client.pub_cancel.publish(cancel)
+                baseline = replacement.action_client.last_status_msg
+                deadline = time.monotonic() + max(0.1, self.move_base_successor_quiescence_timeout_s)
+                while time.monotonic() < deadline and not rospy.is_shutdown():
+                    status = replacement.action_client.last_status_msg
+                    # Reconnecting or a locally DONE client cannot clear a
+                    # server-owned goal. Only a newer, completely idle status can.
+                    if status is not None and status is not baseline:
+                        active = [(str(item.goal_id.id), int(item.status))
+                                  for item in status.status_list if int(item.status) in {0, 1, 6, 7}]
+                        if not active:
+                            ready = True
+                            break
+                    time.sleep(0.01)
+                if not ready:
+                    return False, {**failure, "recovery_reason": "replacement_server_still_active"}
+                make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+                old_client.stop_tracking_goal()
+                old_client.action_client.stop()
+                self.move_base = replacement
+                self.make_plan_client = make_plan_client
+                self._move_base_client_generation += 1
+                self._move_base_server_identity = new_identity
+                with self._move_base_status_condition:
+                    self._move_base_owned_goal_id = ""
+                    self._move_base_active_goal_statuses = ()
+                if old_exited:
+                    with self._container_m1_capture_dwa_profile_lock_for_use():
+                        self._container_m1_capture_dwa_profile_active = None
+                        self._container_m1_capture_dwa_reconfigure_client = None
+                self._audit_move_base_lifecycle(
+                    "client_reconnected", abandoned_goal_id=owned,
+                    previous_process_exited=old_exited,
+                    reconnect_attempt=self._move_base_reconnect_attempts,
+                )
+                return True, {"reason": "move_base_client_reconnected", "server_status_confirmed": True}
+            finally:
+                if self.move_base is not replacement:
+                    replacement.stop_tracking_goal()
+                    replacement.action_client.stop()
+        except Exception as exc:
+            return False, {**failure, "recovery_error": str(exc)}
+        finally:
+            if self.move_base is not locals().get("replacement"):
+                self._audit_move_base_lifecycle("reconnect_failed", attempt=self._move_base_reconnect_attempts)
+                if (self._move_base_reconnect_attempts >= self._move_base_reconnect_limit
+                        and not self._move_base_transport_terminal):
+                    self._latch_move_base_transport_terminal(failure)
+            worker_lock.release()
+
+    def _wait_for_move_base_server(self, client, timeout_s: float) -> bool:
+        if not hasattr(self, "_move_base_action_name"):
+            return bool(client.wait_for_server(rospy.Duration(timeout_s)))
+        # Noetic's wait_for_server timeout uses ROS time, which can stop with
+        # the simulator. Mirror its connection handshake with a wall deadline.
+        deadline = time.monotonic() + timeout_s
+        transport = client.action_client
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            status = transport.last_status_msg
+            if status is not None:
+                server = (getattr(status, "_connection_header", None) or {}).get("callerid")
+                if (server and transport.pub_goal.impl.has_connection(server)
+                        and transport.pub_cancel.impl.has_connection(server)
+                        and any(c.callerid_pub == server for c in transport.result_sub.impl.connections)
+                        and any(c.callerid_pub == server for c in transport.feedback_sub.impl.connections)):
+                    return True
+            time.sleep(0.01)
+        return False
 
     def _publish_dispatched_subgoal(self, frame_id: str, x: float, y: float) -> None:
         publisher = getattr(self, "subgoal_pub", None)
@@ -3782,6 +4242,7 @@ class SemanticBehaviorExecutor:
             self._latest_planning_occupancy_header_seq = header_seq
             self._latest_planning_occupancy_header_stamp_sec = header_stamp_sec
             self._latest_planning_occupancy_received_at = time.monotonic()
+            self._latest_portal_planning_occupancy = message
             self._global_costmap_condition.notify_all()
 
     def _global_costmap_callback(self, message: OccupancyGrid) -> None:
@@ -3792,6 +4253,12 @@ class SemanticBehaviorExecutor:
             self._global_costmap_received_count += 1
             self._latest_global_costmap_header_seq = header_seq
             self._latest_global_costmap_received_at = time.monotonic()
+            if getattr(self, "container_anchor_clearance_enabled", False):
+                try:
+                    grid = ArrivalClearanceGrid.from_message(message, costmap=True)
+                    self._global_clearance_snapshot = (grid, time.monotonic())
+                except (AttributeError, TypeError, ValueError):
+                    self._global_clearance_snapshot = None
             self._global_costmap_condition.notify_all()
 
     def _global_costmap_update_callback(self, message: OccupancyGridUpdate) -> None:
@@ -3802,6 +4269,12 @@ class SemanticBehaviorExecutor:
             self._global_costmap_update_received_count += 1
             self._latest_global_costmap_update_header_seq = header_seq
             self._latest_global_costmap_update_received_at = time.monotonic()
+            snapshot = getattr(self, "_global_clearance_snapshot", None)
+            if snapshot is not None:
+                try:
+                    self._global_clearance_snapshot = (snapshot[0].updated(message), time.monotonic())
+                except (AttributeError, TypeError, ValueError):
+                    self._global_clearance_snapshot = None
             self._global_costmap_condition.notify_all()
 
     def _record_post_interaction_costmap_baseline_locked(
@@ -4319,6 +4792,14 @@ class SemanticBehaviorExecutor:
                     )
                 )
 
+    def _global_plan_callback(self, message: Path) -> None:
+        points = tuple((float(p.pose.position.x), float(p.pose.position.y)) for p in message.poses)
+        if not all(math.isfinite(v) for point in points for v in point):
+            return
+        with self.lock:
+            self._global_plan_points = points
+            self._global_plan_frame = str(message.header.frame_id).lstrip("/")
+
     def _local_plan_callback(self, message: Path) -> None:
         # A non-empty plan is only a watchdog hint.  It is additionally scoped
         # to the current navigation send time below, so a retained plan from a
@@ -4393,17 +4874,45 @@ class SemanticBehaviorExecutor:
         reservation_retry = None
         with self.lock:
             reason = self._effective_timeout_reason_locked()
+            latest_task_step_index = self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            )
             if (
                 not reason
+                and not getattr(self, "_interaction_command_sent_id", "")
                 and not self._drawer_scan_execution_wait_active_locked()
                 and self.machine.state == STATE_INTERACTING
+                and latest_task_step_index is None
                 and self._interaction_command_sent_at > 0.0
                 and time.monotonic() - self._interaction_command_sent_at
                 > self.machine.config.interaction_timeout_s
             ):
                 reason = "interaction_result_timeout"
-            if reason == "navigation_timeout":
-                reason = ""
+            # Navigation workers own their finite evaluator-step budgets.  A
+            # wall-clock timeout here races a *live* worker on slow hosts (and,
+            # in particular, aborts a valid interaction terminal-yaw turn
+            # before its step-synchronised DWA budget can expire).  Suppress
+            # only while the current decision still has a registered worker;
+            # if the worker died before publishing a result, retain the
+            # wall-clock timeout as a fail-safe instead of leaving the state
+            # machine stuck forever.
+            if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+                decision_id = str(
+                    (self.selection or self.machine.candidate or {}).get(
+                        "decision_id", ""
+                    )
+                    or ""
+                )
+                active_tokens = getattr(
+                    self, "_active_navigation_run_tokens", {}
+                )
+                worker_active = bool(
+                    decision_id
+                    and isinstance(active_tokens, dict)
+                    and decision_id in active_tokens
+                )
+                if worker_active:
+                    reason = ""
             cancel_navigation = bool(reason) and self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
@@ -4439,7 +4948,32 @@ class SemanticBehaviorExecutor:
                 self._interaction_command_sent_at = 0.0
                 self._interaction_command_sent_id = ""
             else:
-                commands = self.machine.fail_timeout(reason) if reason else []
+                if (
+                    reason == "interaction_observation_timeout"
+                    and self.machine.state
+                    == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+                ):
+                    # The old request cannot authorize the next observation
+                    # attempt; release it before the state machine retries.
+                    decision_id = str(
+                        (self.selection or {}).get("decision_id") or ""
+                    )
+                    if decision_id:
+                        expired_request = self._interaction_observation_requests.pop(
+                            decision_id, None
+                        )
+                        if expired_request and getattr(self, "attribute_refresh_request_pub", None) is not None:
+                            self.attribute_refresh_request_pub.publish(String(data=json.dumps({
+                                "action": "cancel", "request_id": expired_request["request_id"],
+                            })))
+                commands = (
+                    self.machine.fail_timeout(
+                        reason,
+                        task_step_index=latest_task_step_index,
+                    )
+                    if reason
+                    else []
+                )
             if (
                 not reason
                 and self.machine.state == STATE_PREPARING_EXPLORE
@@ -4451,6 +4985,12 @@ class SemanticBehaviorExecutor:
                     reservation_retry = dict(self.selection)
             state_payload = {
                 **self.machine.summary(),
+                "navigation_transport": {
+                    "client_generation": getattr(self, "_move_base_client_generation", 0),
+                    "reconnect_attempts": getattr(self, "_move_base_reconnect_attempts", 0),
+                    "terminal": dict(getattr(self, "_move_base_transport_terminal", {})),
+                    "audit": list(getattr(self, "_move_base_lifecycle_audit", ())),
+                },
                 "decision_id": "" if self.selection is None else self.selection.get("decision_id", ""),
                 "explore_reservation_publish_count": self._explore_reservation_publish_count,
                 "explore_reservation_waiting_for_ack": self.machine.state
@@ -4480,6 +5020,14 @@ class SemanticBehaviorExecutor:
                 "post_interaction_visual_audit_count": len(
                     getattr(self, "_post_interaction_visual_audits", ())
                 ),
+                "late_interaction_observation_count": len(
+                    getattr(self, "_late_interaction_observations", ())
+                ),
+                "late_interaction_observation_last": (
+                    dict(getattr(self, "_late_interaction_observations", ())[-1])
+                    if getattr(self, "_late_interaction_observations", ())
+                    else {}
+                ),
                 "post_interaction_visual_audit_last": (
                     dict(getattr(self, "_post_interaction_visual_audits", ())[-1])
                     if getattr(self, "_post_interaction_visual_audits", ())
@@ -4487,6 +5035,17 @@ class SemanticBehaviorExecutor:
                 ),
                 "timestamp": time.time(),
             }
+            latch_record = getattr(self, "_navigation_arrival_latch", None)
+            if latch_record is not None and latch_record[0][0] == state_payload.get("decision_id"):
+                latch = latch_record[1]
+                state_payload["navigation_arrival"] = {
+                    "position_latched": latch.latched,
+                    "goal_xyyaw": list(latch.goal),
+                    "arrival_pose_xyyaw": list(latch.arrival_pose or ()),
+                    "arrival_step_index": latch.arrival_step,
+                    "distance_tolerance_m": latch.distance_tolerance_m,
+                    "mode": "rotation_only" if latch.latched else "approach",
+                }
         self.state_pub.publish(
             String(data=json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")))
         )
@@ -4499,6 +5058,8 @@ class SemanticBehaviorExecutor:
     def _dispatch(self, commands: list[dict]) -> None:
         for command in commands:
             kind = command.get("kind")
+            if getattr(self, "_move_base_transport_terminal", {}) and kind not in {"terminal", "finalize_frontier"}:
+                continue
             if kind == "reserve_frontier":
                 self._publish_explore_command(
                     command["candidate"], action="reserve_frontier"
@@ -4566,9 +5127,13 @@ class SemanticBehaviorExecutor:
             ):
                 return
             interaction = candidate.get("interaction_command") or {}
+            candidate_metadata = dict(
+                (self.machine.candidate or candidate).get("metadata") or {}
+            )
             object_id = str(
                 command.get("object_id")
                 or interaction.get("object_id")
+                or candidate_metadata.get("reobserve_object_id")
                 or candidate.get("target_id")
                 or ""
             )
@@ -4642,6 +5207,17 @@ class SemanticBehaviorExecutor:
                 request["observation_pose_xyyaw"] = [
                     float(value) for value in actual_observation_pose
                 ]
+                if self.machine.candidate is not None:
+                    metadata = dict(self.machine.candidate.get("metadata") or {})
+                    metadata["interaction_observation_actual_pose_xyyaw"] = list(
+                        request["observation_pose_xyyaw"]
+                    )
+                    self.machine.candidate["metadata"] = metadata
+            elif self.machine.candidate is not None:
+                # Never let a missing TF lookup reuse a previous request's pose.
+                self.machine.candidate.get("metadata", {}).pop(
+                    "interaction_observation_actual_pose_xyyaw", None
+                )
             if self._is_container_pre_action_candidate(self.machine.candidate):
                 # Public graph/candidate semantics constrain only the M1 class
                 # contract for this targeted re-observation.  M1 still decides
@@ -4909,7 +5485,7 @@ class SemanticBehaviorExecutor:
         ) is not None
 
     def _reject_drawer_command_without_visual_contract(
-        self, candidate: dict, reason: str
+        self, candidate: dict, reason: str, *, retryable: bool = False
     ) -> None:
         """Fail locally before an empty/ungrounded drawer command reaches bridge."""
 
@@ -4927,7 +5503,8 @@ class SemanticBehaviorExecutor:
                 detail={
                     "reason": reason,
                     "failure_stage": "interaction_visual_precondition",
-                    "terminal_candidate_exclusion": True,
+                    "terminal_candidate_exclusion": not retryable,
+                    "retryable": retryable,
                     "action_executed": False,
                 },
             )
@@ -4936,6 +5513,20 @@ class SemanticBehaviorExecutor:
     def _publish_interaction_command(self, candidate: dict) -> None:
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
+        drawer_kind = str(interaction.get("container_kind") or metadata.get("container_kind") or "").casefold()
+        if metadata.get("interaction_observation_fallback_used") and drawer_kind in {"drawer", "drawer_container", "\u62bd\u5c49"}:
+            candidate, reason = self._drawer_fallback_scan_candidate(candidate)
+            if reason:
+                self._start_drawer_fallback_bbox_wait(candidate, reason)
+                return
+            metadata = candidate.get("metadata") or {}
+            interaction = candidate.get("interaction_command") or {}
+            with self.lock:
+                # Result routing must see the sealed macro actually sent, not
+                # the original ungrounded drawer-open request.
+                for owner in (getattr(self, "selection", None), getattr(getattr(self, "machine", None), "candidate", None)):
+                    if owner is not None and owner.get("decision_id") == candidate.get("decision_id"):
+                        owner["interaction_command"] = dict(interaction)
         drawer_sequence_type = str(
             interaction.get("sequence_type") or ""
         ).casefold()
@@ -5004,6 +5595,12 @@ class SemanticBehaviorExecutor:
             ),
             "interaction_front_axis_validation_required": bool(
                 interaction.get("interaction_front_axis_validation_required", False)
+            ),
+            "m1_observation_fallback": bool(
+                metadata.get("interaction_observation_fallback_used", False)
+            ),
+            "m1_observation_fallback_reason": str(
+                metadata.get("interaction_observation_fallback_reason") or ""
             ),
             "interaction_ready_distance_m": float(
                 interaction.get("interaction_ready_distance_m", 0.45) or 0.45
@@ -5075,6 +5672,80 @@ class SemanticBehaviorExecutor:
         self.interaction_command_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
+
+    def _start_drawer_fallback_bbox_wait(self, candidate: dict, reason: str) -> None:
+        decision_id = str(candidate.get("decision_id") or "")
+        with self.lock:
+            if not self._interaction_is_current(decision_id):
+                return
+            waits = getattr(self, "_drawer_fallback_bbox_waits", None)
+            if waits is None:
+                waits = self._drawer_fallback_bbox_waits = {}
+            if decision_id in waits:
+                return
+            context = {
+                "started_step": self._public_step_or_none(getattr(self, "_latest_step_sync_index", None)),
+                "started_at": time.monotonic(), "reason": reason,
+            }
+            waits[decision_id] = context
+        threading.Thread(target=self._wait_for_drawer_fallback_bbox,
+                         args=(decision_id, candidate, context), daemon=True).start()
+
+    def _wait_for_drawer_fallback_bbox(self, decision_id: str, candidate: dict, context: dict) -> None:
+        """Keep the latched pose while the normal detector produces a fresh box."""
+        try:
+            while not rospy.is_shutdown():
+                with self.lock:
+                    if not self._interaction_is_current(decision_id):
+                        return
+                    planned, reason = self._drawer_fallback_scan_candidate(candidate)
+                    if not reason:
+                        # Bind and publish under the same RLock so the public
+                        # frame identity cannot change between these checks.
+                        self._publish_interaction_command(planned)
+                        return
+                    context["reason"] = reason
+                    latest = self._public_step_or_none(getattr(self, "_latest_step_sync_index", None))
+                    started = context["started_step"]
+                    expired = (latest is not None and started is not None
+                               and latest - started >= getattr(self, "drawer_fallback_bbox_wait_task_steps", 8))
+                    stalled = time.monotonic() - context["started_at"] >= 30.0
+                    if expired or stalled:
+                        self._reject_drawer_command_without_visual_contract(
+                            candidate, "drawer_fallback_bbox_wait_timeout", retryable=True)
+                        return
+                    self._publish_container_staging_hold_stop()
+                time.sleep(0.05)
+        finally:
+            with self.lock:
+                waits = getattr(self, "_drawer_fallback_bbox_waits", {})
+                if waits.get(decision_id) is context:
+                    waits.pop(decision_id, None)
+
+    def _drawer_fallback_scan_candidate(self, candidate: dict) -> tuple[dict, str]:
+        with self.lock:
+            node = self._selected_graph_node_locked(candidate)
+            attributes = node.get("attributes") or {}
+            # This is the box's identity, not the graph publication or RGB seq.
+            raw_capture = attributes.get("bbox_capture_step", node.get("bbox_capture_step"))
+            if "bbox_capture_step" not in attributes and "bbox_capture_step" not in node:
+                for key in ("last_observation_frame_index", "observation_capture_step", "frame_index", "capture_step"):
+                    if key in attributes:
+                        raw_capture = attributes[key]
+                        break
+            capture_step = self._public_step_or_none(raw_capture)
+            graph_step = self._public_step_or_none((self.latest_graph or {}).get("capture_step"))
+            current_step = self._public_step_or_none(getattr(self, "_latest_step_sync_index", None))
+            if capture_step is None:
+                return candidate, "drawer_fallback_bbox_capture_missing"
+            if capture_step != graph_step or (current_step is not None and abs(current_step - capture_step) > 1):
+                return candidate, "drawer_fallback_bbox_capture_not_fresh"
+            planned = candidate_with_direct_drawer_scan(candidate, node, capture_step=capture_step)
+            if planned is None:
+                return candidate, "drawer_fallback_visible_bbox_missing"
+            # Only a sealed, frame-bound scan may have no visible M1 regions.
+            planned["interaction_command"]["drawer_scan_fallback_to_all"] = True
+            return planned, ""
 
     def _plan_and_publish_interaction(self, decision_id: str, candidate: dict) -> None:
         with self.lock:
@@ -5611,10 +6282,11 @@ class SemanticBehaviorExecutor:
 
     def _selected_graph_node_locked(self, candidate: dict) -> dict:
         target_id = str(candidate.get("target_id") or "")
+        graph = getattr(self, "latest_graph", {}) or {}
         return next(
             (
                 dict(node)
-                for node in self.latest_graph.get("nodes") or []
+                for node in graph.get("nodes") or []
                 if str(node.get("id") or "") == target_id
             ),
             {},
@@ -6159,7 +6831,217 @@ class SemanticBehaviorExecutor:
             "costmap_resolution_m": resolution,
             "costmap_origin_xy": list(origin_xy),
             "costmap_origin_yaw": origin_yaw,
+            "costmap_received_at": received_at,
+            "costmap_source": "local_costmap",
         }
+
+    @staticmethod
+    def _container_anchor_sampled_poses(candidate: dict) -> list[list[float]]:
+        metadata = candidate.get("metadata") or {}
+        poses = list(metadata.get("container_m1_sampled_capture_poses_xyyaw") or [])
+        last = metadata.get("container_m1_last_sampled_capture_goal_xyyaw")
+        if last is not None:
+            poses.append(last)
+        result = []
+        for pose in poses:
+            try:
+                values = [float(value) for value in pose[:3]]
+                if len(values) == 3 and all(math.isfinite(value) for value in values):
+                    result.append(values)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _container_anchor_eligible(self, candidate: dict, index: int, goal) -> tuple[bool, dict]:
+        metadata = candidate.get("metadata") or {}
+        if not (self._is_container_two_stage_m1_staging(candidate) or is_container_two_stage_m1_capture(candidate)):
+            return True, {}
+        excluded = set()
+        for key in (
+            "container_m1_excluded_anchor_indices", "container_m1_unavailable_staging_indices",
+            "interaction_observation_viewpoint_staging_indices", "container_m1_rejected_face_staging_indices",
+        ):
+            for value in metadata.get(key) or []:
+                try:
+                    excluded.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        try:
+            canonical = int(metadata.get("container_two_stage_staging_goal_option_index", index)) if is_container_two_stage_m1_capture(candidate) else int(index)
+        except (TypeError, ValueError):
+            return False, {"reason": "container_anchor_index_invalid"}
+        if canonical in excluded:
+            return False, {"reason": "container_anchor_excluded", "anchor_index": canonical}
+        for pose in self._container_anchor_sampled_poses(candidate):
+            if (math.hypot(goal[0] - pose[0], goal[1] - pose[1]) < 0.25
+                    and abs(normalize_angle(goal[2] - pose[2])) < 0.25):
+                return False, {"reason": "container_anchor_viewpoint_duplicate", "anchor_index": canonical}
+        return True, {}
+
+    def _portal_map_clearance(self, occupancy, frame_id, goal, arrival_tolerance):
+        try:
+            info = occupancy.info
+            width, height, resolution = int(info.width), int(info.height), float(info.resolution)
+            if min(width, height) <= 0 or not math.isfinite(resolution) or resolution <= 0 or len(occupancy.data) != width * height:
+                raise ValueError("invalid grid")
+            x, y = float(goal[0]), float(goal[1])
+            if frame_id != occupancy.header.frame_id:
+                translation, rotation = self.tf_listener.lookupTransform(occupancy.header.frame_id, frame_id, rospy.Time(0))
+                yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+                x, y = (translation[0] + math.cos(yaw)*x - math.sin(yaw)*y,
+                        translation[1] + math.sin(yaw)*x + math.cos(yaw)*y)
+            origin_yaw = _costmap_origin_yaw(occupancy)
+            dx, dy = x-info.origin.position.x, y-info.origin.position.y
+            gx, gy = (math.cos(origin_yaw)*dx + math.sin(origin_yaw)*dy,
+                      -math.sin(origin_yaw)*dx + math.cos(origin_yaw)*dy)
+            radius = (getattr(self, "rear_goal_robot_radius_m", 0.25)
+                      + getattr(self, "rear_goal_safety_margin_m", 0.05)
+                      + resolution/math.sqrt(2.0))
+            detail = {"clearance_radius_m": radius, "arrival_region_radius_m": 0.0,
+                      "costmap_resolution_m": resolution, "costmap_frame": occupancy.header.frame_id}
+            if not (radius <= gx < width*resolution-radius and radius <= gy < height*resolution-radius):
+                return False, {**detail, "reason": "portal_anchor_outside_map_window"}
+            col, row = int(gx/resolution), int(gy/resolution)
+            data = np.asarray(occupancy.data).reshape(height, width)
+            center_cost = int(data[row, col])
+            detail["center_cost"] = center_cost
+            if center_cost < 0 or center_cost >= 99:
+                return False, {**detail, "reason": "portal_anchor_center_blocked"}
+            # Query a bounded window; 99 is already inflated and is tested only
+            # at the centre. Sweep lethal/unknown cells once with the full disc.
+            cells = int(math.ceil(max(radius, 0.8)/resolution)) + 1
+            x0, x1 = max(0, col-cells), min(width, col+cells+1)
+            y0, y1 = max(0, row-cells), min(height, row+cells+1)
+            patch = data[y0:y1, x0:x1]
+            yy, xx = np.where((patch >= 100) | (patch < 0))
+            distances = np.hypot((xx+x0+.5)*resolution-gx, (yy+y0+.5)*resolution-gy)
+            nearest = min(0.8, float(distances.min())) if distances.size else 0.8
+            detail["obstacle_clearance_m"] = nearest
+            if distances.size and np.any(distances <= radius):
+                return False, {**detail, "reason": "portal_anchor_arrival_region_blocked"}
+            return True, {**detail, "reason": "portal_anchor_clearance_confirmed"}
+        except (AttributeError, TypeError, ValueError, IndexError, tf.LookupException,
+                tf.ConnectivityException, tf.ExtrapolationException):
+            return False, {"reason": "portal_anchor_costmap_invalid"}
+
+    def _portal_anchor_clearance(self, candidate, frame_id, goal):
+        metadata = candidate.get("metadata") or {}
+        latched = bool(metadata.get("portal_clearance_position_latched"))
+        contract_goal = (metadata.get("effective_interaction_approach_pose_xyyaw") or goal) if latched else goal
+        profile = portal_approach_profile(candidate, contract_goal)
+        if profile is None:
+            return False, {"reason": "portal_anchor_front_contract_invalid"}
+        tolerance = 0.0 if latched else profile["distance_tolerance_m"]
+        local, local_detail = self._fresh_rear_local_costmap_snapshot()
+        if local is not None:
+            clear, detail = self._portal_map_clearance(local, frame_id, goal, tolerance)
+            if detail["reason"] != "portal_anchor_outside_map_window":
+                return clear, {**local_detail, **detail, "local_clearance_deferred": False}
+        else:
+            with self.lock:
+                stale_local = getattr(self, "_latest_occupancy", None)
+            if stale_local is not None:
+                _, stale_detail = self._portal_map_clearance(stale_local, frame_id, goal, tolerance)
+                if stale_detail["reason"] != "portal_anchor_outside_map_window":
+                    return False, {**local_detail, "reason": "portal_anchor_local_costmap_not_fresh"}
+        if latched:
+            return False, {"reason": "portal_anchor_local_costmap_not_fresh"}
+        with self.lock:
+            global_map = getattr(self, "_latest_portal_planning_occupancy", None)
+            received_at = getattr(self, "_latest_planning_occupancy_received_at", 0.0)
+        age = time.monotonic()-received_at if received_at > 0 else math.inf
+        if global_map is None or age > self.rear_goal_local_costmap_max_age_s:
+            return False, {"reason": "portal_anchor_global_map_not_fresh", "costmap_age_s": age}
+        clear, detail = self._portal_map_clearance(global_map, frame_id, goal, tolerance)
+        return clear, {**detail, "costmap_source": "planning_occupancy", "costmap_age_s": age,
+                       "costmap_received_at": received_at, "local_clearance_deferred": True}
+
+    def _container_anchor_local_clearance(self, candidate: dict, frame_id: str, goal) -> tuple[bool, dict]:
+        """Check the goal footprint before latching, the actual footprint after it."""
+        if is_clearance_aware_portal(candidate):
+            return self._portal_anchor_clearance(candidate, frame_id, goal)
+        if not (self._is_container_two_stage_m1_staging(candidate) or is_container_two_stage_m1_capture(candidate)
+                or is_container_two_stage_physical_action(candidate)):
+            return True, {}
+        latched = bool((candidate.get("metadata") or {}).get("container_clearance_position_latched"))
+        tolerance = 0.0 if latched else self._interaction_navigation_pose_tolerance_m(candidate)
+        occupancy, detail = self._fresh_rear_local_costmap_snapshot()
+        if occupancy is None:
+            return False, {**detail, "reason": "container_anchor_local_costmap_not_fresh"}
+        clear, checked = self._container_map_clearance(occupancy, frame_id, goal, tolerance)
+        if checked["reason"] != "container_anchor_outside_map_window":
+            return clear, {**detail, **checked, "local_clearance_deferred": False}
+        if latched:
+            return False, {**detail, **checked, "local_clearance_deferred": False}
+        with self.lock:
+            planning = getattr(self, "_latest_portal_planning_occupancy", None)
+            received_at = getattr(self, "_latest_planning_occupancy_received_at", 0.0)
+        age = time.monotonic() - received_at if received_at > 0 else math.inf
+        if planning is None or age > self.rear_goal_local_costmap_max_age_s:
+            return False, {"reason": "container_anchor_global_map_not_fresh", "costmap_age_s": age}
+        clear, checked = self._container_map_clearance(planning, frame_id, goal, tolerance, costmap=False)
+        return clear, {**checked, "costmap_source": "planning_occupancy", "costmap_age_s": age,
+                       "costmap_received_at": received_at, "local_clearance_deferred": True}
+
+    def _container_map_clearance(self, occupancy, frame_id, goal, tolerance, *, costmap=True):
+        x, y = float(goal[0]), float(goal[1])
+        try:
+            # Reuse the immutable decoded grid across all anchors in one map.
+            cache = getattr(self, "_arrival_clearance_grid_cache", {})
+            cached = cache.get(costmap)
+            if cached is None or cached[0] is not occupancy:
+                grid = ArrivalClearanceGrid.from_message(occupancy, costmap=costmap)
+                cache[costmap] = (occupancy, grid)
+                self._arrival_clearance_grid_cache = cache
+            else:
+                grid = cached[1]
+            if frame_id.lstrip("/") != grid.frame_id.lstrip("/"):
+                translation, rotation = self.tf_listener.lookupTransform(grid.frame_id, frame_id, rospy.Time(0))
+                yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+                x, y = (translation[0] + math.cos(yaw) * x - math.sin(yaw) * y,
+                        translation[1] + math.sin(yaw) * x + math.cos(yaw) * y)
+            detail = grid.check((x, y), tolerance,
+                                robot_radius_m=getattr(self, "rear_goal_robot_radius_m", 0.25),
+                                safety_margin_m=getattr(self, "rear_goal_safety_margin_m", 0.05))
+            detail["reason"] = "container_anchor_" + detail["reason"]
+            return bool(detail.pop("clear")), detail
+        except (AttributeError, TypeError, ValueError, IndexError, tf.LookupException,
+                tf.ConnectivityException, tf.ExtrapolationException):
+            return False, {"reason": "container_anchor_costmap_invalid"}
+
+    def _confirm_container_anchor_blocked(self, decision_id, candidate, frame_id, goal, initial_detail):
+        """Stop first, then confirm a changed endpoint on distinct map updates."""
+        self.move_base.cancel_goal()
+        samples = [dict(initial_detail)]
+        received_at = initial_detail.get("costmap_received_at")
+        started = time.monotonic()
+        with self.lock:
+            started_step = getattr(self, "_latest_step_sync_index", None)
+        last_step = started_step
+        max_steps = max(1, int(getattr(self, "container_anchor_blocked_confirmation_task_steps", 3)))
+        geometric_reasons = {"container_anchor_arrival_region_blocked", "container_anchor_center_blocked", "container_anchor_outside_map_window"}
+        blocked_samples = int(initial_detail.get("reason") in geometric_reasons)
+        wait_budget = max(20, max_steps)
+        stall_timeout = max(15.0, float(getattr(self, "navigation_step_sync_stall_timeout_s", 60.0)))
+        while not rospy.is_shutdown() and self._navigation_is_current(decision_id):
+            if time.monotonic() - started >= stall_timeout:
+                break
+            time.sleep(0.05)
+            clear, detail = self._container_anchor_local_clearance(candidate, frame_id, goal)
+            with self.lock:
+                step = getattr(self, "_latest_step_sync_index", None)
+            if detail.get("costmap_received_at") != received_at and (step != last_step or step is None):
+                received_at = detail.get("costmap_received_at")
+                last_step = step
+                samples.append(dict(detail))
+                if clear:
+                    return True, {**detail, "clearance_confirmation_samples": samples, "clearance_recovered_after_stop": True}
+                blocked_samples = blocked_samples + 1 if detail.get("reason") in geometric_reasons else 0
+            if blocked_samples >= max_steps or (started_step is not None and step is not None and step - started_step >= wait_budget):
+                break
+        return False, {**samples[-1], "clearance_confirmation_samples": samples,
+                       "clearance_confirmation_inconclusive": blocked_samples < max_steps,
+                       "clearance_confirmation_task_steps": max_steps, "clearance_recovered_after_stop": False}
 
     def _acquire_rear_goal_cmd_vel_lease(
         self, decision_id: str, *, allow_idle_action_client: bool = False
@@ -6861,6 +7743,9 @@ class SemanticBehaviorExecutor:
                 )
                 if not reason and reached_step_cap:
                     reason = "scan_step_cap"
+                if (not reason and (_candidate.get("metadata") or {}).get("frontier_recovery_scan")
+                        and not self._rear_goal_rotation_command_safe()):
+                    reason = "frontier_recovery_scan_unsafe"
                 if reason:
                     detail = self._startup_scan_detail(
                         reason=reason,
@@ -7092,8 +7977,17 @@ class SemanticBehaviorExecutor:
         *,
         trigger_source: str = "initial_rear_goal",
         allow_reverse: bool = True,
+        position_tolerance_m: float = 0.0,
     ) -> bool:
         self._last_rear_goal_recovery_detail = {}
+        if position_tolerance_m > 0.0:
+            pose = self._current_pose(frame_id)
+            if pose is not None and math.hypot(goal_x - pose[0], goal_y - pose[1]) <= position_tolerance_m:
+                self._last_rear_goal_recovery_detail = {
+                    "reason": "rear_goal_position_already_ready",
+                    "trigger_source": trigger_source,
+                }
+                return True
         if not self.rear_goal_prerotate_enabled:
             self._last_rear_goal_recovery_detail = {
                 "reason": "rear_goal_prerotation_disabled",
@@ -7184,6 +8078,75 @@ class SemanticBehaviorExecutor:
             **({"turn_failure_detail": turn_failure_detail} if not rotated else {}),
         }
         return bool(rotated)
+
+    def _run_same_face_yaw_recovery(self, decision_id, candidate, goal, option_index, attempts, navigation_run_token):
+        """An already-reached XY needs only an exclusive, step-bounded turn."""
+        frame = str((candidate.get("metadata") or {}).get("frame_id") or self.map_frame)
+        pose = self._current_pose(frame)
+        tolerance = self._interaction_navigation_pose_tolerance_m(candidate)
+        yaw_tolerance = self._interaction_navigation_yaw_tolerance_rad(candidate)
+        latch = PositionToleranceLatch(tuple(goal), tolerance)
+        with self.lock:
+            step = getattr(self, "_latest_step_sync_index", None)
+        if not latch.observe(pose, step):
+            return False, {"reason": "same_face_yaw_recovery_position_not_reached"}
+        candidate = dict(candidate)
+        candidate["metadata"] = dict(candidate.get("metadata") or {})
+        candidate["metadata"]["interaction_same_face_yaw_retry_pending"] = False
+        attempts = [dict(item) for item in attempts]
+        attempts.append({"index": option_index, "goal_xyyaw": list(goal), "navigation_attempt": len(attempts) + 1, "rotation_only": True})
+        self._set_effective_interaction_approach(decision_id, candidate, goal, option_index, attempts)
+        with self.lock:
+            key = (decision_id, tuple(goal), str(candidate["metadata"].get("container_two_stage_phase") or ""), tolerance)
+            self._navigation_arrival_latch = (key, latch)
+
+        def rotation_safe():
+            current = self._current_pose(frame)
+            if current is None:
+                return False
+            clear, detail = self._container_anchor_local_clearance(candidate, frame, current)
+            return clear and not detail.get("local_clearance_deferred", False)
+
+        if not rotation_safe():
+            return False, {"reason": "same_face_yaw_recovery_footprint_blocked"}
+        if not self._acquire_rear_goal_cmd_vel_lease(decision_id, allow_idle_action_client=True):
+            return False, {**self._last_rear_goal_recovery_detail, "failure_stage": "interaction_approach_navigation"}
+        try:
+            budget = min(self.interaction_final_align_max_control_steps, prerotation_control_step_budget(
+                normalize_angle(goal[2] - pose[2]), yaw_tolerance,
+                self.interaction_final_align_rotate_speed_rad_s,
+                self.interaction_final_align_control_dt_s,
+                self.interaction_final_align_max_control_steps,
+            ) + self.interaction_final_align_control_step_margin_steps)
+            aligned = self._rotate_to_yaw(
+                decision_id, frame, goal[2], yaw_tolerance,
+                self.interaction_final_align_rotate_speed_rad_s,
+                self.interaction_final_align_timeout_s,
+                max_prerotate_control_steps=budget,
+                step_command_gate=self._interaction_final_align_gate,
+                step_sync_stall_timeout_s=max(15.0, self.interaction_final_align_step_sync_stall_timeout_s),
+                delivery_retry_steps=self.interaction_final_align_delivery_retry_steps,
+                post_budget_settle_steps=self.interaction_final_align_post_budget_settle_steps,
+                rotation_label="same-face-yaw-recovery",
+                step_sync_budget_authoritative=True,
+                command_guard=rotation_safe,
+            )
+        finally:
+            self._release_rear_goal_cmd_vel_lease()
+        if not aligned:
+            return False, {"reason": "same_face_yaw_recovery_failed", "failure_stage": "interaction_approach_navigation"}
+        current = self._current_pose(frame)
+        validation = latch.apply(interaction_pose_validation(
+            list(goal), None if current is None else list(current),
+            distance_tolerance_m=tolerance, yaw_tolerance_rad=yaw_tolerance,
+        ))
+        self._complete_interaction_approach_navigation(
+            decision_id, candidate, selected_goal=goal, selected_goal_option_index=option_index,
+            interaction_approach_attempts=attempts, goal_option_count=1,
+            detail={"reason": "interaction_same_face_yaw_recovery", "interaction_pose_validation": validation, "interaction_arrival_step_index": step},
+            navigation_run_token=navigation_run_token,
+        )
+        return True, {}
 
     def _final_align_goal(
         self,
@@ -7461,6 +8424,39 @@ class SemanticBehaviorExecutor:
                 dict(item) for item in interaction_approach_attempts
             ],
         }
+        if pose_ready:
+            if self._is_container_two_stage_m1_staging(candidate) or is_container_two_stage_m1_capture(candidate):
+                eligible, rejection = self._container_anchor_eligible(
+                    candidate, selected_goal_option_index, selected_goal
+                )
+                actual_pose = (poll_detail.get("interaction_pose_validation") or {}).get("actual_pose_xyyaw")
+                if eligible and self._container_anchor_sampled_poses(candidate):
+                    if not actual_pose or len(actual_pose) < 3:
+                        eligible, rejection = False, {"reason": "container_anchor_actual_pose_unavailable"}
+                    else:
+                        eligible, rejection = self._container_anchor_eligible(
+                            candidate, selected_goal_option_index, actual_pose
+                        )
+                if eligible and (getattr(self, "container_anchor_clearance_enabled", False) or is_clearance_aware_portal(candidate)):
+                    checked = {**candidate, "metadata": {**candidate.get("metadata", {}),
+                                                        "container_clearance_position_latched": True}}
+                    eligible, rejection = self._container_anchor_local_clearance(
+                        checked, str((candidate.get("metadata") or {}).get("frame_id") or self.map_frame), actual_pose
+                    ) if actual_pose is not None else (False, {"reason": "container_anchor_actual_pose_unavailable"})
+                    eligible = eligible and not rejection.get("local_clearance_deferred", False)
+                if not eligible:
+                    pose_ready = False
+                    detail.update(rejection)
+        if pose_ready and is_clearance_aware_portal(candidate):
+            frame = str((candidate.get("metadata") or {}).get("frame_id") or self.map_frame)
+            actual = self._current_pose(frame)
+            checked = {**candidate, "metadata": {**candidate.get("metadata", {}), "portal_clearance_position_latched": True,
+                                                 "effective_interaction_approach_pose_xyyaw": list(selected_goal)}}
+            clear, rejection = self._portal_anchor_clearance(checked, frame, actual) if actual is not None else (
+                False, {"reason": "portal_anchor_actual_pose_unavailable"})
+            if not clear or rejection.get("local_clearance_deferred"):
+                pose_ready = False
+                detail.update(rejection)
         if pose_ready:
             self._handle_navigation_result(
                 decision_id,
@@ -7798,6 +8794,10 @@ class SemanticBehaviorExecutor:
         restore_configuration = active_profile.get("restore_configuration")
         if client is None or not isinstance(restore_configuration, dict):
             return False, {"reason": "container_m1_capture_dwa_restore_missing_snapshot"}
+        if hasattr(self, "_move_base_action_name"):
+            quiescent, detail = self._check_move_base_goal_quiescent_before_successor()
+            if not quiescent:
+                return False, {"reason": "container_m1_capture_dwa_restore_deferred", "quiescence": detail}
         try:
             client.update_configuration(dict(restore_configuration))
         except Exception as exc:  # Keep the failure visible; never issue a blind retry.
@@ -8083,6 +9083,8 @@ class SemanticBehaviorExecutor:
             restored, detail = self._restore_container_m1_capture_dwa_profile_locked(
                 active_profile
             )
+            if detail.get("reason") == "container_m1_capture_dwa_restore_deferred":
+                return {"released": False, "restored": False, **detail}
             # Clear even when a ROS respawn makes restoration unavailable.  The
             # lease must not let an old, terminated worker block future
             # navigation; the failure is surfaced in the log and the next
@@ -8149,6 +9151,21 @@ class SemanticBehaviorExecutor:
     def _confirm_move_base_goal_quiescent_before_successor(
         self,
     ) -> tuple[bool, dict]:
+        if getattr(self, "_move_base_transport_terminal", {}):
+            return False, dict(self._move_base_transport_terminal)
+        worker_lock = getattr(self, "_move_base_worker_lock", None)
+        if worker_lock is not None and not worker_lock.acquire(blocking=False):
+            return False, {"reason": "move_base_predecessor_worker_active"}
+        try:
+            ready, detail = self._check_move_base_goal_quiescent_before_successor()
+            if not ready and hasattr(self, "_move_base_action_name"):
+                return self._recover_move_base_client(detail)
+            return ready, detail
+        finally:
+            if worker_lock is not None:
+                worker_lock.release()
+
+    def _check_move_base_goal_quiescent_before_successor(self) -> tuple[bool, dict]:
         """Cancel and prove the prior move_base goal is no longer commanding.
 
         SimpleActionClient can report a local terminal result one callback before
@@ -8185,14 +9202,15 @@ class SemanticBehaviorExecutor:
         if state_before in active_states:
             try:
                 move_base.cancel_goal()
-                move_base.wait_for_result(
-                    rospy.Duration(
-                        max(
-                            0.0,
-                            float(getattr(self, "final_align_cancel_wait_s", 1.0)),
+                if not hasattr(self, "_move_base_action_name"):
+                    move_base.wait_for_result(
+                        rospy.Duration(
+                            max(
+                                0.0,
+                                float(getattr(self, "final_align_cancel_wait_s", 1.0)),
+                            )
                         )
                     )
-                )
                 state_after = int(move_base.get_state())
                 cancel_issued = True
             except Exception as exc:
@@ -8232,16 +9250,17 @@ class SemanticBehaviorExecutor:
                         for goal_id, status in active_statuses
                         if owned_goal_id and goal_id == owned_goal_id
                     )
+                    if hasattr(self, "_move_base_action_name"):
+                        owned_active_statuses = active_statuses
                     status_receipts_observed = max(0, receipt_count - status_baseline)
-                    # Server activity is goal-id scoped.  Historical
-                    # PREEMPTING/RECALLING entries from an older action must not
-                    # block a terminal current client, and an empty active set
-                    # already proves quiescence without waiting for an arbitrary
-                    # newer status receipt.  When actionlib's internal goal id is
-                    # unavailable, the terminal client state is the best bounded
-                    # authority and avoids turning status-history retention into
-                    # a global navigation outage.
-                    if not owned_active_statuses and (
+                    fresh = True
+                    if hasattr(self, "_move_base_action_name"):
+                        fresh = receipt_count > 0 and time.monotonic() - getattr(
+                            self, "_move_base_status_received_at", 0.0
+                        ) <= timeout_s
+                        if cancel_issued:
+                            fresh = fresh and receipt_count > status_baseline
+                    if fresh and not owned_active_statuses and (
                         bool(owned_goal_id) or state_after not in active_states
                     ):
                         server_status_confirmed = True
@@ -8268,6 +9287,8 @@ class SemanticBehaviorExecutor:
                     "goal_generation": goal_generation,
                     "timeout_s": timeout_s,
                 }
+        if hasattr(self, "_move_base_action_name"):
+            state_after = int(move_base.get_state())
         if state_after in active_states:
             return False, {
                 "reason": "move_base_successor_goal_still_active",
@@ -8728,6 +9749,9 @@ class SemanticBehaviorExecutor:
             max_segments
         ):
             return False
+        current_pose = self._current_pose(goal_frame)
+        if current_pose is None or math.hypot(final_goal[0] - current_pose[0], final_goal[1] - current_pose[1]) <= self._interaction_navigation_pose_tolerance_m(candidate):
+            return False
         reachable, path_xy, reason = self._preflight_navigation_path(
             goal_frame, final_goal[0], final_goal[1], final_goal[2]
         )
@@ -8981,6 +10005,21 @@ class SemanticBehaviorExecutor:
         start_goal_option_index: int = 0,
         interaction_approach_attempts: list[dict] | None = None,
     ) -> None:
+        worker_lock = getattr(self, "_move_base_worker_lock", None)
+        if worker_lock is None:
+            worker_lock = self._move_base_worker_lock = threading.RLock()
+        with worker_lock:
+            if hasattr(self, "_move_base_action_name") and not self._navigation_is_current(decision_id):
+                return
+            self._run_navigation_serialized(
+                decision_id, candidate, start_goal_option_index, interaction_approach_attempts,
+            )
+
+    def _run_navigation_serialized(
+        self, decision_id: str, candidate: dict,
+        start_goal_option_index: int = 0,
+        interaction_approach_attempts: list[dict] | None = None,
+    ) -> None:
         """Run one navigation worker with a unique result-ownership token."""
 
         run_token = self._register_navigation_run(decision_id, candidate)
@@ -9037,6 +10076,9 @@ class SemanticBehaviorExecutor:
                     else candidate
                 )
             result_detail = dict(detail or {})
+            terminal = getattr(self, "_move_base_transport_terminal", {})
+            if terminal:
+                result_detail.update(terminal)
             if isinstance(capture_dwa_profile_detail, dict):
                 result_detail.setdefault(
                     "interaction_goal_tolerance_profile",
@@ -9050,10 +10092,25 @@ class SemanticBehaviorExecutor:
                 navigation_run_token=navigation_run_token,
             )
 
-        ready = self.move_base.wait_for_server(rospy.Duration(30.0))
-        if not ready:
-            report_result(False, {"reason": "move_base_unavailable"})
+        if getattr(self, "_move_base_transport_terminal", {}):
+            report_result(False, dict(self._move_base_transport_terminal))
             return
+        if hasattr(self, "_move_base_action_name"):
+            identity = self._probe_move_base_server_identity()
+            previous = self._move_base_server_identity
+            if previous and identity != previous:
+                recovered, recovery_detail = self._recover_move_base_client({"reason": "move_base_server_changed"})
+                if not recovered:
+                    report_result(False, recovery_detail)
+                    return
+            elif identity:
+                self._move_base_server_identity = identity
+        ready = self._wait_for_move_base_server(self.move_base, 2.0)
+        if not ready:
+            recovered, recovery_detail = self._recover_move_base_client({"reason": "move_base_unavailable"})
+            if not recovered:
+                report_result(False, recovery_detail)
+                return
         if not navigation_is_current():
             return
         primary_goal_values = list(candidate.get("goal_xyyaw") or [])
@@ -9078,6 +10135,17 @@ class SemanticBehaviorExecutor:
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
         goal_labels = list(metadata.get("interaction_approach_pose_labels") or [])
+        observation_anchor = bool(
+            self._is_container_two_stage_m1_staging(candidate) or is_container_two_stage_m1_capture(candidate)
+        )
+        if metadata.get("interaction_same_face_yaw_retry_pending"):
+            handled, detail = self._run_same_face_yaw_recovery(
+                decision_id, candidate, goal_options[start_goal_option_index], start_goal_option_index,
+                interaction_approach_attempts, navigation_run_token,
+            )
+            if not handled:
+                report_result(False, detail)
+            return
         # A physical container action is reached from a farther M1-authorized
         # stance.  Before giving DWA a long close-range endpoint, optionally
         # dispatch one short point sampled from an already verified global
@@ -9097,6 +10165,10 @@ class SemanticBehaviorExecutor:
             )
         ):
             return
+        if is_clearance_aware_portal(candidate):
+            candidate = candidate_with_effective_interaction_approach(
+                candidate, goal_options[start_goal_option_index], goal_option_index=start_goal_option_index)
+            metadata = candidate.get("metadata") or {}
         if behavior_type == "INTERACT":
             direct_distance_tolerance = self._interaction_navigation_pose_tolerance_m(
                 candidate
@@ -9112,6 +10184,9 @@ class SemanticBehaviorExecutor:
                 metadata.get("direct_goal_yaw_tolerance_rad", 0.0) or 0.0
             )
         corridor_navigation = self._container_inner_corridor_marker(candidate)
+        if observation_anchor and self._container_anchor_sampled_poses(candidate):
+            direct_distance_tolerance = min(direct_distance_tolerance, getattr(self, "container_m1_distinct_view_arrival_tolerance_m", 0.05))
+            direct_yaw_tolerance = min(direct_yaw_tolerance, getattr(self, "container_m1_distinct_view_arrival_yaw_tolerance_rad", 0.08))
         if direct_distance_tolerance > 0.0:
             current_pose = self._current_pose(
                 str(metadata.get("frame_id") or self.map_frame)
@@ -9122,9 +10197,18 @@ class SemanticBehaviorExecutor:
                     primary_x - current_pose[0], primary_y - current_pose[1]
                 )
                 yaw_error = abs(normalize_angle(primary_yaw - current_pose[2]))
-                if position_error <= direct_distance_tolerance and (
+                eligible, _ = self._container_anchor_eligible(candidate, start_goal_option_index, goal_options[start_goal_option_index])
+                if eligible and position_error <= direct_distance_tolerance and (
                     direct_yaw_tolerance <= 0.0 or yaw_error <= direct_yaw_tolerance
                 ):
+                    if (getattr(self, "container_anchor_clearance_enabled", False) or is_clearance_aware_portal(candidate)):
+                        clear, clearance_detail = self._container_anchor_local_clearance(
+                            candidate, str(metadata.get("frame_id") or self.map_frame),
+                            goal_options[start_goal_option_index],
+                        )
+                        if not clear or clearance_detail.get("local_clearance_deferred"):
+                            report_result(False, {**clearance_detail, "failure_stage": "interaction_approach_navigation"})
+                            return
                     direct_detail = {
                         "reason": "already_at_verified_approach_pose",
                         "position_error_m": position_error,
@@ -9143,6 +10227,9 @@ class SemanticBehaviorExecutor:
                                 yaw_tolerance_rad=direct_yaw_tolerance,
                             )
                         )
+                        direct_latch = PositionToleranceLatch((primary_x, primary_y, primary_yaw), direct_distance_tolerance)
+                        direct_latch.observe(current_pose, arrival_step_index)
+                        direct_detail["interaction_pose_validation"] = direct_latch.apply(direct_detail["interaction_pose_validation"])
                         direct_detail["interaction_arrival_step_index"] = (
                             arrival_step_index
                         )
@@ -9260,7 +10347,10 @@ class SemanticBehaviorExecutor:
         # is read-only and does not justify a state-machine transition per empty
         # path. The selected canonical index is carried into capture/action
         # mapping, so batching does not confuse which visual face was reached.
-        if self._is_container_two_stage_m1_staging(candidate):
+        resume_same_anchor = bool(interaction_approach_attempts and interaction_approach_attempts[-1].get("resume_same_anchor"))
+        if resume_same_anchor:
+            option_indices = [start_goal_option_index]
+        elif self._is_container_two_stage_m1_staging(candidate):
             option_indices = container_two_stage_m1_preflight_batch_indices(
                 candidate, start_goal_option_index
             )
@@ -9309,6 +10399,16 @@ class SemanticBehaviorExecutor:
                 # metadata but intentionally expose one navigation goal.
                 continue
             option_x, option_y, option_yaw = goal_options[option_index]
+            eligible, rejection = self._container_anchor_eligible(candidate, option_index, goal_options[option_index])
+            if eligible and (getattr(self, "container_anchor_clearance_enabled", False) or is_clearance_aware_portal(candidate)):
+                eligible, rejection = self._container_anchor_local_clearance(candidate, goal_frame, goal_options[option_index])
+            if not eligible:
+                attempted_goals.append({
+                    "index": option_index, "goal_xyyaw": list(goal_options[option_index]),
+                    "reachable": False, "preflight_reason": rejection["reason"],
+                    "preflight_attempts": 0, "local_clearance": rejection,
+                })
+                continue
             plan_reachable = False
             option_lookahead = None
             preflight_reason = ""
@@ -9326,6 +10426,10 @@ class SemanticBehaviorExecutor:
                 preflight_call_elapsed_s = max(
                     0.0, time.monotonic() - preflight_call_started_at
                 )
+                if preflight_reason == "service_unavailable" and hasattr(self, "_move_base_action_name"):
+                    _, recovery_detail = self._recover_move_base_client({"reason": "make_plan_transport_failure"})
+                    report_result(False, {**recovery_detail, "retryable": True})
+                    return
                 if is_post_interaction_traversal:
                     # Do not inherit normal-navigation's configurable
                     # make_plan_fail_open path.  This continuation is held
@@ -9415,13 +10519,25 @@ class SemanticBehaviorExecutor:
                     "post_interaction_traversal_retry": (
                         is_post_interaction_traversal
                     ),
+                    "local_clearance": dict(rejection),
                 }
             )
             if plan_reachable or fail_open_empty_plan:
-                if self._is_container_two_stage_m1_staging(candidate):
+                if is_clearance_aware_portal(candidate):
+                    option_priority = (-min(0.65, float(rejection.get("obstacle_clearance_m", 0.0))),
+                                       -float((portal_approach_profile(candidate, goal_options[option_index]) or {}).get("distance_tolerance_m", 0.0)),
+                                       math.hypot(option_x-goal_options[0][0], option_y-goal_options[0][1]), option_index)
+                    if selected_goal_priority is None or option_priority < selected_goal_priority:
+                        selected_goal = option_x, option_y, option_yaw
+                        selected_goal_option_index = option_index
+                        selected_goal_priority = option_priority
+                        path_lookahead = option_lookahead
+                elif self._is_container_two_stage_m1_staging(candidate):
                     option_priority = container_two_stage_m1_anchor_priority(
                         candidate, option_index
                     )
+                    if interaction_approach_attempts and direct_distance_tolerance > 0.0 and current_pose is not None:
+                        option_priority = (math.hypot(option_x - current_pose[0], option_y - current_pose[1]), *option_priority)
                     if (
                         selected_goal is None
                         or selected_goal_priority is None
@@ -9718,7 +10834,29 @@ class SemanticBehaviorExecutor:
                 failure_detail,
             )
             return
+        if is_clearance_aware_portal(candidate):
+            candidate = candidate_with_effective_interaction_approach(
+                candidate, selected_goal, goal_option_index=int(selected_goal_option_index or 0))
+            metadata = candidate.get("metadata") or {}
+            direct_distance_tolerance = self._interaction_navigation_pose_tolerance_m(candidate)
+            direct_yaw_tolerance = self._interaction_navigation_yaw_tolerance_rad(candidate)
         x, y, yaw = selected_goal
+        arrival_latch = PositionToleranceLatch(
+            tuple(selected_goal),
+            direct_distance_tolerance if direct_distance_tolerance > 0.0
+            else float(rospy.get_param("/move_base/DWAPlannerROS/xy_goal_tolerance", 0.25)),
+        )
+        latch_key = (decision_id, tuple(selected_goal), str(metadata.get("container_two_stage_phase") or ""), arrival_latch.distance_tolerance_m)
+        with self.lock:
+            previous_latch = getattr(self, "_navigation_arrival_latch", None)
+            if previous_latch is not None and previous_latch[0] == latch_key:
+                arrival_latch = previous_latch[1]
+            else:
+                self._navigation_arrival_latch = (latch_key, arrival_latch)
+        terminal_yaw_tolerance = (
+            direct_yaw_tolerance if direct_yaw_tolerance > 0.0
+            else float(rospy.get_param("/move_base/DWAPlannerROS/yaw_goal_tolerance", 0.20))
+        )
         semantic_subgoal_key = self._semantic_navigation_subgoal_key(
             candidate, selected_goal_option_index
         )
@@ -9728,10 +10866,15 @@ class SemanticBehaviorExecutor:
                 candidate, preflight_debug_attempts
             )
             selected_attempt = dict(selected_preflight_attempt or attempted_goals[-1])
-            selected_attempt["navigation_attempt"] = (
-                len(interaction_approach_attempt_history) + 1
-            )
-            interaction_approach_attempt_history.append(selected_attempt)
+            if resume_same_anchor:
+                previous = dict(interaction_approach_attempt_history[-1])
+                previous.pop("resume_same_anchor", None)
+                previous["clearance_resend_count"] = int(previous.get("clearance_resend_count", 0)) + 1
+                previous["resend_preflight"] = selected_attempt
+                interaction_approach_attempt_history[-1] = previous
+            else:
+                selected_attempt["navigation_attempt"] = len(interaction_approach_attempt_history) + 1
+                interaction_approach_attempt_history.append(selected_attempt)
             self._set_effective_interaction_approach(
                 decision_id,
                 candidate,
@@ -9747,13 +10890,14 @@ class SemanticBehaviorExecutor:
             )
         prerotated = True
         rear_preturn_completed = False
-        if navigation_should_prerotate(behavior_type) and not corridor_navigation:
+        if navigation_should_prerotate(behavior_type) and not corridor_navigation and not arrival_latch.latched:
             prerotated = self._prerotate_for_rear_goal(
                 decision_id,
                 goal_frame,
                 x,
                 y,
                 heading_target_xy=path_lookahead,
+                position_tolerance_m=arrival_latch.distance_tolerance_m,
             )
             rear_preturn_completed = bool(
                 prerotated
@@ -9842,8 +10986,15 @@ class SemanticBehaviorExecutor:
             return
         if not navigation_is_current():
             return
+        selected_clearance = {}
+        if (getattr(self, "container_anchor_clearance_enabled", False) or is_clearance_aware_portal(candidate)):
+            eligible, rejection = self._container_anchor_eligible(candidate, int(selected_goal_option_index), selected_goal)
+            clear, selected_clearance = self._container_anchor_local_clearance(candidate, goal_frame, selected_goal)
+            if not eligible or not clear:
+                report_result(False, {**(rejection if not eligible else selected_clearance), "failure_stage": "interaction_approach_navigation"})
+                return
         if str(behavior_type).upper() == "INTERACT":
-            profile_ready, profile_detail = (
+            profile_ready, profile_detail = (True, {"active": False, "reason": "local_clearance_pending"}) if selected_clearance.get("local_clearance_deferred") and not is_clearance_aware_portal(candidate) else (
                 self._activate_container_m1_capture_dwa_profile(
                     decision_id,
                     navigation_run_token,
@@ -9921,6 +11072,13 @@ class SemanticBehaviorExecutor:
         goal.target_pose.pose.position.y = y
         goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
         goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
+        if arrival_latch.latched:
+            held_pose = self._current_pose(goal_frame)
+            if held_pose is None:
+                report_result(False, {"reason": "latched_rotation_pose_unavailable"})
+                return
+            goal.target_pose.pose.position.x = held_pose[0]
+            goal.target_pose.pose.position.y = held_pose[1]
         self.move_base.send_goal(goal)
         self._record_move_base_goal_dispatch()
         self._publish_dispatched_subgoal(goal_frame, x, y)
@@ -9942,6 +11100,9 @@ class SemanticBehaviorExecutor:
                 getattr(self, "_latest_step_sync_index", None)
             )
         start_pose = self._current_pose(goal_frame)
+        arrival_latch.observe(start_pose, navigation_started_step_index)
+        path_replan_count = 0
+        path_replan_step = navigation_started_step_index
         start_goal_distance_m = (
             None
             if start_pose is None
@@ -10001,7 +11162,7 @@ class SemanticBehaviorExecutor:
                 getattr(
                     self,
                     "container_m1_capture_dwa_terminal_yaw_settle_max_task_steps",
-                    75,
+                    100,
                 )
             ),
         )
@@ -10126,6 +11287,74 @@ class SemanticBehaviorExecutor:
                 if pose is None
                 else math.hypot(x - pose[0], y - pose[1])
             )
+            arrival_latch.observe(pose, latest_task_step_index)
+            if (
+                str(behavior_type).upper() == "INTERACT"
+                and state not in TERMINAL_STATES and not arrival_latch.latched
+                and pose is not None and goal_distance_m is not None and goal_distance_m > 0.35
+                and latest_task_step_index is not None and path_replan_step is not None
+                and latest_task_step_index - path_replan_step >= 20 and path_replan_count < 3
+            ):
+                with self.lock:
+                    points = getattr(self, "_global_plan_points", ())
+                    plan_frame = getattr(self, "_global_plan_frame", "")
+                if (
+                    len(points) >= 2 and plan_frame == str(goal_frame).lstrip("/")
+                    and math.hypot(points[-1][0] - x, points[-1][1] - y) < 0.10
+                    and path_deviation_m(pose, points) > 0.35 and navigation_is_current()
+                ):
+                    # Replan the same pose on the current costmap; never
+                    # change the anchor or reset a terminal position latch.
+                    goal.target_pose.header.stamp = rospy.Time.now()
+                    self.move_base.send_goal(goal)
+                    self._record_move_base_goal_dispatch()
+                    path_replan_count += 1
+                    path_replan_step = latest_task_step_index
+                    rospy.loginfo(
+                        "[semantic_behavior_executor] interaction_path_deviation_replan "
+                        "decision=%s step=%d count=%d deviation_m=%.3f",
+                        decision_id, latest_task_step_index, path_replan_count,
+                        path_deviation_m(pose, points),
+                    )
+                    continue
+            if (observation_anchor or is_container_two_stage_physical_action(candidate) or is_clearance_aware_portal(candidate)) and (getattr(self, "container_anchor_clearance_enabled", False) or is_clearance_aware_portal(candidate)):
+                clearance_goal = pose if arrival_latch.latched and pose is not None else selected_goal
+                clearance_candidate = candidate
+                if arrival_latch.latched:
+                    clearance_candidate = {**candidate, "metadata": {**candidate.get("metadata", {}),
+                        "portal_clearance_position_latched": True, "container_clearance_position_latched": True}}
+                clear, clearance_detail = self._container_anchor_local_clearance(clearance_candidate, goal_frame, clearance_goal)
+                if not clear:
+                    recovered, clearance_detail = self._confirm_container_anchor_blocked(
+                        decision_id, clearance_candidate, goal_frame, clearance_goal, clearance_detail,
+                    )
+                    if recovered and navigation_is_current():
+                        interaction_approach_attempt_history[-1]["clearance_recheck_resend"] = True
+                        interaction_approach_attempt_history[-1]["resume_same_anchor"] = True
+                        interaction_approach_attempt_history[-1]["clearance_confirmation"] = clearance_detail
+                        self._schedule_navigation_successor(decision_id, candidate, selected_goal_option_index, interaction_approach_attempt_history)
+                        return
+                    if clearance_detail.get("clearance_confirmation_inconclusive"):
+                        report_result(False, {**clearance_detail, "reason": "navigation_costmap_not_fresh",
+                            "retryable": True, "interaction_approach_attempts": interaction_approach_attempt_history})
+                        return
+                    if self._retry_interaction_approach(
+                        decision_id, candidate, selected_goal_option_index,
+                        interaction_approach_attempt_history, len(goal_options), clearance_detail,
+                    ):
+                        return
+                    report_result(False, {**clearance_detail, "failure_stage": "interaction_approach_navigation"})
+                    return
+                if selected_clearance.get("local_clearance_deferred") and not clearance_detail.get("local_clearance_deferred") and not is_clearance_aware_portal(candidate):
+                    # Tighten the profile only after the transit goal has
+                    # stopped and its worker has released the controller.
+                    self.move_base.cancel_goal()
+                    interaction_approach_attempt_history[-1]["resume_same_anchor"] = True
+                    self._schedule_navigation_successor(
+                        decision_id, candidate, selected_goal_option_index,
+                        interaction_approach_attempt_history,
+                    )
+                    return
             local_plan_fresh = self._has_fresh_local_plan(
                 navigation_started_at, now
             )
@@ -10133,7 +11362,9 @@ class SemanticBehaviorExecutor:
             semantic_yaw_error_rad = None
             if pose is not None and latest_task_step_index is not None:
                 desired_heading = None
-                if (
+                if arrival_latch.latched:
+                    desired_heading = float(yaw)
+                elif (
                     path_lookahead is not None
                     and math.hypot(
                         float(path_lookahead[0]) - float(pose[0]),
@@ -10142,7 +11373,7 @@ class SemanticBehaviorExecutor:
                     > 0.05
                     and (
                         goal_distance_m is None
-                        or goal_distance_m > self.final_align_max_distance_m
+                        or goal_distance_m > max(self.final_align_max_distance_m, arrival_latch.distance_tolerance_m)
                     )
                 ):
                     desired_heading = math.atan2(
@@ -10151,6 +11382,10 @@ class SemanticBehaviorExecutor:
                     )
                 elif require_final_yaw:
                     desired_heading = float(yaw)
+                if desired_heading is not None:
+                    if not arrival_latch.latched and goal_distance_m is not None and goal_distance_m <= arrival_latch.distance_tolerance_m + 0.10:
+                        # Outside XY tolerance, near-goal spinning cannot count as translation progress.
+                        desired_heading = None
                 if desired_heading is not None:
                     yaw_error = abs(
                         normalize_angle(desired_heading - float(pose[2]))
@@ -10191,13 +11426,13 @@ class SemanticBehaviorExecutor:
             # than the primary decision goal) using the same public distance /
             # yaw contract that gates the bridge interaction command.  This
             # keeps a wrong side or heading from being accepted.
-            if str(behavior_type).upper() == "INTERACT" and pose is not None:
-                interaction_pose_detail = interaction_pose_validation(
+            if (str(behavior_type).upper() == "INTERACT" or arrival_latch.latched) and pose is not None:
+                interaction_pose_detail = arrival_latch.apply(interaction_pose_validation(
                     list((x, y, yaw)),
                     list(pose),
-                    distance_tolerance_m=direct_distance_tolerance,
-                    yaw_tolerance_rad=direct_yaw_tolerance,
-                )
+                    distance_tolerance_m=arrival_latch.distance_tolerance_m,
+                    yaw_tolerance_rad=terminal_yaw_tolerance,
+                ))
                 if bool(interaction_pose_detail.get("valid")):
                     self.move_base.cancel_goal()
                     with self.lock:
@@ -10214,6 +11449,9 @@ class SemanticBehaviorExecutor:
                         "interaction_pose_validation": interaction_pose_detail,
                         "interaction_arrival_step_index": arrival_step_index,
                     }
+                    if str(behavior_type).upper() != "INTERACT":
+                        report_result(True, {**arrival_detail, "reason": "position_latched_yaw_ready"})
+                        return
                     if capture_dwa_owns_terminal_pose:
                         current_yaw_error_rad = float(
                             interaction_pose_detail.get("yaw_error_rad", 0.0)
@@ -10268,11 +11506,7 @@ class SemanticBehaviorExecutor:
                 # the turn, _complete_interaction_approach_navigation still
                 # rechecks a fresh simulator-step pose before the bridge sees
                 # the command.
-                position_ready = bool(
-                    interaction_pose_detail.get("checked")
-                    and float(interaction_pose_detail.get("position_error_m", math.inf))
-                    <= float(interaction_pose_detail.get("distance_tolerance_m", 0.0))
-                )
+                position_ready = arrival_latch.latched
                 yaw_needs_alignment = bool(
                     position_ready
                     and float(interaction_pose_detail.get("yaw_error_rad", 0.0))
@@ -10674,14 +11908,35 @@ class SemanticBehaviorExecutor:
                 with self.lock:
                     supervisor = getattr(self, "_semantic_navigation_progress", None)
                     if supervisor is not None:
-                        semantic_progress_detail = supervisor.observe(
-                        subgoal_key=semantic_subgoal_key,
-                        pose=pose,
-                        task_step_index=latest_task_step_index,
-                        goal_distance_m=goal_distance_m,
-                        yaw_error_rad=semantic_yaw_error_rad,
-                        allow_yaw_progress=semantic_yaw_error_rad is not None,
-                    )
+                        # Terminal yaw is an executor-owned, bounded stationary
+                        # macro.  The DWA terminal-yaw budget (and its own
+                        # no-progress bound below) must be the only watchdog
+                        # deciding whether this phase failed.  Counting the
+                        # same evaluator steps in the semantic supervisor made
+                        # a valid interaction approach look stalled at k=60,
+                        # before the configured DWA settle budget could finish.
+                        if (
+                            capture_dwa_final_yaw_in_progress
+                            or interaction_dwa_final_yaw_in_progress
+                        ):
+                            supervisor.pause(latest_task_step_index)
+                            semantic_progress_detail = {
+                                "subgoal_stalled": False,
+                                "mission_stalled": False,
+                                "semantic_progress_paused": True,
+                                "semantic_progress_pause_reason": (
+                                    "terminal_yaw_controller"
+                                ),
+                            }
+                        else:
+                            semantic_progress_detail = supervisor.observe(
+                                subgoal_key=semantic_subgoal_key,
+                                pose=pose,
+                                task_step_index=latest_task_step_index,
+                                goal_distance_m=goal_distance_m,
+                                yaw_error_rad=semantic_yaw_error_rad,
+                                allow_yaw_progress=semantic_yaw_error_rad is not None,
+                            )
             if bool(
                 semantic_progress_detail.get("subgoal_stalled")
                 or semantic_progress_detail.get("mission_stalled")
@@ -10849,11 +12104,27 @@ class SemanticBehaviorExecutor:
         if navigation_task_step_timeout:
             if not self._navigation_is_current(decision_id):
                 return
+            interaction_navigation_timeout = (
+                str(behavior_type).upper() == "INTERACT"
+            )
             timeout_detail = {
-                "reason": "navigation_timeout",
-                "failure_reason": "navigation_timeout",
+                "reason": (
+                    "interaction_navigation_timeout"
+                    if interaction_navigation_timeout
+                    else "navigation_timeout"
+                ),
+                "failure_reason": (
+                    "interaction_navigation_timeout"
+                    if interaction_navigation_timeout
+                    else "navigation_timeout"
+                ),
                 "navigation_timeout_kind": "task_step_budget",
                 "navigation_max_task_steps": interaction_task_step_budget,
+                "interaction_navigation_timeout_task_steps": (
+                    interaction_task_step_budget
+                    if interaction_navigation_timeout
+                    else None
+                ),
                 "navigation_started_step_index": (
                     navigation_started_step_index
                 ),
@@ -11000,12 +12271,13 @@ class SemanticBehaviorExecutor:
             # still applies; this only carries the already-observed evidence
             # into _complete_interaction_approach_navigation.
             terminal_pose = self._current_pose(goal_frame)
-            terminal_validation = interaction_pose_validation(
+            arrival_latch.observe(terminal_pose, navigation_started_step_index)
+            terminal_validation = arrival_latch.apply(interaction_pose_validation(
                 [x, y, yaw],
                 None if terminal_pose is None else list(terminal_pose),
                 distance_tolerance_m=direct_distance_tolerance,
                 yaw_tolerance_rad=direct_yaw_tolerance,
-            )
+            ))
             with self.lock:
                 arrival_step_index = getattr(self, "_latest_step_sync_index", None)
             detail.update(
@@ -11025,7 +12297,7 @@ class SemanticBehaviorExecutor:
                     ),
                     "timed_out": False,
                 }
-        if success and require_final_yaw and not capture_dwa_owns_terminal_pose:
+        if success and require_final_yaw and not capture_dwa_owns_terminal_pose and not arrival_latch.latched:
             aligned = self._final_align_goal(
                 decision_id,
                 goal_frame,
@@ -11278,6 +12550,9 @@ class SemanticBehaviorExecutor:
             "terminal_status": terminal_detail.get("status"),
         }
         retry_candidate["metadata"] = retry_metadata
+        retry_attempts = [dict(item) for item in interaction_approach_attempts]
+        if retry_attempts:
+            retry_attempts[-1]["resume_same_anchor"] = True
         rospy.logwarn(
             "[semantic_behavior_executor] outer container M1 staging goal "
             "ABORTED after reachable preflight; fresh plan confirmed, retrying "
@@ -11288,7 +12563,7 @@ class SemanticBehaviorExecutor:
             decision_id,
             retry_candidate,
             option_index,
-            [dict(item) for item in interaction_approach_attempts],
+            retry_attempts,
         )
         return True
 
@@ -12009,6 +13284,24 @@ class SemanticBehaviorExecutor:
         pose = self._current_pose(frame_id)
         if pose is None:
             return self.make_plan_fail_open, None, "pose_unavailable"
+        snapshot = getattr(self, "_global_clearance_snapshot", None)
+        if snapshot is not None and time.monotonic() - snapshot[1] <= getattr(self, "rear_goal_local_costmap_max_age_s", .75):
+            grid = snapshot[0]
+            start_xy, goal_xy = pose[:2], (goal_x, goal_y)
+            if frame_id.lstrip("/") != grid.frame_id.lstrip("/"):
+                try:
+                    translation, rotation = self.tf_listener.lookupTransform(grid.frame_id, frame_id, rospy.Time(0))
+                    yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+                    start_xy, goal_xy = [
+                        (translation[0]+math.cos(yaw)*p[0]-math.sin(yaw)*p[1],
+                         translation[1]+math.sin(yaw)*p[0]+math.cos(yaw)*p[1])
+                        for p in (start_xy, goal_xy)
+                    ]
+                except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                    return False, None, "clearance_tf_unavailable"
+            path = grid.reachable(start_xy, goal_xy)
+            if not path["clear"]:
+                return False, None, path["reason"]
         stamp = rospy.Time.now()
         start = PoseStamped()
         start.header.frame_id = frame_id
@@ -12240,6 +13533,10 @@ class SemanticBehaviorExecutor:
         navigation_run_token: int | None = None,
     ) -> None:
         detail = dict(detail or {})
+        terminal = getattr(self, "_move_base_transport_terminal", {})
+        if terminal:
+            success = False
+            detail.update(terminal)
         if not self._navigation_run_is_active(decision_id, navigation_run_token):
             return
         if success and bool(
@@ -12254,7 +13551,7 @@ class SemanticBehaviorExecutor:
                 if supervisor is not None:
                     supervisor.note_success(progress_pose, progress_step)
         self._clear_rear_dwa_monitor(decision_id)
-        if self._consume_container_inner_corridor_result(
+        if not terminal and self._consume_container_inner_corridor_result(
             decision_id, success, detail, candidate=source_candidate
         ):
             return
@@ -12262,11 +13559,34 @@ class SemanticBehaviorExecutor:
             locks = getattr(self, "_rear_goal_turn_locks", None)
             if isinstance(locks, dict):
                 locks.pop(decision_id, None)
-        restart, active_goal_recovery_detail = (
-            self._attempt_single_goal_navigation_recovery(
-                decision_id, success, detail
+            remembered_portal_candidate = None
+            remembered_portal_object_id = ""
+            if success:
+                active_candidate = self.machine.candidate or self.selection
+                active_metadata = dict(
+                    (active_candidate or {}).get("metadata") or {}
+                )
+                if (
+                    str((active_candidate or {}).get("behavior_type") or "").upper()
+                    == "NAVIGATE"
+                    and bool(active_metadata.get("reobserve_interaction_target"))
+                ):
+                    remembered_portal_candidate = dict(active_candidate)
+                    node = self._selected_graph_node_locked(active_candidate)
+                    attributes = dict(node.get("attributes") or {})
+                    remembered_portal_object_id = str(
+                        attributes.get("instance_id")
+                        or attributes.get("source_object_name")
+                        or node.get("name")
+                        or active_candidate.get("target_name")
+                        or active_candidate.get("target_id")
+                        or ""
+                    )
+            restart, active_goal_recovery_detail = (None, {}) if detail.get("navigation_transport_terminal") else (
+                self._attempt_single_goal_navigation_recovery(
+                    decision_id, success, detail
+                )
             )
-        )
         if restart is not None:
             rospy.logwarn(
                 "[semantic_behavior_executor] recovered active navigation goal; "
@@ -12289,7 +13609,7 @@ class SemanticBehaviorExecutor:
         ).startswith("rear_goal_")
         recovery_detail = (
             {}
-            if rear_safe_failure
+            if rear_safe_failure or detail.get("navigation_transport_terminal")
             else self._maybe_run_stuck_recovery(decision_id, success, detail)
         )
         if recovery_detail:
@@ -12318,6 +13638,7 @@ class SemanticBehaviorExecutor:
                     "semantic_subgoal_no_progress",
                     "navigation_step_sync_stall",
                     "navigation_timeout",
+                    "interaction_navigation_timeout",
                     "navigation_terminal_failure",
                     "final_yaw_alignment_failed",
                     "interaction_pose_poll_exhausted",
@@ -12366,15 +13687,61 @@ class SemanticBehaviorExecutor:
                     self.machine.candidate = bound_candidate
                     # Keep executor-side feedback and bridge command metadata
                     # coherent with the exact fallback that move_base reached.
+                    bound_candidate.setdefault("metadata", {})["navigation_arrival_validation"] = dict(detail.get("interaction_pose_validation") or {})
                     self.selection = dict(bound_candidate)
             wait_for_drawer_scan = bool(
                 success and self._needs_fresh_drawer_scan_locked()
             )
-            commands = self.machine.on_navigation_result(
-                success,
-                detail=detail,
-                wait_for_drawer_scan=wait_for_drawer_scan,
+            task_step_index = self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
             )
+            if remembered_portal_candidate is not None:
+                remembered_handler = getattr(
+                    self.machine,
+                    "on_remembered_portal_navigation_result",
+                    None,
+                )
+                if callable(remembered_handler):
+                    commands = remembered_handler(
+                        success,
+                        detail=detail,
+                        object_id=remembered_portal_object_id,
+                        task_step_index=task_step_index,
+                    )
+                    if self.machine.candidate is not None:
+                        # The M1 barrier and its terminal feedback must retain
+                        # the same candidate metadata while this fallback waits.
+                        self.selection = dict(self.machine.candidate)
+                else:
+                    # Keep compatibility with lightweight test doubles and
+                    # older state-machine instances that do not yet expose the
+                    # dedicated remembered-portal barrier. Their ordinary
+                    # navigation result is terminal; prepend the refresh so a
+                    # graph-facing M1 request is still emitted before feedback.
+                    commands = self.machine.on_navigation_result(
+                        success,
+                        detail=detail,
+                        wait_for_drawer_scan=wait_for_drawer_scan,
+                        task_step_index=task_step_index,
+                    )
+                    commands.insert(
+                        0,
+                        {
+                            "kind": "request_remembered_portal_observation",
+                            "candidate": remembered_portal_candidate,
+                            "object_id": remembered_portal_object_id,
+                            "min_capture_step": self._public_step_or_none(
+                                getattr(self, "_latest_rgb_step_seq", None)
+                            ),
+                        },
+                    )
+            else:
+                commands = self.machine.on_navigation_result(
+                    success,
+                    detail=detail,
+                    wait_for_drawer_scan=wait_for_drawer_scan,
+                    task_step_index=task_step_index,
+                )
             if (
                 self.machine.state == STATE_VERIFYING
                 and requires_graph_verification(
@@ -12538,7 +13905,207 @@ class SemanticBehaviorExecutor:
                 and self.machine.state in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
             )
 
+    def _observation_only_interaction_result_locked(
+        self,
+        selection: dict,
+        detail: dict,
+        *,
+        success: bool,
+    ) -> dict | None:
+        """Build the mapper result for a terminal M1 no-action observation."""
+
+        metadata = dict(selection.get("metadata") or {})
+        observation_outcome = str(
+            detail.get("observation_outcome") or ""
+        ).casefold()
+        is_remembered_portal_reobserve = bool(
+            metadata.get("observation_only_reobserve")
+        )
+        if (
+            not success
+            or (
+                str(selection.get("behavior_type") or "").upper() != "INTERACT"
+                and not is_remembered_portal_reobserve
+            )
+            or observation_outcome != "finish_without_action"
+            or detail.get("action_executed") is not False
+        ):
+            return None
+        interaction = dict(selection.get("interaction_command") or {})
+        observation = dict(metadata.get("last_interaction_observation") or {})
+        node = self._selected_graph_node_locked(selection)
+        node_attributes = dict(node.get("attributes") or {})
+        selected_object_id = str(
+            interaction.get("object_id")
+            or metadata.get("reobserve_object_id")
+            or node_attributes.get("instance_id")
+            or node_attributes.get("source_object_name")
+            or selection.get("target_name")
+            or ""
+        )
+        selected_node_id = str(
+            interaction.get("node_id")
+            or selection.get("target_id")
+            or node.get("id")
+            or ""
+        )
+        latest_attribute_updates = getattr(self, "_latest_attribute_updates", {})
+        latest_attribute = {}
+        if isinstance(latest_attribute_updates, dict):
+            latest_attribute = dict(
+                latest_attribute_updates.get(selected_object_id)
+                or latest_attribute_updates.get(selected_node_id)
+                or {}
+            )
+        sources = (detail, observation, latest_attribute, node_attributes)
+
+        def first_value(*keys, default=None):
+            for source in sources:
+                for key in keys:
+                    if key in source and source.get(key) is not None:
+                        return source.get(key)
+            return default
+
+        command_id = self._command_id(selection)
+        capture_step = first_value(
+            "observation_capture_step",
+            "attribute_capture_step",
+            "capture_step",
+            "result_published_step",
+            default=self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            ),
+        )
+        try:
+            capture_step = int(capture_step) if capture_step is not None else None
+        except (TypeError, ValueError):
+            capture_step = None
+        result = {
+            "event_id": str(
+                first_value(
+                    "event_id",
+                    default=f"{command_id}:observation_finish",
+                )
+            ),
+            "command_id": command_id,
+            "decision_id": str(selection.get("decision_id") or ""),
+            "candidate_id": str(selection.get("candidate_id") or ""),
+            "episode_id": str(
+                selection.get("episode_id")
+                or detail.get("episode_id")
+                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                or ""
+            ),
+            "node_id": str(
+                first_value(
+                    "node_id",
+                    default=interaction.get("node_id")
+                    or selection.get("target_id")
+                    or node.get("id")
+                    or "",
+                )
+            ),
+            "object_id": str(
+                first_value(
+                    "object_id",
+                    "instance_id",
+                    default=selected_object_id,
+                )
+            ),
+            "node_type": str(
+                first_value(
+                    "node_type",
+                    default=interaction.get("node_type")
+                    or metadata.get("node_type")
+                    or node.get("type")
+                    or "",
+                )
+            ),
+            "action": str(
+                first_value("action", default=interaction.get("action") or "open")
+            ),
+            "state": str(
+                first_value(
+                    "state",
+                    "post_state",
+                    default=interaction.get("expected_state") or "open",
+                )
+            ),
+            "post_state": str(
+                first_value(
+                    "post_state",
+                    "state",
+                    default=interaction.get("expected_state") or "open",
+                )
+            ),
+            "success": True,
+            "status": "SUCCEEDED",
+            "action_executed": False,
+            "observation_outcome": "finish_without_action",
+            "interaction_capability": str(
+                first_value("interaction_capability", "capability", default="unavailable")
+            ),
+            "interactable": bool(first_value("interactable", default=False)),
+            "requires_interaction": bool(
+                first_value("requires_interaction", default=False)
+            ),
+            "traversable": bool(first_value("traversable", default=True)),
+            "source": str(
+                first_value(
+                    "source",
+                    "attribute_source",
+                    default="executor_observation_finish_without_action",
+                )
+            ),
+            "reason": str(
+                first_value(
+                    "reason",
+                    default="interaction_not_required_after_observation",
+                )
+            ),
+            "confidence": float(first_value("confidence", default=1.0) or 1.0),
+            "stamp_sec": float(
+                first_value(
+                    "observation_stamp_sec",
+                    "stamp_sec",
+                    default=time.time(),
+                )
+                or time.time()
+            ),
+        }
+        if capture_step is not None:
+            result.update(
+                {
+                    "capture_step": capture_step,
+                    "result_published_step": capture_step,
+                    "observation_capture_step": capture_step,
+                }
+            )
+        for key in (
+            "portal_morphology",
+            "portal_aperture_evidence",
+            "portal_state_consensus",
+            "target_bbox_containment",
+            "observed_bbox_2d",
+            "evidence_frame_ids",
+            "evidence_capture_steps",
+            "evidence_observation_pose_xyyaw",
+            "m1_evidence_views",
+            "visual_evidence_truncated",
+            "visual_evidence_truncated_edges",
+        ):
+            value = first_value(key)
+            if value is not None:
+                result[key] = value
+        consensus = result.get("portal_state_consensus")
+        if isinstance(consensus, dict):
+            result["portal_state_consensus_accepted"] = bool(
+                consensus.get("accepted", False)
+            )
+        return result
+
     def _finish_terminal(self, command: dict) -> None:
+        interaction_result = None
         with self.lock:
             selection = dict(self.selection or {})
             decision_id = str(selection.get("decision_id") or "")
@@ -12556,6 +14123,27 @@ class SemanticBehaviorExecutor:
                 detail.setdefault("drawer_scan_wait", drawer_scan_wait)
             if self.model_events:
                 detail["mllm_events"] = list(self.model_events)
+            interaction_result = self._observation_only_interaction_result_locked(
+                selection,
+                detail,
+                success=bool(command.get("success")),
+            )
+            # Publish the graph-facing terminal result before behavior feedback.
+            # The decision node may select again as soon as feedback arrives;
+            # mapper-first ordering gives the graph a chance to latch an
+            # observation-only portal result and suppress that duplicate choice.
+            if interaction_result is not None:
+                publisher = getattr(self, "interaction_result_pub", None)
+                if publisher is not None:
+                    publisher.publish(
+                        String(
+                            data=json.dumps(
+                                interaction_result,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                    )
             self._publish_feedback(selection, status, bool(command.get("success")), detail)
             self.selection = None
             self._clear_drawer_scan_execution_wait_locked()

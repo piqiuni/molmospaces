@@ -50,6 +50,92 @@ class RecordingClient:
         )
 
 
+def test_targeted_m1_survives_bbox_bucket_change_until_explicit_cancel():
+    from collections import defaultdict
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode"
+    node.pending = {"drawer": {"signature": "area_log2=11", "episode_id": "episode",
+        "generation": 0, "request_sequence": 36,
+        "targeted_refresh": {"request_id": "decision:m1:001"}}}
+    node.generations = {"drawer": 0}
+    node.last_request = {"drawer": 1.0}
+    node.targeted_refresh_requests = {}
+    node.request_queue = RecordingQueue()
+    node.filter_counts = defaultdict(int)
+    discarded = []
+    node._publish_discarded_attribute_requests = lambda *args, **kw: discarded.append(kw)
+    node._invalidate_if_state_changed("drawer", "area_log2=12", "episode")
+    assert node._is_current_request("drawer", "episode", 0, 36)
+    assert not discarded
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "action": "cancel", "request_id": "decision:m1:001", "episode_id": "old"})))
+    assert node._is_current_request("drawer", "episode", 0, 36)
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "action": "cancel", "request_id": "decision:m1:001", "episode_id": "episode"})))
+    assert not node._is_current_request("drawer", "episode", 0, 36)
+    assert discarded == [{"error": "targeted_refresh_cancelled"}]
+
+
+def test_detection_reaches_request_queue_despite_ros_sequence_offset(monkeypatch):
+    from collections import defaultdict, deque
+    from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    rgb = np.zeros((32, 48, 3), dtype=np.uint8)
+    node.latest_stamp = 1789304037.594208
+    node.latest_image = rgb
+    node.image_history = deque([
+        {"image": rgb, "stamp": node.latest_stamp, "stamp_key": (1789304037, 594208001),
+         "header_seq": 925, "image_sequence": 925},
+    ])
+    node.pending_detection_payload = {
+        "capture_step": 923, "stamp_sec": 1789304037, "stamp_nsec": 594208001,
+        "image_size": [48, 32],
+        "detections": [{"id": "fridge", "name": "refrigerator", "bbox_2d": [10, 5, 35, 28]}],
+    }
+    node.filter_counts = defaultdict(int)
+    node.request_queue = LatestPriorityRequestQueue(4)
+    node.crop_margin_ratio = 0.1
+    node.request_timeout_s = 8.0
+    node._register_aliases = lambda *args: None
+    node._targeted_refresh_for_detection = lambda *args, **kwargs: None
+    node._passes_observation_filter = lambda *args: True
+    node._is_portal_detection = lambda *args: False
+    node._target_bbox_containment = lambda *args: {"valid": True}
+    node._invalidate_if_state_changed = lambda *args: None
+    node._try_reserve = lambda *args, **kwargs: {"generation": 0, "request_sequence": 1}
+    node._priority = lambda *args: 1.0
+    node._publish_status = lambda: None
+    patches = []
+    node._publish_updates = lambda *args: patches.extend(args[-1])
+    monkeypatch.setattr(attribute_module.rospy, "loginfo_throttle", lambda *args: None)
+    node._process_pending_detections()
+    assert node.pending_detection_payload is None
+    assert node.filter_counts["enqueued"] == 1
+    assert len(node.request_queue) == 1
+    assert patches[0]["attribute_status"] == "pending"
+    assert patches[0]["observation_capture_step"] == 923
+    assert node.last_image_pairing_result["stage"] == "paired"
+
+
+def test_portal_confirmation_bypasses_completed_attribute_cache_not_pending() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.pending = {}
+    node.completed = {"door": {"signature": "same", "refresh_interval_s": 0.0}}
+    node.last_request = {}
+    node.min_interval_s = 0.0
+    node.success_refresh_interval_s = 120.0
+    node.request_sequence = 0
+    node.generations = {}
+    node.current_episode_id = "episode"
+    assert node._try_reserve("door", "same") is None
+    assert node._try_reserve("door", "same", portal_confirmation=True) is not None
+    assert node._try_reserve("door", "same", portal_confirmation=True) is None
+
+
 def test_initial_generation_zero_request_is_current() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()
@@ -248,6 +334,69 @@ def test_public_detector_border_flag_marks_only_clipped_boxes() -> None:
     assert InteractionAttributeInferenceNode._detection_bbox_border_edges(
         image, {"bbox_2d": [40, 70, 160, 100]}
     ) == ["bottom"]
+
+
+def test_portal_m1_waits_for_complete_stable_view() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 2
+    node.portal_observation_streaks = {}
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    clipped = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [0, 20, 80, 80]},
+        capture_step=10,
+        image_sequence=10,
+        targeted_refresh=False,
+    )
+    assert clipped["ready"] is False
+    assert clipped["reason"] == "portal_visual_evidence_truncated:left"
+
+    first_complete = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [40, 20, 160, 80]},
+        capture_step=11,
+        image_sequence=11,
+        targeted_refresh=False,
+    )
+    assert first_complete["ready"] is False
+    assert first_complete["reason"] == "portal_observation_not_stable"
+
+    second_complete = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [42, 21, 162, 81]},
+        capture_step=12,
+        image_sequence=12,
+        targeted_refresh=False,
+    )
+    assert second_complete["ready"] is True
+
+
+def test_targeted_portal_refresh_rejects_border_clipped_view_without_m1() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 2
+    node.portal_observation_streaks = {}
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    readiness = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [0, 20, 80, 80]},
+        capture_step=10,
+        image_sequence=10,
+        targeted_refresh=True,
+    )
+    assert readiness["ready"] is False
+    assert "truncated" in readiness["reason"]
 
 
 def test_uncertain_portal_result_retries_after_short_refresh_interval(
@@ -736,7 +885,8 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
         "target"
     ]
     assert published[0][0]["object_id"] == "object_1"
-    assert published[0][0]["approach_ready"] is True
+    assert published[0][0]["attribute_status"] == "in_flight"
+    assert published[-1][0]["approach_ready"] is True
 
 
 def test_superseded_portal_response_does_not_advance_consensus() -> None:
@@ -816,7 +966,7 @@ def test_superseded_portal_response_does_not_advance_consensus() -> None:
     )
 
     assert node.portal_state_consensus.calls == []
-    assert published == []
+    assert [patch["attribute_status"] for patch in published] == ["in_flight"]
 
 
 def test_m1_multiview_sends_one_montage_and_binds_authoritative_latest_view() -> None:
@@ -893,7 +1043,7 @@ def test_m1_multiview_sends_one_montage_and_binds_authoritative_latest_view() ->
     assert "exactly 2 panel(s)" in request["instruction"]
     assert request["metrics_context"]["m1_transport_image_count"] == 1
     assert request["metrics_context"]["m1_montage_panel_count"] == 2
-    patch = published[0]
+    patch = next(p for p in published if p["attribute_status"] == "ready")
     # Historical panels are comparison context only.  Even if the model emits
     # an older selected_view_id, action authorization must stay bound to the
     # latest/rightmost panel and its actual robot pose/AABB face.
@@ -991,7 +1141,7 @@ def test_targeted_container_refresh_constrains_class_without_supplying_view() ->
     properties = request["response_schema"]["schema"]["properties"]
     assert properties["interaction_class"]["enum"] == ["container"]
     assert properties["portal_morphology"] == {"type": "null"}
-    patch = published[0]
+    patch = next(p for p in published if p["attribute_status"] == "ready")
     assert patch["interaction_class"] == "container"
     assert patch["coarse_state"] == "unknown"
     assert patch["m1_reported_interaction_class"] == "portal"

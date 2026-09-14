@@ -21,16 +21,20 @@ rospy = pytest.importorskip("rospy")
 
 import semantic_mapping_node as semantic_mapping_module
 from semantic_mapping_node import OccupancyGrid, SemanticMappingNode
-from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
+from semantic_mapping_py_pkg.semantic_occ_overlay import (
+    OverlayUpdateRegionTracker,
+    SemanticOccupancyOverlay,
+)
 
 
-class _Overlay:
+class _Overlay(SemanticOccupancyOverlay):
     def __init__(self) -> None:
+        super().__init__()
         self.pending = []
 
-    def set_interaction_pending(self, node_id, pending):
+    def set_interaction_pending(self, node_id, pending, *, node_type=None):
         self.pending.append((node_id, pending))
-        return True
+        return super().set_interaction_pending(node_id, pending, node_type=node_type)
 
 
 class _RoomSegmenter:
@@ -88,15 +92,21 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     node.lock = threading.RLock()
     node.pending_interaction_commands = {}
     node.semantic_occ_overlay = _Overlay()
+    node.semantic_occ_update_tracker = OverlayUpdateRegionTracker()
+    node.door_clear_mask_pub = _Publisher()
+    node.planning_occupancy_grid_updates_pub = _Publisher()
     node.graph_store = _GraphStore()
     node.room_segmenter = _RoomSegmenter()
     node.room_post_open_force_refresh = True
     node.scene_store = _SceneStore()
     node.world_frame = "world"
     events = []
-    node.planning_occupancy_grid_pub = SimpleNamespace(
-        publish=lambda msg: events.append(("publish", msg))
-    )
+
+    def publish_planning(msg):
+        assert node.room_segmenter.calls == []
+        events.append(("publish", msg))
+
+    node.planning_occupancy_grid_pub = SimpleNamespace(publish=publish_planning)
     node._refresh_room_grid_locked = lambda *, force_stable=False: events.append(
         ("room_refresh", force_stable)
     )
@@ -128,8 +138,11 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     fresh_raw = _raw_occupancy(12.1)
     SemanticMappingNode.occupancy_callback(node, fresh_raw)
 
-    # The planner receives the exact raw message before portal hints/room work.
+    # This portal is outside the tiny map, so its effective planning data stays
+    # unchanged. Publication must still precede portal hints and room work.
     assert events == [("publish", fresh_raw), ("room_refresh", True)]
+    assert len(node.door_clear_mask_pub.messages) == 1
+    assert list(node.door_clear_mask_pub.messages[0].data) == [0, 0, 0, 0]
     assert node._post_open_room_refresh_result is None
     observations, source_mode, refresh_active = node.room_segmenter.calls[0]
     assert source_mode == "realtime_gt_observation"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import queue
+import threading
 from pathlib import Path
 import sys
 import time
@@ -410,9 +411,18 @@ class AtomicForceInteractionController:
         self._head_view_controller = HeadViewController()
         self._last_view_restore_result: dict[str, Any] | None = None
         self._pause_navigation = False
+        self._execution_lock = threading.RLock()
+        self._execution_command: dict[str, Any] = {}
+        self._execution_step = -1
+        self._execution_progress_at = 0.0
+        self._execution_timer = None
 
     def prepare(self, task) -> None:
         self._ensure_ros()
+        with self._execution_lock:
+            self._execution_command = {}
+            self._execution_step = -1
+            self._execution_progress_at = 0.0
         self._commands = queue.Queue()
         self._seen_command_ids.clear()
         self._event_index = 1
@@ -501,6 +511,10 @@ class AtomicForceInteractionController:
         return detail
 
     def before_step(self, task, step: int) -> dict[str, Any] | None:
+        with self._execution_lock:
+            if self._execution_command:
+                self._execution_step = int(step)
+                self._execution_progress_at = time.monotonic()
         if self._pending is not None:
             if self._pending.get("kind") == "drawer_sequence":
                 try:
@@ -525,6 +539,11 @@ class AtomicForceInteractionController:
             command = self._commands.get_nowait()
         except queue.Empty:
             return None
+        with self._execution_lock:
+            self._execution_command = command
+            self._execution_step = int(step)
+            self._execution_progress_at = time.monotonic()
+        self._publish_execution_progress()
         try:
             # A refrigerator may already be open when the interaction command
             # reaches the bridge (for example after a previous action or a
@@ -1831,6 +1850,12 @@ class AtomicForceInteractionController:
 
     @staticmethod
     def _validate_interaction_pose(task, command: dict[str, Any]) -> dict[str, Any]:
+        """Reject before force; only wrong-face evidence permits face exclusion.
+
+        Orientation/position failures preserve the selected face for bounded
+        recovery from public observations. Unverified geometry requires another
+        observation, never a GT axis or corrective yaw in the public result.
+        """
         expected = list(command.get("interaction_approach_pose_xyyaw") or [])
         if len(expected) < 3:
             return {"checked": False, "reason": "no_expected_approach_pose"}
@@ -1875,10 +1900,9 @@ class AtomicForceInteractionController:
             ),
         )
         comparison_epsilon = 1e-3
-        pose_valid = (
-            position_error_m <= distance_tolerance_m + comparison_epsilon
-            and yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
-        )
+        position_valid = position_error_m <= distance_tolerance_m + comparison_epsilon
+        yaw_valid = yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
+        pose_valid = position_valid and yaw_valid
         face_required = bool(
             command.get("interaction_front_axis_validation_required", False)
         )
@@ -1886,6 +1910,8 @@ class AtomicForceInteractionController:
         center_values = list(command.get("interaction_target_center_xy") or [])
         face_checked = False
         face_valid = not face_required
+        face_position_valid = not face_required
+        face_yaw_valid = not face_required
         face_position_error_rad: float | None = None
         face_yaw_error_rad: float | None = None
         face_position_tolerance_rad = max(
@@ -1931,10 +1957,11 @@ class AtomicForceInteractionController:
                     )
                 )
                 face_checked = True
-                face_valid = (
+                face_position_valid = (
                     face_position_error_rad <= face_position_tolerance_rad
-                    and face_yaw_error_rad <= face_yaw_tolerance_rad
                 )
+                face_yaw_valid = face_yaw_error_rad <= face_yaw_tolerance_rad
+                face_valid = face_position_valid and face_yaw_valid
         # Both containers and portals require an independent geometric front
         # check.  A portal's arrival yaw alone is not a front-side guarantee.
         # A portal's AABB face check above is the authoritative physical front
@@ -1949,30 +1976,54 @@ class AtomicForceInteractionController:
         )
         physical_front_checked = False
         physical_front_valid = not physical_front_required
-        physical_front_position_error_rad: float | None = None
-        physical_front_yaw_error_rad: float | None = None
-        physical_front_source = ""
+        physical_front_position_valid = not physical_front_required
+        physical_front_yaw_valid = not physical_front_required
+        # A cardinal AABB face is a coarse normal. Only the independent
+        # physical check gets this margin; pose and selected-face gates stay.
+        cardinal_front = str(command.get("interaction_front_axis_source") or "") == "m1_selected_montage_view_aabb_cardinal_face"
+        physical_position_tolerance = max(face_position_tolerance_rad, math.radians(25.0)) if cardinal_front else face_position_tolerance_rad
+        physical_yaw_tolerance = max(face_yaw_tolerance_rad, math.radians(25.0)) if cardinal_front else face_yaw_tolerance_rad
+        selected_face_matches_physical_front: bool | None = None
         if physical_front_required:
             physical_front = infer_articulation_front_axis_xy(
                 task.env, str(command.get("_execution_object_id") or command.get("object_id") or "")
-            )
-            physical_front_checked = bool(physical_front.get("checked"))
-            physical_front_source = str(
-                physical_front.get("source") or physical_front.get("reason") or ""
             )
             physical_axis = list(physical_front.get("axis_xy") or [])
             # Do not substitute the M1-selected axis when simulator geometry is
             # unavailable.  M1 is an image classifier, not an independent
             # physical-front oracle; accepting its axis here would allow a
             # side/rear view to authorize an action.  Fail closed and let the
-            # executor advance to the next bounded anchor instead.
-            if physical_front_checked and len(physical_axis) >= 2 and len(center_values) >= 2:
+            # executor reobserve or retry a bounded anchor instead.
+            if (
+                bool(physical_front.get("checked"))
+                and len(physical_axis) >= 2
+                and face_checked
+            ):
                 offset_x = actual[0] - float(center_values[0])
                 offset_y = actual[1] - float(center_values[1])
                 offset_norm = math.hypot(offset_x, offset_y)
-                if offset_norm > 1e-6:
+                try:
                     physical_axis_x = float(physical_axis[0])
                     physical_axis_y = float(physical_axis[1])
+                except (TypeError, ValueError):
+                    physical_axis_x = physical_axis_y = float("nan")
+                physical_axis_norm = math.hypot(physical_axis_x, physical_axis_y)
+                if math.isfinite(physical_axis_norm) and physical_axis_norm > 1e-6:
+                    physical_axis_x /= physical_axis_norm
+                    physical_axis_y /= physical_axis_norm
+                    physical_front_checked = True
+                    # Classify the selected AABB face, not the robot's yaw or
+                    # lateral drift. Halfway between cardinal faces is ambiguous.
+                    # This classification never relaxes the action tolerances.
+                    selected_face_dot = (
+                        normalized_axis[0] * physical_axis_x
+                        + normalized_axis[1] * physical_axis_y
+                    )
+                    face_boundary = math.cos(math.pi / 4.0)
+                    if abs(selected_face_dot - face_boundary) > 1e-6:
+                        selected_face_matches_physical_front = (
+                            selected_face_dot > face_boundary
+                        )
                     dot = max(
                         -1.0,
                         min(
@@ -1991,15 +2042,41 @@ class AtomicForceInteractionController:
                             math.cos(actual[2] - physical_front_yaw),
                         )
                     )
-                    physical_front_valid = bool(
-                        physical_front_position_error_rad
-                        <= face_position_tolerance_rad
-                        and physical_front_yaw_error_rad <= face_yaw_tolerance_rad
+                    physical_front_position_valid = (
+                        physical_front_position_error_rad <= physical_position_tolerance
+                    )
+                    physical_front_yaw_valid = (
+                        physical_front_yaw_error_rad <= physical_yaw_tolerance
+                    )
+                    physical_front_valid = (
+                        physical_front_position_valid and physical_front_yaw_valid
                     )
         valid = pose_valid and face_valid and physical_front_valid
+        reason = ""
+        recovery_action = ""
+        if not valid:
+            if selected_face_matches_physical_front is False:
+                reason, recovery_action = "interaction_wrong_face", "select_other_face"
+            elif (face_required and not face_checked) or (
+                physical_front_required and selected_face_matches_physical_front is None
+            ):
+                reason, recovery_action = "interaction_front_unverified", "reobserve_front"
+            elif (
+                not position_valid
+                or not face_position_valid
+                or not physical_front_position_valid
+            ):
+                reason = "interaction_position_misaligned"
+                recovery_action = "reposition_same_face"
+            else:
+                reason = "interaction_orientation_misaligned"
+                recovery_action = "realign_yaw"
         result = {
             "checked": True,
             "valid": valid,
+            "reason": reason,
+            "recovery_action": recovery_action,
+            "reject_selected_face": reason == "interaction_wrong_face",
             "expected_pose_xyyaw": [float(value) for value in expected[:3]],
             "actual_pose_xyyaw": actual,
             "position_error_m": position_error_m,
@@ -2011,6 +2088,8 @@ class AtomicForceInteractionController:
             "face_validation_required": face_required,
             "face_checked": face_checked,
             "face_valid": face_valid,
+            "face_position_valid": face_position_valid,
+            "face_yaw_valid": face_yaw_valid,
             "target_center_xy": center_values,
             "front_axis_source": str(
                 command.get("interaction_front_axis_source") or ""
@@ -2022,9 +2101,9 @@ class AtomicForceInteractionController:
             "physical_front_required": physical_front_required,
             "physical_front_checked": physical_front_checked,
             "physical_front_valid": physical_front_valid,
-            "physical_front_source": physical_front_source,
-            "physical_front_position_error_rad": physical_front_position_error_rad,
-            "physical_front_yaw_error_rad": physical_front_yaw_error_rad,
+            # Publish only pass/fail, never GT axes, angles or a corrective yaw.
+            "physical_front_position_valid": physical_front_position_valid,
+            "physical_front_yaw_valid": physical_front_yaw_valid,
         }
         if not valid:
             command["interaction_pose_validation"] = result
@@ -2061,6 +2140,8 @@ class AtomicForceInteractionController:
         invalid_physical_front = str(exc).startswith(
             "Interaction physical front invalid:"
         )
+        invalid_pose_precondition = invalid_interaction_pose or invalid_physical_front
+        pose_validation = dict(command.get("interaction_pose_validation") or {})
         unsafe_open_sweep = str(exc).strip() == "unsafe_open_sweep"
         drawer_sequence_type = str(command.get("sequence_type") or "").casefold()
         drawer_sequence_execution_failed = str(exc).startswith(
@@ -2121,13 +2202,14 @@ class AtomicForceInteractionController:
         elif drawer_sequence_execution_failed:
             verification_source = "executor_drawer_sequence_failure"
             failure_reason = f"{drawer_sequence_type or 'drawer'}_execution_failed"
-        elif invalid_physical_front:
+        elif invalid_pose_precondition:
             verification_source = "executor_pose_precondition"
-            failure_reason = "interaction_wrong_face"
-            resolved_capability = "articulated"
-        elif invalid_interaction_pose:
-            verification_source = "executor_pose_precondition"
-            failure_reason = "interaction_pose_invalid"
+            # Legacy/unstructured pose errors are not evidence for deleting a face.
+            failure_reason = str(
+                pose_validation.get("reason") or "interaction_pose_invalid"
+            )
+            if pose_validation.get("physical_front_checked"):
+                resolved_capability = "articulated"
         else:
             verification_source = "executor_resolution_failure"
             failure_reason = "articulation_resolution_failed"
@@ -2152,14 +2234,15 @@ class AtomicForceInteractionController:
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep or invalid_physical_front
+                if unsafe_open_sweep
+                or (invalid_pose_precondition and resolved_capability == "articulated")
                 else None
             ),
             "retryable": (
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep or invalid_physical_front
+                if unsafe_open_sweep or invalid_pose_precondition
                 else None
             ),
             "state": semantic_state,
@@ -2196,6 +2279,11 @@ class AtomicForceInteractionController:
             "step": int(step),
             "stamp_sec": stamp_sec,
         }
+        if invalid_pose_precondition:
+            result["recovery_action"] = str(
+                pose_validation.get("recovery_action") or "reobserve_front"
+            )
+            result["reject_selected_face"] = failure_reason == "interaction_wrong_face"
         if unsafe_open_sweep:
             result["recommended_retreat_m"] = float(
                 (command.get("_open_sweep_preflight") or {}).get(
@@ -2232,6 +2320,9 @@ class AtomicForceInteractionController:
         self._write_snapshot()
 
     def close(self) -> None:
+        if self._execution_timer is not None:
+            self._execution_timer.shutdown()
+            self._execution_timer = None
         if self._subscriber is not None:
             self._subscriber.unregister()
             self._subscriber = None
@@ -2275,8 +2366,31 @@ class AtomicForceInteractionController:
             self._command_callback,
             queue_size=8,
         )
+        self._execution_timer = rospy.Timer(
+            rospy.Duration(1.0), self._publish_execution_progress
+        )
+
+    def _publish_execution_progress(self, _event=None) -> None:
+        if self._feedback_publisher is None:
+            return
+        with self._execution_lock:
+            command = self._execution_command
+            if not command:
+                return
+            self._publish(self._feedback_publisher, {
+                "status": "RUNNING", "execution_active": True,
+                "command_id": str(command.get("command_id") or ""),
+                "decision_id": str(command.get("decision_id") or ""),
+                "object_id": str(command.get("object_id") or ""),
+                "execution_step": self._execution_step,
+                "progress_age_s": max(0.0, time.monotonic() - self._execution_progress_at),
+            })
 
     def _publish(self, publisher, payload: dict[str, Any]) -> None:
+        if publisher is not None and publisher is self._result_publisher:
+            with self._execution_lock:
+                if payload.get("command_id") == self._execution_command.get("command_id"):
+                    self._execution_command = {}
         if publisher is None or self._String is None:
             return
         publisher.publish(

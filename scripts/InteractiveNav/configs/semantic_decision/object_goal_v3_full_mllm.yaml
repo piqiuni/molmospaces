@@ -46,7 +46,7 @@ candidate:
   container_navigation_anchor_tangent_offset_m: 0.20
   container_anchor_shared_pose_enabled: true
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   fridge_navigation_anchor_aabb_fan_enabled: true
   fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
@@ -149,6 +149,7 @@ executor:
   # Container observation/navigation remains the ordinary implementation.  V3
   # changes only the opaque force boundary and its result wait below.
   interaction_observation_timeout_s: 12.0
+  interaction_fallback_on_m1_failure: true
   interaction_observation_same_pose_samples_per_view: 1
   interaction_observation_max_viewpoints: 3
   interaction_observation_max_total_requests: 3
@@ -158,7 +159,7 @@ executor:
   container_m1_capture_dwa_profile_enabled: true
   container_m1_capture_dwa_reconfigure_server: "/move_base/DWAPlannerROS"
   container_m1_capture_dwa_reconfigure_timeout_s: 1.0
-  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 100
   container_m1_capture_successor_quiescence_timeout_s: 1.0
   move_base_successor_quiescence_timeout_s: 1.0
   container_outer_staging_abort_replan_global_costmap_wait_s: 1.0
@@ -209,14 +210,14 @@ executor:
   semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
-  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_step_sync_stall_timeout_s: 30.0
   navigation_stagnation_post_rotation_grace_s: 15.0
   interaction_final_align_enabled: true
   interaction_final_align_max_distance_m: 0.35
   interaction_final_align_yaw_tolerance_rad: 0.15
   interaction_final_align_rotate_speed_rad_s: 0.30
   interaction_final_align_timeout_s: 15.0
-  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 100
   interaction_final_align_step_sync_enabled: true
   interaction_final_align_control_dt_s: 0.2
   interaction_final_align_max_control_steps: 56

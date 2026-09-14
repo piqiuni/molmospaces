@@ -42,6 +42,36 @@ def test_estimate_planar_twist_wraps_yaw_delta() -> None:
     assert math.isclose(wz, 0.5, abs_tol=1e-5)
 
 
+def test_step_delta_twist_survives_same_step_republication() -> None:
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.cmd_vel_control_dt_s = 0.2
+    policy._step_idx = 0
+    assert policy._step_delta_twist(np.array([0.0, 0.0, 0.0])) == (0.0, 0.0, 0.0)
+    policy._step_idx = 1
+    pose = np.array([0.0, 0.0, 0.05])
+    first = policy._step_delta_twist(pose)
+    assert math.isclose(first[2], 0.25)
+    for _ in range(10):
+        assert policy._step_delta_twist(pose) == first
+    policy._step_idx = 2
+    assert policy._step_delta_twist(pose) == (0.0, 0.0, 0.0)
+
+
+def test_step_delta_twist_handles_missing_steps_reset_and_position_jumps() -> None:
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.cmd_vel_control_dt_s = 0.2
+    policy._step_idx = 0
+    policy._step_delta_twist(np.zeros(3))
+    policy._step_idx = 2
+    assert math.isclose(policy._step_delta_twist(np.array([0.4, 0, 0]))[0], 1.0)
+    policy._step_idx = 3
+    assert policy._step_delta_twist(np.array([8.0, 0, 0]), position_jump=True) == (0, 0, 0)
+    policy._step_idx = 4
+    assert policy._step_delta_twist(np.array([8.0, 0, 0])) == (0, 0, 0)
+    policy._step_idx = 0
+    assert policy._step_delta_twist(np.zeros(3)) == (0, 0, 0)
+
+
 def test_extract_planar_twist_uses_instantaneous_base_qvel() -> None:
     base_group = type("BaseGroup", (), {"joint_vel": np.array([0.0, 1.0, 0.4])})()
     robot_view = type(

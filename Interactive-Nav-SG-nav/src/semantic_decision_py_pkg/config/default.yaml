@@ -60,6 +60,7 @@ candidate:
   # (wait for visual MLLM evidence).  An ablation may override explicitly.
   # portal_unknown_default_interact: true
   portal_standoff_m: 0.85
+  portal_tangent_offsets_m: [0.10, -0.10, 0.15, -0.15]
   portal_allow_opposite_side_interaction: false
   portal_interaction_front_angle_tolerance_rad: 0.15
   container_standoff_m: 0.5
@@ -109,7 +110,7 @@ candidate:
   # physical-action pose.  Legacy/rule callers keep the staged contract.
   container_anchor_shared_pose_enabled: false
   drawer_navigation_anchor_aabb_fan_enabled: false
-  drawer_navigation_anchor_fan_clearances_m: [0.60, 0.95, 1.30]
+  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
 
 policy:
@@ -141,6 +142,8 @@ policy:
   # Also suppress the unchanged target for a deterministic number of simulator
   # observations; wall time alone is unstable under parallel evaluation load.
   container_anchor_unreachable_cooldown_steps: 300
+  container_navigation_cooldown_steps: 20
+  container_navigation_cooldown_s: 15.0
   # After a portal open, retain the crossing candidate until the *same* portal
   # is publicly open/traversable and a fresh capture has reached the graph.
   # The evaluator continues advancing RGB-D/scan steps while decision making
@@ -242,7 +245,13 @@ executor:
   base_frame: "tf_frame_base_link"
   navigation_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
+  # Interaction navigation is bounded by evaluator steps.  360 steps keeps
+  # enough room for a slow terminal-yaw alignment without coupling failure to
+  # host/render wall time.
+  interaction_navigation_timeout_task_steps: 360
   interaction_timeout_s: 30.0
+  interaction_timeout_task_steps: 120
+  interaction_step_stall_timeout_s: 180.0
   # A grounded drawer scan has a finite evaluator-step macro.  While those
   # steps keep arriving, do not let host/render wall time turn it into a false
   # failure.  The cap covers the strict public schema maximum of eight regions
@@ -251,8 +260,19 @@ executor:
   drawer_scan_execution_max_task_steps: 120
   drawer_scan_execution_step_budget_margin: 8
   drawer_scan_execution_step_sync_stall_timeout_s: 5.0
+  drawer_fallback_bbox_wait_task_steps: 8
   drawer_scan_execution_wall_cap_s: 180.0
+  # A targeted M1 result is a step-synchronised observation barrier.  Keep the
+  # wall value only as a legacy fallback when no public step clock exists.
   interaction_observation_timeout_s: 30.0
+  interaction_observation_view_wait_task_steps: 6
+  interaction_execution_stall_timeout_s: 60.0
+  interaction_execution_wall_cap_s: 600.0
+  interaction_observation_timeout_task_steps: 48
+  # A confirmed physical interaction pose is sufficient to attempt a portal
+  # action when M1 fails or returns no result.  Two-stage containers and
+  # drawer scans keep their stricter visual contracts in the executor.
+  interaction_fallback_on_m1_failure: true
   interaction_observation_poll_interval_s: 0.05
   # A container reaches the paired inner action pose only after one causally
   # later, direct-front M1 observation at the *outer* safe staging pose.  The
@@ -348,7 +368,7 @@ executor:
   interaction_final_align_timeout_s: 15.0
   # If move_base is still ACTIVE after entering the interaction XY envelope,
   # keep DWA as the single terminal-yaw controller for this many evaluator
-  # steps (75 steps = 15 simulated seconds at the default dt=.2).
+  # steps (100 steps = 20 simulated seconds at the default dt=.2).
   interaction_dwa_terminal_yaw_settle_max_task_steps: 100
   interaction_dwa_terminal_yaw_no_progress_task_steps: 20
   # When interaction final-align is enabled by a task override, emit each
@@ -408,8 +428,8 @@ executor:
   semantic_subgoal_no_progress_task_steps: 60
   semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
-  interaction_navigation_max_task_steps: 240
-  navigation_step_sync_stall_timeout_s: 5.0
+  interaction_navigation_max_task_steps: 360
+  navigation_step_sync_stall_timeout_s: 30.0
   navigation_stagnation_distance_m: 0.10
   navigation_stagnation_yaw_rad: 0.15
   # Do not cancel a deliberately slow DWA trajectory when it has published a

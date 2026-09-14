@@ -46,6 +46,89 @@ def test_drawer_aabb_fan_anchors_use_true_surface_clearance() -> None:
     ]
 
 
+def test_drawer_default_clearances_match_runtime_profiles():
+    from pathlib import Path
+    import yaml
+    expected = (0.50, 0.85, 1.00)
+    assert CandidateGeneratorConfig().drawer_navigation_anchor_fan_clearances_m == expected
+    root = Path(__file__).resolve().parents[4]
+    for path in (
+        "Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml",
+        "scripts/InteractiveNav/configs/semantic_decision/full_mllm_interactive_exploration.yaml",
+        "scripts/InteractiveNav/configs/semantic_decision/object_goal_v3_full_mllm.yaml",
+    ):
+        config = yaml.safe_load((root / path).read_text())
+        assert tuple(config["candidate"]["drawer_navigation_anchor_fan_clearances_m"]) == expected
+
+
+def test_clearance_filter_preserves_shared_anchor_index_alignment():
+    node = {"id": "drawer", "type": "container", "label": "chestofdrawers",
+            "aabb_center": [4., 2., 1.], "aabb_size": [1., 1., 2.],
+            "state_age_sec": 0., "is_currently_visible": True,
+            "interaction": {"is_interactable": True, "requires_interaction": True,
+                            "state": "closed", "confidence": 1.}}
+    generator = CandidateGenerator(CandidateGeneratorConfig(
+        drawer_pre_action_mllm=True, container_anchor_shared_pose_enabled=True,
+        drawer_navigation_anchor_aabb_fan_enabled=True,
+        drawer_navigation_anchor_fan_clearances_m=(.50, .85, 1.00)))
+    graph = {"nodes": [node]}
+    original = generator.generate({}, graph, robot_xy=(0., 2.))[0]
+    blocked = original.metadata["goal_xyyaw_candidates"][0]
+    def checker(goal, tolerance, **kwargs):
+        return {"clear": list(goal) != list(blocked), "reason": "test_obstacle"}
+    filtered = generator.generate({}, graph, robot_xy=(0., 2.), clearance_check=checker)[0]
+    goals = filtered.metadata["goal_xyyaw_candidates"]
+    assert goals == original.metadata["goal_xyyaw_candidates"][1:]
+    assert filtered.goal_xyyaw == tuple(goals[0]) or list(filtered.goal_xyyaw) == goals[0]
+    assert filtered.metadata["container_m1_capture_goal_xyyaw_by_staging_index"] == goals
+    assert filtered.metadata["container_action_goal_xyyaw_by_staging_index"] == goals
+    assert len(filtered.metadata["interaction_approach_pose_labels"]) == len(goals)
+    assert generator.clearance_rejections
+    assert not generator.generate({}, graph, robot_xy=(0., 2.),
+        clearance_check=lambda *args, **kw: {"clear": False, "reason": "blocked"})
+    assert node["interaction"]["requires_interaction"]
+
+
+@pytest.mark.parametrize("safe_replacement", [False, True])
+def test_frontier_recovery_keeps_identity_and_rechecks_original_tolerance(safe_replacement):
+    generator = CandidateGenerator()
+    status = {"proposals": [{"proposal_id": "wall", "goal_xyyaw": [1., 0., 0.],
+                              "frontier_point": [1., 1.], "frame_id": "map"}]}
+    checked = []
+
+    def check(goal, tolerance, **kwargs):
+        checked.append((tolerance, kwargs.get("frame_id")))
+        return {"clear": safe_replacement and goal[0] == .6, "reason": "arrival_region_blocked"}
+
+    candidates = generator.generate(status, {}, (0., 0.), clearance_check=check,
+        navigation_goal_recovery=lambda _candidate: [[.6, 0., 1.], [1.1, 0., 1.]])
+    assert all(tolerance == .25 and frame == "map" for tolerance, frame in checked)
+    assert len(candidates) == int(safe_replacement)
+    if candidates:
+        assert candidates[0].candidate_id == "frontier:wall"
+        assert candidates[0].metadata["frontier_point"] == [1., 1.]
+        assert candidates[0].metadata["clearance_original_goal_xyyaw"] == [1., 0., 0.]
+        assert candidates[0].metadata["goal_xyyaw_candidates"] == [[.6, 0., 1.]]
+    else:
+        assert generator.clearance_rejections[0]["deferred"]
+    assert status["proposals"][0]["goal_xyyaw"] == [1., 0., 0.]
+
+
+def test_clearance_filter_does_not_rotate_portal_normal_when_primary_is_blocked():
+    node = {"id": "door", "type": "portal", "aabb_center": [0., 0., 1.],
+            "aabb_size": [.2, 2., 2.], "state_age_sec": 0., "is_currently_visible": True,
+            "interaction": {"is_interactable": True, "requires_interaction": True,
+                            "state": "closed", "state_confidence": 1.}}
+    generator = CandidateGenerator(CandidateGeneratorConfig(
+        portal_standoff_m=.85, interaction_safety_margin_m=.10,
+        portal_allow_opposite_side_interaction=False))
+    original = generator.generate({}, {"nodes": [node]}, robot_xy=(2., 0.))[0]
+    filtered = generator.generate({}, {"nodes": [node]}, robot_xy=(2., 0.),
+        clearance_check=lambda goal, tolerance, **kw: {"clear": abs(goal[1]) > .01})[0]
+    assert abs(filtered.goal_xyyaw[1]) > .01
+    assert filtered.interaction_command["interaction_approach_axis_xy"] == original.interaction_command["interaction_approach_axis_xy"]
+
+
 def test_drawer_m1_face_selection_covers_all_four_aabb_faces() -> None:
     generator = CandidateGenerator(CandidateGeneratorConfig())
     anchors, labels = generator._approach_candidates(
@@ -138,9 +221,12 @@ def test_empty_candidate_stream_reobserves_remembered_invisible_portal() -> None
     )
 
     assert len(candidates) == 1
-    assert candidates[0].behavior_type == "NAVIGATE"
+    assert candidates[0].behavior_type == "INTERACT"
     assert candidates[0].candidate_id == "reobserve_portal:portal_hidden"
     assert candidates[0].metadata["reobserve_interaction_target"] is True
+    assert candidates[0].metadata["observation_required"] is True
+    assert candidates[0].interaction_command["action"] == "open"
+    assert candidates[0].interaction_command["interaction_front_axis_validation_required"] is True
 
 
 def test_remembered_portal_reobserve_stays_visible_but_is_execution_fallback() -> None:
@@ -190,6 +276,44 @@ def test_remembered_invisible_portal_remains_interaction_candidate_when_enabled(
                 "centroid": [2.0, 0.0, 1.0],
                 "aabb_size": [0.1, 1.0, 2.0],
                 "state_age_sec": 1.0,
+                "is_currently_visible": False,
+                "attributes": {},
+                "interaction": {
+                    "requires_interaction": True,
+                    "is_interactable": True,
+                    "state": "closed",
+                    "state_confidence": 0.9,
+                    "capability": "confirmed",
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, (0.0, 0.0))
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:portal_hidden:open"
+    ]
+
+
+def test_reobserve_fallback_is_not_duplicated_when_interaction_is_present() -> None:
+    """A remembered door keeps one semantic interaction row, not NAV+INTERACT."""
+
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_current_visibility=False,
+            remembered_portal_reobservation_enabled=True,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_hidden",
+                "type": "portal",
+                "name": "door",
+                "centroid": [2.0, 0.0, 1.0],
+                "aabb_size": [0.1, 1.0, 2.0],
                 "is_currently_visible": False,
                 "attributes": {},
                 "interaction": {
@@ -1502,11 +1626,11 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert candidate.metadata["portal_clearance_aabb_center_xy"] == [5.4, 5.0]
     assert candidate.metadata["portal_clearance_aabb_size_xy"] == [1.0, 2.0]
     goals = candidate.metadata["goal_xyyaw_candidates"]
-    assert len(goals) == 3
+    assert len(goals) > 3
     assert math.isclose(
-        goals[1][0], 3.50, abs_tol=1e-6
+        next(goal[0] for goal in goals if goal[0] < goals[0][0] and goal[1] == 5.0), 3.50, abs_tol=1e-6
     )
-    # All production interaction poses stay on the AABB normal.
+    # Small tangents retain the source face and face the same reference.
     for goal_x, goal_y, goal_yaw in goals:
         expected_yaw = math.atan2(5.0 - goal_y, 5.0 - goal_x)
         assert math.isclose(
@@ -1564,11 +1688,11 @@ def test_full_profile_disables_opposite_portal_interaction_side() -> None:
         "portal",
     )
     assert candidates
-    assert all(label == "portal_source_side" for label in labels)
+    assert all(label.startswith("portal_source_side") for label in labels)
     assert all(goal[0] > 0.0 for goal in candidates)
 
 
-def test_portal_front_contract_has_no_tangent_interaction_poses() -> None:
+def test_portal_front_contract_keeps_normal_with_bounded_tangent_poses() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
             interaction_types=("portal",),
@@ -1600,8 +1724,12 @@ def test_portal_front_contract_has_no_tangent_interaction_poses() -> None:
     assert command["interaction_front_yaw_tolerance_rad"] == 0.15
     assert command["navigation_goal_position_tolerance_m"] == 0.15
     assert command["navigation_goal_yaw_tolerance_rad"] == 0.15
-    assert len(command["interaction_approach_pose_labels"]) == 3
-    assert all(label == "portal_source_side" for label in command["interaction_approach_pose_labels"])
+    assert len(command["interaction_approach_pose_labels"]) > 3
+    assert all(label.startswith("portal_source_side") for label in command["interaction_approach_pose_labels"])
+    from semantic_decision_py_pkg.portal_approach import portal_approach_profile
+    from dataclasses import asdict
+    for goal in candidates[0].metadata["goal_xyyaw_candidates"]:
+        assert portal_approach_profile(asdict(candidates[0]), goal) is not None
 
 
 def test_fridge_aabb_fan_applies_angular_scale() -> None:

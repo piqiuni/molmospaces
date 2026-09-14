@@ -5,6 +5,8 @@ import math
 import re
 from typing import Any
 
+from .portal_approach import bounded_portal_tolerances
+
 
 BEHAVIOR_EXPLORE = "EXPLORE"
 BEHAVIOR_INTERACT = "INTERACT"
@@ -139,6 +141,7 @@ class CandidateGeneratorConfig:
     # or more fresh observations before an action can be dispatched.
     portal_unknown_observation_max_attempts: int = 2
     portal_standoff_m: float = 1.0
+    portal_tangent_offsets_m: tuple[float, ...] = (0.10, -0.10, 0.15, -0.15)
     # Interaction poses stay on the observed portal side.  The opposite side is
     # a traversal/navigation concept, never a physical interaction fallback.
     portal_allow_opposite_side_interaction: bool = False
@@ -224,7 +227,7 @@ class CandidateGeneratorConfig:
     drawer_navigation_anchor_fan_clearances_m: tuple[float, ...] = (
         0.50,
         0.85,
-        1.20,
+        1.00,
     )
     drawer_navigation_anchor_fan_angles_deg: tuple[float, ...] = (
         -30.0,
@@ -326,16 +329,19 @@ class CandidateGenerator:
         robot_xy: tuple[float, float] | None,
         target_context: dict[str, Any] | None = None,
         room_segment_grid: dict[str, Any] | None = None,
+        clearance_check=None,
+        navigation_goal_recovery=None,
     ) -> list[BehaviorCandidate]:
+        self.clearance_rejections = []
+        self.clearance_recoveries = []
         if (explorer_status or {}).get("initial_scan_complete") is False:
             return []
         candidates = self._frontier_candidates(explorer_status or {})
         if robot_xy is not None:
-            candidates.extend(
-                self._interaction_candidates(
-                    graph or {}, robot_xy, target_context or {}, room_segment_grid
-                )
+            interaction_candidates = self._interaction_candidates(
+                graph or {}, robot_xy, target_context or {}, room_segment_grid, clearance_check
             )
+            candidates.extend(interaction_candidates)
             candidates.extend(
                 self._portal_traversal_candidates(graph or {}, robot_xy)
             )
@@ -343,15 +349,57 @@ class CandidateGenerator:
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
             if self.config.remembered_portal_reobservation_enabled:
-                # Re-observation is an independent remembered-interaction
-                # candidate. It must not be suppressed merely because an
-                # unrelated frontier or portal candidate already exists;
-                # otherwise stale doors disappear from the global candidate set.
+                # A remembered re-observation is only a recovery candidate for
+                # a portal that could not produce an INTERACT candidate at all
+                # (for example, a visibility-gated or unknown portal).  Do not
+                # publish a second NAVIGATE row for the same door when its
+                # graph interaction is already present: that duplicate made
+                # the visualization look as if navigation had preempted the
+                # interaction, even though the executor would defer the row.
+                interaction_portal_ids = {
+                    str(candidate.target_id or "")
+                    for candidate in interaction_candidates
+                    if candidate.behavior_type == BEHAVIOR_INTERACT
+                    and str(candidate.target_id or "")
+                }
                 candidates.extend(
                     self._remembered_portal_reobservation_candidates(
-                        graph or {}, robot_xy
+                        graph or {},
+                        robot_xy,
+                        skip_target_ids=interaction_portal_ids,
+                        clearance_check=clearance_check,
                     )
                 )
+        if clearance_check is not None:
+            admitted = []
+            for candidate in candidates:
+                if candidate.behavior_type in {BEHAVIOR_EXPLORE, BEHAVIOR_NAVIGATE} and candidate.goal_xyyaw:
+                    tolerance = float(candidate.metadata.get("navigation_goal_position_tolerance_m", 0.25))
+                    detail = clearance_check(candidate.goal_xyyaw, tolerance,
+                                             frame_id=candidate.metadata.get("frame_id"))
+                    if not detail.get("clear"):
+                        alternatives = navigation_goal_recovery(candidate) if navigation_goal_recovery is not None else []
+                        alternatives = [goal for goal in alternatives if clearance_check(
+                            goal, tolerance, frame_id=candidate.metadata.get("frame_id")
+                        ).get("clear")]
+                        if alternatives:
+                            original = list(candidate.goal_xyyaw)
+                            candidate.goal_xyyaw = list(alternatives[0])
+                            candidate.metadata.update(goal_xyyaw_candidates=alternatives,
+                                                      clearance_original_goal_xyyaw=original)
+                            if robot_xy is not None:
+                                candidate.features["distance_m"] = math.dist(robot_xy, candidate.goal_xyyaw[:2])
+                            self.clearance_recoveries.append({"candidate_id": candidate.candidate_id,
+                                "original_goal_xyyaw": original, "goal_xyyaw": candidate.goal_xyyaw,
+                                "reason": detail.get("reason"), "alternative_count": len(alternatives)})
+                            admitted.append(candidate)
+                            continue
+                        self.clearance_rejections.append({"candidate_id": candidate.candidate_id,
+                            "behavior_type": candidate.behavior_type, "goal_xyyaw": candidate.goal_xyyaw,
+                            "deferred": True, "recovery_attempted": navigation_goal_recovery is not None, **detail})
+                        continue
+                admitted.append(candidate)
+            candidates = admitted
         self._attach_portal_child_room_context(candidates, graph or {})
         self._attach_frontier_room_context(candidates, graph or {}, robot_xy)
         self._attach_spatial_context(candidates, graph or {})
@@ -362,19 +410,28 @@ class CandidateGenerator:
         self,
         graph: dict[str, Any],
         robot_xy: tuple[float, float],
+        *,
+        skip_target_ids: set[str] | None = None,
+        clearance_check=None,
     ) -> list[BehaviorCandidate]:
         """Keep a concrete subgoal while unresolved doors are out of view.
 
-        Full-MLLM physical door candidates deliberately require current pixels.
-        That visibility gate must not turn remembered unresolved doors into a
-        permanently empty candidate stream.  Navigate to the ordinary safe
-        portal approach first; the next graph revision can then emit the real
-        visually-authorized INTERACT candidate.
+        Remembered doors still navigate and request a current M1 observation.
+        Carry an explicit physical contract so a missing M1 response can use
+        the configured fallback after the normal geometric arrival checks.
         """
 
         candidates: list[BehaviorCandidate] = []
+        skip_target_ids = {
+            str(value)
+            for value in (skip_target_ids or set())
+            if str(value)
+        }
         for node in graph.get("nodes") or []:
             if str(node.get("type") or "").strip().casefold() != "portal":
+                continue
+            node_id = str(node.get("id") or "")
+            if node_id in skip_target_ids:
                 continue
             interaction = node.get("interaction") or {}
             if not bool(
@@ -419,18 +476,50 @@ class CandidateGenerator:
                 node,
                 self.config.portal_standoff_m,
                 "portal",
+                portal_front_angle_tolerance_rad=min(0.20, max(0.05, float(self.config.interaction_ready_yaw_tolerance_rad))),
+            )
+            normal_goal = goals[0] if goals else None
+            goals, labels = self._clear_interaction_goals(
+                goals, labels, node, target_xy, clearance_check,
+                min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                min(0.20, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
             )
             if not goals:
                 continue
-            node_id = str(node.get("id") or "")
+            center = list(attributes.get("interaction_reference_aabb_center") or position)
+            size = list(attributes.get("interaction_reference_aabb_size") or node.get("aabb_size") or [])
+            yaw_tolerance = min(0.20, max(0.05, float(self.config.interaction_ready_yaw_tolerance_rad)))
+            position_tolerance = min(0.15, max(0.05, float(self.config.interaction_ready_distance_m)))
+            interaction_command = {
+                "node_id": node_id,
+                "node_type": "portal",
+                "object_id": str(attributes.get("instance_id") or attributes.get("source_object_name") or node.get("name") or node_id),
+                "action": "open",
+                "expected_state": "open",
+                "interaction_mode": str(interaction.get("interaction_mode") or "open_close"),
+                "interaction_approach_pose_xyyaw": list(goals[0]),
+                "interaction_approach_axis_xy": [-math.cos(normal_goal[2]), -math.sin(normal_goal[2])],
+                "interaction_target_center_xy": list(center[:2]),
+                "interaction_front_axis_source": "portal_aabb_normal" if len(size) >= 2 else "portal_cardinal_fallback",
+                "interaction_front_axis_validation_required": True,
+                "interaction_ready_distance_m": position_tolerance,
+                "interaction_ready_yaw_tolerance_rad": yaw_tolerance,
+                "navigation_goal_position_tolerance_m": position_tolerance,
+                "navigation_goal_yaw_tolerance_rad": yaw_tolerance,
+                "navigation_goal_tolerance_contract_explicit": True,
+                "interaction_front_position_tolerance_rad": yaw_tolerance,
+                "interaction_front_yaw_tolerance_rad": yaw_tolerance,
+                "portal_aperture_observation": self._portal_aperture_observation(node),
+            }
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"reobserve_portal:{node_id}",
-                    behavior_type=BEHAVIOR_NAVIGATE,
+                    behavior_type=BEHAVIOR_INTERACT,
                     source="remembered_interaction_reobserve",
                     target_id=node_id,
                     target_name=str(node.get("label") or node.get("name") or "door"),
                     goal_xyyaw=list(goals[0]),
+                    interaction_command=interaction_command,
                     features={
                         "exploration_gain": 0.8,
                         "visibility_gain": 1.0,
@@ -443,6 +532,13 @@ class CandidateGenerator:
                     },
                     metadata={
                         "reobserve_interaction_target": True,
+                        "portal_clearance_aware_approach": True,
+                        "portal_approach_base_tolerances": [position_tolerance, yaw_tolerance],
+                        "node_type": "portal",
+                        "observation_required": True,
+                        "interaction_observation_source": "mllm_attribute_inference",
+                        "portal_aabb_center_xy": list(center[:2]),
+                        "portal_aabb_size_xy": list(size[:2]),
                         "requires_approach": True,
                         "goal_xyyaw_candidates": [list(goal) for goal in goals],
                         "interaction_approach_pose_labels": list(labels),
@@ -983,6 +1079,8 @@ class CandidateGenerator:
                     metadata={
                         "cluster_id": cluster_id,
                         "frontier_point": frontier_point,
+                        "frame_id": str(proposal.get("frame_id") or status.get("frame_id") or ""),
+                        "frontier_recovery_targets": list(proposal.get("frontier_cells_world") or [frontier_point])[::max(1, len(proposal.get("frontier_cells_world") or [])//12)],
                         "cell_count": int(
                             raw_features.get(
                                 "frontier_cell_count", proposal.get("cell_count", 0)
@@ -1363,6 +1461,7 @@ class CandidateGenerator:
         robot_xy: tuple[float, float],
         target_context: dict[str, Any],
         room_segment_grid: dict[str, Any] | None = None,
+        clearance_check=None,
     ) -> list[BehaviorCandidate]:
         candidates = []
         allowed_types = set(self.config.interaction_types)
@@ -1731,6 +1830,7 @@ class CandidateGenerator:
                 ),
                 operational_container_axis=operational_container_axis,
             )
+            normal_goal = goal_candidates[0] if goal_candidates else None
             if node_type == "container":
                 # Container centres normally lie in occupied/unknown cells.
                 # Resolve the containing room from free room-segmentation cells
@@ -1788,6 +1888,14 @@ class CandidateGenerator:
                 approach_pose_labels = same_room_labels
                 if not goal_candidates:
                     continue
+            goal_candidates, approach_pose_labels = self._clear_interaction_goals(
+                goal_candidates, approach_pose_labels, node, position, clearance_check,
+                container_staging_ready_distance_m if node_type == "container" else min(0.15, self.config.interaction_ready_distance_m),
+                self.config.portal_interaction_front_angle_tolerance_rad,
+                portal_normal_goal=normal_goal,
+            )
+            if not goal_candidates:
+                continue
             container_face_axes_by_staging = [
                 list(axis) if axis is not None else []
                 for axis in (
@@ -1949,8 +2057,8 @@ class CandidateGenerator:
                 # the executor/bridge can validate position and yaw against the
                 # same normal that generated the candidate.
                 center = portal_aabb_center_xy or [float(position[0]), float(position[1])]
-                dx = float(approach[0]) - float(center[0])
-                dy = float(approach[1]) - float(center[1])
+                dx = float(normal_goal[0]) - float(center[0])
+                dy = float(normal_goal[1]) - float(center[1])
                 norm = math.hypot(dx, dy)
                 if norm > 1e-6:
                     portal_front_axis_xy = [dx / norm, dy / norm]
@@ -2560,6 +2668,11 @@ class CandidateGenerator:
                         # approach options.  The post-open continuation uses it
                         # to select an AABB-clear goal on the far side instead
                         # of recreating one radial point at the door center.
+                        "portal_clearance_aware_approach": node_type == "portal",
+                        "portal_approach_base_tolerances": [
+                            interaction_command["navigation_goal_position_tolerance_m"],
+                            interaction_command["navigation_goal_yaw_tolerance_rad"],
+                        ] if node_type == "portal" else [],
                         "portal_aabb_center_xy": portal_aabb_center_xy,
                         "portal_aabb_size_xy": portal_aabb_size_xy,
                         "portal_clearance_aabb_center_xy": (
@@ -2832,6 +2945,8 @@ class CandidateGenerator:
                         ),
                         "state": state,
                         "post_interaction_traversal": True,
+                        "portal_center_xy": [center_x, center_y],
+                        "portal_through_axis_xy": [unit_x, unit_y],
                         "opened_portal_id": node_id,
                         "source_interaction_event_id": event_id,
                         "connected_room_ids": list(
@@ -3074,6 +3189,32 @@ class CandidateGenerator:
             ring_count = 1
         return offset, max(1, min(4, ring_count)), tangent, offset_source
 
+    def _clear_interaction_goals(self, goals, labels, node, target_xy, checker,
+                                 arrival_tolerance, front_tolerance, *, portal_normal_goal=None):
+        if checker is None or not goals:
+            return goals, labels
+        normal = portal_normal_goal or goals[0]
+        axis = [-math.cos(normal[2]), -math.sin(normal[2])]
+        center = (node.get("attributes") or {}).get("interaction_reference_aabb_center") or node.get("aabb_center") or target_xy
+        admitted, admitted_labels = [], []
+        for goal, label in zip(goals, labels):
+            tolerance = arrival_tolerance
+            if node.get("type") == "portal":
+                profile = bounded_portal_tolerances(goal, center, axis, tolerance,
+                                                   front_tolerance, front_tolerance, front_tolerance)
+                if profile is None:
+                    continue
+                tolerance = profile["distance_tolerance_m"]
+            detail = checker(goal, tolerance)
+            if detail.get("clear"):
+                admitted.append(goal)
+                admitted_labels.append(label)
+            else:
+                self.clearance_rejections.append({"target_id": node.get("id"), "goal_xyyaw": goal, **detail})
+        # Filter before deriving index-aligned capture/action arrays, never
+        # remove or renumber anchors from an already active decision.
+        return admitted, admitted_labels
+
     def _approach_candidates(
         self,
         robot_xy: tuple[float, float],
@@ -3091,6 +3232,7 @@ class CandidateGenerator:
         container_multiview_angular_scale: float = 1.0,
         container_m1_face_selection_enabled: bool = False,
         operational_container_axis: tuple[float, float] | None = None,
+        portal_front_angle_tolerance_rad: float | None = None,
     ) -> tuple[list[list[float]], list[str]]:
         candidates: list[list[float]] = []
         labels: list[str] = []
@@ -3112,31 +3254,31 @@ class CandidateGenerator:
             labels.append(str(label))
 
         if node_type == "portal":
-            # Interaction candidates stay on the observed doorway side.  A
-            # mirrored side can be useful for traversal, but using it as an
-            # interaction pose violates the front-facing contract.
-            side_multipliers = (1.0,)
-            for side_multiplier in side_multipliers:
-                # Tangential poses are useful for camera staging, but they are
-                # not valid physical door interaction poses: they compound the
-                # arrival yaw tolerance and can put the base beside the jamb.
-                for tangent_offset_m in (0.0,):
-                    for extra_standoff in (0.0, 0.25, 0.50):
-                        candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
-                        pose = self._portal_approach_pose(
-                            robot_xy,
-                            target_xy,
-                            node,
-                            candidate_standoff,
-                            side_multiplier=side_multiplier,
-                            tangent_offset_m=tangent_offset_m,
-                        )
-                        append_unique(
-                            pose,
-                            "portal_source_side"
-                            if side_multiplier > 0.0
-                            else "portal_opposite_side",
-                        )
+            front_tolerance = float(portal_front_angle_tolerance_rad if portal_front_angle_tolerance_rad is not None
+                                    else self.config.portal_interaction_front_angle_tolerance_rad)
+            attributes = node.get("attributes") or {}
+            center = attributes.get("interaction_reference_aabb_center") or node.get("aabb_center") or target_xy
+            primary = self._portal_approach_pose(robot_xy, target_xy, node, standoff_m)
+            axis = [-math.cos(primary[2]), -math.sin(primary[2])]
+            offsets = [0.0] + [float(value) for value in self.config.portal_tangent_offsets_m
+                               if math.isfinite(float(value)) and abs(float(value)) <= 0.15]
+            for extra_standoff in (0.0, 0.25, 0.50):
+                for tangent_offset in offsets:
+                    pose = self._portal_approach_pose(
+                        robot_xy, target_xy, node, max(0.0, float(standoff_m)) + extra_standoff,
+                        tangent_offset_m=tangent_offset,
+                    )
+                    # Reserve arrival uncertainty as well as the planned fan
+                    # angle. Keep the original face normal for every option.
+                    profile = bounded_portal_tolerances(
+                        pose, center, axis, min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                        min(front_tolerance, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
+                        front_tolerance, front_tolerance,
+                    )
+                    if tangent_offset and profile is None:
+                        continue
+                    append_unique(pose, "portal_source_side" if not tangent_offset
+                                  else f"portal_source_side_tangent_{tangent_offset:+.2f}")
             return candidates, labels
 
         outer_offset = self._nonnegative_clearance(

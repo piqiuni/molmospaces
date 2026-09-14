@@ -235,6 +235,13 @@ class TerminalInteractionNoPlanExitTracker:
     ) -> bool:
         """Advance only on distinct post-failure simulator observations."""
 
+        exploration = candidate_snapshot.get("exploration_context") or {}
+        if (exploration.get("connected_unknown_area_present")
+                or exploration.get("filtered_frontier_retryable")
+                or int(exploration.get("raw_frontier_material_cluster_count", 0) or 0) > 0):
+            # Remaining frontiers use the bounded navigation recovery budget.
+            self.clear_for_recovery()
+            return False
         if self.complete:
             return True
         if not self.config.enabled or not self.terminal_failure:

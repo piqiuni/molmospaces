@@ -30,7 +30,7 @@ from semantic_mapping_py_pkg.interaction_result_contract import (
     merge_interaction_result_with_command,
     take_pending_interaction_command,
 )
-from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
+from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text, observation_stamp_seconds
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
@@ -1321,12 +1321,9 @@ class SemanticMappingNode:
             if isinstance(observation, dict)
         ]
         episode_id = str(parsed.get("episode_id") or "")
-        stamp_value = parsed.get("stamp_sec")
-        stamp = (
-            float(stamp_value)
-            if stamp_value is not None
-            else rospy.Time.now().to_sec()
-        )
+        stamp = observation_stamp_seconds(parsed, math.nan)
+        if not math.isfinite(stamp):
+            stamp = rospy.Time.now().to_sec()
         episode_reset_requested = False
         portal_structure_changed = False
         with self.lock:

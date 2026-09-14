@@ -417,6 +417,7 @@ class RoomSegmenter:
             self.state.candidate_room_ids = list(room_ids)
             self.state.candidate_room_conf = list(room_conf)
             self.state.candidate_room_count = self.room_grid_stability_frames
+            self._commit_room_merges()
             return list(room_ids), list(room_conf)
 
         if force:
@@ -425,6 +426,7 @@ class RoomSegmenter:
             self.state.candidate_room_ids = list(room_ids)
             self.state.candidate_room_conf = list(room_conf)
             self.state.candidate_room_count = self.room_grid_stability_frames
+            self._commit_room_merges()
             return list(room_ids), list(room_conf)
 
         candidate_ids = self.state.candidate_room_ids
@@ -436,10 +438,14 @@ class RoomSegmenter:
         self.state.candidate_room_conf = list(room_conf)
         if (
             self.state.candidate_room_count >= self.room_grid_stability_frames
-            and not self.state.pending_merges
+            and all(
+                count >= self.room_merge_confirmations
+                for count in self.state.pending_merges.values()
+            )
         ):
             self.state.stable_room_ids = list(room_ids)
             self.state.stable_room_conf = list(room_conf)
+            self._commit_room_merges()
         return list(self.state.stable_room_ids), list(self.state.stable_room_conf or room_conf)
 
     @staticmethod
@@ -448,6 +454,11 @@ class RoomSegmenter:
             return False
         previous = np.asarray(previous_ids, dtype=np.int32)
         current = np.asarray(current_ids, dtype=np.int32)
+        if not np.array_equal(
+            np.unique(previous[previous >= 0]),
+            np.unique(current[current >= 0]),
+        ):
+            return False
         common = (previous >= 0) & (current >= 0)
         if not np.any(common):
             return False
@@ -806,61 +817,81 @@ class RoomSegmenter:
     def _remap_room_component_ids(self, component_cells, grid_info):
         remapped = {}
         used_previous = set()
-        observed_merges = {}
-        previous_ids = None
+        merge_candidates = []
+        stable_ids = None
         signature = self._grid_signature(grid_info)
         if (
             self.state.stable_room_grid_signature == signature
             and self.state.stable_room_ids
         ):
-            previous_ids = self.state.stable_room_ids
-        elif self.state.prev_room_grid_signature == signature and self.state.prev_room_ids:
+            stable_ids = self.state.stable_room_ids
+        previous_ids = stable_ids
+        # Pending splits must inherit candidate IDs until their grid is accepted.
+        # Keep the published grid as a fallback when a transient merge re-splits.
+        if self.state.prev_room_grid_signature == signature and self.state.prev_room_ids:
             previous_ids = self.state.prev_room_ids
 
         for temp_room_id, component in sorted(component_cells.items(), key=lambda item: -len(item[1])):
-            best_prev_room_id = None
-            best_overlap = 0
-            if previous_ids is not None:
-                overlap_counts = {}
-                for idx in component:
-                    prev_room_id = int(previous_ids[idx])
-                    if prev_room_id < 0:
-                        continue
-                    overlap_counts[prev_room_id] = overlap_counts.get(prev_room_id, 0) + 1
-                if overlap_counts:
-                    best_prev_room_id, best_overlap = max(
-                        sorted(overlap_counts.items()),
-                        key=lambda item: item[1],
-                    )
-            if (
-                best_prev_room_id is not None
-                and best_overlap / max(len(component), 1) >= self.room_id_overlap_ratio
-                and best_prev_room_id not in used_previous
-            ):
-                remapped[temp_room_id] = best_prev_room_id
-                used_previous.add(best_prev_room_id)
-                for previous_room_id, overlap in overlap_counts.items():
-                    if previous_room_id == best_prev_room_id:
-                        continue
-                    if overlap / max(len(component), 1) >= self.room_id_overlap_ratio:
-                        observed_merges[int(previous_room_id)] = int(best_prev_room_id)
-            else:
-                remapped[temp_room_id] = self.state.next_room_segment_id
+            previous_overlaps = self._room_component_overlaps(component, previous_ids)
+            stable_overlaps = (
+                previous_overlaps
+                if stable_ids is previous_ids
+                else self._room_component_overlaps(component, stable_ids)
+            )
+            room_id = None
+            for overlaps in (previous_overlaps, stable_overlaps):
+                matches = [
+                    (overlap, previous_id)
+                    for previous_id, overlap in overlaps.items()
+                    if previous_id not in used_previous
+                    and overlap / max(len(component), 1) >= self.room_id_overlap_ratio
+                ]
+                if matches:
+                    _overlap, room_id = min(matches, key=lambda item: (-item[0], item[1]))
+                    break
+            if room_id is None:
+                room_id = self.state.next_room_segment_id
                 self.state.next_room_segment_id += 1
+            remapped[temp_room_id] = room_id
+            used_previous.add(room_id)
+
+            # Merge evidence stays relative to the published grid, even after
+            # the previous candidate already contains the proposed merge.
+            for stable_id, overlap in stable_overlaps.items():
+                if overlap / max(len(component), 1) >= self.room_id_overlap_ratio:
+                    merge_candidates.append((overlap, stable_id, room_id))
+        observed_merges = {}
+        for _overlap, secondary, primary in sorted(merge_candidates, reverse=True):
+            if secondary not in used_previous:
+                observed_merges.setdefault(secondary, primary)
         self._update_merge_confirmations(observed_merges)
         return remapped
+
+    @staticmethod
+    def _room_component_overlaps(component, room_ids):
+        overlaps = {}
+        if room_ids is not None:
+            for index in component:
+                room_id = int(room_ids[index])
+                if room_id >= 0:
+                    overlaps[room_id] = overlaps.get(room_id, 0) + 1
+        return overlaps
 
     def _update_merge_confirmations(self, observed_merges):
         next_pending = {}
         for secondary, primary in observed_merges.items():
             key = (int(secondary), int(primary))
             count = int(self.state.pending_merges.get(key, 0)) + 1
-            if count >= self.room_merge_confirmations:
-                self.state.last_confirmed_merges[int(secondary)] = int(primary)
-                self.state.pending_merges.pop(key, None)
-                continue
-            next_pending[key] = count
+            next_pending[key] = min(count, self.room_merge_confirmations)
         self.state.pending_merges = next_pending
+
+    def _commit_room_merges(self):
+        # Consumers must never redirect rooms while the published grid still
+        # contains the pre-merge labels or after an unconfirmed merge reverses.
+        for (secondary, primary), count in self.state.pending_merges.items():
+            if count >= self.room_merge_confirmations:
+                self.state.last_confirmed_merges[secondary] = primary
+        self.state.pending_merges.clear()
 
     @staticmethod
     def _grid_signature(grid_info):

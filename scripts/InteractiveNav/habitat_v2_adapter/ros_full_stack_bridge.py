@@ -505,13 +505,19 @@ class _State:
         depth = _decode_array(payload.get("depth"), dtype=np.float32, name="depth")
         if depth.ndim == 3:
             depth = depth[..., 0]
+        height, width = depth.shape
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        capture_step = max(0, int(context.get("step", 0) or 0))
+        identity = {
+            "capture_step": capture_step if capture_step > 0 else None,
+            "image_size": [int(width), int(height)],
+        }
         camera = payload.get("camera_info") if isinstance(payload.get("camera_info"), dict) else {}
         intrinsics = [float(value) for value in camera.get("K", [])]
         if len(intrinsics) != 9:
-            return detections
+            return {**detections, **identity}
         fx, fy = max(intrinsics[0], 1e-6), max(intrinsics[4], 1e-6)
         cx, cy = intrinsics[2], intrinsics[5]
-        height, width = depth.shape
         cos_h, sin_h = math.cos(compass), math.sin(compass)
         lifted: list[dict[str, Any]] = []
         for source in detections.get("detections") or []:
@@ -565,6 +571,7 @@ class _State:
             lifted.append(row)
         return {
             **detections,
+            **identity,
             "stamp_sec": int(stamp.secs),
             "stamp_nsec": int(stamp.nsecs),
             "detections": lifted,
@@ -681,7 +688,15 @@ class _State:
                         with urlopen(request, timeout=2.0) as handle:
                             direct = json.loads(handle.read().decode("utf-8"))
                         if isinstance(direct, dict) and isinstance(direct.get("detections"), list):
-                            detections = {**detections, "detections": direct["detections"], "direct_fallback": True}
+                            context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+                            capture_step = max(0, int(context.get("step", 0) or 0))
+                            detections = {
+                                **detections,
+                                "detections": direct["detections"],
+                                "capture_step": capture_step if capture_step > 0 else None,
+                                "image_sequence": None,
+                                "direct_fallback": True,
+                            }
                             direct_fallback = True
                     except (OSError, URLError, ValueError):
                         pass

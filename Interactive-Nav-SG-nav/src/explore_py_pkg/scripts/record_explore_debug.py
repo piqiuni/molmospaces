@@ -48,6 +48,7 @@ import rospy
 import tf
 from explore_py_pkg.debug_semantic_viz import (
     candidate_color,
+    semantic_node_display_label,
     topology_edge_style,
     topology_edge_visible,
     topology_hierarchy_layout,
@@ -56,6 +57,7 @@ from explore_py_pkg.debug_semantic_viz import (
     topology_order_rooms,
 )
 from explore_py_pkg.subgoal_overlay import SubgoalOverlay
+from explore_py_pkg.room_colors import room_color
 from step_sync_image_cache import CachedStepImage, ExactStepImageCache
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -177,8 +179,18 @@ def _interaction_display_selection(selection: dict, command: dict) -> dict:
         merged.setdefault("target_id", target_id)
         merged.setdefault("target_name", target_id)
     action = str(command.get("action") or "")
-    if action:
-        merged.setdefault("behavior_type", action)
+    # ``latest_interaction_command`` carries the physical action (``open`` /
+    # ``close``), not the semantic candidate type.  Copying that verb into
+    # ``behavior_type`` made the map renderer fall through to its NAVIGATE
+    # default, so the same interaction marker changed from orange to green
+    # whenever the live selection message was absent or stale.
+    command_behavior = str(command.get("behavior_type") or "").upper()
+    if command_behavior not in {"EXPLORE", "INTERACT", "NAVIGATE"}:
+        command_behavior = "INTERACT" if action else ""
+    if command_behavior:
+        existing_behavior = str(merged.get("behavior_type") or "").upper()
+        if existing_behavior not in {"EXPLORE", "INTERACT", "NAVIGATE"}:
+            merged["behavior_type"] = command_behavior
     return merged
 
 
@@ -2800,7 +2812,10 @@ class ExploreDebugRecorder:
             self.latest_gt_observations = payload
             if self._retain_video_state_history:
                 self.gt_observation_history.append(
-                    (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
+                    (
+                        float(payload.get("capture_stamp_sec", payload.get("stamp_sec", 0.0)) or 0.0),
+                        payload, set(self.observed_instance_ids),
+                    )
                 )
 
     def external_detections_callback(self, msg: String) -> None:
@@ -4045,14 +4060,7 @@ class ExploreDebugRecorder:
 
     @staticmethod
     def _semantic_node_display_label(node: dict) -> str:
-        if node.get("type") != "room":
-            return str(node.get("label") or node.get("type") or "object")
-        room_attribute = str(
-            (node.get("attributes") or {}).get("room_attribute") or "unknown"
-        ).strip()
-        if room_attribute == "livingroom":
-            return "living room"
-        return f"{room_attribute} room" if room_attribute != "unknown" else "unknown room"
+        return semantic_node_display_label(node)
 
     @staticmethod
     def _known_occupancy_world_bounds(
@@ -6501,18 +6509,8 @@ class ExploreDebugRecorder:
         rgb = np.zeros((height, width, 3), dtype=np.uint8)
         valid = values >= 0
         room_ids = np.unique(values[valid]) if np.any(valid) else []
-        palette = (
-            (255, 185, 185),
-            (185, 220, 255),
-            (195, 245, 195),
-            (245, 220, 170),
-            (225, 195, 245),
-            (175, 235, 230),
-            (245, 195, 225),
-            (220, 220, 170),
-        )
         for room_id in room_ids:
-            rgb[values == int(room_id)] = palette[int(room_id) % len(palette)]
+            rgb[values == int(room_id)] = room_color(int(room_id))
         return rgb
 
     @staticmethod

@@ -202,6 +202,10 @@ def test_manifest_public_gt_precedes_legacy_raw_snapshot_and_preserves_causality
 
     raw_step["gt_observations"]["stamp_sec"] = 10.1
     assert public_gt_payload_for_sim_frame(sim_record, raw_step) is None
+    raw_step["gt_observations"].update(
+        stamp_sec=10, stamp_nsec=100000000, capture_stamp_sec=10.1
+    )
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step) is None
 
 
 def test_episode_viewport_union_is_stable_when_known_map_expands() -> None:
@@ -334,7 +338,8 @@ def test_semantic_xy_target_only_keeps_rooms_and_hides_non_target_labels(monkeyp
         label_mode="interaction_target_only",
     )
 
-    assert "bedroom room" in drawn_labels
+    assert "bedroom" in drawn_labels
+    assert "bedroom room" not in drawn_labels
     assert "INTERACT #1 door_0001" in drawn_labels
     assert "#2 bed" not in drawn_labels
 
@@ -724,7 +729,8 @@ def test_room_panel_draws_room_name_at_room_center(monkeypatch) -> None:
         0,
         (0.0, 0.0, 10.0, 10.0),
     )
-    assert "Room 7: kitchen room" in labels
+    assert "Room 7: kitchen" in labels
+    assert "Room 7: kitchen room" not in labels
 
 
 def test_semantic_sidebar_orders_interact_navigate_explore(monkeypatch) -> None:

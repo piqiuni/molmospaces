@@ -177,6 +177,16 @@ attribute_inference:
   targeted_multiview_min_position_gap_m: 0.25
   targeted_multiview_min_yaw_gap_rad: 0.25
   target_bbox_mask_containment_required: true
+  # Portals need a complete lateral view before M1 can claim open or closed.
+  # The first stable full-frame detection is still only a candidate; the local
+  # two-frame streak below prevents a just-entered detection from authorizing
+  # state inference.
+  portal_m1_require_full_frame: true
+  portal_m1_border_margin_px: 2
+  portal_m1_required_consecutive_observations: 2
+  # Retain recent RGB frames so delayed detector packets can be paired by ID.
+  image_history_size: 32
+  targeted_refresh_timeout_s: 20.0
   # Door state is committed only after three consecutive equal M1 answers
   # from materially separated camera poses. A committed result suppresses M1
   # for this many evaluator steps; changing it requires the same evidence.

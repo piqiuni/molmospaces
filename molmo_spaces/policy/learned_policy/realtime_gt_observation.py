@@ -365,6 +365,8 @@ def _visible_fraction(
     image_size: list[int],
     center: np.ndarray,
     size: np.ndarray,
+    *,
+    visible_pixels: int | None = None,
 ) -> tuple[float, list[float] | None]:
     projected_bbox = _project_aabb_bbox(
         camera_position,
@@ -378,7 +380,16 @@ def _visible_fraction(
     projected_area = _bbox_area(projected_bbox or [])
     if projected_area <= 1e-6:
         return 0.0, projected_bbox
-    return min(1.0, _bbox_area(bbox_2d) / projected_area), projected_bbox
+    overlap = [
+        max(float(bbox_2d[0]), projected_bbox[0]),
+        max(float(bbox_2d[1]), projected_bbox[1]),
+        min(float(bbox_2d[2]), projected_bbox[2]),
+        min(float(bbox_2d[3]), projected_bbox[3]),
+    ]
+    visible_area = _bbox_area(overlap)
+    if visible_pixels is not None:
+        visible_area = min(visible_area, max(0, int(visible_pixels)))
+    return min(1.0, visible_area / projected_area), projected_bbox
 
 
 @dataclass
@@ -402,7 +413,7 @@ class RealtimeGTObservationPublisher:
         topic: str = "/semantic_mapping/gt_observations",
         camera_name: str = "head_camera",
         min_visible_pixels: int = 16,
-        min_visible_bbox_short_side_px: int = 1,
+        min_visible_bbox_short_side_px: int = 2,
         min_portal_bbox_short_side_px: int = 8,
         min_visible_fraction: float = 0.2,
         required_consecutive_observations: int = 2,
@@ -418,7 +429,7 @@ class RealtimeGTObservationPublisher:
         self.camera_name = str(camera_name)
         self.min_visible_pixels = max(1, int(min_visible_pixels))
         self.min_visible_bbox_short_side_px = max(
-            1, int(min_visible_bbox_short_side_px)
+            2, int(min_visible_bbox_short_side_px)
         )
         # Door/portal observations affect topology and planning, so require a
         # visibly two-dimensional component rather than accepting a long wall
@@ -563,6 +574,10 @@ class RealtimeGTObservationPublisher:
                         image_size,
                         center,
                         size,
+                        # Door frames surround empty apertures; mask fill is
+                        # not their observed extent. Resolved-component pixel
+                        # and width checks above still reject tiny fragments.
+                        visible_pixels=None if spec.is_door else visible_pixels,
                     )
                 except (AttributeError, TypeError, ValueError):
                     # Keep the geometry observation usable for custom cameras
@@ -623,6 +638,11 @@ class RealtimeGTObservationPublisher:
             "image_size": image_size,
             "observations": observations,
         }
+        # Preserve the exact source ROS identity; capture_stamp_sec remains
+        # the float wall clock used by latency accounting.
+        if stamp is not None and hasattr(stamp, "secs") and hasattr(stamp, "nsecs"):
+            payload["stamp_sec"] = int(stamp.secs)
+            payload["stamp_nsec"] = int(stamp.nsecs)
         self._submit_payload(payload)
         self._episode_reset_pending = False
         self.frame_index += 1
@@ -808,6 +828,14 @@ class RealtimeGTObservationPublisher:
                 else self.min_visible_bbox_short_side_px
             )
             if _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
+                continue
+            long_side = max(
+                bbox_2d[2] - bbox_2d[0] + 1,
+                bbox_2d[3] - bbox_2d[1] + 1,
+            )
+            # A diagonal or sparse edge can have a large bbox but no resolved
+            # surface. Require actual mask area to support its short extent.
+            if component_pixels < max(2, minimum_short_side) * long_side:
                 continue
             result.append(
                 (
