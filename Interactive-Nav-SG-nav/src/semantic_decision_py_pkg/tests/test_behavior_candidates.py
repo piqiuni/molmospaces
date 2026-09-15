@@ -1794,6 +1794,46 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_goal_distance_m"] > 0.35
 
 
+def test_visible_arrived_target_survives_blocked_navigation_anchor() -> None:
+    from dataclasses import asdict
+    from semantic_decision_py_pkg.mission_completion import TargetMissionTracker
+    from semantic_decision_py_pkg.behavior_execution import target_ready_for_graph_verification
+
+    generator = CandidateGenerator()
+    target = {
+        "id": "object_clock", "type": "object", "label": "alarm clock",
+        "aabb_center": [8.954, 5.337, .188], "parent_id": "container_drawers",
+        "is_currently_visible": True,
+        "attributes": {"visible_pixels": 391, "visible_fraction": .74,
+                       "consecutive_observations": 9},
+    }
+    graph = {"nodes": [
+        {"id": "container_drawers", "type": "container", "label": "dresser",
+         "aabb_center": [8.768, 5.54, .5], "aabb_size": [1.5, 1., 1.]}, target
+    ], "edges": [{"src_id": "container_drawers", "dst_id": "object_clock", "relation": "contains"}]}
+    context = {"enabled": True, "object_labels": ["alarm clock"],
+               "success_distance_threshold_m": 1.5}
+    checked = []
+
+    def blocked(goal, tolerance, **kwargs):
+        checked.append(goal)
+        return {"clear": False, "reason": "arrival_region_blocked"}
+
+    candidates = generator.generate({}, graph, (8.471, 5.535), context, clearance_check=blocked)
+    target_candidate = next(c for c in candidates if c.metadata.get("target_goal"))
+    assert target_candidate.metadata["target_goal_distance_m"] > .35
+    assert target_candidate.metadata["target_navigation_required"] is False
+    assert TargetMissionTracker.visible_arrived_target(asdict(target_candidate))
+    assert target_ready_for_graph_verification(asdict(target_candidate))
+    assert target_candidate.goal_xyyaw not in checked
+
+    for robot_xy, visible in [((6., 5.535), True), ((8.471, 5.535), False)]:
+        target["is_currently_visible"] = visible
+        candidates = generator.generate({}, graph, robot_xy, context, clearance_check=blocked)
+        assert not any(c.metadata.get("target_goal") for c in candidates)
+        assert any(r["candidate_id"] == "target:object_clock" for r in generator.clearance_rejections)
+
+
 def test_contained_target_navigation_anchors_outside_parent_container() -> None:
     generator = CandidateGenerator()
     graph = {

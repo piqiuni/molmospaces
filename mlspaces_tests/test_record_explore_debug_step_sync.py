@@ -15,7 +15,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROS_SRC = REPO_ROOT / "Interactive-Nav-SG-nav" / "src"
 RECORDER_SCRIPT_DIR = ROS_SRC / "explore_py_pkg" / "scripts"
-for path in (ROS_SRC, RECORDER_SCRIPT_DIR):
+for path in (ROS_SRC, RECORDER_SCRIPT_DIR, REPO_ROOT / "scripts/InteractiveNav"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -668,6 +668,7 @@ def test_frozen_grid_renders_path_and_room_panels_without_cell_payload() -> None
         frontier_check_radius_m=1.0,
         plan_goal_match_tolerance_m=1.0,
         semantic_video_max_object_nodes=96,
+        semantic_focus_mode="object_goal",
     )
     recorder.latest_pose = None
     recorder.latest_global_plan = None
@@ -817,6 +818,45 @@ def test_raw_writer_persists_receipts_and_step_boundary_off_callback_thread(tmp_
         assert step_rows[0]["receipts"] == {"raw_occ": "raw_occ:0"}
     finally:
         writer.close()
+
+
+def test_compact_gzip_boundaries_are_live_drainable_and_replayable(tmp_path: Path) -> None:
+    from scripts.InteractiveNav.wait_for_recorder_drain import count_jsonl_records
+    from scripts.InteractiveNav.build_semantic_video_offline import load_jsonl
+
+    original = {
+        "step_index": 7, "unified_graph": {"nodes": [{"id": "door_1"}]},
+        "semantic_candidates": {"candidates": [{"candidate_id": "cross_1"}], "graph_context": {"duplicate": True}},
+        "semantic_decision_trace": {"verbose": "x" * 10000, "terminal_no_plan_exit": {"armed": True}},
+        "semantic_execution_state": {"state": "RUNNING"}, "receipts": {"raw_occ": "raw_occ:1"},
+    }
+    raw_dir = tmp_path / "raw"
+    writer = _AsyncRawRecordingWriter(raw_dir, max_queue=4, compress_steps=True, compact_steps=True)
+    try:
+        for step in range(20):
+            assert writer.enqueue_step_boundary(dict(original, step_index=step))
+        writer.jobs.join()
+        assert count_jsonl_records(raw_dir / "step_boundaries.jsonl") == 20
+        writer.close()
+        rows = load_jsonl(raw_dir / "step_boundaries.jsonl")
+        assert len(rows) == 20
+        assert rows[-1]["unified_graph"] == original["unified_graph"]
+        assert rows[-1]["receipts"] == original["receipts"]
+        assert rows[-1]["semantic_execution_state"] == original["semantic_execution_state"]
+        assert rows[-1]["semantic_candidates"]["candidates"] == original["semantic_candidates"]["candidates"]
+        assert "graph_context" not in rows[-1]["semantic_candidates"]
+        assert rows[-1]["semantic_decision_trace"] == {"terminal_no_plan_exit": {"armed": True}}
+        assert "graph_context" in original["semantic_candidates"]
+        assert not (raw_dir / "step_boundaries.jsonl").exists()
+        assert writer.stats_snapshot()["write_failed"] == {}
+    finally:
+        writer.close()
+
+
+def test_disabled_event_recording_does_not_open_a_file() -> None:
+    recorder = ExploreDebugRecorder.__new__(ExploreDebugRecorder)
+    recorder.events_file = None
+    recorder._write_event("test", {"payload": "unused"})
 
 
 def test_raw_encoder_preserves_room_labels_and_costmap_values_above_100() -> None:

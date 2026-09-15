@@ -3099,3 +3099,52 @@ def test_blocked_mllm_attribute_patch_survives_later_observation() -> None:
     assert interaction["traversable"] is False
     assert interaction["requires_interaction"] is False
     assert interaction["failure_reason"] == "visual_no_operable_door_leaf"
+def test_confirmed_room_split_shrinks_old_box_after_stability_window():
+    from types import SimpleNamespace
+    store = InteractionGraphStore()
+    info = SimpleNamespace(width=4, height=1, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    store.update_room_grid(info, [1, 1, 1, 1], [100] * 4, geometry_stability_frames=3)
+    for _ in range(2):
+        store.update_room_grid(info, [1, 1, 2, 2], [100] * 4, geometry_stability_frames=3)
+        node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+        assert node["aabb_size"][0] == 4.0
+    store.update_room_grid(info, [1, 1, 2, 2], [100] * 4, geometry_stability_frames=3)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert node["aabb_size"][0] == 2.0
+    assert node["aabb_center"][0] == 1.0
+
+
+def test_unknown_loss_and_unrelated_new_room_do_not_authorize_shrink():
+    from types import SimpleNamespace
+    info = SimpleNamespace(width=4, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    previous = {"info": info, "scene_data": [1, 1, -1, -1]}
+    assert not InteractionGraphStore._rooms_with_transferred_cells(previous, info, [1, -1, -1, 2])
+    shifted = SimpleNamespace(width=3, resolution=1.0,
+                              origin=SimpleNamespace(position=SimpleNamespace(x=1., y=0.)))
+    assert InteractionGraphStore._rooms_with_transferred_cells(previous, shifted, [2, -1, -1]) == {1}
+def test_l_shaped_room_box_contains_its_cells_instead_of_using_the_cell_mean():
+    from types import SimpleNamespace
+    info = SimpleNamespace(width=3, height=3, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    store = InteractionGraphStore()
+    labels = [1, 1, 1, 1, -1, -1, 1, -1, -1]
+    store.update_room_grid(info, labels, [100] * 9, geometry_stability_frames=1)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert node["aabb_center"][:2] == [1.5, 1.5]
+    assert node["aabb_size"][:2] == [3.0, 3.0]
+
+
+def test_rotated_room_box_includes_full_cell_corners():
+    from types import SimpleNamespace
+    import math
+    info = SimpleNamespace(width=1, height=1, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.),
+                               orientation=SimpleNamespace(x=0., y=0., z=math.sin(math.pi/8), w=math.cos(math.pi/8))))
+    store = InteractionGraphStore()
+    store.update_room_grid(info, [1], [100], geometry_stability_frames=1)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert abs(node["aabb_center"][0]) < 1e-9
+    assert abs(node["aabb_center"][1] - math.sqrt(.5)) < 1e-9
+    assert all(abs(v - math.sqrt(2)) < 1e-9 for v in node["aabb_size"][:2])

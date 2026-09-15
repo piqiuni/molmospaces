@@ -67,7 +67,7 @@ if _SEMANTIC_SCRIPTS.is_dir() and str(_SEMANTIC_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SEMANTIC_SCRIPTS))
 DEFAULT_BENCHMARK_ROOT = Path(
     "/home/ldl/molmospaces/scripts/InteractiveNav/output/"
-    "interactive_nav_v3_procthor10k_val_release_v1_1/benchmark"
+    "interactive_nav_v3_procthor10k_val_release_v1_2/benchmark"
 )
 DOMAIN_NAMES = ("channel", "container", "mixed")
 

@@ -52,7 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BENCHMARK_ROOT = Path(
     "/home/ldl/molmospaces/scripts/InteractiveNav/output/"
-    "interactive_nav_v3_procthor10k_val_release_v1_1/benchmark"
+    "interactive_nav_v3_procthor10k_val_release_v1_2/benchmark"
 )
 DEFAULT_V3_RUNNER = SCRIPT_DIR / "run_interactive_nav_v3_ros_eval_test.zsh"
 DEFAULT_RAW_RUNNER = SCRIPT_DIR / "run_house7_semantic_exploration_ros_test.zsh"

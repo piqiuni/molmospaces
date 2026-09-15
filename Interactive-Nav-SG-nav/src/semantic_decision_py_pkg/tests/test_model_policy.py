@@ -336,7 +336,7 @@ def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
         {"type": "refrigerator", "distance_m": 0.8, "visible": True}
     ]
     assert "expected_visible_unknown_area_m2" in request["instruction"]
-    assert "distance only as a tie-break" in request["instruction"]
+    assert "distance breaks ties" in request["instruction"]
 
 
 def test_model_request_contains_only_semantic_candidate_fields_and_distance() -> None:
@@ -646,7 +646,7 @@ def test_model_request_exposes_pre_score_and_route_hint_without_geometry() -> No
     assert option["pre_score_terms"] == {"topology_priority": 1.35}
     assert option["decision_hint"] == "NEXT_ROUTE_PORTAL"
     assert request["schema_version"] == 4
-    assert "NEXT_ROUTE_PORTAL before a remote container" in request["instruction"]
+    assert "NEXT_ROUTE_PORTAL when observed topology establishes a prerequisite route" in request["instruction"]
     assert "goal_xyyaw" not in str(request)
     assert "private_joint" not in str(request)
 
@@ -940,7 +940,7 @@ def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_pos
         {"entered_room_ids": ["room_1"]},
     )
     assert request["robot"]["entered_rooms"] == ["room_1"]
-    assert "room_status=unentered_new_room" in request["instruction"]
+    assert "compatible or unknown unentered rooms" in request["instruction"]
 
     traversal = BehaviorCandidate(
         candidate_id="traverse:portal_1",
@@ -1072,9 +1072,11 @@ def test_two_stage_room_object_context_links_apple_to_observed_kitchen_fridge() 
             "connects": ["room_kitchen", "room_bedroom"],
         }
     ]
-    assert "STAGE 1 (OBSERVED_ROOM_OBJECT_PLAUSIBILITY)" in request["instruction"]
-    assert "STAGE 2 (EXECUTABLE_CANDIDATE_RANKING)" in request["instruction"]
-    assert "return only the final Stage 2 JSON" in request["instruction"]
+    stages = ["1. EVIDENCE", "2. DEPENDENCIES", "3. COMPATIBILITY", "4. PROGRESS", "5. VALIDATE"]
+    positions = [request["instruction"].index(stage) for stage in stages]
+    assert positions == sorted(positions)
+    assert "return only the final JSON, not the reasoning" in request["instruction"]
+    assert "A toilet cannot be inside a refrigerator" in request["instruction"]
 
 
 def test_room_object_reasoning_context_caps_observed_graph_evidence() -> None:

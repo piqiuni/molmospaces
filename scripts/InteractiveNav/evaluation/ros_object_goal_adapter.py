@@ -136,6 +136,7 @@ _PERCEPTION_TOP_LEVEL_KEYS = frozenset(
         "episode_reset",
         "capture_step",
         "stamp_sec",
+        "observation_pose_xyyaw",
         "observations",
     }
 )
@@ -189,6 +190,7 @@ _TARGET_CONTEXT_KEYS = frozenset(
         "min_visible_pixels",
         "min_visible_fraction",
         "min_consecutive_observations",
+        "success_distance_threshold_m",
         "completion_requires_visibility",
         "require_current_visibility",
     }
@@ -423,6 +425,8 @@ def _validate_perception_header(payload: Mapping[str, Any]) -> list[Any]:
             "perception payload contains forbidden top-level field(s): "
             + ", ".join(sorted(unexpected_top_level))
         )
+    if "observation_pose_xyyaw" in payload:
+        _float_vector(payload["observation_pose_xyyaw"], size=3, field_name="observation_pose_xyyaw")
     observations = payload.get("observations")
     if not isinstance(observations, list):
         raise RestrictedGTContractError("perception payload observations must be a list")
@@ -703,6 +707,7 @@ def build_public_target_context(
     min_consecutive_observations: int = 1,
     completion_requires_visibility: bool = True,
     require_current_visibility: bool = False,
+    success_distance_threshold_m: float | None = None,
 ) -> dict[str, Any]:
     """Build the only target context sent to the ROS navigation method.
 
@@ -736,6 +741,8 @@ def build_public_target_context(
         "completion_requires_visibility": bool(completion_requires_visibility),
         "require_current_visibility": bool(require_current_visibility),
     }
+    if success_distance_threshold_m is not None:
+        context["success_distance_threshold_m"] = float(success_distance_threshold_m)
     validate_public_target_context(context)
     return context
 
@@ -811,6 +818,9 @@ class RosObjectGoalEvaluatorAdapter:
         self._target_publisher = None
         self._observations_publisher = None
         self._result_publisher = None
+        self._progress_publisher = None
+        self._executing_command_id = ""
+        self._last_progress_at = float("-inf")
         self._command_subscriber = None
         self._episode_id = ""
         self._episode_generation = 0
@@ -894,7 +904,13 @@ class RosObjectGoalEvaluatorAdapter:
             subscriber = self._command_subscriber
             self._command_subscriber = None
             self._started = False
+            progress_publisher = self._progress_publisher
+            self._progress_publisher = None
+            self._executing_command_id = ""
         unregister = getattr(subscriber, "unregister", None)
+        if callable(unregister):
+            unregister()
+        unregister = getattr(progress_publisher, "unregister", None)
         if callable(unregister):
             unregister()
 
@@ -952,6 +968,8 @@ class RosObjectGoalEvaluatorAdapter:
             self._private_instances = normalized_instances
             self._canonical_instance_ids = normalized_aliases
             self._pending_by_command_id.clear()
+            self._executing_command_id = ""
+            self._last_progress_at = float("-inf")
             self._pending_order.clear()
             self._seen_command_ids.clear()
             self._command_sequence = 0
@@ -1057,6 +1075,7 @@ class RosObjectGoalEvaluatorAdapter:
         *,
         capture_step: int | None = None,
         stamp_sec: float | None = None,
+        observation_pose_xyyaw: Sequence[float] | None = None,
     ) -> dict[str, Any]:
         """Publish the canonical V3 restricted-GT payload to semantic mapping.
 
@@ -1075,6 +1094,9 @@ class RosObjectGoalEvaluatorAdapter:
             capture_step=capture_step,
             stamp_sec=float(self._clock() if stamp_sec is None else stamp_sec),
         )
+        if observation_pose_xyyaw is not None:
+            adapted["observation_pose_xyyaw"] = [float(value) for value in observation_pose_xyyaw]
+            validate_semantic_minimal_perception_payload(adapted)
         with self._lock:
             if not self._episode_id:
                 raise RuntimeError("reset() must be called before publishing observations")
@@ -1097,8 +1119,29 @@ class RosObjectGoalEvaluatorAdapter:
                 command_id = self._pending_order.popleft()
                 request = self._pending_by_command_id.get(command_id)
                 if request is not None:
+                    self._executing_command_id = command_id
+                    self._last_progress_at = float("-inf")
                     return request
         return None
+
+    def report_interaction_progress(self) -> None:
+        """Report actual force/observation progress without inventing task steps."""
+        with self._lock:
+            request = self._pending_by_command_id.get(self._executing_command_id)
+            now = float(self._clock())
+            if request is None or not self._started or now - self._last_progress_at < 1.0:
+                return
+            if self._progress_publisher is None:
+                self._progress_publisher = self._rospy.Publisher(
+                    "/semantic_decision/interaction_action_feedback", self._String,
+                    queue_size=4,
+                )
+            self._progress_publisher.publish(self._String(data=json.dumps({
+                "status": "RUNNING", "execution_active": True,
+                "command_id": request.command_id, "decision_id": request.decision_id,
+                "object_id": request.instance_id, "progress_age_s": 0.0,
+            }, separators=(",", ":"))))
+            self._last_progress_at = now
 
     def complete_interaction(
         self,

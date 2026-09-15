@@ -32,6 +32,10 @@ PUBLIC_FAILURE_REASONS = frozenset(
         "interaction_approach_options_exhausted",
         "interaction_not_visible",
         "interaction_pose_invalid",
+        "interaction_wrong_face",
+        "interaction_front_unverified",
+        "interaction_position_misaligned",
+        "interaction_orientation_misaligned",
         "interaction_pose_poll_exhausted",
         "interaction_too_far",
         "interaction_unsupported",
@@ -229,6 +233,7 @@ def sanitize_public_interaction_command(payload: Mapping[str, Any]) -> dict[str,
         "expected_state",
         "sequence_type",
         "operation_method",
+        "interaction_front_axis_source",
     ):
         value = payload.get(key)
         if value is not None:
@@ -237,6 +242,7 @@ def sanitize_public_interaction_command(payload: Mapping[str, Any]) -> dict[str,
         ("approach_goal_xyyaw", 3),
         ("interaction_approach_pose_xyyaw", 3),
         ("interaction_approach_axis_xy", 2),
+        ("interaction_target_center_xy", 2),
     ):
         vector = _finite_vector(payload.get(key), size=size)
         if vector:
@@ -244,10 +250,16 @@ def sanitize_public_interaction_command(payload: Mapping[str, Any]) -> dict[str,
     for key in (
         "interaction_ready_distance_m",
         "interaction_ready_yaw_tolerance_rad",
+        "navigation_goal_position_tolerance_m",
+        "navigation_goal_yaw_tolerance_rad",
+        "interaction_front_position_tolerance_rad",
+        "interaction_front_yaw_tolerance_rad",
     ):
         numeric = _finite_float(payload.get(key), minimum=0.0)
         if numeric is not None:
             result[key] = numeric
+    if isinstance(payload.get("interaction_front_axis_validation_required"), bool):
+        result["interaction_front_axis_validation_required"] = payload["interaction_front_axis_validation_required"]
     aperture = sanitize_public_aperture_observation(
         payload.get("portal_aperture_observation")
     )
@@ -305,7 +317,7 @@ def validate_public_interaction_pose(
     distance_tolerance_m = max(
         0.05,
         _finite_float(
-            command.get("interaction_ready_distance_m", 0.45),
+            command.get("navigation_goal_position_tolerance_m", command.get("interaction_ready_distance_m", 0.45)),
             minimum=0.0,
         )
         or 0.45,
@@ -313,7 +325,7 @@ def validate_public_interaction_pose(
     yaw_tolerance_rad = max(
         0.05,
         _finite_float(
-            command.get("interaction_ready_yaw_tolerance_rad", 0.55),
+            command.get("navigation_goal_yaw_tolerance_rad", command.get("interaction_ready_yaw_tolerance_rad", 0.55)),
             minimum=0.0,
         )
         or 0.55,
@@ -321,8 +333,8 @@ def validate_public_interaction_pose(
     result: dict[str, Any] = {
         "checked": True,
         "valid": bool(
-            position_error_m <= distance_tolerance_m
-            and yaw_error_rad <= yaw_tolerance_rad
+            position_error_m <= distance_tolerance_m + 1e-3
+            and yaw_error_rad <= yaw_tolerance_rad + 1e-3
         ),
         "expected_pose_xyyaw": expected,
         "actual_pose_xyyaw": actual,
@@ -436,9 +448,12 @@ def sanitize_public_interaction_outcome(
     capability = str(source.get("interaction_capability") or "").strip().casefold()
     if capability in PUBLIC_CAPABILITIES:
         result["interaction_capability"] = capability
-    for key in ("interactable", "retryable"):
+    for key in ("interactable", "retryable", "reject_selected_face"):
         if isinstance(source.get(key), bool):
             result[key] = bool(source[key])
+    recovery = str(source.get("recovery_action") or "")
+    if recovery in {"select_other_face", "reobserve_front", "reposition_same_face", "realign_yaw"}:
+        result["recovery_action"] = recovery
     reason = sanitize_public_failure_reason(
         source.get("failure_reason") or source.get("reason")
     )

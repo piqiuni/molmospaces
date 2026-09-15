@@ -330,6 +330,9 @@ class RosBridgePolicyAdapter(ExternalPolicyAdapter):
                 )
         return normalize_policy_action(raw_action)
 
+    def publish_public_rgb_frame(self, observation: Any, *, stamp_sec: float) -> None:
+        self.policy.publish_public_rgb_frame(observation, stamp_sec=stamp_sec)
+
     def queue_step_frame_public_payload(self, payload: dict[str, Any]) -> bool:
         """Forward evaluator-owned public perception to the bridge recorder.
 

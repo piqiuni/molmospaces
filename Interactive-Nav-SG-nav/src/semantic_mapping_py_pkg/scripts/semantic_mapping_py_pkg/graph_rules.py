@@ -234,13 +234,13 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         raw_instance_id = str(observation.get("id") or "")
         is_portal = raw_semantic_name in PORTAL_LABELS or is_public_door_id(raw_instance_id)
         # A GT ``doorframe`` / ``doorway`` / ``door_leaf`` is an asset
-        # annotation.  Keep one generic door identity and the internal portal
-        # topology class on the public wire contract.
+        # annotation. Normalize its category while retaining an already opaque
+        # publisher ID shared by M1, the recorder and interaction commands.
         semantic_name = "portal" if is_portal else raw_semantic_name
         category = "door" if is_portal else semantic_name or "object"
         instance_id = (
             raw_instance_id
-            if is_public_door_id(raw_instance_id)
+            if is_public_door_id(raw_instance_id) or re.fullmatch(r"obj_[0-9]+", raw_instance_id)
             else opaque_door_instance_id(raw_instance_id)
             if is_portal
             else raw_instance_id

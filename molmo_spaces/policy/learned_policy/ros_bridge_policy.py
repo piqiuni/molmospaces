@@ -819,6 +819,22 @@ class RosBridgePolicy(BasePolicy):
             self._latest_gt_payload = payload
         return payload
 
+    def publish_public_rgb_frame(self, observation: Any, *, stamp_sec: float) -> None:
+        """Publish RGB for an evaluator-owned observation, including macro views.
+
+        This does not consume an action step or emit a recorder step marker.
+        The evaluator supplies the timestamp of the same-state public GT frame.
+        """
+        stamp = self._rospy.Time.from_sec(float(stamp_sec))
+        frame = self._extract_image_from_observation(observation)
+        if frame is None:
+            raise ValueError("Evaluator public observation has no RGB frame")
+        msg = self._to_image_msg(frame, stamp=stamp, seq=self._step_idx)
+        if msg is None:
+            raise ValueError("Cannot encode evaluator public RGB frame")
+        self._publish_odom_and_tf(observation, stamp)
+        self._obs_pub.publish(msg)
+
     def queue_step_frame_public_payload(self, payload: Mapping[str, Any]) -> bool:
         """Attach an already-published public perception frame to next RGB.
 

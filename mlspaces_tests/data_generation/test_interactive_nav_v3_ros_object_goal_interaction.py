@@ -1294,7 +1294,9 @@ def test_wrong_public_approach_yaw_is_retryable_and_skips_force(
 
     assert consumed is not None
     outcome = adapter.outcomes[-1]
-    assert outcome["failure_reason"] == "interaction_pose_invalid"
+    assert outcome["failure_reason"] == "interaction_orientation_misaligned"
+    assert outcome["recovery_action"] == "realign_yaw"
+    assert outcome["reject_selected_face"] is False
     assert outcome["verification_source"] == "executor_pose_precondition"
     assert outcome["retryable"] is True
     assert outcome["interaction_capability"] == "articulated"
@@ -1357,9 +1359,9 @@ def test_public_box_too_far_keeps_distinct_retryable_failure_reason(
 
 @pytest.mark.parametrize(
     ("direct_bbox_drawer_scan", "expected_fallback"),
-    [(False, False), (True, False)],
+    [(False, True), (True, True)],
 )
-def test_empty_drawer_regions_never_enumerate_hidden_slide_joints(
+def test_empty_drawer_regions_scan_entire_selected_container(
     monkeypatch: pytest.MonkeyPatch,
     direct_bbox_drawer_scan: bool,
     expected_fallback: bool,

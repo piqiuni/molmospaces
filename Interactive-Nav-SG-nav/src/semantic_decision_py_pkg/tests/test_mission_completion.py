@@ -753,3 +753,22 @@ def test_reliable_historical_target_remains_priority_navigation_candidate() -> N
 
     assert candidate is not None
     assert candidate["candidate_id"] == "target:object_lettuce"
+def test_visible_arrived_target_requires_live_complete_public_evidence():
+    from semantic_decision_py_pkg.mission_completion import TargetMissionTracker
+    candidate = {"behavior_type": "NAVIGATE", "metadata": {
+        "target_goal": True, "target_reliably_observed": True,
+        "target_visible_now": True, "target_goal_distance_m": .1,
+        "target_arrival_tolerance_m": .15}}
+    assert TargetMissionTracker.visible_arrived_target(candidate)
+    task_distance = {**candidate, "metadata": {**candidate["metadata"],
+        "target_goal_distance_m": .6, "target_object_distance_m": .64,
+        "target_success_distance_threshold_m": 1.5}}
+    assert TargetMissionTracker.visible_arrived_target(task_distance)
+    task_distance["metadata"]["target_object_distance_m"] = 1.5
+    assert not TargetMissionTracker.visible_arrived_target(task_distance)
+    for field, value in [("target_visible_now", False),
+                         ("target_reliably_observed", False),
+                         ("target_goal_distance_m", .2),
+                         ("target_goal_distance_m", float("nan"))]:
+        invalid = {**candidate, "metadata": {**candidate["metadata"], field: value}}
+        assert not TargetMissionTracker.visible_arrived_target(invalid)

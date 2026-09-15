@@ -23,6 +23,8 @@ def test_v3_runner_keeps_the_expanded_m1_budget_isolated() -> None:
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}" in source
     assert 'semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}"' in source
@@ -38,6 +40,8 @@ def test_v3_runner_bounds_observation_turns_and_gives_m1_worker_pool_headroom() 
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}" in source
     assert 'semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}"' in source
@@ -59,6 +63,8 @@ def test_v3_runner_matches_zero_padded_episode_result_directory() -> None:
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert 'EPISODE_INDEX_PADDED=$(printf \'%04d\' "${EPISODE_INDEX}")' in source
     assert '${EPISODE_INDEX_PADDED}_*/episode_result.json' in source

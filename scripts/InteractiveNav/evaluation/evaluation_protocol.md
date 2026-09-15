@@ -20,17 +20,15 @@ results.
 
 ## Fixed input
 
-The formal validation input is the runtime-qualified v1.1 release:
+The default evaluation input is the repaired v1.2 release:
 
 ```text
-scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json
+scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json
 ```
 
-The source candidate contained 3000 episodes.  After the frozen runtime quality
-gate, the formal scoring denominator is 2968: 1000 Channel, 976 Container and
-992 Mixed.  The 32 excluded candidate rows remain in
-`scoring/scoring_manifest.jsonl`; they are not policy failures and must not be
-included in aggregate metrics.  The evaluator must not modify the formal JSON.
+The repaired input contains 3000 episodes: 1000 each for Channel, Container and
+Mixed. The historical v1.1 release had 2968 episodes; its quality-gate signature
+must not be reused for v1.2. The evaluator must not modify the benchmark JSON.
 Each episode's `scene_modifications` is the authoritative initial
 object/articulation state.
 
@@ -68,6 +66,30 @@ names, joint names/indices, joint values, open/closed state, container
 relations, visibility privilege, oracle records, and task-selected instance
 IDs at this boundary.  The RLE remains compact on the ROS wire and semantic
 mapping counts it without materialising a dense mask.
+
+The public target context also carries `success_distance_threshold_m`, the
+task's distance criterion (1.5 m in the current release), without the selected
+target position or identity. The method compares this against the observed
+target position, not the distance to a container approach waypoint. The
+evaluator independently verifies the selected instance and strict distance
+inequality. Door frame/leaf render components belonging to one private asset
+instance share a public door identity; their combined mask does not expose the
+underlying component or joint names.
+
+A currently visible, reliably observed target already within the public arrival
+criterion remains eligible for completion verification even when its unused
+navigation standoff is blocked. This candidate requests verification without
+navigation; distant or currently invisible targets retain clearance checks.
+
+The current benchmark interaction profile bypasses refrigerator open-sweep
+preflight and uses ten observation steps after fully opening each drawer.
+An object-goal completion claim during opening is deferred until that drawer
+has completed these ten observation steps. A verified terminal interrupts the
+remaining scan before closing or restoring the view; its public final state is
+open. Pure exploration continues the full open-observe-close scan. Physical
+open success and required-interaction scoring remain separate from target
+discovery; a partly open drawer is not credited merely because its target can
+already be seen.
 
 ## Terminal conditions
 
@@ -228,7 +250,7 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
 
 ```bash
 MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
-  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
   --output-dir scripts/InteractiveNav/output/v3_eval_current_ros_5x100 \
   --policy ros_bridge --ros-action-timeout-s 1.0 \
   --no-require-runtime-goal-consistency \
@@ -282,7 +304,7 @@ Then run one evaluator process against that ROS master:
 
 ```bash
 MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
-  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
   --output-dir scripts/InteractiveNav/output/v3_eval_object_goal_rule_smoke \
   --policy ros_object_goal_rule --workers 1 \
   --ros-action-timeout-s 1.0 --max-steps 500 --max-episodes 5

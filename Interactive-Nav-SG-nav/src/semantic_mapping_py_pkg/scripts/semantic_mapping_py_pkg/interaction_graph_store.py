@@ -487,6 +487,7 @@ class InteractionGraphStore:
         )
         self.room_geometries = {}
         self.room_geometry_candidates = {}
+        self._room_split_shrink_allowed = set()
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
@@ -515,6 +516,7 @@ class InteractionGraphStore:
             self.source_mode = str(source_mode)
         self.room_geometries = {}
         self.room_geometry_candidates = {}
+        self._room_split_shrink_allowed = set()
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
@@ -562,6 +564,9 @@ class InteractionGraphStore:
                 confidence_data,
             )
         )
+        if previous_grid is not None and not cache_hit:
+            self._room_split_shrink_allowed.update(
+                self._rooms_with_transferred_cells(previous_grid, grid_info, scene_data))
         self.last_room_grid_cache_hit = cache_hit
         if cache_hit:
             # Retain the store-owned immutable copies from the previous call;
@@ -1899,6 +1904,9 @@ class InteractionGraphStore:
         node.type = observed_node_type
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
+        if minimal_gt and node.type == "portal":
+            node.label = "door"
+            node.name = "door"
         observed_aabb_center = list(observation["aabb_center"])
         observed_aabb_size = list(observation["aabb_size"])
         aabb_reused_previous = False
@@ -2208,14 +2216,17 @@ class InteractionGraphStore:
             xs = world_x[member_mask]
             ys = world_y[member_mask]
             cell_count = int(member_mask.sum())
+            # Bounds use the midpoint of extrema, not the cell centroid: for
+            # an L-shaped room the latter shifts the box off its own cells.
             center = [
-                float(xs.mean()),
-                float(ys.mean()),
+                float((xs.min() + xs.max()) * 0.5),
+                float((ys.min() + ys.max()) * 0.5),
                 0.5 * self.room_box_height,
             ]
+            cell_extent = resolution * (abs(cos_yaw) + abs(sin_yaw))
             size = [
-                max(resolution, float(xs.max() - xs.min()) + resolution),
-                max(resolution, float(ys.max() - ys.min()) + resolution),
+                max(resolution, float(xs.max() - xs.min()) + cell_extent),
+                max(resolution, float(ys.max() - ys.min()) + cell_extent),
                 self.room_box_height,
             ]
             room_confidence_mask = member_mask & confidence_available
@@ -2408,6 +2419,34 @@ class InteractionGraphStore:
             )
         )
 
+    @staticmethod
+    def _rooms_with_transferred_cells(previous, info, labels):
+        """Only observed reassignment, not unknown-map loss, permits shrinkage."""
+        old_info = previous["info"]
+        resolution = float(info.resolution)
+        yaw = grid_origin_yaw(info)
+        if resolution <= 0 or abs(float(old_info.resolution) - resolution) > 1e-8:
+            return set()
+        if abs(grid_origin_yaw(old_info) - yaw) > 1e-8:
+            return set()
+        old_origin, new_origin = old_info.origin.position, info.origin.position
+        dx, dy = old_origin.x - new_origin.x, old_origin.y - new_origin.y
+        offsets = ((math.cos(yaw) * dx + math.sin(yaw) * dy) / resolution,
+                   (-math.sin(yaw) * dx + math.cos(yaw) * dy) / resolution)
+        if any(abs(value - round(value)) > 1e-4 for value in offsets):
+            return set()
+        x, y = (int(round(value)) for value in offsets)
+        old = np.asarray(previous["scene_data"]).reshape(-1, int(old_info.width))
+        new = np.asarray(labels).reshape(-1, int(info.width))
+        left, bottom = max(0, x), max(0, y)
+        right, top = min(new.shape[1], x + old.shape[1]), min(new.shape[0], y + old.shape[0])
+        if right <= left or top <= bottom:
+            return set()
+        old = old[bottom-y:top-y, left-x:right-x]
+        new = new[bottom:top, left:right]
+        transferred = (old >= 0) & (new >= 0) & (old != new)
+        return set(np.unique(old[transferred]).tolist())
+
     def _accept_room_geometry(self, room_id, center, size, stability_frames):
         candidate = self.room_geometry_candidates.get(room_id)
         if candidate is None:
@@ -2424,6 +2463,29 @@ class InteractionGraphStore:
             }
             self.room_geometry_candidates[room_id] = candidate
             return list(center), list(size)
+
+        # A confirmed split can transfer cells to another room.  Preserve
+        # temporal filtering, but allow a stable smaller footprint to replace
+        # the historical envelope instead of containing the new room forever.
+        shrinks = any(float(size[i]) < float(candidate["accepted_size"][i]) - 1e-6
+                      for i in (0, 1))
+        if shrinks and room_id in getattr(self, "_room_split_shrink_allowed", set()):
+            previous = candidate.get("shrink_proposal")
+            if previous and self._room_geometry_relock_close(
+                previous["center"], previous["size"], center, size
+            ):
+                count = previous["count"] + 1
+            else:
+                count = 1
+            candidate["shrink_proposal"] = {
+                "center": list(center), "size": list(size), "count": count}
+            if count >= max(1, int(stability_frames)):
+                candidate.update(center=list(center), size=list(size), count=0,
+                                 accepted_center=list(center), accepted_size=list(size))
+                candidate.pop("shrink_proposal", None)
+                self._room_split_shrink_allowed.discard(room_id)
+            return list(candidate["accepted_center"]), list(candidate["accepted_size"])
+        candidate.pop("shrink_proposal", None)
 
         proposed_center, proposed_size = self._expanded_room_geometry(
             candidate["accepted_center"],

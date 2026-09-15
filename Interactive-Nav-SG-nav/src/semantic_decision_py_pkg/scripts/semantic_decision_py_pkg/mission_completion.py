@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .behavior_candidates import BehaviorCandidate
+from .behavior_candidates import BehaviorCandidate, target_observation_satisfies_arrival
 
 
 @dataclass
@@ -624,6 +624,13 @@ class TargetMissionTracker:
 
     def reset(self) -> None:
         self.pending_interaction: dict[str, str] | None = None
+
+    @staticmethod
+    def visible_arrived_target(candidate: dict[str, Any] | None) -> bool:
+        """Use the same public visibility and arrival evidence as target navigation."""
+        if not candidate or candidate.get("behavior_type") != "NAVIGATE":
+            return False
+        return target_observation_satisfies_arrival(candidate.get("metadata") or {})
 
     @staticmethod
     def priority_target_candidate(

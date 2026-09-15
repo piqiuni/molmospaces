@@ -581,7 +581,7 @@ class SemanticRuleDecisionNode:
                 timeout_s=float(model_config.get("timeout_s", 3.0)),
                 temperature=float(model_config.get("temperature", 0.0)),
                 max_tokens=int(model_config.get("max_tokens", 96)),
-                reasoning_effort=str(model_config.get("reasoning_effort", "off")),
+                reasoning_effort=str(model_config.get("selection_reasoning_effort", model_config.get("reasoning_effort", "off"))),
                 image_detail=str(model_config.get("image_detail", "low")),
                 max_graph_nodes=int(model_config.get("max_graph_nodes", 80)),
                 max_graph_edges=int(model_config.get("max_graph_edges", 160)),
@@ -921,6 +921,23 @@ class SemanticRuleDecisionNode:
                 self.priority_target_candidate_id = str(
                     priority_target.get("candidate_id") or ""
                 )
+            if (
+                self.mission_mode == "semantic_interaction_object_goal"
+                and not self.goal_complete
+                and self.active_behavior_type == "INTERACT"
+                and self.target_context.get("enabled")
+                and not self.target_context.get("require_interaction", False)
+                and self.target_mission.visible_arrived_target(priority_target)
+            ):
+                self.target_goal_complete = True
+                self.goal_complete = True
+                self._publish_goal_status("SUCCEEDED", detail={
+                    "reason": "target_goal_succeeded",
+                    "completion_source": "interaction_public_target_observation",
+                    "node_id": priority_target.get("target_id"),
+                    "candidate_sequence": payload.get("sequence"),
+                    **dict(priority_target.get("metadata") or {}),
+                })
             if (
                 priority_target is not None
                 and self.active_candidate_id

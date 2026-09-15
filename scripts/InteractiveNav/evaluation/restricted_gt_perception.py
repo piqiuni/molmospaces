@@ -525,6 +525,8 @@ def normalize_semantic_category(category: Any, *, fallback_source_name: str | No
     """
 
     normalized = _clean_semantic_text(category)
+    if normalized in {"door", "doorway", "doorframe", "door frame", "door leaf", "door_leaf"}:
+        return "door"
     if normalized:
         return _CATEGORY_ALIASES.get(normalized, normalized)
     source = _clean_semantic_text(fallback_source_name)
@@ -779,7 +781,61 @@ def build_private_object_specs_from_env(env: Any) -> list[PrivateObjectSpec]:
                 semantic_category=None if category is None else str(category),
             )
         )
-    return specs
+    return _canonicalize_door_specs(model, specs)
+
+
+def _canonicalize_door_specs(model: Any, specs: list[PrivateObjectSpec]) -> list[PrivateObjectSpec]:
+    """Unify frame/leaf render geometry using private asset identity, never proximity."""
+    from dataclasses import replace
+    import re
+
+    door_indices = [i for i, spec in enumerate(specs)
+                    if normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name) == "door"]
+    parents = list(range(len(specs)))
+    def root(index):
+        while parents[index] != index:
+            index = parents[index]
+        return index
+    def ancestors(body_id):
+        result = []
+        while body_id is not None and int(body_id) > 0 and int(body_id) not in result:
+            result.append(int(body_id))
+            if not hasattr(model, "body_parentid"):
+                break
+            body_id = int(model.body_parentid[int(body_id)])
+        return result
+    paths = {i: ancestors(specs[i].body_id) for i in door_indices}
+    def stem(name):
+        match = re.match(r"^(door\w*_.+)_(\d+)_\d+_(\d+)$", name)
+        return (match.group(1), match.group(2), match.group(3)) if match else None
+    for offset, i in enumerate(door_indices):
+        for j in door_indices[offset + 1:]:
+            same_tree = specs[i].body_id in paths[j] or specs[j].body_id in paths[i]
+            same_asset = stem(specs[i].source_name) is not None and stem(specs[i].source_name) == stem(specs[j].source_name)
+            if same_tree or same_asset:
+                parents[root(j)] = root(i)
+    groups = {}
+    for i in door_indices:
+        groups.setdefault(root(i), []).append(i)
+    merged = {i: group for group in groups.values() if len(group) > 1 for i in group}
+    if not merged:
+        return specs
+    mapping = _geom_to_spec_mapping(model, specs)
+    result = []
+    emitted = set()
+    for i, spec in enumerate(specs):
+        group = merged.get(i)
+        if group is None:
+            result.append(spec)
+            continue
+        key = root(i)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        canonical = min(group, key=lambda j: (len(paths[j]), specs[j].source_name))
+        geom_ids = tuple(np.flatnonzero(np.isin(mapping, group)).tolist())
+        result.append(replace(specs[canonical], geom_ids=geom_ids, semantic_category="door"))
+    return result
 
 
 def _mujoco_geom_object_type() -> int:
@@ -1017,7 +1073,7 @@ class RestrictedGTPerceptionPublisher:
         camera_name: str = "head_camera",
         topic: str = "/semantic_mapping/gt_observations",
         min_visible_pixels: int = 16,
-        min_bbox_area_pixels: int = 512,
+        min_bbox_area_pixels: int = 1,
         min_bbox_short_side_pixels: int = 1,
         min_portal_bbox_short_side_pixels: int = 8,
         min_visible_fraction: float = 0.2,

@@ -770,6 +770,9 @@ class SemanticBehaviorExecutor:
             0.0,
             float(config.get("rear_goal_local_costmap_max_age_s", 0.75)),
         )
+        self.container_anchor_blocked_confirmation_task_steps = max(
+            3, int(config.get("container_anchor_blocked_confirmation_task_steps", 3))
+        )
         self.rear_goal_robot_radius_m = max(
             0.0,
             float(config.get("rear_goal_robot_radius_m", 0.25)),
@@ -3801,15 +3804,20 @@ class SemanticBehaviorExecutor:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return
         with self.lock:
+            stamp_options = {"stamp_sec": float(payload["stamp_sec"])} if payload.get("stamp_sec") is not None else {}
+            matched_rgb = False
             if self.startup_scan_enabled:
-                self._startup_scan_gate.record_fresh_gate(step_index)
+                matched_rgb |= bool(self._startup_scan_gate.record_fresh_gate(step_index, **stamp_options))
             if self.rear_goal_prerotate_step_sync_enabled:
-                self._rear_goal_prerotate_gate.record_fresh_gate(step_index)
+                matched_rgb |= bool(self._rear_goal_prerotate_gate.record_fresh_gate(step_index, **stamp_options))
             if (
                 self.interaction_final_align_enabled
                 and self.interaction_final_align_step_sync_enabled
             ):
-                self._interaction_final_align_gate.record_fresh_gate(step_index)
+                matched_rgb |= bool(self._interaction_final_align_gate.record_fresh_gate(step_index, **stamp_options))
+            if matched_rgb:
+                self._latest_rgb_step_seq = step_index
+                self._latest_rgb_step_received_at = time.monotonic()
 
     def _image_callback(self, message: Image) -> None:
         try:
@@ -3817,29 +3825,28 @@ class SemanticBehaviorExecutor:
         except Exception:
             return
         try:
-            rgb_step_seq = int(message.header.seq)
+            rgb_stamp_sec = float(message.header.stamp.to_sec())
         except (AttributeError, TypeError, ValueError):
-            rgb_step_seq = None
+            rgb_stamp_sec = None
         received_at = time.monotonic()
         with self.lock:
             self.latest_image = image.copy()
             self.latest_image_sequence += 1
-            if rgb_step_seq is not None:
-                self._latest_rgb_step_seq = rgb_step_seq
-                self._latest_rgb_step_received_at = received_at
+            if rgb_stamp_sec is not None:
+                matched_steps = []
                 if self.startup_scan_enabled:
-                    self._startup_scan_gate.record_rgb(rgb_step_seq, now=received_at)
+                    matched_steps.append(self._startup_scan_gate.record_rgb_stamp(rgb_stamp_sec, now=received_at))
                 if self.rear_goal_prerotate_step_sync_enabled:
-                    self._rear_goal_prerotate_gate.record_rgb(
-                        rgb_step_seq, now=received_at
-                    )
+                    matched_steps.append(self._rear_goal_prerotate_gate.record_rgb_stamp(rgb_stamp_sec, now=received_at))
                 if (
                     self.interaction_final_align_enabled
                     and self.interaction_final_align_step_sync_enabled
                 ):
-                    self._interaction_final_align_gate.record_rgb(
-                        rgb_step_seq, now=received_at
-                    )
+                    matched_steps.append(self._interaction_final_align_gate.record_rgb_stamp(rgb_stamp_sec, now=received_at))
+                paired_steps = [step for step in matched_steps if step is not None]
+                if paired_steps:
+                    self._latest_rgb_step_seq = max(paired_steps)
+                    self._latest_rgb_step_received_at = received_at
 
     @staticmethod
     def _decode_ros_image(message: Image):
@@ -7049,6 +7056,7 @@ class SemanticBehaviorExecutor:
             if blocked_samples >= max_steps or (started_step is not None and step is not None and step - started_step >= wait_budget):
                 break
         return False, {**samples[-1], "clearance_confirmation_samples": samples,
+                       "consecutive_blocked_samples": blocked_samples,
                        "clearance_confirmation_inconclusive": blocked_samples < max_steps,
                        "clearance_confirmation_task_steps": max_steps, "clearance_recovered_after_stop": False}
 

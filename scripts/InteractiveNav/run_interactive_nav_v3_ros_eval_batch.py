@@ -55,6 +55,14 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
+    "RECORDER_SAVE_EVENTS": "false",
+    "RECORDER_COMPACT_STEPS": "true",
+    "RECORDER_COMPRESS_STEPS": "true",
+    "OFFLINE_SAVE_COMPOSITE_FRAMES": "false",
+    "ROS_LOG_LEVEL": "WARN",
+    "ROS_LOG_MAX_BYTES": "5242880",
+    "ROS_LOG_BACKUP_COUNT": "2",
     "METHOD": "full_mllm_object_goal",
     "POLICY": "ros_object_goal_rule",
     "MIN_STEPS": "300",
@@ -64,7 +72,7 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
     "DYNAMIC_CONTAINER_INTERACTION_STEPS": "200",
     "DYNAMIC_CONTAINER_JOINT_STEPS": "40",
     "DYNAMIC_STEP_QUANTUM": "50",
-    "VIDEO_FPS": "5",
+    "VIDEO_FPS": "15",
     "RECORD_HEAD_CAMERA": "false",
     "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS": "384",
     "ROS_ACTION_TIMEOUT_S": "0.2",
@@ -88,6 +96,7 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
     "ROS_SETUP": str(REPO_ROOT / "Interactive-Nav-SG-nav" / "devel" / "setup.bash"),
 }
 _RUNNER_FILE_ENV_KEYS = (
+    "EVAL_CONFIG",
     "SEMANTIC_DECISION_OVERRIDE",
     "SEMANTIC_MAPPING_OVERRIDE",
     "EXPLORE_PY_CONFIG_OVERRIDE",
@@ -212,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-indices", nargs="+", type=int, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base-master-port", type=int, default=12600)
-    parser.add_argument("--max-steps", type=int, default=1500)
+    parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument(
         "--step-budget-mode",
         choices=("dynamic", "fixed"),
@@ -457,6 +466,11 @@ def planned_invocation_payload(
         if record is None:
             return None
         file_settings[key] = record
+    for name in ("benchmark_eval.conf", "python_logging.conf"):
+        record = _file_digest_record(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation" / name)
+        if record is None:
+            return None
+        file_settings[name] = record
     semantic_model_env: dict[str, str] | None = None
     semantic_model_env_file = getattr(args, "semantic_model_env_file", None)
     if semantic_model_env_file is None:

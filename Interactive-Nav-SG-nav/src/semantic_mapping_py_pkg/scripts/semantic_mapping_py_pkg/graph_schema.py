@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Any
 
 
@@ -12,22 +11,11 @@ _PUBLIC_SOURCE_MODE = {
     "realtime_gt_observation": "geometry_observation",
     "gt_replay": "geometry_replay",
 }
-_PUBLIC_DOOR_ID_RE = re.compile(r"^door_(?:[0-9]{1,8}|x)$")
 
 
 def _public_source(value: Any) -> Any:
     text = str(value or "")
     return _PUBLIC_SOURCE_MODE.get(text, value)
-
-
-def _public_portal_display_name(node_id: Any, attributes: dict[str, Any]) -> str:
-    """Return the generic restricted-GT door label, if this node has one."""
-
-    for value in (attributes.get("instance_id"), node_id):
-        candidate = str(value or "").strip().casefold()
-        if _PUBLIC_DOOR_ID_RE.fullmatch(candidate):
-            return candidate
-    return "portal"
 
 
 def _as_float_list(values, size=3):
@@ -59,9 +47,8 @@ class SceneGraphNode:
     graph_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        public_portal_name = _public_portal_display_name(self.id, self.attributes)
-        public_label = public_portal_name if self.type == "portal" else self.label
-        public_name = public_portal_name if self.type == "portal" else self.name
+        public_label = "door" if self.type == "portal" else self.label
+        public_name = "door" if self.type == "portal" else self.name
         public_attributes = {
             key: _public_source(value) if key in {"source", "source_mode"} else value
             for key, value in dict(self.attributes).items()

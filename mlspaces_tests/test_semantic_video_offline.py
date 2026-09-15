@@ -14,6 +14,7 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(path))
 
 from scripts.InteractiveNav.build_semantic_video_offline import (
+    load_jsonl,
     align_exact_sim_records,
     align_nearest_timestamp_recorder_frames,
     episode_trajectory_prefix,
@@ -31,6 +32,20 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     route_target_at_stamp,
     select_causal_receipt,
 )
+
+
+def test_final_completion_update_preserves_compressed_manifest(tmp_path: Path) -> None:
+    import gzip
+    manifest = tmp_path / "step_boundaries.jsonl"
+    compressed = manifest.with_name(manifest.name + ".gz")
+    with gzip.open(compressed, "wt") as handle:
+        handle.write(json.dumps({"step_index": 3, "unified_graph": {"nodes": []}}) + "\n")
+    status = tmp_path / "completion_status.json"
+    status.write_text(json.dumps({"requested": True, "snapshot_wall_time": 12.0}))
+    assert persist_final_completion_status_to_raw_steps(manifest, status)
+    assert not manifest.exists()
+    assert load_jsonl(manifest)[0]["completion_status"]["requested"]
+    assert not persist_final_completion_status_to_raw_steps(manifest, status)
 import scripts.InteractiveNav.offline_semantic_renderer as offline_renderer
 from scripts.InteractiveNav.offline_semantic_renderer import (
     OfflineSixPanelRenderer,

@@ -786,6 +786,20 @@ class _AsyncArtifactWriter:
                     log_handle.close()
 
 
+def compact_step_boundary(record: dict) -> dict:
+    """Keep replay state, omitting duplicated model input and verbose reasoning."""
+    result = dict(record)
+    candidates = dict(result.get("semantic_candidates") or {})
+    candidates.pop("graph_context", None)
+    result["semantic_candidates"] = candidates
+    trace = result.get("semantic_decision_trace") or {}
+    result["semantic_decision_trace"] = {
+        key: trace[key] for key in ("terminal_no_plan_exit", "completion_status") if key in trace
+    }
+    result["storage_profile"] = "replay_compact_v1"
+    return result
+
+
 class _AsyncRawRecordingWriter:
     """Serialize raw PNG+JSON persistence away from ROS callback threads.
 
@@ -801,6 +815,8 @@ class _AsyncRawRecordingWriter:
         *,
         max_queue: int,
         overflow: str = "block",
+        compress_steps: bool = False,
+        compact_steps: bool = False,
     ) -> None:
         if overflow not in {"block", "drop"}:
             raise ValueError(f"unsupported raw recording overflow policy: {overflow}")
@@ -810,9 +826,15 @@ class _AsyncRawRecordingWriter:
         self.map_manifest = (self.raw_recording_dir / "map_manifest.jsonl").open(
             "a", buffering=1
         )
-        self.step_manifest = (self.raw_recording_dir / "step_boundaries.jsonl").open(
-            "a", buffering=1
+        self.compact_steps = compact_steps
+        self.step_manifest_path = self.raw_recording_dir / (
+            "step_boundaries.jsonl.gz" if compress_steps else "step_boundaries.jsonl"
         )
+        if compress_steps:
+            import gzip
+            self.step_manifest = gzip.open(self.step_manifest_path, "at", encoding="utf-8", compresslevel=3)
+        else:
+            self.step_manifest = self.step_manifest_path.open("a", buffering=1)
         self.overflow = str(overflow)
         self.jobs: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
         self._stats_lock = threading.RLock()
@@ -947,9 +969,12 @@ class _AsyncRawRecordingWriter:
             self._increment(self.persisted, stage)
 
     def _persist_step(self, stage: str, record: dict) -> None:
+        if self.compact_steps:
+            record = compact_step_boundary(record)
         self.step_manifest.write(
             json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+        self.step_manifest.flush()
         with self._stats_lock:
             self._increment(self.persisted, stage)
 
@@ -1746,6 +1771,8 @@ class ExploreDebugRecorder:
             self.raw_recording_dir,
             max_queue=int(getattr(args, "raw_record_queue_size", 64)),
             overflow=str(getattr(args, "raw_record_queue_overflow", "block")),
+            compress_steps=bool(getattr(args, "compress_step_boundaries", False)),
+            compact_steps=bool(getattr(args, "compact_step_boundaries", False)),
         )
         # Compatibility aliases for summary tooling; only the writer thread
         # touches these handles after construction.
@@ -1997,7 +2024,10 @@ class ExploreDebugRecorder:
             self.first_person_video_error = "cv2_or_numpy_unavailable"
             self._write_optional_dependency_warning()
 
-        self.events_file = (output_dir / "events.jsonl").open("a", buffering=1)
+        self.events_file = (
+            (output_dir / "events.jsonl").open("a", buffering=1)
+            if getattr(args, "save_events", True) else None
+        )
         self.trajectory_file = (output_dir / "trajectory.csv").open("a", newline="", buffering=1)
         self.subgoals_file = (output_dir / "subgoals.csv").open("a", newline="", buffering=1)
         self.status_file = (output_dir / "move_base_status.csv").open("a", newline="", buffering=1)
@@ -8515,6 +8545,8 @@ class ExploreDebugRecorder:
         return [self._json_safe_record(record) for record in self.subgoal_records if isinstance(record, dict)]
 
     def _write_event(self, event_type: str, payload: dict) -> None:
+        if self.events_file is None:
+            return
         row = {
             "type": event_type,
             "wall_time": time.time(),
@@ -8800,7 +8832,7 @@ class ExploreDebugRecorder:
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
                 "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
-                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                "raw_step_manifest": str(self.raw_writer.step_manifest_path),
                 # Legacy count is source callbacks received. The detailed
                 # breakdown below distinguishes queued, durable, and explicit
                 # drops/failures for every raw stream.
@@ -8825,7 +8857,8 @@ class ExploreDebugRecorder:
                 self.move_base_log_file,
                 self.semantic_events_file,
             ]:
-                handle.flush()
+                if handle is not None:
+                    handle.flush()
             with self.video_lock:
                 self._finalize_first_person_video_locked()
                 self._finalize_external_video_locked()
@@ -8932,7 +8965,7 @@ class ExploreDebugRecorder:
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
                 "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
-                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                "raw_step_manifest": str(self.raw_writer.step_manifest_path),
                 # Legacy count is source callbacks received. The detailed
                 # breakdown below distinguishes queued, durable, and explicit
                 # drops/failures for every raw stream.
@@ -9003,13 +9036,17 @@ class ExploreDebugRecorder:
                 self.move_base_log_file,
                 self.semantic_events_file,
             ]:
-                handle.close()
+                if handle is not None:
+                    handle.close()
         self.external_video_lock.release()
         self.video_lock.release()
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record explore_py runtime debug artifacts.")
+    parser.add_argument("--save-events", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compress-step-boundaries", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-step-boundaries", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-dir", default="", help="Directory for JSONL, CSV, and PNG overlays.")
     parser.add_argument("--occupancy-grid-topic", default="/struct_mapping/occ_map")
     parser.add_argument(

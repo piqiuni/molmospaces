@@ -174,11 +174,15 @@ def test_v3_restricted_frame_keeps_mask_rle_compact_on_semantic_wire() -> None:
         ],
     }
 
-    payload = adapter.publish_restricted_gt_frame(frame, capture_step=11, stamp_sec=42.0)
+    payload = adapter.publish_restricted_gt_frame(
+        frame, capture_step=11, stamp_sec=42.0,
+        observation_pose_xyyaw=[1.0, 2.0, 0.3],
+    )
 
     validate_semantic_minimal_perception_payload(payload)
     assert payload["capture_step"] == 11
     assert payload["stamp_sec"] == 42.0
+    assert payload["observation_pose_xyyaw"] == [1.0, 2.0, 0.3]
     observation = _payload(rospy.publishers[adapter.gt_observations_topic].messages[-1])["observations"][0]
     assert observation == {
         "id": "obj_000003",

@@ -13,6 +13,26 @@ BEHAVIOR_INTERACT = "INTERACT"
 BEHAVIOR_NAVIGATE = "NAVIGATE"
 BEHAVIOR_SCAN = "SCAN"
 
+
+def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
+    """Public target evidence can establish arrival without another navigation pose."""
+    if not all(metadata.get(key) for key in (
+        "target_goal", "target_reliably_observed", "target_visible_now"
+    )):
+        return False
+    try:
+        success_threshold = metadata.get("target_success_distance_threshold_m")
+        if success_threshold is not None:
+            distance = float(metadata["target_object_distance_m"])
+            threshold = float(success_threshold)
+            return math.isfinite(distance) and math.isfinite(threshold) and 0 <= distance < threshold
+        distance = float(metadata["target_goal_distance_m"])
+        tolerance = float(metadata["target_arrival_tolerance_m"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return math.isfinite(distance) and math.isfinite(tolerance) and 0 <= distance <= tolerance
+
+
 SPATIAL_CONTEXT_LABELS = {
     "bed",
     "bathtub",
@@ -370,9 +390,17 @@ class CandidateGenerator:
                         clearance_check=clearance_check,
                     )
                 )
+        for candidate in candidates:
+            if candidate.behavior_type == BEHAVIOR_NAVIGATE and target_observation_satisfies_arrival(candidate.metadata):
+                candidate.metadata["target_navigation_required"] = False
         if clearance_check is not None:
             admitted = []
             for candidate in candidates:
+                if candidate.behavior_type == BEHAVIOR_NAVIGATE and target_observation_satisfies_arrival(candidate.metadata):
+                    # This row requests observation verification, not motion to its
+                    # standoff pose, which may be obstructed by the open drawer.
+                    admitted.append(candidate)
+                    continue
                 if candidate.behavior_type in {BEHAVIOR_EXPLORE, BEHAVIOR_NAVIGATE} and candidate.goal_xyyaw:
                     tolerance = float(candidate.metadata.get("navigation_goal_position_tolerance_m", 0.25))
                     detail = clearance_check(candidate.goal_xyyaw, tolerance,
@@ -746,6 +774,12 @@ class CandidateGenerator:
                         "target_max_consecutive_observations": max_consecutive_observations,
                         "target_reliably_observed": reliably_observed,
                         "target_goal_distance_m": distance_m,
+                        "target_object_distance_m": (
+                            math.hypot(self._node_xy(node, prefer_aabb=True)[0] - robot_xy[0],
+                                       self._node_xy(node, prefer_aabb=True)[1] - robot_xy[1])
+                            if self._node_xy(node, prefer_aabb=True) is not None else None
+                        ),
+                        "target_success_distance_threshold_m": target_context.get("success_distance_threshold_m"),
                         "target_arrival_tolerance_m": target_arrival_tolerance_m,
                         "target_navigation_required": (
                             distance_m > target_arrival_tolerance_m

@@ -43,6 +43,7 @@ def _install_ros_import_stubs(monkeypatch) -> None:
             self.data = data
 
     _stub_module(monkeypatch, "actionlib", SimpleActionClient=_Placeholder)
+    _stub_module(monkeypatch, "rospy.numpy_msg", numpy_msg=lambda message_type: message_type)
     _stub_module(
         monkeypatch,
         "rospy",
@@ -4260,7 +4261,7 @@ def test_rear_prerotate_pairs_rgb_with_the_fresh_bridge_window(
     executor._latest_rgb_step_seq = None
     executor._latest_rgb_step_received_at = 0.0
     image = SimpleNamespace(
-        header=SimpleNamespace(seq=37),
+        header=SimpleNamespace(seq=93, stamp=SimpleNamespace(to_sec=lambda: 100.25)),
         encoding="bgr8",
         height=1,
         width=1,
@@ -4271,7 +4272,7 @@ def test_rear_prerotate_pairs_rgb_with_the_fresh_bridge_window(
     executor._image_callback(image)
     assert executor._rear_goal_prerotate_gate.consume_step() is None
     executor._fresh_command_gate_callback(
-        SimpleNamespace(data=json.dumps({"step_index": 37}))
+        SimpleNamespace(data=json.dumps({"step_index": 37, "stamp_sec": 100.25}))
     )
     assert executor._rear_goal_prerotate_gate.consume_step() == 37
     assert executor._interaction_final_align_gate.consume_step() == 37

@@ -221,6 +221,9 @@ class MLLMClient:
                 body_payload["reasoning_effort"] = reasoning_effort
             if self._thinking_disabled(config):
                 body_payload["enable_thinking"] = False
+            else:
+                body_payload["enable_thinking"] = True
+                body_payload["chat_template_kwargs"] = {"enable_thinking": True}
         is_openai_chat = protocol in {"openai_chat", "chat_completions", "openai"}
         if is_openai_chat:
             body_payload["stream"] = True

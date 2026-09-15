@@ -2,6 +2,27 @@
 
 最后更新：2026-09-15
 
+### 2026-09-15: 轻量录制配置与动态预算
+
+- 配置入口：`scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf`，详细说明见同目录 `README.md`。单场命令只需输出目录与 episode index；可用第三个参数传入 Bash 覆盖配置。
+- 默认动态预算、上限 2000；关闭 `events.jsonl` 与离线六宫格 PNG，保存精简且 gzip 压缩的 `step_boundaries.jsonl.gz`。保留完整图 6 数据与终止摘要，旧 JSONL 仍可重绘。
+- 每场保存 `config/effective_config.env`、四份算法 YAML、ROS 日志配置；不复制凭据内容。Python ROS 日志默认 WARN、每文件 5 MiB 加 2 份轮转，控制台日志不是严格总量配额。
+- M2 使用五步逻辑提示词与独立 `selection_reasoning_effort=low`，1536 token 总上限、12 秒超时。仅消费最终 JSON；需区分请求推理模式与后端实际返回 reasoning token。
+- 历史对照（实际 applied action）：Container 动态 650、成功 202；Mixed 动态 1000、首次失败 1000、复跑成功 685；旧 Channel 动态 650、历史失败 1000。这不是动态预算下的新仿真结果。
+
+```bash
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  /home/ldl/outputs/interactive-nav/my_eval 0
+```
+
+### 2026-09-15: Benchmark v16 感知与门 M1 接口修复
+
+- 默认评测数据改为 `interactive_nav_v3_procthor10k_val_release_v1_2`，三类各 1000 条。旧 v1.1 的 2968 条结果和质量门控签名不沿用。
+- Benchmark 感知移除额外的 512 像素平方 bbox 面积门槛；保留像素、短边、距离和投影可见范围检查。图像里可见不等于已通过这些过滤，不应把没有发布解释为物理不可见。
+- `doorway` / `doorframe` / `door_leaf` 统一公开类别为 `door`，保留 `obj_…` 身份；帧头携带同一采集时刻的相机 `observation_pose_xyyaw`，使门的多视点 M1 门控能够正常请求。
+- 最小回归：`python -m pytest mlspaces_tests/data_generation/test_v3_semantic_minimal_bridge.py mlspaces_tests/data_generation/test_ros_object_goal_evaluator_adapter.py mlspaces_tests/data_generation/test_restricted_gt_perception.py mlspaces_tests/data_generation/test_benchmark_current_contract.py`。
+- 本次未重新运行仿真；此前 v15 视频不能作为 v16 端到端验收。整体 AABB 包含也不能作为真实容器内腔关系的证据。
+
 ### 2026-09-15: 跳过等待后的十场并行 500-step 回归
 
 - 当前可提交的完整性能记录：[2026-09-15 性能检查点](docs/interactive_nav_performance_20260915.md)。提交前扩大回归 1218 + 13 = 1231 项通过；没有重新启动另一轮仿真。
@@ -1139,12 +1160,54 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.y
 
 ### 5.3.3 冻结 V3 单 episode 可视化评测
 
+当前 ROS benchmark 使用 `interactive_nav_v3_benchmark_eval_v15`。复用原始
+`AtomicForceInteractionController` 的 smooth 状态机：转换 5 步、每抽屉打开观察
+3 步、关闭并恢复视角；这些步骤真实调用 task.step、发布受限观察并进入录制，
+计入动作预算和观察步号。`drawer_scan` 扫描选定容器全部抽屉，不要求 M1 region；
+`drawer_open` 仍按 region 选择。单场和 batch 均默认 15 fps。门候选采用原始
+unknown-state 逻辑，M1 distinct-view 到达容差为 0.15 m / 0.20 rad。
+锚点阻挡确认最少连续 3 次不同地图更新，中途恢复 clear 则恢复同一锚点导航。
+每次 smooth 交互的私有阶段、实际打开比例和录制步号保存在
+`eval/smooth_interactions/*.json`；必须结合视频的 open/observe/close 验收，不能
+只看后端 success。v15 与历史 fast 运行的步数、视频和性能结果不可混算。
+
+上一版 evaluator 协议为 `interactive_nav_v3_benchmark_eval_v14`：受限 GT 和同状态 RGB
+使用相同源时间戳（包括宏内开/关观测），交互前置条件复用原始执行器的容差与选面检查，
+公开结果保留姿态失败恢复类型，V3 候选开启导航净空检查。不要把 v13/v14 结果合并计分。
+执行器通过 fresh-command window 的源时间戳将 RGB 绑定到明确的任务步号，
+不再把 ROS 自动改写的 `Image.header.seq` 当作任务步号；额外宏观测不会推进旋转预算。
+同步 force 宏在真实执行进度点发送 command-scoped `RUNNING` 反馈，避免长抽屉扫描
+被新版执行器误判为后端未确认；完成后停止反馈，仍保留进度停滞和总时长保护。
+交互仍是历史 benchmark 的同步 fast 宏，不是原始 smooth 逐 task-step 交互；宏内 RGB
+不额外增加 evaluator 动作步或六联图 step marker。
+
+三类录制 smoke 使用各 domain 文件的 episode 0、固定 200 applied-step 上限，
+分别选择空闲 ROS 端口和全新输出目录。例如 channel：
+
+```bash
+TMPDIR=/home/ldl/tmp/v3-smoke \
+XDG_CACHE_HOME=/home/ldl/.cache/v3-smoke \
+HF_HOME=/home/ldl/.cache/v3-smoke/hf \
+TORCH_HOME=/home/ldl/.cache/v3-smoke/torch \
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+BENCHMARK=/home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/channel.json \
+ROS_MASTER_URI=http://127.0.0.1:16451 \
+MAX_STEPS=200 MIN_STEPS=200 STEP_BUDGET_MODE=fixed FAST_EVAL=false \
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  /home/ldl/outputs/interactive-nav/v3_smoke_channel_new 0
+```
+
+container/mixed 分别替换 domain 文件、端口和输出目录。验收同时检查 M1 status 的
+`image_pairing.stage=paired`、`reason=matched`，episode result、真实交互结果及
+`offline_video_summary.json` 的帧数/对齐状态；不能把 wrapper 退出 0 等同于任务成功。
+GT 先于对应 RGB 到达时可出现短暂等待计数，需区分随后配对成功与持续配帧失败。
+
 冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master 和 ROS 算法栈；默认还会启动 recorder，并强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
 
 ```bash
 ROS_MASTER_URI=http://127.0.0.1:11311 \
 MAX_STEPS=1000 \
-VIDEO_FPS=5 \
+VIDEO_FPS=15 \
 bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/v3_container_episode_1000 1000
 ```
@@ -2282,3 +2345,20 @@ raise SystemExit(pytest.main(sys.argv[1:]))
 H10 step 307 恢复 1 个、step 445 恢复 2 个；H3 step 33/57 的 7 个交互锚点均不连通，
 0.8 m 搜索范围内仍无安全探索替代点。H9 step 250 的原位姿通过新角度复核单测。
 这些结果仅验证控制逻辑和已记录几何，不代表新一轮仿真或覆盖率验收通过。
+# Room 分割离线诊断回放
+
+已有录制目录包含 `debug/raw/map_manifest.jsonl` 与
+`debug/raw/step_boundaries.jsonl` 时，可不启动 ROS、仿真或模型服务：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+MPLCONFIGDIR=/home/ldl/.cache/matplotlib \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/replay_room_segmentation.py \
+  /home/ldl/outputs/interactive-nav/benchmark-v16-1000-20260915_055700 \
+  --output-dir /home/ldl/outputs/interactive-nav/room-replay
+```
+
+输出三场 OCC / 历史 room 标签 / 离线回放拼图、逐帧 room ID 和最终栅格。
+回放使用当前 `semantic_map` 配置、历史公开门观测和已确认的 graph overlay，
+按记录的 step 顺序处理；不复现 ROS 的完整异步回调顺序，也不能替代闭环导航验收。

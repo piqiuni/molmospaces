@@ -3,7 +3,7 @@
 #
 # Usage:
 #   bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
-#     <run-output-dir> <episode-index>
+#     <run-output-dir> <episode-index> [override-config.conf]
 #
 # The script intentionally owns one ROS master per episode.  In normal mode it
 # also owns a recorder; FAST_EVAL=true is evaluator-only and deliberately has
@@ -24,112 +24,18 @@ if [[ ! "${EPISODE_INDEX}" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-BENCHMARK=${BENCHMARK:-${REPO_ROOT}/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json}
-# POLICY is the evaluator's ROS/restricted-GT adapter.  METHOD names the
-# semantic method loaded into that adapter and is deliberately fixed to MLLM
-# for all V3 benchmark runs through this entry point.
-METHOD=${METHOD:-full_mllm_object_goal}
-POLICY=${POLICY:-ros_object_goal_rule}
-MAX_STEPS=${MAX_STEPS:-2000}
-STEP_BUDGET_MODE=${STEP_BUDGET_MODE:-dynamic}
-MIN_STEPS=${MIN_STEPS:-300}
-DYNAMIC_PATH_FREE_M=${DYNAMIC_PATH_FREE_M:-3.0}
-DYNAMIC_STEPS_PER_PATH_M=${DYNAMIC_STEPS_PER_PATH_M:-25.0}
-DYNAMIC_CHANNEL_INTERACTION_STEPS=${DYNAMIC_CHANNEL_INTERACTION_STEPS:-150}
-DYNAMIC_CONTAINER_INTERACTION_STEPS=${DYNAMIC_CONTAINER_INTERACTION_STEPS:-200}
-DYNAMIC_CONTAINER_JOINT_STEPS=${DYNAMIC_CONTAINER_JOINT_STEPS:-40}
-DYNAMIC_STEP_QUANTUM=${DYNAMIC_STEP_QUANTUM:-50}
-VIDEO_FPS=${VIDEO_FPS:-5}
-# This is a diagnostic runner, not the large-scale benchmark launcher: keep
-# one path/costmap/semantic composite for every evaluator step.
-VIDEO_STEP_SAMPLE_EVERY=${VIDEO_STEP_SAMPLE_EVERY:-1}
-VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-480}
-# A 1500-step V3 episode needs a large frozen-snapshot queue when six-panel
-# rendering is slower than simulation.  If this exceptional capacity is still
-# exhausted, discard the oldest pending render job so fresh RGB/plan snapshots
-# remain paired instead of blocking callbacks into placeholder frames.
-VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-2048}
-VIDEO_FRAME_QUEUE_OVERFLOW=${VIDEO_FRAME_QUEUE_OVERFLOW:-drop_oldest}
-STEP_SYNC_QUEUE_SIZE=${STEP_SYNC_QUEUE_SIZE:-4096}
-STEP_SYNC_IMAGE_CACHE_SIZE=${STEP_SYNC_IMAGE_CACHE_SIZE:-256}
-STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC=${STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC:-12}
-VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
-# Frozen OCC/local proxies use this cap.  The recorder intentionally retains
-# the global costmap at native grid resolution as lossless PNG so its
-# inflation bands remain inspectable in the six-panel diagnostic video.
-VIDEO_SNAPSHOT_GRID_MAX_DIM=${VIDEO_SNAPSHOT_GRID_MAX_DIM:-512}
-VIDEO_SNAPSHOT_JPEG_QUALITY=${VIDEO_SNAPSHOT_JPEG_QUALITY:-90}
-VIDEO_SNAPSHOT_CATEGORICAL_FORMAT=${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT:-png}
-VIDEO_OCC_CROP_MARGIN_M=${VIDEO_OCC_CROP_MARGIN_M:-2.5}
-# Keep the full-known-map coverage inset enabled for the maintained offline
-# six-panel artifact.  It can be disabled for a compact legacy replay with
-# VIDEO_SEMANTIC_XY_OVERVIEW_INSET=false.
-VIDEO_SEMANTIC_XY_OVERVIEW_INSET=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET:-false}
-ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-256}
-# Full per-step composites may take substantially longer than the simulator;
-# let the recorder finish them before teardown.
-RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-${RECORDER_DRAIN_WAIT_S:-5400}}
-RECORDER_DRAIN_POLL_S=${RECORDER_DRAIN_POLL_S:-0.5}
-RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-10}
-RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-600}
-RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
-FAST_EVAL=${FAST_EVAL:-false}
-# Load the complete ProcTHOR scene by default, then project the final ROS map
-# onto its GT navigable area.  TOPDOWN_ROS_ONLY=true is an explicit lightweight
-# fallback; it cannot report whole-scene GT coverage because it lacks the GT
-# denominator.
-TOPDOWN_ROS_ONLY=${TOPDOWN_ROS_ONLY:-false}
-if [[ -z "${TOPDOWN_REQUIRE_FULL_SCENE+x}" ]]; then
-  if [[ "${TOPDOWN_ROS_ONLY}" == true ]]; then
-    TOPDOWN_REQUIRE_FULL_SCENE=false
-  else
-    TOPDOWN_REQUIRE_FULL_SCENE=true
-  fi
+DEFAULT_EVAL_CONFIG="${SCRIPT_DIR}/configs/evaluation/benchmark_eval.conf"
+source "${DEFAULT_EVAL_CONFIG}"
+EVAL_CONFIG=${3:-${EVAL_CONFIG:-${DEFAULT_EVAL_CONFIG}}}
+if [[ "${EVAL_CONFIG}" != "${DEFAULT_EVAL_CONFIG}" ]]; then
+  source "${EVAL_CONFIG}"
 fi
-ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
-# This entry point is a Bash script (despite its historical .zsh suffix), so
-# source the Bash ROS environment by default.  Sourcing setup.zsh under Bash
-# can fail before the evaluator starts (e.g. zsh's `cd -q` syntax).
-ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.bash}
-SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
-# Keep V3's Module-1 cap explicit as well: portal visual-evidence JSON can
-# exceed the historical 256-token budget when the model pretty-prints fields.
-# This launch argument reaches only the object-attribute (M1) lane; M2/M3 use
-# object_goal_v3_full_mllm.yaml and room MLLM keeps its own mapping config cap.
-SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}
-# Match the ordinary full-MLLM interaction profile.  A caller may still lower
-# this explicitly for a dedicated throughput experiment.
-SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}
-# Keep the bridge freshness/synchronisation contract aligned with the ordinary
-# interaction runner.  These values control public observation delivery only;
-# restricted perception and evaluator scoring remain separate V3 concerns.
-ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.2}
-ROS_STEP_READY_BARRIER_ENABLED=${ROS_STEP_READY_BARRIER_ENABLED:-true}
-ROS_STEP_READY_TOPIC=${ROS_STEP_READY_TOPIC:-/semantic_decision/step_ready}
-ROS_STEP_READY_WARMUP_SKIP_FRAMES=${ROS_STEP_READY_WARMUP_SKIP_FRAMES:-0}
-ROS_STEP_READY_TIMEOUT_S=${ROS_STEP_READY_TIMEOUT_S:-2.0}
-ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S=${ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S:-10.0}
-# Non-applied bridge refreshes must not make a fixed applied-step evaluation
-# unbounded.  1.5x admits the observed normal async slack while bounding an
-# intermittent-command/no-progress loop before the outer scene timeout.
-ROS_COMMAND_STARVATION_TIMEOUT_S=${ROS_COMMAND_STARVATION_TIMEOUT_S:-60.0}
-ROS_OBSERVATION_TURN_MULTIPLIER=${ROS_OBSERVATION_TURN_MULTIPLIER:-1.5}
-SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
-SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
-EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
-NAV_CONFIG_OVERRIDE=${NAV_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
-RECORDER=${RECORDER:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py}
-RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
-VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
-STEP_FRAME_QUEUE_SIZE=${STEP_FRAME_QUEUE_SIZE:-4}
-STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
-RECORDER_DRAIN_STALL_TIMEOUT_S=${RECORDER_DRAIN_STALL_TIMEOUT_S:-300}
-# Keep defaults on the large /home volume even when this runner is invoked
-# directly rather than through the batch wrapper.
-SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/home/ldl/.cache/molmospaces/matplotlib-${UID}}
-RUNTIME_TMPDIR=${TMPDIR:-/home/ldl/tmp/molmospaces-v3-${UID}}
-RUNTIME_XDG_CACHE_HOME=${XDG_CACHE_HOME:-/home/ldl/.cache}
+case "${ROS_LOG_LEVEL}" in DEBUG|INFO|WARN|ERROR|FATAL) ;; *) echo "Invalid ROS_LOG_LEVEL" >&2; exit 2;; esac
+if [[ ! "${ROS_LOG_MAX_BYTES}" =~ ^[1-9][0-9]*$ || ! "${ROS_LOG_BACKUP_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid ROS log rotation limits" >&2
+  exit 2
+fi
 
 for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
   "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
@@ -203,6 +109,24 @@ export XDG_CACHE_HOME="${RUNTIME_XDG_CACHE_HOME}"
 export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
 export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
 export PYTHONUNBUFFERED=1
+# Preserve resolved non-secret settings and the exact algorithm YAMLs for replay.
+mkdir -p "${RUN_DIR}/config"
+cp "${DEFAULT_EVAL_CONFIG}" "${RUN_DIR}/config/defaults.conf"
+CONFIG_KEYS=(ARTIFACT_WRITE_QUEUE_SIZE DYNAMIC_CHANNEL_INTERACTION_STEPS DYNAMIC_CONTAINER_INTERACTION_STEPS DYNAMIC_CONTAINER_JOINT_STEPS DYNAMIC_PATH_FREE_M DYNAMIC_STEPS_PER_PATH_M DYNAMIC_STEP_QUANTUM EXPLORE_PY_CONFIG_OVERRIDE FAST_EVAL MAX_STEPS METHOD MIN_STEPS NAV_CONFIG_OVERRIDE OFFLINE_SAVE_COMPOSITE_FRAMES POLICY RECORDER RECORDER_COMPACT_STEPS RECORDER_COMPRESS_STEPS RECORDER_DRAIN_HELPER RECORDER_DRAIN_POLL_S RECORDER_DRAIN_PROGRESS_S RECORDER_DRAIN_STALL_TIMEOUT_S RECORDER_DRAIN_TIMEOUT_S RECORDER_SAVE_EVENTS RECORDER_SHUTDOWN_GRACE_S RECORD_HEAD_CAMERA ROS_ACTION_TIMEOUT_S ROS_COMMAND_STARVATION_TIMEOUT_S ROS_LOG_BACKUP_COUNT ROS_LOG_LEVEL ROS_LOG_MAX_BYTES ROS_MASTER_URI ROS_OBSERVATION_TURN_MULTIPLIER ROS_SETUP ROS_STEP_READY_BARRIER_ENABLED ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S ROS_STEP_READY_TIMEOUT_S ROS_STEP_READY_TOPIC ROS_STEP_READY_WARMUP_SKIP_FRAMES RUNTIME_TMPDIR RUNTIME_XDG_CACHE_HOME RUN_ROS_MASTER_URI SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S SEMANTIC_DECISION_OVERRIDE SEMANTIC_MAPPING_OVERRIDE SEMANTIC_MODEL_ENV_FILE SHARED_MPLCONFIGDIR STEP_BUDGET_MODE STEP_CAPTURE_ACK_TIMEOUT_S STEP_FRAME_QUEUE_SIZE STEP_SYNC_IMAGE_CACHE_SIZE STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC STEP_SYNC_QUEUE_SIZE TOPDOWN_ROS_ONLY VIDEO_BUILDER VIDEO_FPS VIDEO_FRAME_JOB_QUEUE_SIZE VIDEO_FRAME_QUEUE_OVERFLOW VIDEO_HISTORY_SIZE VIDEO_OCC_CROP_MARGIN_M VIDEO_PANEL_WIDTH_PX VIDEO_SEMANTIC_XY_OVERVIEW_INSET VIDEO_SNAPSHOT_CATEGORICAL_FORMAT VIDEO_SNAPSHOT_GRID_MAX_DIM VIDEO_SNAPSHOT_JPEG_QUALITY VIDEO_STEP_SAMPLE_EVERY)
+for config_key in BENCHMARK TOPDOWN_REQUIRE_FULL_SCENE RUN_DIR EPISODE_INDEX EVAL_CONFIG "${CONFIG_KEYS[@]}"; do
+  printf '%s=%q\n' "${config_key}" "${!config_key-}"
+done >"${RUN_DIR}/config/effective_config.env"
+cp "${SEMANTIC_DECISION_OVERRIDE}" "${RUN_DIR}/config/semantic_decision.yaml"
+cp "${SEMANTIC_MAPPING_OVERRIDE}" "${RUN_DIR}/config/semantic_mapping.yaml"
+cp "${EXPLORE_PY_CONFIG_OVERRIDE}" "${RUN_DIR}/config/explore.yaml"
+cp "${NAV_CONFIG_OVERRIDE}" "${RUN_DIR}/config/navigation.yaml"
+export ROSCONSOLE_CONFIG_FILE="${RUN_DIR}/config/rosconsole.config"
+export ROS_PYTHON_LOG_CONFIG_FILE="${RUN_DIR}/config/python_logging.conf"
+export ROS_LOG_LEVEL ROS_LOG_MAX_BYTES ROS_LOG_BACKUP_COUNT
+sed "s/@LEVEL@/${ROS_LOG_LEVEL}/g" "${SCRIPT_DIR}/configs/evaluation/python_logging.conf" >"${ROS_PYTHON_LOG_CONFIG_FILE}"
+
+printf 'log4j.logger.ros=%s\n' "${ROS_LOG_LEVEL}" >"${ROSCONSOLE_CONFIG_FILE}"
+
 
 set +u
 CONDA_SH=${CONDA_SH:-/home/ldl/miniconda3/etc/profile.d/conda.sh}
@@ -231,6 +155,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   printf '%s\n' "Missing MolmoSpaces Python executable: ${PYTHON_BIN}" >&2
   exit 2
 fi
+for config_key in CONDA_SH CONDA_ENV PYTHON_BIN ROS_SOURCE_DIR; do
+  printf '%s=%q\n' "${config_key}" "${!config_key-}"
+done >>"${RUN_DIR}/config/effective_config.env"
 MLSPACES_SITE_PACKAGES="$(${PYTHON_BIN} -c 'import site; print(site.getsitepackages()[0])')"
 export PYTHONPATH="${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
 export PATH="${ACTIVE_CONDA_PREFIX}/bin:${PATH}"
@@ -304,7 +231,7 @@ if timeout 1s rosparam list >/dev/null 2>&1; then
   exit 2
 fi
 
-roscore -p "${MASTER_PORT}" >"${RUN_DIR}/roscore.log" 2>&1 &
+setsid roscore -p "${MASTER_PORT}" >"${RUN_DIR}/roscore.log" 2>&1 &
 ROSCORE_PID=$!
 MASTER_READY=false
 for _attempt in {1..120}; do
@@ -327,7 +254,7 @@ if [[ "${MASTER_READY}" != true ]]; then
   exit 3
 fi
 
-roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
+setsid roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=false \
   start_mapping:=true \
   mapping_mode:=odom_locked \
@@ -350,9 +277,17 @@ roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
 ROSLAUNCH_PID=$!
 
 if [[ "${FAST_EVAL}" != true ]]; then
+  RECORDER_STORAGE_ARGS=()
+  for setting in "save-events:${RECORDER_SAVE_EVENTS}" "compact-step-boundaries:${RECORDER_COMPACT_STEPS}" "compress-step-boundaries:${RECORDER_COMPRESS_STEPS}"; do
+    if [[ "${setting#*:}" == true ]]; then
+      RECORDER_STORAGE_ARGS+=("--${setting%%:*}")
+    else
+      RECORDER_STORAGE_ARGS+=("--no-${setting%%:*}")
+    fi
+  done
   # Start before the evaluator so every public observation/step-sync is captured.
   PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -u "${RECORDER}" \
-    --output-dir "${RUN_DIR}/debug" \
+    --output-dir "${RUN_DIR}/debug" "${RECORDER_STORAGE_ARGS[@]}" \
     --occupancy-grid-topic /semantic_mapping/planning_occ_map \
     --raw-occupancy-grid-topic /struct_mapping/occ_map \
     --image-topic /molmo_spaces/head_camera/image \
@@ -535,6 +470,11 @@ VIDEO_BUILDER_ARGS=(
 )
 if [[ "${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}" == true ]]; then
   VIDEO_BUILDER_ARGS+=(--semantic-xy-overview-inset)
+fi
+if [[ "${OFFLINE_SAVE_COMPOSITE_FRAMES}" == true ]]; then
+  VIDEO_BUILDER_ARGS+=(--save-composite-frames)
+else
+  VIDEO_BUILDER_ARGS+=(--no-save-composite-frames)
 fi
 "${PYTHON_BIN}" "${VIDEO_BUILDER_ARGS[@]}" \
   >"${RUN_DIR}/offline_video.log" 2>&1

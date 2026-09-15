@@ -1543,54 +1543,12 @@ class ModelPolicyClient:
             )
         else:
             instruction = (
-                "Rank the concrete subgoals for the object-goal mission. Each ID is an executable navigation, "
-                "interaction, or frontier action and must be returned unchanged. Only IDs present in the "
-                "current candidates array may appear in ranked_ids; IDs mentioned only in recent_decisions, "
-                "history, or graph are historical context and are forbidden. Your response must begin with "
-                "the key ranked_ids; never copy, serialize, or summarize the input mission, robot, graph, "
-                "room_object_reasoning, candidates, or recent_decisions fields. Use one internal two-stage "
-                "process and return only the final Stage 2 JSON. STAGE 1 "
-                "(OBSERVED_ROOM_OBJECT_PLAUSIBILITY): read room_object_reasoning before ranking. Treat "
-                "observed_rooms, anchor_objects, observed_containers, and observed_portals as graph evidence. "
-                "Treat target plausible_room_types and plausible_container_types only as semantic priors, not "
-                "proof of containment or unobserved state; identify observed rooms, portals, and containers "
-                "that could plausibly reveal the target. STAGE 2 (EXECUTABLE_CANDIDATE_RANKING): apply those "
-                "Stage 1 findings to the current candidates array and rank only executable candidate IDs. "
-                "A room marked potential_room is an unobserved topological child behind a successfully opened "
-                "portal; use it to favor crossing or nearby exploration, but do not treat it as observed free "
-                "space or infer its contents. "
-                "Apply this order: "
-                "(1) TARGET_GOAL when the target is reliably observed; (2) POST_INTERACTION_TRAVERSE immediately "
-                "after opening a portal so the robot actually crosses the state-changing doorway; "
-                "(3) NEXT_ROUTE_PORTAL before a remote container or frontier because it opens the observed "
-                "topological route; (4) TARGET_CONTAINER or a semantically plausible container; "
-                "(5) an eligible frontier with room_status=unentered_new_room when its room_target_affinity "
-                "is neutral or positive, before a frontier in current_room or entered_room; "
-                "(6) other frontiers. If room_target_affinity_reason says high_confidence_mismatch, keep "
-                "that room as a fallback but rank it below a compatible or unknown new room. decision_hint is "
-                "deterministic graph/goal evidence and pre_score is a transparent "
-                "ranking prior; normally rank a high-priority hint first unless recent_decisions show that the "
-                "same region/action just failed without progress. If POST_INTERACTION_TRAVERSE is present and "
-                "TARGET_GOAL is absent, it is the mandatory first choice unless that exact current candidate's "
-                "history reports failure; do not detour to another portal, container, or frontier. Never infer "
-                "that a generic nearby container contains the target. Use the target's semantic type, likely "
-                "use, room function, support/container affordance, and observed co-occurring objects to "
-                "estimate compatibility. Prefer candidates with a coherent semantic relationship and "
-                "downgrade candidates whose category, room function, or affordance conflicts with the target, "
-                "even when they are closer. These are soft priors, not proof of containment: keep an unknown "
-                "but plausible candidate available and never invent an unobserved relation. A semantically "
-                "conflicting container must rank below a portal or useful frontier even when closer. Do not repeat a "
-                "successful interaction; after a failed or low-gain repetition choose a different route or "
-                "spatial region. Among comparable frontiers prioritize expected_visible_unknown_area_m2, then "
-                "unknown_component_area_m2, using distance only as a tie-break. Use only observed graph state, "
-                "room attributes, anchor objects, candidate history, pre_score_terms, and interaction effects. "
-                "Do not invent geometry, actions, containment, or candidate IDs. "
-                "Return exactly one compact JSON object with ranked_ids containing at most three IDs, "
-                "reason set to TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, "
-                "INFORMATION_GAIN, INTERACTION_COVERAGE, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
-                "NO_SEMANTIC_PREFERENCE, and confidence set to low, medium, or high. Do not return prose, "
-                "scores, markdown, or additional keys. Output must begin exactly as a compact object whose "
-                "first key is ranked_ids; never echo the supplied context."
+                'Find the requested target. Rank up to three CURRENT executable candidate IDs. Work through the following checks internally; return only the final JSON, not the reasoning.\n'
+                '1. EVIDENCE: Read mission, room_object_reasoning and the observed graph. Separate observed visibility/connectivity from uncertain room labels, semantic priors and pre_score. Priors never prove containment. A potential room is unexplored topology, not observed free space. Never invent facts or select historical IDs.\n'
+                '2. DEPENDENCIES: Prefer a reliably observed TARGET_GOAL. Otherwise choose POST_INTERACTION_TRAVERSE after opening a portal, unless that exact candidate failed. Next prefer NEXT_ROUTE_PORTAL when observed topology establishes a prerequisite route. Do not infer route necessity from proximity.\n'
+                '3. COMPATIBILITY: Before ranking a container, check whether it can physically and semantically contain this target, or its observed effect enables the route. A toilet cannot be inside a refrigerator. Unrelated containers rank below useful portals/frontiers, however close. Unknown plausible containers remain eligible. This is target search, not interaction coverage.\n'
+                '4. PROGRESS: Compare eligible candidates by expected target discovery. Prefer compatible or unknown unentered rooms over exhausted regions; treat high-confidence room mismatch as a fallback. Among comparable frontiers use expected_visible_unknown_area_m2, then unknown_component_area_m2; distance breaks ties. Do not repeat completed interactions. After failure or no information gain, diversify unless evidence changed; a failed approach alone does not rule out another listed viewpoint.\n'
+                '5. VALIDATE: Check current candidate membership, unmet prerequisites and recent outcomes. Return only {"ranked_ids":[...],"reason":"...","confidence":"..."}, with ranked_ids first and no additional keys. Allowed reason: TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, NO_SEMANTIC_PREFERENCE. Allowed confidence: low, medium, high.\n'
             )
         return {
             "schema_version": 4,

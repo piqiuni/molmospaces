@@ -86,7 +86,7 @@ def test_compact_mask_rle_is_counted_without_expanding_the_mask() -> None:
     assert normalized["visible_pixels"] == 6
     assert normalized["visible_fraction"] == 0.3
     assert normalized["confidence"] == 1.0
-    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["source_object_name"] == "obj_000001"
     assert normalized["private_source_object_name"] == "obj_000001"
 
 
@@ -127,7 +127,7 @@ def test_compact_minimal_gt_discards_private_routing_aliases() -> None:
 
     normalized = normalize_observation(raw)
 
-    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["source_object_name"] == "obj_000001"
     assert normalized["private_source_object_name"] == "obj_000001"
     assert normalized["visible_pixels"] == 6
     assert normalized["confidence"] == 1.0
@@ -339,9 +339,9 @@ def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
         node for node in store.as_graph_dict(stamp=2.0)["nodes"] if node["type"] == "portal"
     )
     assert portal["id"] == opaque_portal_instance_id("double_door_root")
-    assert portal["name"] == portal["attributes"]["instance_id"]
-    assert portal["label"] == portal["attributes"]["instance_id"]
-    assert portal["name"].startswith("door_")
+    assert portal["name"] == "door"
+    assert portal["label"] == "door"
+    assert portal["attributes"]["instance_id"].startswith("door_")
     assert portal["confidence"] == 1.0
     assert portal["interaction"]["is_interactable"] is True
     assert portal["interaction"]["interaction_mode"] == "open_close"
@@ -384,7 +384,7 @@ def test_public_graph_redacts_portal_source_name_but_keeps_private_feedback_rout
 
     graph = store.as_graph_dict()
     portal = next(node for node in graph["nodes"] if node["type"] == "portal")
-    assert portal["label"] == portal["name"] == portal["attributes"]["instance_id"]
+    assert portal["label"] == portal["name"] == "door"
     assert portal["attributes"]["instance_id"].startswith("door_")
     assert "source_object_name" not in portal["attributes"]
     serialized = str(graph).casefold()
@@ -558,3 +558,13 @@ def test_non_mllm_attribute_patch_cannot_write_realtime_gt_portal_state() -> Non
     assert portal["interaction"]["state"] == "unknown"
     assert portal["interaction"]["state_source"] == "unobserved"
     assert portal["interaction"]["is_interactable"] is True
+def test_serialized_opaque_portal_displays_door_and_preserves_routing_identity():
+    from semantic_mapping_py_pkg.graph_schema import SceneGraphNode
+    node = SceneGraphNode(id="portal_obj_000030", type="portal", label="door", name="door",
+                          attributes={"instance_id": "obj_000030", "source_object_name": "private_frame"})
+    payload = node.to_dict()
+    assert payload["name"] == payload["label"] == "door"
+    assert payload["type"] == "portal"
+    assert payload["id"] == "portal_obj_000030"
+    assert payload["attributes"]["instance_id"] == "obj_000030"
+    assert "source_object_name" not in payload["attributes"]

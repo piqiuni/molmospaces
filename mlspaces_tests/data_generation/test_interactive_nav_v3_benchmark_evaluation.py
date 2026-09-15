@@ -1049,6 +1049,8 @@ def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() ->
         perception=Perception(),
         adapter=Adapter(),
         goal_evidence=Evidence(),
+        category_goal_evidence=None,
+        public_rgb_sink=None,
         published_frame_sink=lambda payload: queued.append(payload) or True,
     )
 

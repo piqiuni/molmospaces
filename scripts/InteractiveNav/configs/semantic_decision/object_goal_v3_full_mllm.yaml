@@ -13,6 +13,7 @@ target:
   completion_requires_visibility: true
 
 candidate:
+  navigation_clearance_enabled: true
   # V3 object-goal constraints.
   target_require_current_visibility: false
   target_require_same_room: false
@@ -59,11 +60,9 @@ candidate:
   container_safe_staging_arrival_tolerance_m: 0.15
   container_interaction_ready_distance_m: 0.15
   container_action_lateral_offset_m: 0.22
-  # Do not turn the graph's initial unknown/default portal state into an
-  # OPEN action.  The asynchronous Module 1 object lane must first classify
-  # the visible door; a ready-but-unknown classification is also non-actionable.
-  portal_require_attribute_ready: true
-  portal_allow_unknown_state: false
+  # Match the native portal candidate/observation flow.
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
   remembered_portal_reobservation_enabled: true
   # Keep the channel interaction pose contract identical to the ordinary
   # full-MLLM navigation profile.  ``portal_standoff_m`` is measured from the
@@ -110,7 +109,10 @@ model:
   # instead of overriding it with the default config's local model name.
   model: ""
   timeout_s: 12.0
-  max_tokens: 384
+  # M2 reasons internally through evidence/dependencies/compatibility; only the
+  # final compact ranking JSON enters the executor. Tokens include reasoning.
+  selection_reasoning_effort: "low"
+  max_tokens: 1536
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   # Curate with observation-derived semantic/topological priors before asking
@@ -137,6 +139,7 @@ topics:
   global_costmap_updates: "/move_base/global_costmap/costmap_updates"
 
 executor:
+  container_anchor_blocked_confirmation_task_steps: 3
   container_m1_same_pose_flip_retry_count: 0
   # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
   # opaque and is expanded privately into low-view open-observe-close steps.
@@ -154,8 +157,8 @@ executor:
   interaction_observation_max_viewpoints: 3
   interaction_observation_max_total_requests: 3
   container_m1_capture_yaw_tolerance_rad: 0.5235987756
-  container_m1_distinct_view_arrival_tolerance_m: 0.05
-  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.08
+  container_m1_distinct_view_arrival_tolerance_m: 0.15
+  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.20
   container_m1_capture_dwa_profile_enabled: true
   container_m1_capture_dwa_reconfigure_server: "/move_base/DWAPlannerROS"
   container_m1_capture_dwa_reconfigure_timeout_s: 1.0
