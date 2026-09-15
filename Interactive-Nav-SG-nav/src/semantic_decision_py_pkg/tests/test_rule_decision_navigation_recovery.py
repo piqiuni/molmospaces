@@ -224,6 +224,24 @@ def observe(tracker, step, **kwargs):
     )
 
 
+def test_idle_recovery_handles_unresolved_interaction_without_frontiers(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker()
+    payload = snapshot(30)
+    payload["exploration_context"].update(
+        connected_unknown_area_present=False, raw_frontier_material_cluster_count=0,
+        unresolved_interaction_target_count=1,
+    )
+    tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
+    clock[0] += 11
+    assert tracker.recovery_candidate(payload) is not None
+    clock[0] += 20
+    detail = tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
+    assert detail["blocked"]
+    assert detail["no_eligible_elapsed_wall_seconds"] < 60
+
+
 def test_no_eligible_wait_is_bounded_by_unique_observation_steps():
     tracker = decision.NoEligibleCandidateTracker()
     for _ in range(100):
@@ -234,6 +252,58 @@ def test_no_eligible_wait_is_bounded_by_unique_observation_steps():
     detail = observe(tracker, 546)
     assert detail["blocked"]
     assert detail["reason"] == "no_eligible_candidates_after_bounded_recovery"
+
+
+def test_idle_timeout_excludes_recovery_execution(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker()
+    payload = snapshot(30)
+    payload["exploration_context"]["unresolved_interaction_target_count"] = 1
+    tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
+    clock[0] = 111.0
+    recovery = tracker.recovery_candidate(payload)
+    assert recovery is not None
+    clock[0] = 151.0
+    tracker.finish_recovery(recovery.candidate_id)
+    detail = tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
+    assert not detail["blocked"]
+    assert detail["no_eligible_elapsed_wall_seconds"] == 11.0
+
+
+def test_nonempty_pool_does_not_hide_failure_to_select_an_action(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker()
+    payload = snapshot(30)
+    detail = tracker.update(payload, eligible_candidate_count=3,
+        has_active_behavior=False, has_executable_candidate=False)
+    assert not detail["blocked"]
+    clock[0] += 31
+    detail = tracker.update(payload, eligible_candidate_count=3,
+        has_active_behavior=False, has_executable_candidate=False)
+    assert detail["blocked"]
+    assert detail["eligible_candidate_count"] == 3
+    assert detail["executable_candidate_count"] == 0
+    assert tracker.update(payload, eligible_candidate_count=3,
+        has_active_behavior=False, has_executable_candidate=True) == {}
+
+
+def test_active_recovery_scan_keeps_idle_tracker_state(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker()
+    payload = snapshot(30)
+    payload["exploration_context"]["unresolved_interaction_target_count"] = 1
+    tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
+    clock[0] = 111.0
+    recovery = tracker.recovery_candidate(payload)
+    assert recovery is not None
+    tracker.update(payload, eligible_candidate_count=0, has_active_behavior=True)
+    assert tracker.since_step == 30
+    clock[0] = 121.0
+    tracker.finish_recovery(recovery.candidate_id)
+    assert not tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)["blocked"]
 
 
 @pytest.mark.parametrize("eligible,active,scan_complete", [

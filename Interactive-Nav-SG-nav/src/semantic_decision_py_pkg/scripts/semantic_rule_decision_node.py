@@ -139,9 +139,10 @@ def container_approach_navigation_failed(detail: dict) -> bool:
 class NoEligibleCandidateTracker:
     """Bound waiting for safe candidates without declaring the map exhausted."""
 
-    def __init__(self, min_steps: int = 120, confirmations: int = 3) -> None:
+    def __init__(self, min_steps: int = 120, confirmations: int = 3, max_idle_seconds: float = 30.0) -> None:
         self.min_steps = max(1, int(min_steps))
         self.required_confirmations = max(2, int(confirmations))
+        self.max_idle_seconds = max(1.0, float(max_idle_seconds))
         self.reset()
 
     def reset(self) -> None:
@@ -149,6 +150,17 @@ class NoEligibleCandidateTracker:
         self.last_step: int | None = None
         self.confirmations = 0
         self.recovery_count = 0
+        self.since_wall: float | None = None
+        self.recovery_started_wall: float | None = None
+        self.recovery_candidate_id = ""
+
+    def finish_recovery(self, candidate_id: str) -> None:
+        if candidate_id != self.recovery_candidate_id or self.recovery_started_wall is None:
+            return
+        if self.since_wall is not None:
+            self.since_wall += max(0.0, time.monotonic() - self.recovery_started_wall)
+        self.recovery_started_wall = None
+        self.recovery_candidate_id = ""
 
     @staticmethod
     def has_frontiers(snapshot: dict) -> bool:
@@ -158,15 +170,21 @@ class NoEligibleCandidateTracker:
                     or int(context.get("raw_frontier_material_cluster_count", 0) or 0) > 0)
 
     def recovery_candidate(self, snapshot: dict) -> BehaviorCandidate | None:
-        if self.since_step is None or self.recovery_count >= 2 or not self.has_frontiers(snapshot):
+        context = snapshot.get("exploration_context") or {}
+        recoverable = self.has_frontiers(snapshot) or int(context.get("unresolved_interaction_target_count", 0) or 0) > 0
+        if self.since_step is None or self.recovery_count >= 2 or not recoverable:
             return None
         elapsed = (self.last_step or self.since_step) - self.since_step
+        wall_elapsed = time.monotonic() - self.since_wall if self.since_wall is not None else 0.0
         due = max(1, self.min_steps // (6 if self.recovery_count == 0 else 2))
-        if elapsed < due or elapsed >= self.min_steps:
+        wall_due = self.max_idle_seconds * (1 / 3 if self.recovery_count == 0 else 2 / 3)
+        if (elapsed < due and wall_elapsed < wall_due) or elapsed >= self.min_steps or wall_elapsed >= self.max_idle_seconds:
             return None
         self.recovery_count += 1
+        self.recovery_started_wall = time.monotonic()
+        self.recovery_candidate_id = f"frontier_recovery_scan:{self.since_step}:{self.recovery_count}"
         return BehaviorCandidate(
-            candidate_id=f"frontier_recovery_scan:{self.since_step}:{self.recovery_count}",
+            candidate_id=self.recovery_candidate_id,
             behavior_type=BEHAVIOR_SCAN,
             source="frontier_recovery",
             target_id="frontier_recovery",
@@ -180,11 +198,14 @@ class NoEligibleCandidateTracker:
         *,
         eligible_candidate_count: int,
         has_active_behavior: bool,
+        has_executable_candidate: bool | None = None,
     ) -> dict:
         context = snapshot.get("exploration_context") or {}
+        executable = eligible_candidate_count > 0 if has_executable_candidate is None else has_executable_candidate
+        recovery_active = self.recovery_started_wall is not None
         if (
-            eligible_candidate_count > 0
-            or has_active_behavior
+            executable
+            or (has_active_behavior and not recovery_active)
             or not bool(context.get("initial_scan_complete", True))
         ):
             self.reset()
@@ -202,13 +223,15 @@ class NoEligibleCandidateTracker:
             self.reset()
         if self.since_step is None:
             self.since_step = step
+            self.since_wall = time.monotonic()
         if step != self.last_step:
             self.confirmations += 1
             self.last_step = step
         elapsed = step - self.since_step
+        wall_elapsed = time.monotonic() - self.since_wall if self.since_wall is not None else 0.0
         blocked = (
-            elapsed >= self.min_steps
-            and self.confirmations >= self.required_confirmations
+            (elapsed >= self.min_steps and self.confirmations >= self.required_confirmations)
+            or wall_elapsed >= self.max_idle_seconds
         )
         return {
             "reason": (
@@ -216,10 +239,13 @@ class NoEligibleCandidateTracker:
                 if blocked else "no_eligible_candidates_waiting_for_recovery"
             ),
             "blocked": blocked,
-            "eligible_candidate_count": 0,
+            "eligible_candidate_count": eligible_candidate_count,
+            "executable_candidate_count": 0,
             "observation_step": step,
             "no_eligible_since_step": self.since_step,
             "no_eligible_elapsed_steps": elapsed,
+            "no_eligible_elapsed_wall_seconds": wall_elapsed,
+            "no_eligible_max_idle_seconds": self.max_idle_seconds,
             "no_eligible_confirmations": self.confirmations,
             "no_eligible_min_steps": self.min_steps,
             "no_eligible_confirmations_required": self.required_confirmations,
@@ -984,6 +1010,9 @@ class SemanticRuleDecisionNode:
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
             return
+        tracker = getattr(self, "no_eligible_candidate_tracker", None)
+        if tracker is not None:
+            tracker.finish_recovery(candidate_id)
         if (
             status == "SUCCEEDED"
             and self.ablation.module3 == "direct_atomic"
@@ -2387,6 +2416,7 @@ class SemanticRuleDecisionNode:
                 execution_eligible_candidate_count, int(selected is not None)
             ),
             has_active_behavior=bool(self.active_candidate_id),
+            has_executable_candidate=selected is not None,
         )
         if selected is None and not self.active_candidate_id:
             selected = self.no_eligible_candidate_tracker.recovery_candidate(execution_snapshot)

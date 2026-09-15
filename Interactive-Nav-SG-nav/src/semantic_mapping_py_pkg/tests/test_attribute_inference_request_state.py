@@ -336,6 +336,27 @@ def test_public_detector_border_flag_marks_only_clipped_boxes() -> None:
     ) == ["bottom"]
 
 
+def test_portal_m1_tracks_complete_views_during_camera_rotation() -> None:
+    node = InteractionAttributeInferenceNode.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 3
+    node.portal_observation_streaks = {}
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    boxes = [[188, 164, 312, 428], [240, 182, 334, 382], [273, 189, 359, 367]]
+    results = [node._portal_m1_visual_readiness("door", image, {"bbox_2d": box},
+        capture_step=step, image_sequence=step * 2, targeted_refresh=False)
+        for step, box in enumerate(boxes, 8)]
+    assert [result["ready"] for result in results] == [False, False, True]
+    duplicate = node._portal_m1_visual_readiness("door", image, {"bbox_2d": boxes[-1]},
+        capture_step=10, image_sequence=20, targeted_refresh=False)
+    assert not duplicate["ready"]
+    gap = node._portal_m1_visual_readiness("door", image, {"bbox_2d": boxes[-1]},
+        capture_step=20, image_sequence=40, targeted_refresh=False)
+    assert not gap["ready"]
+
+
 def test_portal_m1_waits_for_complete_stable_view() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()

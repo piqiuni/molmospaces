@@ -2,6 +2,38 @@
 
 最后更新：2026-09-15
 
+### 2026-09-15: 到达判定与无动作恢复回归
+
+- 目标导航候选与最终图验证都检查对象距离；导航锚点到达不能替代目标成功距离。目标视点在成功半径内生成，受阻时检查其他方向，保留当前可见且已到达目标的无移动验证路径。
+- `require_current_visibility=false` 时，可靠历史观测与当前对象距离共同决定到达，允许抽屉关闭后接近已观测目标；这与 evaluator 的公共观测证据账本一致。显式开启实时可见性要求时仍检查当前帧；历史可见不能绕过距离阈值。
+- 无有效 frontier 但仍有未解决交互对象时，允许有界恢复扫描。无候选等待保留 120 观察步上限，并增加 30 秒空闲上限；扫描执行时间不计入空闲墙钟时间，避免与 bridge 的 60 秒无新动作保护竞态。
+- 门 M1 在完整入镜前提下，按同一对象的相邻源帧累计稳定观测；不再以旋转扫描中包围框 IoU 作为连续观测的必要条件。重复帧不累加、间断帧重置，精确 RGB 配对与后续状态确认仍保留。
+- 三轮端到端复测使用 `run_interactive_nav_v3_ros_eval_batch.py`、动态预算与完整录制。正式评估以 `applied_action_step_count` 为预算单位，不能用录像帧数比较预算；任务失败与执行进程失败分开统计。复测与并发结论须以最终批次报告为准，不能仅凭以下单测宣称全部场景成功。
+
+最小回归（从仓库根目录运行，复用已有 Conda 环境）：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python - <<'PY'
+import sys
+from pathlib import Path
+root = Path.cwd() / "Interactive-Nav-SG-nav"
+sys.path.extend(str(p) for p in (root / "src").glob("*/scripts"))
+sys.path.extend([
+    "/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages",
+    str(root / "devel/lib/python3.11/site-packages"),
+])
+import pytest
+decision = root / "src/semantic_decision_py_pkg/tests"
+tests = [decision / name for name in (
+    "test_behavior_candidates.py", "test_behavior_execution.py", "test_mission_completion.py",
+    "test_rule_decision_navigation_recovery.py", "test_target_distance_verification.py",
+)]
+tests.append(root / "src/semantic_mapping_py_pkg/tests/test_attribute_inference_request_state.py")
+raise SystemExit(pytest.main([*(str(p) for p in tests), "-q", "-p", "no:cacheprovider"]))
+PY
+```
+
 ### 2026-09-15: 轻量录制配置与动态预算
 
 - 配置入口：`scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf`，详细说明见同目录 `README.md`。单场命令只需输出目录与 episode index；可用第三个参数传入 Bash 覆盖配置。

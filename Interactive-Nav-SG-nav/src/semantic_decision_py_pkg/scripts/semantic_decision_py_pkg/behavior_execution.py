@@ -13,6 +13,7 @@ from .behavior_candidates import (
     BEHAVIOR_INTERACT,
     BEHAVIOR_NAVIGATE,
     BEHAVIOR_SCAN,
+    target_observation_satisfies_arrival,
 )
 
 
@@ -1244,9 +1245,9 @@ def target_ready_for_graph_verification(selection: dict[str, Any] | None) -> boo
         str(selection.get("behavior_type") or "").upper() == BEHAVIOR_NAVIGATE
         and metadata.get("target_goal")
         and metadata.get("verify_target_visibility", True)
-        and metadata.get("target_visible_now")
         and metadata.get("target_reliably_observed")
         and not bool(metadata.get("target_navigation_required", True))
+        and target_observation_satisfies_arrival(metadata)
     )
 
 

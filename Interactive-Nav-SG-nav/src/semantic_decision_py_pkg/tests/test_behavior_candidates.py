@@ -1794,6 +1794,43 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_goal_distance_m"] > 0.35
 
 
+def test_near_anchor_cannot_complete_target_outside_success_distance() -> None:
+    from dataclasses import asdict
+    from semantic_decision_py_pkg.behavior_execution import target_ready_for_graph_verification
+
+    graph = {"nodes": [{
+        "id": "bed", "type": "support", "label": "bed",
+        "aabb_center": [1.95, 0., .5], "aabb_size": [2., 1., 1.],
+        "is_currently_visible": True,
+        "attributes": {"visible_pixels": 2000, "visible_fraction": .7,
+                       "consecutive_observations": 10},
+    }]}
+    candidates = CandidateGenerator().generate({}, graph, (0., 0.), {
+        "enabled": True, "object_labels": ["bed"], "standoff_m": .85,
+        "success_distance_threshold_m": 1.5,
+    })
+    target = next(c for c in candidates if c.metadata.get("target_goal"))
+    assert target.metadata["target_goal_distance_m"] > .35
+    assert math.dist(target.goal_xyyaw[:2], [1.95, 0.]) < 1.25
+    assert target.metadata["target_navigation_required"]
+    stale = asdict(target)
+    stale["metadata"]["target_navigation_required"] = False
+    assert not target_ready_for_graph_verification(stale)
+
+
+def test_target_uses_clear_alternate_inside_success_radius() -> None:
+    graph = {"nodes": [{"id": "bed", "type": "support", "label": "bed",
+        "aabb_center": [1.95, 0., .5], "aabb_size": [2., 1., 1.],
+        "is_currently_visible": True, "attributes": {"visible_pixels": 2000,
+        "visible_fraction": .7, "consecutive_observations": 10}}]}
+    candidates = CandidateGenerator().generate({}, graph, (0., 0.), {
+        "enabled": True, "object_labels": ["bed"], "success_distance_threshold_m": 1.5,
+    }, clearance_check=lambda goal, tolerance, **kw: {"clear": goal[1] > .8})
+    target = next(c for c in candidates if c.metadata.get("target_goal"))
+    assert target.goal_xyyaw[1] > .8
+    assert math.dist(target.goal_xyyaw[:2], [1.95, 0.]) + .25 < 1.5
+
+
 def test_visible_arrived_target_survives_blocked_navigation_anchor() -> None:
     from dataclasses import asdict
     from semantic_decision_py_pkg.mission_completion import TargetMissionTracker
@@ -1811,7 +1848,7 @@ def test_visible_arrived_target_survives_blocked_navigation_anchor() -> None:
         {"id": "container_drawers", "type": "container", "label": "dresser",
          "aabb_center": [8.768, 5.54, .5], "aabb_size": [1.5, 1., 1.]}, target
     ], "edges": [{"src_id": "container_drawers", "dst_id": "object_clock", "relation": "contains"}]}
-    context = {"enabled": True, "object_labels": ["alarm clock"],
+    context = {"enabled": True, "object_labels": ["alarm clock"], "require_current_visibility": True,
                "success_distance_threshold_m": 1.5}
     checked = []
 
@@ -1831,7 +1868,25 @@ def test_visible_arrived_target_survives_blocked_navigation_anchor() -> None:
         target["is_currently_visible"] = visible
         candidates = generator.generate({}, graph, robot_xy, context, clearance_check=blocked)
         assert not any(c.metadata.get("target_goal") for c in candidates)
-        assert any(r["candidate_id"] == "target:object_clock" for r in generator.clearance_rejections)
+        if visible:
+            assert any(r["candidate_id"] == "target:object_clock" for r in generator.clearance_rejections)
+
+
+def test_observed_target_can_complete_after_container_closes_only_when_configured():
+    from semantic_decision_py_pkg.behavior_candidates import target_observation_satisfies_arrival
+    from semantic_decision_py_pkg.behavior_execution import target_ready_for_graph_verification
+    metadata = {"target_goal": True, "target_reliably_observed": True,
+        "target_visible_now": False, "target_require_current_visibility": False,
+        "target_object_distance_m": .83, "target_success_distance_threshold_m": 1.5,
+        "target_navigation_required": False}
+    candidate = {"behavior_type": "NAVIGATE", "metadata": metadata}
+    assert target_observation_satisfies_arrival(metadata)
+    assert target_ready_for_graph_verification(candidate)
+    metadata["target_object_distance_m"] = 1.69
+    assert not target_observation_satisfies_arrival(metadata)
+    metadata["target_object_distance_m"] = .83
+    metadata["target_require_current_visibility"] = True
+    assert not target_ready_for_graph_verification(candidate)
 
 
 def test_contained_target_navigation_anchors_outside_parent_container() -> None:

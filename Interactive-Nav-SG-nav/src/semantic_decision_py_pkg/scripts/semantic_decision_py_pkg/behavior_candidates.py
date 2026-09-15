@@ -16,9 +16,9 @@ BEHAVIOR_SCAN = "SCAN"
 
 def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
     """Public target evidence can establish arrival without another navigation pose."""
-    if not all(metadata.get(key) for key in (
-        "target_goal", "target_reliably_observed", "target_visible_now"
-    )):
+    if not all(metadata.get(key) for key in ("target_goal", "target_reliably_observed")):
+        return False
+    if metadata.get("target_require_current_visibility", True) and not metadata.get("target_visible_now"):
         return False
     try:
         success_threshold = metadata.get("target_success_distance_threshold_m")
@@ -31,6 +31,30 @@ def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     return math.isfinite(distance) and math.isfinite(tolerance) and 0 <= distance <= tolerance
+
+
+def target_success_region_goals(candidate: BehaviorCandidate, robot_xy: tuple[float, float]) -> list[list[float]]:
+    """Offer observation poses whose arrival tolerance stays inside the goal radius."""
+    metadata = candidate.metadata
+    center = metadata.get("target_object_xy")
+    threshold = metadata.get("target_success_distance_threshold_m")
+    if center is None or threshold is None or candidate.goal_xyyaw is None:
+        return []
+    tolerance = max(float(metadata.get("navigation_goal_position_tolerance_m", .25)),
+                    float(metadata.get("direct_goal_tolerance_m", 0.0)))
+    radius = float(threshold) - tolerance - .05
+    if not math.isfinite(radius) or radius <= 0:
+        return []
+    cx, cy = map(float, center[:2])
+    angle = math.atan2(robot_xy[1] - cy, robot_xy[0] - cx)
+    goals = []
+    if math.hypot(candidate.goal_xyyaw[0] - cx, candidate.goal_xyyaw[1] - cy) <= radius:
+        goals.append(list(candidate.goal_xyyaw))
+    for offset in (0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180):
+        theta = angle + math.radians(offset)
+        x, y = cx + radius * math.cos(theta), cy + radius * math.sin(theta)
+        goals.append([x, y, math.atan2(cy - y, cx - x)])
+    return goals
 
 
 SPATIAL_CONTEXT_LABELS = {
@@ -391,8 +415,13 @@ class CandidateGenerator:
                     )
                 )
         for candidate in candidates:
-            if candidate.behavior_type == BEHAVIOR_NAVIGATE and target_observation_satisfies_arrival(candidate.metadata):
-                candidate.metadata["target_navigation_required"] = False
+            if candidate.behavior_type == BEHAVIOR_NAVIGATE and candidate.metadata.get("target_goal"):
+                candidate.metadata["target_navigation_required"] = not target_observation_satisfies_arrival(candidate.metadata)
+                if candidate.metadata["target_navigation_required"] and robot_xy is not None:
+                    goals = target_success_region_goals(candidate, robot_xy)
+                    if goals:
+                        candidate.goal_xyyaw = goals[0]
+                        candidate.metadata["goal_xyyaw_candidates"] = goals
         if clearance_check is not None:
             admitted = []
             for candidate in candidates:
@@ -406,7 +435,10 @@ class CandidateGenerator:
                     detail = clearance_check(candidate.goal_xyyaw, tolerance,
                                              frame_id=candidate.metadata.get("frame_id"))
                     if not detail.get("clear"):
-                        alternatives = navigation_goal_recovery(candidate) if navigation_goal_recovery is not None else []
+                        if candidate.metadata.get("target_goal"):
+                            alternatives = candidate.metadata.get("goal_xyyaw_candidates", [])
+                        else:
+                            alternatives = navigation_goal_recovery(candidate) if navigation_goal_recovery is not None else []
                         alternatives = [goal for goal in alternatives if clearance_check(
                             goal, tolerance, frame_id=candidate.metadata.get("frame_id")
                         ).get("clear")]
@@ -428,6 +460,12 @@ class CandidateGenerator:
                         continue
                 admitted.append(candidate)
             candidates = admitted
+        if robot_xy is not None:
+            for candidate in candidates:
+                if candidate.metadata.get("target_goal") and candidate.goal_xyyaw:
+                    distance = math.dist(robot_xy, candidate.goal_xyyaw[:2])
+                    candidate.features["distance_m"] = distance
+                    candidate.metadata["target_goal_distance_m"] = distance
         self._attach_portal_child_room_context(candidates, graph or {})
         self._attach_frontier_room_context(candidates, graph or {}, robot_xy)
         self._attach_spatial_context(candidates, graph or {})
@@ -779,6 +817,7 @@ class CandidateGenerator:
                                        self._node_xy(node, prefer_aabb=True)[1] - robot_xy[1])
                             if self._node_xy(node, prefer_aabb=True) is not None else None
                         ),
+                        "target_object_xy": self._node_xy(node, prefer_aabb=True),
                         "target_success_distance_threshold_m": target_context.get("success_distance_threshold_m"),
                         "target_arrival_tolerance_m": target_arrival_tolerance_m,
                         "target_navigation_required": (

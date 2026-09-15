@@ -2291,14 +2291,17 @@ class InteractionAttributeInferenceNode:
             }
         with self.lock:
             previous = dict(self.portal_observation_streaks.get(object_id) or {})
-            previous_bbox = previous.get("bbox")
             previous_sample = previous.get("sample_index")
             previous_streak = int(previous.get("streak", 0) or 0)
+            # Exact RGB pairing already protects frame identity. During a scan,
+            # camera motion shifts a consistently tracked door's box; overlap
+            # is not a measure of whether that door was observed consecutively.
             same_observation = (
                 previous_sample is not None
-                and int(sample_index) > int(previous_sample)
-                and self._bbox_iou(previous_bbox, bbox) >= 0.5
+                and 0 < int(sample_index) - int(previous_sample) <= 2
             )
+            if previous_sample is not None and int(sample_index) == int(previous_sample):
+                return {"ready": False, "reason": "duplicate_portal_observation"}
             streak = previous_streak + 1 if same_observation else 1
             self.portal_observation_streaks[object_id] = {
                 "sample_index": int(sample_index),

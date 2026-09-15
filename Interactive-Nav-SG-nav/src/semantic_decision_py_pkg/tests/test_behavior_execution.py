@@ -2655,6 +2655,8 @@ def test_visible_reliable_target_skips_navigation_and_verifies_graph() -> None:
             "target_visible_now": True,
             "target_reliably_observed": True,
             "target_navigation_required": False,
+            "target_object_distance_m": 1.0,
+            "target_success_distance_threshold_m": 1.5,
         }
     )
     assert target_ready_for_graph_verification(candidate)

@@ -4836,22 +4836,43 @@ class SemanticBehaviorExecutor:
                 str(self.selection.get("behavior_type") or "") == "NAVIGATE"
                 and bool(metadata.get("target_goal"))
             ):
-                visible_pixels = int(attributes.get("visible_pixels", 0) or 0)
+                threshold = metadata.get("target_success_distance_threshold_m")
+                if threshold is not None:
+                    pose = self._current_pose(self.map_frame)
+                    center = node.get("aabb_center") or node.get("centroid")
+                    try:
+                        distance = math.hypot(float(center[0]) - pose[0], float(center[1]) - pose[1])
+                        distance_ok = math.isfinite(distance) and distance < float(threshold)
+                    except (TypeError, ValueError, IndexError):
+                        distance, distance_ok = None, False
+                    if not distance_ok:
+                        return self.machine.on_verification_result(False, detail={
+                            "reason": "target_distance_not_satisfied",
+                            "node_id": node.get("id"),
+                            "target_object_distance_m": distance,
+                            "target_success_distance_threshold_m": threshold,
+                        })
+                require_current = bool(metadata.get("target_require_current_visibility", True))
+                def observation_value(name, default):
+                    current = attributes.get(name, default)
+                    return current if require_current else attributes.get("max_" + name, current)
+
+                visible_pixels = int(observation_value("visible_pixels", 0) or 0)
                 min_visible_pixels = int(
                     metadata.get("target_min_visible_pixels", 1) or 1
                 )
-                target_visible = bool(node.get("is_currently_visible")) and (
+                target_visible = (not require_current or bool(node.get("is_currently_visible"))) and (
                     visible_pixels >= min_visible_pixels
                 )
                 visible_fraction = float(
-                    attributes.get("visible_fraction", 1.0) or 0.0
+                    observation_value("visible_fraction", 1.0) or 0.0
                 )
                 consecutive_observations = int(
-                    attributes.get("consecutive_observations", 2) or 0
+                    observation_value("consecutive_observations", 2) or 0
                 )
                 target_visible = target_visible and (
                     visible_fraction >= float(
-                        metadata.get("target_min_visible_fraction", 0.2) or 0.2
+                        metadata.get("target_min_visible_fraction", 0.2)
                     )
                     and consecutive_observations >= int(
                         metadata.get("target_min_consecutive_observations", 2) or 2
@@ -4862,6 +4883,8 @@ class SemanticBehaviorExecutor:
                     detail={
                         "node_id": node.get("id"),
                         "target_visible": target_visible,
+                        "target_currently_visible": bool(node.get("is_currently_visible")),
+                        "target_evidence_source": "current" if require_current else "observation_history",
                         "visible_pixels": visible_pixels,
                         "visible_fraction": visible_fraction,
                         "consecutive_observations": consecutive_observations,
