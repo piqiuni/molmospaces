@@ -766,6 +766,18 @@ class InteractionGraphStore:
         except (TypeError, ValueError):
             observed_step = None
         sequence_type = str(result.get("sequence_type") or "").strip().casefold()
+        # The evaluator's public drawer-scan result historically omitted
+        # ``sequence_type`` and exposed only the verification source.  Treat
+        # that source as the same completed scan contract so a successful
+        # closed-after-scan result remains terminal in the graph and is not
+        # regenerated as another container interaction.
+        if (
+            not sequence_type
+            and str(result.get("verification_source") or "").strip().casefold()
+            == "drawer_scan_backend"
+            and node.type == "container"
+        ):
+            sequence_type = "drawer_scan"
         if bool(result.get("success")) and sequence_type == "drawer_scan":
             grounded_regions = [
                 str(item.get("region_id") or "")

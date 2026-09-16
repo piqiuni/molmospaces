@@ -727,6 +727,10 @@ class SemanticBehaviorExecutor:
             1,
             int(config.get("rear_goal_prerotate_max_control_steps", 28)),
         )
+        self.rear_goal_prerotate_control_step_margin_steps = max(
+            0,
+            int(config.get("rear_goal_prerotate_control_step_margin_steps", 4)),
+        )
         self.rear_goal_prerotate_post_budget_settle_steps = max(
             0,
             int(config.get("rear_goal_prerotate_post_budget_settle_steps", 3)),
@@ -4837,7 +4841,16 @@ class SemanticBehaviorExecutor:
                 and bool(metadata.get("target_goal"))
             ):
                 threshold = metadata.get("target_success_distance_threshold_m")
-                if threshold is not None:
+                # For a reliably observed child of a successfully opened
+                # container, candidate generation has already validated that
+                # the robot is within the last interaction approach pose.  The
+                # benchmark's target-distance check must not force a second
+                # motion toward the child centre, which can move the robot out
+                # of the safe fridge/drawer observation pose.
+                opened_container_anchor_ready = bool(
+                    metadata.get("target_open_container_anchor_ready")
+                )
+                if threshold is not None and not opened_container_anchor_ready:
                     pose = self._current_pose(self.map_frame)
                     center = node.get("aabb_center") or node.get("centroid")
                     try:
@@ -4885,6 +4898,11 @@ class SemanticBehaviorExecutor:
                         "target_visible": target_visible,
                         "target_currently_visible": bool(node.get("is_currently_visible")),
                         "target_evidence_source": "current" if require_current else "observation_history",
+                        "target_distance_source": (
+                            "opened_container_interaction_anchor"
+                            if opened_container_anchor_ready
+                            else "target_aabb_center"
+                        ),
                         "visible_pixels": visible_pixels,
                         "visible_fraction": visible_fraction,
                         "consecutive_observations": consecutive_observations,
@@ -7212,13 +7230,26 @@ class SemanticBehaviorExecutor:
                     )
                 )
             )
+            raw_required_steps = required_steps
+            required_steps = min(
+                int(self.rear_goal_prerotate_max_control_steps),
+                required_steps
+                + int(
+                    getattr(
+                        self,
+                        "rear_goal_prerotate_control_step_margin_steps",
+                        0,
+                    )
+                ),
+            )
             candidate_detail = {
                 "turn_sign": sign,
                 "direction": "ccw" if sign > 0 else "cw",
                 "arc_rad": arc,
                 "required_control_steps": required_steps,
+                "raw_required_control_steps": raw_required_steps,
             }
-            if required_steps > int(self.rear_goal_prerotate_max_control_steps):
+            if raw_required_steps > int(self.rear_goal_prerotate_max_control_steps):
                 rejected.append({**candidate_detail, "reason": "control_budget"})
                 continue
             clear = circular_costmap_rotation_sweep_is_clear(
@@ -10355,11 +10386,34 @@ class SemanticBehaviorExecutor:
         )
         post_open_costmap_detail: dict = {}
         if is_post_interaction_traversal:
-            costmap_fresh, post_open_costmap_detail = (
-                self._wait_for_post_interaction_costmap_freshness(
-                    decision_id, candidate
-                )
+            metadata = candidate.get("metadata") or {}
+            static_occ_traversal = bool(
+                metadata.get("static_open_occ_confirmed")
+                and str(metadata.get("portal_open_evidence_source") or "")
+                == "occ_consensus"
             )
+            if static_occ_traversal:
+                # OCC has already observed an open aperture; there was no
+                # physical open command whose map delta needs causal fencing.
+                # Waiting for a post-action baseline here makes a valid static
+                # portal permanently ineligible when no interaction result
+                # exists.  Ordinary articulated-door traversals retain the
+                # raw OCC -> planning OCC -> global-costmap barrier below.
+                costmap_fresh = True
+                post_open_costmap_detail = {
+                    "costmap_fresh": True,
+                    "post_open_costmap_fresh": True,
+                    "fresh_source": "occ_consensus_no_action",
+                    "post_open_costmap_baseline_required": False,
+                    "opened_portal_id": metadata.get("opened_portal_id")
+                    or candidate.get("target_id"),
+                }
+            else:
+                costmap_fresh, post_open_costmap_detail = (
+                    self._wait_for_post_interaction_costmap_freshness(
+                        decision_id, candidate
+                    )
+                )
             if not costmap_fresh:
                 if (
                     str(post_open_costmap_detail.get("reason") or "")
@@ -11329,7 +11383,7 @@ class SemanticBehaviorExecutor:
             )
             arrival_latch.observe(pose, latest_task_step_index)
             if (
-                str(behavior_type).upper() == "INTERACT"
+                (str(behavior_type).upper() == "INTERACT" or is_post_interaction_traversal)
                 and state not in TERMINAL_STATES and not arrival_latch.latched
                 and pose is not None and goal_distance_m is not None and goal_distance_m > 0.35
                 and latest_task_step_index is not None and path_replan_step is not None

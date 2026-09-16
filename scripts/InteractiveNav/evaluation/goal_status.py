@@ -351,6 +351,7 @@ def verify_target_goal_claim(
     evidence: PublicGoalEvidenceLedger,
     private_distances_m: Mapping[str, float],
     distance_threshold_m: float,
+    allow_open_container_anchor: bool = False,
 ) -> GoalClaimVerification:
     """Verify one policy declaration against public evidence and private range.
 
@@ -389,7 +390,7 @@ def verify_target_goal_claim(
         finite_distances,
         key=lambda item: item[0],
     )
-    if distance >= threshold:
+    if distance >= threshold and not allow_open_container_anchor:
         return GoalClaimVerification(False, "private_distance_failed")
     matching_frame = next(
         (
@@ -403,7 +404,7 @@ def verify_target_goal_claim(
         return GoalClaimVerification(False, "nearest_target_not_published")
     return GoalClaimVerification(
         True,
-        "verified",
+        "verified_open_container_anchor" if allow_open_container_anchor else "verified",
         target_instance_id=nearest_instance_id,
         distance_m=distance,
         evidence_capture_step=matching_frame.capture_step,

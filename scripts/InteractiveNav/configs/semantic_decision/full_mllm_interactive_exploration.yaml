@@ -44,7 +44,7 @@ candidate:
   # selected point is used for navigation, M1, and the physical bridge in this
   # model lane; the bridge still performs its independent collision/sweep gate.
   container_action_standoff_m: 0.50
-  drawer_action_standoff_m: 0.50
+  drawer_action_standoff_m: 0.70
   # The shared anchor keeps M1 and physical action at the selected fan distance.
   fridge_action_standoff_m: 1.15
   # AABB supplies four cardinal candidate faces only.  Targeted M1 decides
@@ -54,7 +54,7 @@ candidate:
   # Legacy capture aliases remain documented for old traces.  They are not
   # used to create a second pose while the shared contract is enabled.
   container_m1_capture_standoff_m: 0.50
-  drawer_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.70
   fridge_m1_capture_standoff_m: 1.15
   # These legacy navigation-ring values are retained for compatibility; the
   # shared contract below deliberately sets their effective offset to zero.
@@ -67,7 +67,7 @@ candidate:
   # Drawer outer navigation uses the real AABB surface, centred on the
   # robot-visible face normal.  This replaces the four tilted radial rings.
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
+  drawer_navigation_anchor_fan_clearances_m: [0.70, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   # Refrigerators use the same four-face M1 authorization, but their physical
   # fan is narrower and remains farther away to preserve leaf/interior space.

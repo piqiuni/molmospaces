@@ -1077,7 +1077,7 @@ class RestrictedGTPerceptionPublisher:
         min_bbox_short_side_pixels: int = 1,
         min_portal_bbox_short_side_pixels: int = 8,
         min_visible_fraction: float = 0.2,
-        max_distance_m: float = 4.0,
+        max_distance_m: float = 8.0,
         step_interval: int = 1,
         frame_id: str = "world",
         rospy_module: Any | None = None,

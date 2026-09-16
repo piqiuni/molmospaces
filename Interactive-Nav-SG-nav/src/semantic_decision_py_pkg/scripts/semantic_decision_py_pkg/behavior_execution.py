@@ -1297,6 +1297,11 @@ def next_interaction_approach_option_index(
         "navigation_stagnation",
         "interaction_pose_poll_exhausted",
         "interaction_pose_invalid",
+        # The bridge can identify a valid but wrong-facing approach pose.
+        # Advance the preserved face/side options so the same pose is not
+        # retried; two-stage containers additionally switch their M1 staging
+        # face through the dedicated branch in the executor.
+        "interaction_wrong_face",
         "unsafe_open_sweep",
         "visual_reposition_required",
         "navigation_timeout",

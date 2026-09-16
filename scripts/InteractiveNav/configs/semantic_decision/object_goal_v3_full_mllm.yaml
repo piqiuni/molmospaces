@@ -35,19 +35,22 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   container_action_standoff_m: 0.50
-  drawer_action_standoff_m: 0.50
+  # The drawer can travel about 0.35 m toward the robot.  Keep the action and
+  # M1 capture poses 0.70 m outside the closed AABB surface, leaving room for
+  # the 0.25 m base radius and a small residual margin after opening.
+  drawer_action_standoff_m: 0.70
   fridge_action_standoff_m: 1.15
   container_m1_face_selection_enabled: true
   fridge_multiview_angular_scale: 1.0
   container_m1_capture_standoff_m: 0.50
-  drawer_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.70
   fridge_m1_capture_standoff_m: 1.15
   container_navigation_anchor_outer_offset_m: 0.35
   container_navigation_anchor_ring_count: 3
   container_navigation_anchor_tangent_offset_m: 0.20
   container_anchor_shared_pose_enabled: true
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
+  drawer_navigation_anchor_fan_clearances_m: [0.70, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   fridge_navigation_anchor_aabb_fan_enabled: true
   fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
@@ -190,6 +193,7 @@ executor:
   rear_goal_prerotate_step_sync_enabled: true
   rear_goal_prerotate_control_dt_s: 0.2
   rear_goal_prerotate_max_control_steps: 28
+  rear_goal_prerotate_control_step_margin_steps: 4
   rear_goal_prerotate_post_budget_settle_steps: 3
   rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
   rear_goal_local_costmap_max_age_s: 0.75

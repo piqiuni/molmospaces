@@ -943,6 +943,25 @@ class SemanticRuleDecisionNode:
             priority_target = self.target_mission.priority_target_candidate(
                 payload.get("candidates") or []
             )
+            # ``priority_target_candidate`` intentionally reads the producer's
+            # raw evidence so completion can still be recognized from the same
+            # observation.  Preemption is an execution action, however: a
+            # target that just timed out is already on cooldown and must not
+            # repeatedly cancel a healthy EXPLORE worker until that cooldown
+            # expires.  Keep this check local and cheap because candidates may
+            # arrive once per simulator step.
+            preemptible_priority_target = priority_target
+            if priority_target is not None:
+                priority_candidate_id = str(
+                    priority_target.get("candidate_id") or ""
+                )
+                priority_target_id = str(priority_target.get("target_id") or "")
+                cooldown_deadline = max(
+                    float(self.cooldown_until.get(priority_candidate_id, 0.0) or 0.0),
+                    float(self.cooldown_until.get(priority_target_id, 0.0) or 0.0),
+                )
+                if time.monotonic() < cooldown_deadline:
+                    preemptible_priority_target = None
             if priority_target is not None:
                 self.priority_target_candidate_id = str(
                     priority_target.get("candidate_id") or ""
@@ -965,7 +984,7 @@ class SemanticRuleDecisionNode:
                     **dict(priority_target.get("metadata") or {}),
                 })
             if (
-                priority_target is not None
+                preemptible_priority_target is not None
                 and self.active_candidate_id
                 and self.active_behavior_type == "EXPLORE"
                 and not self.active_target_goal
@@ -980,7 +999,7 @@ class SemanticRuleDecisionNode:
                                 "decision_id": self.active_decision_id,
                                 "candidate_id": self.active_candidate_id,
                                 "replacement_candidate_id": str(
-                                    priority_target.get("candidate_id") or ""
+                                    preemptible_priority_target.get("candidate_id") or ""
                                 ),
                                 "reason": "preempted_by_target",
                                 "candidate_sequence": int(
@@ -1464,6 +1483,37 @@ class SemanticRuleDecisionNode:
             elif transition["phase"] == "complete":
                 self.target_goal_complete = True
                 detail = dict(transition["detail"])
+                # The executor feedback intentionally carries only the
+                # public behavior result.  Preserve the narrow target
+                # navigation contract from the selected candidate so the
+                # evaluator can distinguish a contained-object completion at
+                # the successful container anchor from an ordinary
+                # centre-distance claim.  This also closes the one-frame race
+                # where the graph metadata was present at selection time but
+                # absent from the feedback payload.
+                selected_metadata = next(
+                    (
+                        dict(candidate.get("metadata") or {})
+                        for candidate in self.latest_candidates_payload.get(
+                            "candidates", []
+                        )
+                        if str(candidate.get("candidate_id") or "")
+                        == str(candidate_id or self.active_candidate_id or "")
+                    ),
+                    {},
+                )
+                for key in (
+                    "target_navigation_required",
+                    "target_reliably_observed",
+                    "containing_container_id",
+                    "approach_strategy",
+                    "direct_goal_tolerance_m",
+                    "target_open_container_anchor_distance_m",
+                    "target_open_container_anchor_ready",
+                    "target_open_container_anchor_xyyaw",
+                ):
+                    if key in selected_metadata and key not in detail:
+                        detail[key] = selected_metadata[key]
                 detail["reason"] = "target_goal_succeeded"
                 if target_interaction_succeeded and not self.active_target_goal:
                     detail["target_interaction_source"] = "autonomous_interaction"

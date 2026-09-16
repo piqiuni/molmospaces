@@ -110,7 +110,7 @@ candidate:
   # physical-action pose.  Legacy/rule callers keep the staged contract.
   container_anchor_shared_pose_enabled: false
   drawer_navigation_anchor_aabb_fan_enabled: false
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.00]
+  drawer_navigation_anchor_fan_clearances_m: [0.70, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
 
 policy:

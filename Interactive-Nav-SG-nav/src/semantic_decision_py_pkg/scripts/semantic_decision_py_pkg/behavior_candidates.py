@@ -20,6 +20,13 @@ def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
         return False
     if metadata.get("target_require_current_visibility", True) and not metadata.get("target_visible_now"):
         return False
+    # A child observed inside a container that has just been opened is already
+    # at a valid observation/action pose when the robot is still at the
+    # successful container-interaction anchor.  The child centre can be deeper
+    # inside a fridge/drawer than the public target radius; moving toward that
+    # centre would leave the safe observation pose and can close the container.
+    if metadata.get("target_open_container_anchor_ready"):
+        return True
     try:
         success_threshold = metadata.get("target_success_distance_threshold_m")
         if success_threshold is not None:
@@ -269,7 +276,7 @@ class CandidateGeneratorConfig:
     # Clearances are measured from the ray/box intersection, never the centre.
     drawer_navigation_anchor_aabb_fan_enabled: bool = False
     drawer_navigation_anchor_fan_clearances_m: tuple[float, ...] = (
-        0.50,
+        0.70,
         0.85,
         1.00,
     )
@@ -756,6 +763,87 @@ class CandidateGenerator:
             )
             if require_current_visibility and not target_visible_now:
                 continue
+            direct_goal_tolerance = 0.45 if containing_container is not None else 0.0
+            containing_interaction = (
+                (containing_container or {}).get("interaction") or {}
+            )
+            containing_state = str(
+                containing_interaction.get("state") or ""
+            ).strip().casefold()
+            successful_open_history = any(
+                bool(event.get("success"))
+                and str(
+                    event.get("post_state") or event.get("state") or ""
+                ).strip().casefold()
+                in {"open", "opened", "ajar", "static_open"}
+                for event in list(
+                    containing_interaction.get("operation_history") or []
+                )
+                if isinstance(event, dict)
+            )
+            successful_drawer_scan = bool(
+                containing_interaction.get("drawer_scan_completed")
+            ) or any(
+                bool(event.get("success"))
+                and (
+                    str(event.get("sequence_type") or "").strip().casefold()
+                    == "drawer_scan"
+                    or str(
+                        event.get("verification_source") or ""
+                    ).strip().casefold()
+                    == "drawer_scan_backend"
+                )
+                for event in list(
+                    containing_interaction.get("operation_history") or []
+                )
+                if isinstance(event, dict)
+            )
+            opened_container_anchor_distance = None
+            if previous_interaction_goal is not None and robot_xy is not None:
+                try:
+                    opened_container_anchor_distance = math.hypot(
+                        float(previous_interaction_goal[0]) - float(robot_xy[0]),
+                        float(previous_interaction_goal[1]) - float(robot_xy[1]),
+                    )
+                except (TypeError, ValueError, IndexError):
+                    opened_container_anchor_distance = None
+            target_object_xy = self._node_xy(node, prefer_aabb=True)
+            target_object_distance = None
+            if target_object_xy is not None and robot_xy is not None:
+                try:
+                    target_object_distance = math.hypot(
+                        float(target_object_xy[0]) - float(robot_xy[0]),
+                        float(target_object_xy[1]) - float(robot_xy[1]),
+                    )
+                except (TypeError, ValueError, IndexError):
+                    target_object_distance = None
+            success_distance_threshold = target_context.get(
+                "success_distance_threshold_m"
+            )
+            try:
+                target_distance_satisfied = bool(
+                    success_distance_threshold is None
+                    or (
+                        target_object_distance is not None
+                        and math.isfinite(target_object_distance)
+                        and target_object_distance
+                        < float(success_distance_threshold)
+                    )
+                )
+            except (TypeError, ValueError):
+                target_distance_satisfied = False
+            opened_container_anchor_ready = bool(
+                containing_container is not None
+                and previous_interaction_goal is not None
+                and (
+                    containing_state in {"open", "opened", "ajar", "static_open"}
+                    and successful_open_history
+                    or successful_drawer_scan
+                )
+                and opened_container_anchor_distance is not None
+                and math.isfinite(opened_container_anchor_distance)
+                and opened_container_anchor_distance <= direct_goal_tolerance
+            )
             verify_visibility = bool(
                 target_context.get(
                     "completion_requires_visibility",
@@ -812,12 +900,8 @@ class CandidateGenerator:
                         "target_max_consecutive_observations": max_consecutive_observations,
                         "target_reliably_observed": reliably_observed,
                         "target_goal_distance_m": distance_m,
-                        "target_object_distance_m": (
-                            math.hypot(self._node_xy(node, prefer_aabb=True)[0] - robot_xy[0],
-                                       self._node_xy(node, prefer_aabb=True)[1] - robot_xy[1])
-                            if self._node_xy(node, prefer_aabb=True) is not None else None
-                        ),
-                        "target_object_xy": self._node_xy(node, prefer_aabb=True),
+                        "target_object_distance_m": target_object_distance,
+                        "target_object_xy": target_object_xy,
                         "target_success_distance_threshold_m": target_context.get("success_distance_threshold_m"),
                         "target_arrival_tolerance_m": target_arrival_tolerance_m,
                         "target_navigation_required": (
@@ -850,11 +934,21 @@ class CandidateGenerator:
                             if containing_container is not None
                             else ""
                         ),
-                        "direct_goal_tolerance_m": (
-                            0.45 if containing_container is not None else 0.0
-                        ),
+                        "direct_goal_tolerance_m": direct_goal_tolerance,
                         "direct_goal_yaw_tolerance_rad": (
                             0.65 if containing_container is not None else 0.0
+                        ),
+                        "target_open_container_state": containing_state,
+                        "target_open_container_anchor_xyyaw": (
+                            list(previous_interaction_goal)
+                            if previous_interaction_goal is not None
+                            else []
+                        ),
+                        "target_open_container_anchor_distance_m": (
+                            opened_container_anchor_distance
+                        ),
+                        "target_open_container_anchor_ready": (
+                            opened_container_anchor_ready
                         ),
                     },
                 )
@@ -2914,7 +3008,34 @@ class CandidateGenerator:
                 continue
             interaction = node.get("interaction") or {}
             state = str(interaction.get("state") or "unknown").casefold()
-            if state != "open":
+            attributes = node.get("attributes") or {}
+            # A door that is already open is sometimes reported as
+            # ``static_open`` because the backend cannot actuate it.  Once M1
+            # aperture and OCC connectivity have both reached the stable
+            # consensus gate, it is safe to create the same one-shot
+            # through-door goal.  A bare static label is deliberately kept
+            # fail-closed below.
+            occ_gate = attributes.get("portal_state_gate") or {}
+            occ_consensus = attributes.get("portal_state_consensus") or {}
+            unavailable_resolution = (
+                attributes.get("portal_unavailable_state_resolution") or {}
+            )
+            occ_open_confirmed = (
+                state == "static_open"
+                and interaction.get("traversable") is True
+                and bool(attributes.get("portal_state_consensus_accepted"))
+                and str(attributes.get("connectivity_status") or "").casefold()
+                == "connected"
+                and (
+                    bool(occ_gate.get("accepted"))
+                    or bool(unavailable_resolution.get("observed_open_connectivity"))
+                )
+                and bool(unavailable_resolution.get("m1_open_aperture", True))
+                and bool(occ_consensus.get("accepted", True))
+                and len(list(attributes.get("observed_connected_room_ids") or []))
+                >= 2
+            )
+            if state != "open" and not occ_open_confirmed:
                 continue
             # Do not treat a missing/unknown traversability bit as a valid
             # post-open route.  Only a confirmed backend result or an OCC/room
@@ -2930,10 +3051,15 @@ class CandidateGenerator:
                 ),
                 None,
             )
-            if open_event is None:
+            if occ_open_confirmed:
+                # OCC-only confirmation has no articulated approach event.
+                # Use a fresh robot-to-centre axis, so the goal always moves
+                # forward through the side currently occupied by the robot.
+                approach = [float(robot_xy[0]), float(robot_xy[1]), 0.0]
+            elif open_event is None:
                 continue
-            approach = list(open_event.get("approach_goal_xyyaw") or [])
-            attributes = node.get("attributes") or {}
+            else:
+                approach = list(open_event.get("approach_goal_xyyaw") or [])
             center = list(
                 attributes.get("interaction_reference_aabb_center")
                 or node.get("aabb_center")
@@ -2969,16 +3095,53 @@ class CandidateGenerator:
             traversal_distance = max(
                 0.0, float(self.config.portal_traversal_distance_m)
             )
+            if occ_open_confirmed:
+                # In an OCC-only observation the door leaf can remain in the
+                # local costmap until the robot has crossed the aperture.  A
+                # shorter first waypoint stays inside the free doorway cell;
+                # subsequent navigation can then turn around furniture in the
+                # newly entered room.
+                traversal_distance = min(traversal_distance, 0.35)
             goal = [
                 center_x + unit_x * traversal_distance,
                 center_y + unit_y * traversal_distance,
                 math.atan2(unit_y, unit_x),
             ]
+            goal_options = [goal]
+            if occ_open_confirmed:
+                # The door centre can remain inside a stale inflated leaf or
+                # a piece of furniture immediately beyond the aperture.  Let
+                # move_base preflight two small lateral offsets and choose a
+                # reachable point; this keeps the through-door transition
+                # one-shot without changing normal articulated-door goals.
+                lateral = 0.20
+                normal_x, normal_y = -unit_y, unit_x
+                goal_options.extend(
+                    [
+                        [
+                            goal[0] + normal_x * lateral,
+                            goal[1] + normal_y * lateral,
+                            goal[2],
+                        ],
+                        [
+                            goal[0] - normal_x * lateral,
+                            goal[1] - normal_y * lateral,
+                            goal[2],
+                        ],
+                    ]
+                )
             distance_m = math.hypot(
                 goal[0] - float(robot_xy[0]), goal[1] - float(robot_xy[1])
             )
             node_id = str(node.get("id") or "")
-            event_id = str(open_event.get("event_id") or "latest_open")
+            if occ_open_confirmed:
+                event_id = "occ_consensus_" + str(
+                    occ_gate.get("observation_capture_step")
+                    or interaction.get("state_observed_step")
+                    or "latest"
+                )
+            else:
+                event_id = str((open_event or {}).get("event_id") or "latest_open")
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
@@ -2986,6 +3149,17 @@ class CandidateGenerator:
             target_room_id = attributes.get("portal_child_room_id")
             if target_room_id is None and potential_room_ids:
                 target_room_id = potential_room_ids[0]
+            if target_room_id is None and occ_open_confirmed:
+                connected_room_ids = list(attributes.get("connected_room_ids") or [])
+                current_room_id = node.get("room_id")
+                target_room_id = next(
+                    (
+                        room_id
+                        for room_id in connected_room_ids
+                        if str(room_id) != str(current_room_id)
+                    ),
+                    None,
+                )
             source_room_id = attributes.get("portal_child_source_room_id")
             candidates.append(
                 BehaviorCandidate(
@@ -3017,6 +3191,10 @@ class CandidateGenerator:
                             or "door"
                         ),
                         "state": state,
+                        "portal_open_evidence_source": (
+                            "occ_consensus" if occ_open_confirmed else "interaction_result"
+                        ),
+                        "static_open_occ_confirmed": bool(occ_open_confirmed),
                         "post_interaction_traversal": True,
                         "portal_center_xy": [center_x, center_y],
                         "portal_through_axis_xy": [unit_x, unit_y],
@@ -3032,7 +3210,7 @@ class CandidateGenerator:
                         "room_transition_required": True,
                         "requires_approach": False,
                         "verify_target_visibility": False,
-                        "goal_xyyaw_candidates": [goal],
+                        "goal_xyyaw_candidates": goal_options,
                     },
                 )
             )

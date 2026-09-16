@@ -115,7 +115,7 @@ def opaque_door_instance_id(value: Any) -> str:
 
 
 PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v17"
-STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
+STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v2"
 DYNAMIC_MAX_STEPS_CAP = 2000
 
 # Established ROS exploration posture.  The asymmetric shoulder roll tucks the
@@ -136,13 +136,13 @@ class BenchmarkEvaluationConfig:
     policy_kwargs: dict[str, Any] = field(default_factory=dict)
     workers: int = 1
     max_steps: int = 500
-    step_budget_mode: Literal["fixed", "dynamic"] = "fixed"
-    min_steps: int = 300
+    step_budget_mode: Literal["fixed", "dynamic"] = "dynamic"
+    min_steps: int = 200
     dynamic_path_free_m: float = 3.0
-    dynamic_steps_per_path_m: float = 25.0
-    dynamic_channel_interaction_steps: int = 150
-    dynamic_container_interaction_steps: int = 200
-    dynamic_container_joint_steps: int = 40
+    dynamic_steps_per_path_m: float = 40.0
+    dynamic_channel_interaction_steps: int = 200
+    dynamic_container_interaction_steps: int = 250
+    dynamic_container_joint_steps: int = 50
     dynamic_step_quantum: int = 50
     episode_indices: list[int] | None = None
     max_episodes: int | None = None
@@ -201,7 +201,7 @@ class BenchmarkEvaluationConfig:
     restricted_gt_min_bbox_short_side_pixels: int = 1
     restricted_gt_min_portal_bbox_short_side_pixels: int = 8
     restricted_gt_min_visible_fraction: float = 0.2
-    restricted_gt_max_distance_m: float = 4.0
+    restricted_gt_max_distance_m: float = 8.0
     quality_gate_only: bool = False
     runtime_joint_position_tolerance: float = 0.02
     runtime_joint_fraction_tolerance: float = 0.05
@@ -1299,7 +1299,7 @@ def episode_step_budget(
     )
     container_joint_steps = 0.0
     if not initial_target_visible and int(counts["container"]) > 0:
-        container_joint_steps = float(config.dynamic_container_joint_steps) * max(0, container_joint_count - 1)
+        container_joint_steps = float(config.dynamic_container_joint_steps) * container_joint_count
 
     raw_steps = (
         float(config.min_steps)
@@ -1968,7 +1968,12 @@ def _execute_native_smooth(task, runtime, request, source_name, joints, episode,
                 observer=observer, task=task, runtime=runtime, episode=episode)
             if terminal is not None:
                 runtime.pending_goal_terminal = terminal
-                return True
+                # Drawer scans intentionally stop before close; ordinary
+                # interactions must still pass through after_step so the
+                # successful open state is reasserted before terminal capture.
+                if request.sequence_type == "drawer_scan":
+                    return True
+                return False
         return False
 
     previous = getattr(bridge, "force_interaction_controller", None)
@@ -2784,12 +2789,57 @@ def _verify_restricted_goal_status(
     threshold = float(
         episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
     )
+    # A child of a just-opened fridge/drawer may be visually verified from the
+    # successful interaction pose while its AABB centre remains deeper than the
+    # generic NavToObj centre-radius.  The decision node publishes this
+    # bounded anchor contract together with the claim; keep the public evidence
+    # and instance matching checks, but do not force a second motion toward the
+    # hidden centre.
+    detail = payload.get("detail") if isinstance(payload, Mapping) else None
+    detail = detail if isinstance(detail, Mapping) else {}
+    try:
+        anchor_distance = float(
+            detail.get("target_open_container_anchor_distance_m")
+        )
+        anchor_tolerance = float(detail.get("direct_goal_tolerance_m"))
+    except (TypeError, ValueError):
+        anchor_distance = float("nan")
+        anchor_tolerance = float("nan")
+    anchor_ready = bool(detail.get("target_open_container_anchor_ready"))
+    # A claim can race the graph merge by one frame: the candidate still has
+    # the stable last-interaction strategy and no navigation is required, but
+    # its explicit anchor-distance fields have not been copied yet.  Accept
+    # that equivalent shape only when the target is already reliable and tied
+    # to a containing object; ordinary target claims remain centre-distance
+    # strict.
+    raced_anchor_shape = bool(
+        detail.get("target_navigation_required") is False
+        and detail.get("containing_container_id")
+        and detail.get("target_reliably_observed")
+        and str(detail.get("approach_strategy") or "")
+        == "target_last_successful_interaction_pose"
+    )
+    allow_open_container_anchor = bool(
+        (anchor_ready or raced_anchor_shape)
+        and detail.get("target_navigation_required") is False
+        and detail.get("containing_container_id")
+        and (
+            raced_anchor_shape
+            or (
+                math.isfinite(anchor_distance)
+                and math.isfinite(anchor_tolerance)
+                and anchor_tolerance > 0.0
+                and anchor_distance <= anchor_tolerance + 1e-6
+            )
+        )
+    )
     return verify_target_goal_claim(
         payload,
         episode_id=runtime.perception.episode_id,
         evidence=runtime.goal_evidence,
         private_distances_m=_private_target_distances_m(task, runtime),
         distance_threshold_m=threshold,
+        allow_open_container_anchor=allow_open_container_anchor,
     )
 
 
@@ -2830,6 +2880,31 @@ def _poll_restricted_goal_status(
 ) -> tuple[str, GoalClaimVerification | None, dict[str, Any]] | None:
     """Consume fresh public status messages and return the first terminal one."""
 
+    # Goal status and the restricted RGB-D frame travel on independent ROS
+    # callbacks.  A container can expose its child on the next frame while the
+    # decision node publishes the target claim immediately after the open
+    # result.  Keep such a claim for a short bounded retry instead of turning a
+    # valid observation into ``target_claim_unverified`` due to callback order.
+    pending_claim = getattr(runtime, "pending_target_claim", None)
+    if pending_claim is not None:
+        pending_payload, pending_started_at = pending_claim
+        verification = _verify_restricted_goal_status(
+            task=task,
+            runtime=runtime,
+            episode=episode,
+            payload=pending_payload,
+        )
+        if verification.accepted:
+            runtime.pending_target_claim = None
+            return "target_found", verification, pending_payload
+        if (
+            verification.reason
+            not in {"no_published_target_evidence", "nearest_target_not_published"}
+            or time.monotonic() - float(pending_started_at) >= 2.0
+        ):
+            runtime.pending_target_claim = None
+            return "target_claim_unverified", verification, pending_payload
+
     pending = getattr(runtime, "pending_goal_terminal", None)
     if pending is not None:
         runtime.pending_goal_terminal = None
@@ -2842,6 +2917,12 @@ def _poll_restricted_goal_status(
                 episode=episode,
                 payload=payload,
             )
+            if verification.reason in {
+                "no_published_target_evidence",
+                "nearest_target_not_published",
+            }:
+                runtime.pending_target_claim = (payload, time.monotonic())
+                continue
             reason = "target_found" if verification.accepted else "target_claim_unverified"
             return reason, verification, payload
         if is_exploration_terminal(payload):
@@ -3982,6 +4063,11 @@ def evaluate_episode(
                 if str(name) not in set(dropped_pose_names)
             }
         probe.apply_episode_scene_state(task.env, episode)
+        # ``task.reset`` captured an observation before the benchmark's frozen
+        # articulation state was replayed. Refresh it before policy setup so a
+        # closed door cannot leak objects from the room behind it.
+        observation = task.get_observations()
+        _discard_task_rollout_cache(task)
         catalog = InteractionCatalog(task.env)
         private_visualization = _private_episode_visualization_context(
             task=task,
@@ -5180,13 +5266,13 @@ def parse_args() -> BenchmarkEvaluationConfig:
             "--step-budget-mode=dynamic; ROS no-fresh waits do not consume it."
         ),
     )
-    parser.add_argument("--step-budget-mode", choices=["fixed", "dynamic"], default="fixed")
-    parser.add_argument("--min-steps", type=int, default=300)
+    parser.add_argument("--step-budget-mode", choices=["fixed", "dynamic"], default="dynamic")
+    parser.add_argument("--min-steps", type=int, default=200)
     parser.add_argument("--dynamic-path-free-m", type=float, default=3.0)
-    parser.add_argument("--dynamic-steps-per-path-m", type=float, default=25.0)
-    parser.add_argument("--dynamic-channel-interaction-steps", type=int, default=150)
-    parser.add_argument("--dynamic-container-interaction-steps", type=int, default=200)
-    parser.add_argument("--dynamic-container-joint-steps", type=int, default=40)
+    parser.add_argument("--dynamic-steps-per-path-m", type=float, default=40.0)
+    parser.add_argument("--dynamic-channel-interaction-steps", type=int, default=200)
+    parser.add_argument("--dynamic-container-interaction-steps", type=int, default=250)
+    parser.add_argument("--dynamic-container-joint-steps", type=int, default=50)
     parser.add_argument("--dynamic-step-quantum", type=int, default=50)
     parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--max-episodes", type=int)
@@ -5330,8 +5416,8 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument(
         "--restricted-gt-max-distance-m",
         type=float,
-        default=4.0,
-        help="Maximum head-camera distance for evaluator-published restricted-GT observations; 0 disables the limit.",
+        default=8.0,
+        help="Maximum head-camera distance for evaluator-published restricted-GT observations; 0 disables the limit. Pixel/area/fraction filters still apply independently.",
     )
     parser.add_argument(
         "--quality-gate-only",

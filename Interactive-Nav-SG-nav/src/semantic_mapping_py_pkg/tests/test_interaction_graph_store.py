@@ -2446,6 +2446,38 @@ def test_successful_drawer_scan_completion_survives_closed_observation() -> None
     ]
 
 
+def test_drawer_scan_backend_source_implies_completion_when_sequence_type_missing() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    dresser = observation(
+        instance_id="dresser_scan_source_1",
+        semantic_name="dresser",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="slide",
+        joint_range=[0.0, 0.4],
+        joint_value=0.0,
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_dresser_scan_source_1",
+            "event_id": "drawer_scan_source_1",
+            "action": "open",
+            "success": True,
+            "post_state": "closed",
+            "verification_source": "drawer_scan_backend",
+            "step": 43,
+        }
+    )
+    node = next(
+        item
+        for item in store.as_graph_dict()["nodes"]
+        if item["id"] == "container_dresser_scan_source_1"
+    )
+    assert node["interaction"]["drawer_scan_completed"] is True
+    assert node["interaction"]["drawer_scan_completed_step"] == 43
+
+
 def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     info = type("Info", (), {"width": 3, "resolution": 1.0})()

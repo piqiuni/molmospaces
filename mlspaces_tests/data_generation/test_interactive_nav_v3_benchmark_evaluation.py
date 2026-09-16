@@ -313,8 +313,8 @@ def test_dynamic_step_budget_matches_short_visible_example() -> None:
         ),
     )
 
-    assert budget == 300
-    assert hidden_budget == 800
+    assert budget == 200
+    assert hidden_budget == 850
     assert basis["initial_target_visible"] is True
 
 
@@ -335,9 +335,22 @@ def test_dynamic_step_budget_accounts_for_mixed_drawer_search() -> None:
         ),
     )
 
-    assert budget == 1000
+    assert budget == 1200
     assert basis["required_interaction_type_counts"] == {"channel": 1, "container": 1, "unknown": 0}
     assert basis["container_joint_count"] == 4
+
+
+def test_dynamic_budget_counts_first_joint_and_respects_smaller_cap() -> None:
+    config = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"), output_dir=Path("out"), max_steps=2000,
+    )
+    episode = _budget_episode(path_length_m=10, interaction_types=["container_sliding_drawer"],
+                              container_joint_count=1)
+    budget, basis = benchmark_runner.episode_step_budget(config, episode)
+    assert config.step_budget_mode == "dynamic"
+    assert basis["components"]["container_joint_steps"] == 50
+    assert budget == 800
+    assert benchmark_runner.episode_step_budget(replace(config, max_steps=625), episode)[0] == 625
 
 
 def test_dynamic_step_budget_clamps_and_fixed_mode_stays_compatible() -> None:
@@ -1027,18 +1040,24 @@ def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() ->
     }
     recorded: list[tuple[dict, int]] = []
     queued: list[dict] = []
+    task = SimpleNamespace(env=SimpleNamespace(camera_manager=SimpleNamespace(
+        registry={"head_camera": SimpleNamespace(pos=[1.0, 2.0, 3.0], forward=[0.0, 1.0, 0.0])}
+    )))
 
     class Perception:
-        def build(self, task, *, step_index, force):
-            assert task == "task"
+        camera_name = "head_camera"
+
+        def build(self, observed_task, *, step_index, force):
+            assert observed_task is task
             assert step_index == 5
             assert force
             return {"private_build": "not forwarded"}
 
     class Adapter:
-        def publish_restricted_gt_frame(self, payload, *, capture_step):
+        def publish_restricted_gt_frame(self, payload, *, capture_step, observation_pose_xyyaw):
             assert payload == {"private_build": "not forwarded"}
             assert capture_step == 5
+            assert observation_pose_xyyaw == pytest.approx([1.0, 2.0, np.pi / 2])
             return published
 
     class Evidence:
@@ -1056,7 +1075,7 @@ def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() ->
 
     assert benchmark_runner._publish_restricted_ros_frame(
         runtime,
-        "task",
+        task,
         decision_index=5,
     )
     assert recorded == [(published, 5)]

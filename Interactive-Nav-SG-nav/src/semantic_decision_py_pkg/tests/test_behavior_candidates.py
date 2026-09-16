@@ -49,7 +49,7 @@ def test_drawer_aabb_fan_anchors_use_true_surface_clearance() -> None:
 def test_drawer_default_clearances_match_runtime_profiles():
     from pathlib import Path
     import yaml
-    expected = (0.50, 0.85, 1.00)
+    expected = (0.70, 0.85, 1.00)
     assert CandidateGeneratorConfig().drawer_navigation_anchor_fan_clearances_m == expected
     root = Path(__file__).resolve().parents[4]
     for path in (
@@ -559,6 +559,60 @@ def test_static_portal_history_never_generates_a_post_interaction_traversal() ->
     }
 
     assert generator.generate({}, graph, robot_xy=(-1.0, 0.0)) == []
+
+
+def test_occ_confirmed_static_open_portal_generates_traversal_goal() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_traversal_distance_m=0.8,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_occ_1",
+                "type": "portal",
+                "room_id": 3,
+                "aabb_center": [0.0, 0.0, 1.0],
+                "attributes": {
+                    "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+                    "connected_room_ids": [3, 5],
+                    "observed_connected_room_ids": [3, 5],
+                    "connectivity_status": "connected",
+                    "portal_state_consensus_accepted": True,
+                    # The first OCC gate can remain rejected from an earlier
+                    # unstable frame; the later stable consensus plus the
+                    # unavailable-capability resolution is authoritative.
+                    "portal_state_gate": {"accepted": False, "observation_capture_step": 107},
+                    "portal_unavailable_state_resolution": {
+                        "m1_open_aperture": True,
+                        "observed_open_connectivity": True,
+                    },
+                    "portal_state_consensus": {"accepted": True},
+                },
+                "interaction": {
+                    "state": "static_open",
+                    "capability": "unavailable",
+                    "traversable": True,
+                    "requires_interaction": False,
+                    "state_observed_step": 420,
+                    "operation_history": [],
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, robot_xy=(-1.0, 0.0))
+
+    assert len(candidates) == 1
+    traversal = candidates[0]
+    assert traversal.candidate_id == "traverse:portal_occ_1:occ_consensus_107"
+    assert traversal.goal_xyyaw == [0.35, 0.0, 0.0]
+    assert len(traversal.metadata["goal_xyyaw_candidates"]) == 3
+    assert traversal.metadata["static_open_occ_confirmed"] is True
+    assert traversal.metadata["portal_open_evidence_source"] == "occ_consensus"
+    assert traversal.metadata["target_room_id"] == 5
 
     # Guard the historical route too: even a stale graph whose current state
     # was later overwritten to open cannot reinterpret its static event as an
@@ -1884,6 +1938,10 @@ def test_observed_target_can_complete_after_container_closes_only_when_configure
     assert target_ready_for_graph_verification(candidate)
     metadata["target_object_distance_m"] = 1.69
     assert not target_observation_satisfies_arrival(metadata)
+    metadata["target_open_container_anchor_ready"] = True
+    assert target_observation_satisfies_arrival(metadata)
+    assert target_ready_for_graph_verification(candidate)
+    metadata["target_open_container_anchor_ready"] = False
     metadata["target_object_distance_m"] = .83
     metadata["target_require_current_visibility"] = True
     assert not target_ready_for_graph_verification(candidate)
@@ -2003,6 +2061,63 @@ def test_target_reuses_successful_parent_container_approach_pose() -> None:
     assert candidate.metadata["approach_strategy"] == (
         "target_last_successful_interaction_pose"
     )
+
+
+def test_open_container_target_stops_at_successful_interaction_anchor() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "aabb_center": [4.0, 2.0, 1.0],
+                "aabb_size": [2.0, 2.0, 2.0],
+                "interaction": {
+                    "state": "open",
+                    "operation_history": [
+                        {
+                            "success": True,
+                            "post_state": "open",
+                            "approach_goal_xyyaw": [3.25, 2.5, 0.75],
+                        }
+                    ],
+                },
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "parent_id": "container_fridge",
+                # The item is deep inside the open container.  Its centre is
+                # deliberately outside the 1.5 m public target radius; the
+                # robot must remain at the successful interaction anchor.
+                "centroid": [5.4, 2.0, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": False,
+                "attributes": {"visible_pixels": 64, "max_visible_pixels": 64},
+            },
+        ],
+        "edges": [
+            {"src_id": "container_fridge", "relation": "contains", "dst_id": "object_apple"}
+        ],
+    }
+
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(3.3, 2.5),
+        target_context={
+            "enabled": True,
+            "object_labels": ["apple"],
+            "success_distance_threshold_m": 1.5,
+            "require_current_visibility": False,
+        },
+    )[0]
+
+    assert candidate.metadata["target_open_container_anchor_ready"] is True
+    assert candidate.metadata["target_navigation_required"] is False
+    assert candidate.metadata["target_object_distance_m"] > 1.5
 
 
 def test_contained_target_reuses_container_interaction_pose() -> None:

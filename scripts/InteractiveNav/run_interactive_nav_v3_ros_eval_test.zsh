@@ -376,7 +376,7 @@ if [[ "${FAST_EVAL}" != true && "${RECORD_HEAD_CAMERA}" == true ]]; then
   EVAL_ARGS+=(--record-video)
 fi
 set +e
-MUJOCO_GL=egl "${PYTHON_BIN}" "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
+PYTHONUNBUFFERED=1 MUJOCO_GL=egl "${PYTHON_BIN}" -u "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
 EVAL_EXIT=$?
 set -e
 

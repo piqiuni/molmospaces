@@ -393,6 +393,18 @@ def test_interaction_pose_poll_failure_advances_to_next_preserved_option() -> No
     )
 
 
+def test_wrong_face_advances_to_next_preserved_option() -> None:
+    kwargs = {
+        "behavior_type": "INTERACT",
+        "failure_detail": {"reason": "interaction_wrong_face"},
+        "selected_option_index": 1,
+        "attempted_navigation_count": 1,
+        "max_navigation_attempts": 3,
+        "goal_option_count": 4,
+    }
+    assert next_interaction_approach_option_index(**kwargs) == 2
+
+
 def test_visual_reposition_advances_to_next_preserved_option() -> None:
     kwargs = {
         "behavior_type": "INTERACT",

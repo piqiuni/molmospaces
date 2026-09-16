@@ -1,6 +1,83 @@
 # 交互导航开发测试手册
 
-最后更新：2026-09-15
+最后更新：2026-09-17
+
+### 2026-09-17: 完整方法实验基线
+
+Git 标签 `codex/experiment-baseline-20260917` 固定本轮完整方法与评测器代码，
+作为后续模块级消融的共同起点。提交前 HEAD 为 `301f0aff8`。
+这是代码与配置基线，本次未重新运行仿真或完整 benchmark，不代表新增性能验收结果。
+
+- 方法：`full_mllm_object_goal`；M1/M2/M3 分别为
+  `dynamic_mllm / mllm_score / mllm_skill_verified`。
+- 评测器：`interactive_nav_v3_benchmark_eval_v17`；动态预算公式 v2，基础 200，
+  路径超过 3 m 后每米 40，必要通道交互 200，必要容器交互 250，
+  容器每个记录关节 50，向上取整到 50，launcher 硬上限 2000。
+- 默认 launcher：10 worker，episode 10–12、1010–1012、2010–2013，
+  完整录制，本机模型入口 8010。观察轮次倍率保持当前值 1；因此可能先达到观察轮次
+  上限，不能把每场运行解释为一定执行满动态动作预算。后续变更须对所有比较组一致生效。
+- restricted-GT 最大距离 8 m；抽屉 action/M1 最小站距 0.70 m；
+  保留当前容器交互锚点完成判定、drawer scan 完成记忆、静态开门通行与目标冷却修复。
+  容器锚点判定与旧版单纯目标中心距离判定不同，消融组必须共用本基线评测器。
+- Manifest：`interactive_nav_v3_procthor10k_val_release_v1_2` 的 `benchmark/benchmark.json`，
+  3000 episode、639 house，SHA-256：
+  `4021ca2bebd9c875ccc4df70c746d9ed7f2376d13247fa1b7e98f2e9690b219f`。
+- 默认 `benchmark_batch.json` SHA-256：
+  `d535b883a8f0c8758eb9d555a687ae6a366e969c5e9082d7e5b00366775b27b0`。
+- 模型权重、认证、数据集、运行产物及包含个人云端队列/挂载的资源 YAML 不进入本提交。
+  Git 标签不固定外部模型服务；每轮仍需记录模型版本、推理参数和实际生效配置。
+
+提交前验证共 408 项通过：候选生成、执行状态机、决策恢复、交互图、launcher、
+批量调度器、benchmark 预算/指标、restricted-GT 与目标完成契约。
+其中 33 项决策恢复测试需要先加载 `/home/ldl/conda_envs/ros-noetic/setup.bash`；
+其余测试使用 `mlspaces` Python，并将 `semantic_decision_py_pkg/scripts`、
+`semantic_mapping_py_pkg/scripts`、`semantic_mllm_py_pkg/scripts` 加入 `PYTHONPATH`。
+另通过修改文件的 Python AST、Shell 语法、JSON 解析和 `git diff --check`。
+本机检查日志在 `/home/ldl/outputs/interactive-nav/baseline-check-20260917/`，不纳入 Git。
+
+### 2026-09-16: 双卡自定义任务评测 smoke
+
+入口为 `scripts/InteractiveNav/run_v3_custom_task_smoke.sh`，内部使用当前本机统一入口
+`python scripts/InteractiveNav/run_benchmark_eval.py`。提交配置为
+`scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml`
+（本机云端资源配置，含队列及挂载信息，不纳入 Git）。
+配置使用一个 `ml.pni2.7xlarge` 双卡实例：GPU 0/1 分别启动一个 Qwen 35B FP8
+后端（端口 8000/8001），本机 8010 负载均衡器供 10 个隔离的 ROS/MuJoCo
+worker 使用。Qwen 与仿真共享同一实例，启动方式与本机双服务一致。
+测试选择 10 个 episode，覆盖 channel、container、mixed，固定 100 applied steps；
+使用 `--no-recording`，用于验证云端调度、模型服务、ROS 与仿真链路，不作为性能回归。
+
+```bash
+cd /home/ldl
+volc ml_task submit \
+  -c molmospaces-exp-setting/scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml \
+  -n interactive_nav_v3_qwen_10w10s100_$(date +%Y%m%d_%H%M%S)
+```
+
+提交后用返回的 task ID 监控；不要用 CLI `--set TaskRoleSpecs[0]...` 修改副本数，
+当前 CLI 会把数组覆盖解析成无效规格。
+
+```bash
+volc ml_task get -i TASK_ID --output json
+volc ml_task instance list -i TASK_ID --output json
+volc ml_task logs -i TASK_ID
+```
+
+Python 3.10 编译头从 Ubuntu 开发包解压到
+`/home/ldl/.cache/python3.10-dev`，不修改系统 Python 或 Qwen 虚拟环境。
+容器镜像未预装 GLVND 的 EGL loader，因此 `libegl1`/`libglvnd0` 运行库解压到
+`/home/ldl/.cache/egl-runtime`，入口在启动 Qwen 前执行一次 MuJoCo EGL context
+预检；NVIDIA 驱动库仍由双卡实例注入，不复制本机驱动。
+云端容器还必须显式设置 `MLSPACES_CACHE_DIR=/home/ldl/molmo-spaces-resources` 和
+`MLSPACES_ASSETS_DIR=/home/ldl/molmospaces/assets`。否则资源管理器会在容器默认
+home 下重新初始化资源；首个 worker 持锁联网，其余 worker 会长期阻塞在 `.lock`。
+同时设置 `NLTK_DATA=/home/ldl/nltk_data`，复用已有 WordNet，禁止 worker 向
+`/root/nltk_data` 下载语料。
+共享输出目录为
+`/home/ldl/outputs/interactive-nav/custom-task-TASK_ID/evaluation`。重点检查
+`resource_telemetry.csv`、`summary.csv`、各 episode 的 `eval.log`，以及
+`task-state/evaluation.exit_code`。任一 episode、Qwen、环境预检或 batch runner
+失败都会令自定义任务失败，避免平台显示 Success 时掩盖评测未实际运行。
 
 ### 2026-09-15: 到达判定与无动作恢复回归
 

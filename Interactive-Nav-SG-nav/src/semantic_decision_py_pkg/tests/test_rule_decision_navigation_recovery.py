@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -192,6 +193,50 @@ def test_navigation_retry_survives_fingerprint_and_candidate_action_change(node)
     assert node._eligible_candidates_from_snapshot(
         snapshot(445, [rebuilt]), now=1e20, region_history={}
     ) == ([], {rebuilt["candidate_id"]: "container_anchor_step_cooldown"})
+
+
+def test_target_preemption_ignores_ineligible_cooldown_candidate(node):
+    target = {
+        "candidate_id": "target:object_bowl",
+        "behavior_type": "NAVIGATE",
+        "source": "semantic_graph",
+        "target_id": "object_bowl",
+        "target_name": "bowl",
+        "goal_xyyaw": [2.0, 0.0, 0.0],
+        "features": {"distance_m": 2.0, "priority": 1.0},
+        "metadata": {
+            "target_goal": True,
+            "target_visible_now": True,
+            "target_reliably_observed": True,
+            "target_goal_distance_m": 2.0,
+        },
+    }
+    payload = snapshot(
+        10,
+        candidates=[target],
+        target_context={
+            "enabled": True,
+            "target_name": "bowl",
+            "object_labels": ["bowl"],
+            "require_interaction": False,
+        },
+        navigation_frontier_count=1,
+        interaction_frontier_count=0,
+    )
+    node.active_candidate_id = "frontier:old"
+    node.active_decision_id = "decision_old"
+    node.active_behavior_type = "EXPLORE"
+    node.active_target_goal = False
+    node.cooldown_until[target["candidate_id"]] = 10**12
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert not node.preempt_pub.messages
+
+    node.cooldown_until.clear()
+    payload["sequence"] = 12
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert node.preempt_pub.messages[-1]["replacement_candidate_id"] == target[
+        "candidate_id"
+    ]
 
 
 def test_three_navigation_failures_use_existing_terminal_limit(node):
