@@ -2,6 +2,26 @@
 
 最后更新：2026-09-17
 
+### 2026-09-17: 独立模块消融入口
+
+新增 `scripts/InteractiveNav/run_benchmark_ablation.py`，提供 `full`、
+`no_interaction_graph`、`no_task_decision`、`no_outcome_update` 四组。
+原算法、原 launch、原评测器及默认配置保持不变；适配通过运行目录中的 launch-prefix 生效。
+实验定义、边界和命令见 [消融说明](scripts/InteractiveNav/ablations/README.md)。
+其中图消融是高层关系图推理消融，底层候选可行性仍共用原图。
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python \
+  /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_benchmark_ablation.py \
+  --variant no_task_decision --workers 1 --episode-indices 10 --max-steps 20 --dry-run
+```
+
+`--dry-run` 不创建产物，不启动 ROS/模型/仿真。
+本轮 28 项新增消融测试及 100 项原有相关回归通过，共 128 项。
+检查日志位于 `/home/ldl/outputs/interactive-nav/ablation-check-20260917/`；
+已验证三组生成 launch 均可由实际 ROS loader 解析，并且只替换指定的节点。
+这里只验证接口和模块行为，未运行长时仿真或 benchmark。
+
 ### 2026-09-17: 完整方法实验基线
 
 Git 标签 `codex/experiment-baseline-20260917` 固定本轮完整方法与评测器代码，
