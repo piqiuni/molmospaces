@@ -89,6 +89,49 @@ else
 fi
 printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m semantic_xy_overview_inset=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}"
 
+recover_managed_qwen() {
+  [[ "${QWEN_SERVICE_MODE:-}" == managed ]] || return 0
+
+  local qwen_root=/home/ldl/qwen36-fp8
+  local runtime_dir=${QWEN36_RUNTIME_DIR:-/home/ldl/tmp/qwen36-mtp3-service}
+  local log_dir=${QWEN36_LOG_DIR:-/home/ldl/outputs/qwen36-mtp3-service}
+  local manager=${QWEN_MANAGE_SCRIPT:-${qwen_root}/manage_qwen36_mtp3.sh}
+  local lock_file=${runtime_dir}/service-recovery.lock
+  local recovery_fd
+
+  managed_qwen_healthy() {
+    local port
+    for port in 8000 8001 8010; do
+      curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1 || return 1
+    done
+  }
+
+  managed_qwen_healthy && return 0
+  command -v flock >/dev/null 2>&1 || {
+    printf '%s\n' "Managed Qwen service is unhealthy and flock is unavailable" >&2
+    return 1
+  }
+  mkdir -p "${runtime_dir}" "${log_dir}"
+  exec {recovery_fd}>"${lock_file}"
+  if flock -n "${recovery_fd}"; then
+    if ! managed_qwen_healthy; then
+      printf '%s\n' "[v3-eval] managed Qwen service unhealthy; restarting managed replicas and load balancer"
+      "${manager}" restart
+    fi
+  fi
+  for _ in $(seq 1 360); do
+    if managed_qwen_healthy; then
+      printf '%s\n' "[v3-eval] managed Qwen replicas and load balancer healthy"
+      return 0
+    fi
+    sleep 1
+  done
+  printf '%s\n' "Managed Qwen service recovery timed out" >&2
+  return 1
+}
+
+recover_managed_qwen
+
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}" "${RUNTIME_TMPDIR}" "${RUNTIME_XDG_CACHE_HOME}"
 if [[ "${FAST_EVAL}" != true ]]; then
   mkdir -p "${RUN_DIR}/debug" "${RUN_DIR}/sim_step_frames"

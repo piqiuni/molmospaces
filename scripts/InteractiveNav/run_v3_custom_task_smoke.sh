@@ -5,11 +5,14 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/home/ldl/molmospaces-exp-setting}"
 TASK_ID="${MLP_TASK_ID:-manual-$(date +%Y%m%d-%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-/home/ldl/outputs/interactive-nav/custom-task-${TASK_ID}}"
+EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-${RUN_ROOT}/evaluation}"
 BENCHMARK_LAUNCHER_CONFIG="${BENCHMARK_LAUNCHER_CONFIG:-scripts/InteractiveNav/configs/evaluation/benchmark_batch_custom_task_10w10s100.json}"
 EXPECTED_EPISODES="${EXPECTED_EPISODES:-10}"
 SHORT_TASK_ID="${TASK_ID##*-}"
 STATE_DIR="${RUN_ROOT}/task-state"
 QWEN_ROOT=/home/ldl/qwen36-fp8
+QWEN_SERVICE_MODE="${QWEN_SERVICE_MODE:-legacy}"
+QWEN_MANAGE_SCRIPT="${QWEN_MANAGE_SCRIPT:-${QWEN_ROOT}/manage_qwen36_mtp3.sh}"
 PYTHON310_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include/python3.10
 PYTHON310_MULTIARCH_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include
 EGL_RUNTIME_LIB=/home/ldl/.cache/egl-runtime/usr/lib/x86_64-linux-gnu
@@ -59,8 +62,12 @@ if (( gpu_count < 2 )); then
 fi
 
 pids=()
+managed_qwen_started=false
 cleanup() {
   trap - EXIT INT TERM
+  if [[ "${managed_qwen_started}" == true ]]; then
+    "${QWEN_MANAGE_SCRIPT}" stop >/dev/null 2>&1 || true
+  fi
   for pid in "${pids[@]:-}"; do
     if kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
@@ -87,39 +94,49 @@ start_qwen() {
   pids+=("$!")
 }
 
-start_qwen 0 8000 qwen-gpu0
-start_qwen 1 8001 qwen-gpu1
+if [[ "${QWEN_SERVICE_MODE}" == managed ]]; then
+  export QWEN36_RUNTIME_DIR="/home/ldl/tmp/inav-${SHORT_TASK_ID}-qwen-mtp3"
+  export QWEN36_LOG_DIR="${RUN_ROOT}/qwen-service"
+  export QWEN36_MTP_TOKENS="${QWEN36_MTP_TOKENS:-3}"
+  export QWEN36_GPU_MEMORY_UTILIZATION="${QWEN36_GPU_MEMORY_UTILIZATION:-0.6}"
+  managed_qwen_started=true
+  "${QWEN_MANAGE_SCRIPT}" start
+  "${QWEN_MANAGE_SCRIPT}" status | tee "${STATE_DIR}/qwen.status"
+else
+  start_qwen 0 8000 qwen-gpu0
+  start_qwen 1 8001 qwen-gpu1
 
-for port in 8000 8001; do
-  ready=false
-  for _ in $(seq 1 240); do
-    if curl -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
-      ready=true
-      break
-    fi
-    for pid in "${pids[@]}"; do
-      kill -0 "${pid}" 2>/dev/null || {
-        echo "A Qwen process exited before readiness; inspect ${RUN_ROOT}/qwen-gpu*.log" >&2
-        exit 1
-      }
+  for port in 8000 8001; do
+    ready=false
+    for _ in $(seq 1 240); do
+      if curl -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+        ready=true
+        break
+      fi
+      for pid in "${pids[@]}"; do
+        kill -0 "${pid}" 2>/dev/null || {
+          echo "A Qwen process exited before readiness; inspect ${RUN_ROOT}/qwen-gpu*.log" >&2
+          exit 1
+        }
+      done
+      sleep 5
     done
-    sleep 5
+    [[ "${ready}" == true ]] || { echo "Qwen port ${port} readiness timed out" >&2; exit 1; }
   done
-  [[ "${ready}" == true ]] || { echo "Qwen port ${port} readiness timed out" >&2; exit 1; }
-done
 
-"${QWEN_ROOT}/venv/bin/python" "${QWEN_ROOT}/bench/lb.py" \
-  --listen-port 8010 --backends 8000,8001 >"${RUN_ROOT}/qwen-lb.log" 2>&1 &
-pids+=("$!")
-for _ in $(seq 1 60); do
-  curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1 && break
-  kill -0 "${pids[2]}" 2>/dev/null || { echo "Qwen load balancer exited" >&2; exit 1; }
-  sleep 2
-done
-curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1 || {
-  echo "Qwen load balancer readiness timed out" >&2
-  exit 1
-}
+  "${QWEN_ROOT}/venv/bin/python" "${QWEN_ROOT}/bench/lb.py" \
+    --listen-port 8010 --backends 8000,8001 >"${RUN_ROOT}/qwen-lb.log" 2>&1 &
+  pids+=("$!")
+  for _ in $(seq 1 60); do
+    curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1 && break
+    kill -0 "${pids[2]}" 2>/dev/null || { echo "Qwen load balancer exited" >&2; exit 1; }
+    sleep 2
+  done
+  curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1 || {
+    echo "Qwen load balancer readiness timed out" >&2
+    exit 1
+  }
+fi
 touch "${STATE_DIR}/qwen.ready"
 
 cd "${REPO_ROOT}"
@@ -130,13 +147,13 @@ set +e
 /home/ldl/conda_envs/mlspaces/bin/python -u \
   scripts/InteractiveNav/run_benchmark_eval.py \
   --config "${BENCHMARK_LAUNCHER_CONFIG}" \
-  --output-dir "${RUN_ROOT}/evaluation"
+  --output-dir "${EVALUATION_OUTPUT_DIR}"
 eval_exit_code=$?
 set -e
 if (( eval_exit_code == 0 )); then
   set +e
   /home/ldl/conda_envs/mlspaces/bin/python - \
-    "${RUN_ROOT}/evaluation/summary.json" "${EXPECTED_EPISODES}" <<'PY'
+    "${EVALUATION_OUTPUT_DIR}/summary.json" "${EXPECTED_EPISODES}" <<'PY'
 import json
 import sys
 from pathlib import Path
