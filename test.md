@@ -2491,3 +2491,87 @@ MPLCONFIGDIR=/home/ldl/.cache/matplotlib \
 输出三场 OCC / 历史 room 标签 / 离线回放拼图、逐帧 room ID 和最终栅格。
 回放使用当前 `semantic_map` 配置、历史公开门观测和已确认的 graph overlay，
 按记录的 step 顺序处理；不复现 ROS 的完整异步回调顺序，也不能替代闭环导航验收。
+
+## 目标等价离线重评分
+
+对已完成的批量评估使用独立的新口径：同容器内同类实例，或同房间、支持关系兼容的
+0.30 m 内同类近邻。仍要求原评估器已经验证替代实例的公开观测和到达距离。
+同房间但距离较远的目标不自动放宽，需要另行证明必要门交互一致且两者均非容器目标。
+
+```bash
+EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --scene-dir /home/ldl/molmo-spaces-resources/scenes/procthor-10k-val/20251217_with_occupancy \
+  --near-radius-m 0.30 \
+  --output-dir "$EVAL_RUN/goal_equivalence_v1"
+```
+
+输出 `report.md`、`report.json`（逐场改分理由与证据 SHA256）、`rescored_results.json`。
+输出目录必须不存在；原始 summary/result、benchmark、交互完成事实不变，不启动仿真。
+Nav SR 与交互任务 SR 分别展示；CD 未开抽屉只改 Nav SR。`spl_original_reference`
+使用原目标参考路径，不能当作重新计算等价目标最短路后的标准 SPL。Total Cost 同步去除
+新成功场景的失败惩罚。详情见 `evaluation/evaluation_protocol.md` 的 post-hoc 小节。
+
+最小回归：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  scripts/InteractiveNav/test_rescore_benchmark_goals.py -q -p no:cacheprovider
+```
+
+## 2026-09-17 Perception-only 交互后视觉刷新修正
+
+修正仅在 `scripts/InteractiveNav/ablations/` 的第三组适配器生效：纯观察结束不清空
+M1 共识；实际动作后禁止旧状态立即重复执行，必须先完成 observation-only 刷新。
+Full、原生 mapper/executor 和评分逻辑未改。51 项相关测试通过：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -c '
+import sys, cv2
+sys.path.append("/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages")
+import pytest
+raise SystemExit(pytest.main(sys.argv[1:]))
+' -q -p no:cacheprovider \
+  scripts/InteractiveNav/ablations/tests \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_portal_state_consensus.py
+```
+
+第三组重跑目录：
+`/home/ldl/outputs/interactive-nav/ablation-v3-perception-selected10-20260917-202540`。
+`comparison.md` 为完整状态/结果，`diagnostic_notes.md` 与 `repair_case_evidence.json`
+记录 mixed 15/29 的视觉票与交互对照。启动命令冻结在同名 `.launch.json` 中。
+入口 `run_ablation_pool.py --variants no_outcome_update` 只运行第三组；场景选择输入使用
+上次保存的 `selected_scene_source.json`。本次动态 max2000、无录制，worker 上限25，
+实际10场同时运行。原始 Full 与另外两组不重跑，历史结果保留不覆盖。
+
+### Mixed 场景质量审计与条件子集重评分
+
+在上述目标等价报告基础上，审计所有 mixed 场景（包括成功场景），分别输出
+原始全量、原始 eligible、场景定义有效、再排除执行器异常四种分母。
+已核实的规则包括初始状态不一致、严格原目标无需容器交互即可完成的必要性反例，
+以及抽屉扫描/关闭成功后姿态恢复超时。关闭 ROS 时的异常不计为运行期失败；
+私有 GT 看见目标、导航警告或算法耗尽预算，均不能单独作为剔除理由。
+
+```bash
+EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+python scripts/InteractiveNav/audit_mixed_benchmark_run.py "$EVAL_RUN/evaluation" \
+  --goal-rescore-dir "$EVAL_RUN/goal_equivalence_v1" \
+  --output-dir "$EVAL_RUN/mixed_quality_audit_v1_verified"
+```
+
+输出目录必须不存在。`exclusions.json` 列出本次运行的隔离清单，`report.json`
+保留逐场证据与日志行号，`filtered_results.json` 是全量场景中保留下来的计分集合。
+不改成功标签，不删除 benchmark，不修复算法，也不重跑仿真。此为事后质量条件子集，
+不可当作算法提升或替代全量 benchmark；执行超时场景应修复/重跑后再恢复计分。
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  scripts/InteractiveNav/test_audit_mixed_benchmark_run.py \
+  scripts/InteractiveNav/test_rescore_benchmark_goals.py -q -p no:cacheprovider
+```
