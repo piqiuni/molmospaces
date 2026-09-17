@@ -23,7 +23,14 @@ OWNER_KEY = "INTERACTIVE_NAV_EVAL_RUN_ID"
 def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
     indices = config.get("episode_indices")
     if indices is None:
-        indices = [i for lo, hi in config["episode_ranges"] for i in range(lo, hi + 1)]
+        episode_stride = int(config.get("episode_stride", 1))
+        if episode_stride < 1:
+            raise ValueError("episode_stride must be positive")
+        indices = [
+            i
+            for lo, hi in config["episode_ranges"]
+            for i in range(lo, hi + 1, episode_stride)
+        ]
     if not indices or len(indices) != len(set(indices)):
         raise ValueError("episode_ranges must be nonempty and must not overlap")
     if config["workers"] < 1 or config["max_steps"] < 1 or config["progress_interval_s"] <= 0:
@@ -40,6 +47,8 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
         command += ["--" + key.replace("_", "-"), *map(str, config[key])]
     if not config.get("recording", True):
         command += ["--no-recording"]
+    if config.get("resume", False):
+        command += ["--resume"]
     return command + ["--resource-telemetry", "--allow-failures"], indices
 
 
@@ -257,11 +266,12 @@ def main() -> int:
     for port in range(config["base_master_port"], config["base_master_port"] + config["workers"]):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", port))
-    output.mkdir(parents=True, exist_ok=False)
+    resume = bool(config.get("resume", False))
+    output.mkdir(parents=True, exist_ok=resume)
     environment = os.environ.copy()
     for key, suffix in (("TMPDIR", "tmp"), ("XDG_CACHE_HOME", "cache")):
         directory = output / suffix
-        directory.mkdir()
+        directory.mkdir(exist_ok=resume)
         environment[key] = str(directory)
     environment.update({OWNER_KEY: str(output), "MIN_STEPS": str(min(config.get("min_steps", 200), config["max_steps"])),
                         "CONDA_ENV": config["conda_env"], "PYTHON_BIN": config["python_bin"],
@@ -283,7 +293,7 @@ def main() -> int:
     started = time.monotonic()
     process = None
     try:
-        with (output / "batch.log").open("wb") as log:
+        with (output / "batch.log").open("ab" if resume else "wb") as log:
             process = subprocess.Popen(command, cwd=REPO, env=environment, stdout=log,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             while True:

@@ -28,6 +28,25 @@ def test_command_pins_runtime_and_budget(tmp_path):
         launcher.build_command(config, tmp_path)
 
 
+def test_command_can_resume_matching_incomplete_batch(tmp_path):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config["resume"] = True
+    command, _ = launcher.build_command(config, tmp_path)
+    assert "--resume" in command
+
+
+def test_command_uniformly_samples_episode_range_by_stride(tmp_path):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config["episode_ranges"] = [[0, 19]]
+    config["episode_stride"] = 5
+    _, indices = launcher.build_command(config, tmp_path)
+    assert indices == [0, 5, 10, 15]
+
+    config["episode_stride"] = 0
+    with pytest.raises(ValueError, match="episode_stride must be positive"):
+        launcher.build_command(config, tmp_path)
+
+
 def test_progress_does_not_count_placeholder_as_finished(tmp_path):
     (tmp_path / "summary.csv").write_text(
         "episode_index,worker_result_reported,runner_exit_code,completed\n"
@@ -77,6 +96,30 @@ def test_cli_overrides(tmp_path):
     assert command[command.index("--workers") + 1] == "2"
     assert command[command.index("--max-steps") + 1] == "50"
     assert "--no-recording" in command
+
+
+def test_resume_reuses_existing_output_and_appends_batch_log(tmp_path, monkeypatch):
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "batch.log").write_text("previous batch\n")
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config.update(workers=1, base_master_port=0, resume=True)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        launcher,
+        "build_command",
+        lambda config, output: ([sys.executable, "-c", "print('resumed batch')"], [10]),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(launcher.__file__), "--config", str(config_path), "--output-dir", str(output)],
+    )
+    assert launcher.main() == 0
+    assert (output / "batch.log").read_text() == "previous batch\nresumed batch\n"
+    assert (output / "tmp").is_dir()
+    assert (output / "cache").is_dir()
 
 
 def test_completion_report_uses_weighted_timings_and_explicit_denominators(tmp_path):
