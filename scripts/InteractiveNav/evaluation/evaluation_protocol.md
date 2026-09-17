@@ -324,3 +324,78 @@ oracle recipe, source name, or joint state.  After a successful command, the
 decision node may record an episode-local `command_outcome_belief` from its own
 requested action; this prevents duplicate open commands but is not a simulator
 state read.  The default ROS configuration remains `rule_verified`.
+
+## Post-hoc goal-equivalence scoring (v1)
+
+`rescore_benchmark_goals.py` produces a separate, versioned result set. It does
+not mutate the released benchmark, the original results, the online v17 terminal
+verifier, or the policy's observations. Report this as a changed evaluation
+definition, not an algorithm improvement or a replacement for frozen-instance SR.
+
+Only an eligible, completed episode with a saved category-level `verified`
+success claim can be promoted. That existing verifier requires public observation
+evidence for the same opaque instance and robot-to-object distance below 1.5 m.
+The alternative must have the same metadata category. Explicit unique/attribute
+grounding is not relaxed automatically. Equivalence is accepted when either:
+
+- The alternative's metadata ancestor is the target container and its frozen
+  position lies inside the closed-container AABB, excluding the top 1 cm; room
+  IDs must also match. Metadata `parent` alone is insufficient because it also
+  represents objects supported *on* furniture.
+- Its planar position is within 0.30 m of the original target, room IDs match,
+  and both have the same support/parent or both are outside known containers.
+  This is a target-to-target tolerance; the robot's arrival threshold is unchanged.
+
+Room-wide equivalence is not enabled by the CLI. It would additionally require
+both targets to be non-container objects and an independent proof that their
+necessary door interactions are identical. Same room ID alone does not prove
+this. Objects in another room, another required container, or without verified
+public evidence remain failures.
+
+`nav_success`/`task_success` and paper SR use the revised target predicate.
+`success`/`interaction_conditioned_success` still require the original required
+interaction, sequence, and applicable non-interaction checks. In particular,
+finding a nearby CD without opening the required drawer improves Nav SR but not
+interaction-conditioned SR. Interaction precision, eligibility, executed path,
+steps, and terminal log facts do not change. Total Cost removes the original
+failure-penalty term for newly successful navigation episodes.
+
+The reported `spl_original_reference` reweights success using the original
+frozen target's reference path. It is a fixed-reference comparison, **not** a
+recomputed standard SPL for the expanded goal set. Recomputing that shortest
+path would require a separate oracle/geodesic evaluation.
+
+Legacy v17 identity recovery uses scene metadata/XML, the deterministic sorted
+registry construction, and a cross-check against the recorded full channel
+alias set. Double-leaf door roots have no skill alias. When recordings exist,
+the accepted public opaque ID's geometry is also cross-checked. Missing or
+inconsistent evidence fails closed. Reports include input hashes and per-episode
+reasons; original files are preserved and existing report directories are never
+overwritten. No simulation, model inference, asset downloads, or installation
+is performed by the rescoring command.
+
+### Mixed quality audit subsets
+
+`audit_mixed_benchmark_run.py` consumes an existing goal-equivalence report and
+audits **all** mixed episodes, including successes. It does not edit any success
+label. Four explicitly named subsets retain their own denominators:
+
+1. `all_planned`: unchanged goal-equivalence scores.
+2. `original_eligible`: the existing runtime consistency gate.
+3. `scene_valid`: additionally quarantine a strict original-target completion
+   with only portal interactions while the frozen task requires opening a closed
+   container to reveal that target. This is a runtime counterexample to interaction
+   necessity, not proof of a particular mesh or physics defect. Relaxed-category
+   goal completion alone is insufficient for this exclusion.
+4. `scene_and_execution_valid`: additionally quarantine a matching public/private
+   drawer-scan command that scanned all regions and closed successfully but failed
+   the checked pose-restoration convergence bound. This establishes an execution
+   fault, not that the policy would otherwise have found its intended target.
+
+The quarantine is specific to these evaluation attempts and requires revalidation
+or rerunning before reuse; it never deletes benchmark data. Private transient GT
+visibility without public completion, navigation/planning warnings, and shutdown
+exceptions are recorded for review but do not automatically exclude a scene.
+System-wide planning/actionlib races must not be used to select only failed
+episodes for removal. These post-hoc conditional subsets are diagnostic and must
+be reported alongside the unfiltered score, not as an unbiased algorithm gain.
