@@ -8,19 +8,26 @@ _WORDNET = None
 
 
 def get_wordnet():
-    """Lazily download NLTK's wordnet corpora and return the wordnet2022 module.
+    """Lazily load NLTK's wordnet corpora and return the wordnet2022 module.
 
-    Downloading/importing wordnet is deferred to first actual use (rather than
-    module import time) since this module is imported by config/env code that
-    loads on every entry point invocation, regardless of whether any wordnet
-    lookup is ever performed.
+    Importing wordnet is deferred to first actual use (rather than module import
+    time) since this module is imported by config/env code that loads on every
+    entry point invocation.  Avoid contacting the NLTK download service when a
+    local zipped or unpacked corpus is already available.
     """
     global _WORDNET
     if _WORDNET is None:
         import nltk
 
         for corpus in ["wordnet", "wordnet2022"]:
-            nltk.download(corpus)
+            for resource in [f"corpora/{corpus}", f"corpora/{corpus}.zip"]:
+                try:
+                    nltk.data.find(resource)
+                    break
+                except LookupError:
+                    pass
+            else:
+                nltk.download(corpus, raise_on_error=True)
 
         from nltk.corpus import wordnet2022 as wn
 
