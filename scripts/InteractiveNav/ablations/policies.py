@@ -53,6 +53,25 @@ class NearestInteractionPolicy:
         return min(candidates, key=self.key) if candidates else None
 
 
+class CuratedGreedyPolicy(ModelPolicyClient):
+    """Use Full's model lane (including curation/revalidation), without an API call."""
+
+    def select(self, candidates, target_context=None, graph=None, robot_context=None, metrics_context=None):
+        if self.config.selection_granularity.casefold() != "candidate":
+            raise ValueError("curated greedy requires candidate selection granularity")
+        selected = NearestInteractionPolicy().select(candidates)
+        self.last_metrics = {}
+        self.last_ranking_ids = [selected.candidate_id] if selected else []
+        self.last_selected_candidate_id = selected.candidate_id if selected else ""
+        self.last_selected_group_id = self.last_selected_candidate_id
+        self.last_result_source = "curated_greedy_no_model_call"
+        self.last_reason = "DISTANCE_TIEBREAK"
+        self.last_confidence = "high"
+        self.last_pre_score_guard = ""
+        self.last_rejected_model_ids = []
+        return selected
+
+
 class FlatCandidateCurator(CandidateCurator):
     """Keep native eligibility/cooldowns; replace relational ranking by distance."""
 
@@ -99,25 +118,26 @@ class FlatMemoryModelPolicy(ModelPolicyClient):
 
     def build_request(self, candidates, target_context, graph, robot_context=None):
         candidate_keys = {"id", "action", "subject_id", "subject_type", "subject_name",
-                          "subject_semantic_type", "distance_m", "state",
+                          "subject_semantic_type", "distance_m",
                           "unknown_component_area_m2", "expected_visible_unknown_area_m2"}
         options = [{key: deepcopy(value) for key, value in compact_candidate(c).items()
                     if key in candidate_keys} for c in candidates]
         self.last_candidate_groups = options
-        node_keys = {"id", "type", "label", "name", "centroid", "is_currently_visible",
-                     "state_age_sec", "interaction_state"}
+        node_keys = {"id", "type", "label", "name", "centroid", "is_currently_visible"}
         memory = [{key: deepcopy(value) for key, value in node.items() if key in node_keys}
                   for node in graph.get("nodes", []) if node.get("type") not in {"room", "floor", "building"}]
         history_keys = {"candidate_id", "behavior_type", "target_id", "status", "result"}
         history = [{key: deepcopy(value) for key, value in row.items()
                     if key in history_keys and isinstance(value, (str, int, float, bool))}
-                   for row in (robot_context or {}).get("decision_history", [])[-8:]]
+                   for row in (robot_context or {}).get("decision_history", [])[-8:]
+                   if str(row.get("behavior_type", "")).upper() != "INTERACT"]
         return {
             "schema_version": 4,
             "instruction": (
                 "Find the requested target using the observed flat object memory and executable actions. "
                 "Rank up to three CURRENT candidate IDs unchanged. Compare object semantics, observed "
-                "state, distance and exploration gain. Avoid repeated completed or failed actions when "
+                "geometry, distance and exploration gain. No interaction-state memory is available. "
+                "Avoid repeated completed or failed actions when "
                 "alternatives exist. Never invent observations or select historical IDs. Return only "
                 '{"ranked_ids":[...],"reason":"...","confidence":"..."}, ranked_ids first. '
                 "Allowed reason: TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, "
@@ -156,6 +176,7 @@ def without_outcome_continuations(snapshot):
     result = deepcopy(snapshot)
     result["candidates"] = [c for c in result.get("candidates", [])
                             if not c.get("metadata", {}).get("post_interaction_traversal")
-                            or c.get("metadata", {}).get("static_open_occ_confirmed")]
+                            or c.get("metadata", {}).get("static_open_occ_confirmed")
+                            or c.get("metadata", {}).get("perception_open_occ_confirmed")]
     result["candidate_count"] = len(result["candidates"])
     return result

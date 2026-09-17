@@ -120,6 +120,21 @@ def test_no_outcome_update_filters_latest_snapshot_revalidation(node_factory):
     assert len(data["candidates"]) == 2
 
 
+def test_post_action_guard_survives_latest_snapshot_revalidation(node_factory):
+    node = node_factory("no_outcome_update")
+    data = snapshot([candidate("door", 1.)])
+    node.latest_candidates_payload = deepcopy(data)
+    node._perception_result_callback(String(data=json.dumps({
+        "node_id": "door", "step": 100, "success": True, "post_state": "open",
+        "episode_id": "ablation-test",
+    })))
+    eligible, _ = node._eligible_candidates_from_snapshot(data, now=0., region_history={})
+    assert eligible[0].metadata["observation_only_reobserve"]
+    data["candidates"][0]["metadata"].update(perception_visual_ready=True, perception_visual_step=101)
+    eligible, _ = node._eligible_candidates_from_snapshot(data, now=0., region_history={})
+    assert not eligible[0].metadata.get("observation_only_reobserve")
+
+
 def test_actual_mapping_preserves_sensor_and_occupancy_callbacks():
     from semantic_mapping_node import SemanticMappingNode
     adapted = mapping_node_class(SemanticMappingNode, "no_outcome_update")
@@ -129,3 +144,27 @@ def test_actual_mapping_preserves_sensor_and_occupancy_callbacks():
     node = adapted.__new__(adapted)
     node.interaction_command_callback(String(data='{"node_id":"door","action":"open"}'))
     node.interaction_result_callback(String(data='{"node_id":"door","success":true}'))
+
+
+def test_full_and_greedy_receive_identical_curated_candidate_pools(node_factory, monkeypatch):
+    pools = {}
+    raw = [candidate(f"door_{i}", float(i + 1)) for i in range(12)]
+    for variant in ("full", "no_task_decision"):
+        node = node_factory(variant)
+        assert node.policy_backend == "model"
+        original_select = node.model_policy.select
+
+        def select(candidates, _variant=variant, _select=original_select, **kwargs):
+            pools[_variant] = [c.candidate_id for c in candidates]
+            return _select(candidates, **kwargs)
+
+        monkeypatch.setattr(node.model_policy, "select", select)
+        monkeypatch.setattr(node.model_policy, "_request", lambda payload, **kwargs: {
+            "ranked_ids": [pools["full"][0]], "reason": "INFORMATION_GAIN", "confidence": "high",
+        })
+        data = snapshot(raw)
+        node.latest_candidates_payload = deepcopy(data)
+        node._decide_from_snapshot(data)
+        assert node.active_candidate_id in pools[variant]
+    assert pools["full"] == pools["no_task_decision"]
+    assert 0 < len(pools["full"]) < len(raw)

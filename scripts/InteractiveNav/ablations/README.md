@@ -1,86 +1,122 @@
-# 模块级消融
+# 模块级消融（设计版本 3；第三组视觉重观测修正）
 
-共同基线为 `154aa0226e7ce42bcbc8b3efe31bfd1990ab5a36`，标签
-`codex/experiment-baseline-20260917`。只设置 Full + 三个模块级对照，分别回答：
-关系表示是否有用、任务语义是否改善选择、交互结果是否改善后续决策。
+## 版本 3：交互后先完成视觉更新
 
-| `--variant` | 干预 | 保留内容 | 建议论文名称 |
+版本 2 的第三组在 mixed 15/29 出现大量重复开门。执行结果事件包含实际操作和
+`action_executed=false` 的纯观察结束；后者不能再清空 M1 共识。实际操作完成时仍清除
+操作前缓存，重复投递的同一完成事件只处理一次，不读取其开闭状态标签。
+
+第三组新增按对象记录的视觉刷新屏障：操作之后，旧图产生的 INTERACT 必须先进入
+原生的 observation-only 流程；新视觉状态写回图后才允许重新操作。门要求新的三视角
+共识；状态闭合后仍允许再次操作，不用固定重试上限替代状态感知。观察超时不能走
+物理操作 fallback。该屏障同样作用于 M2 返回后的最新候选复核。
+Full、Flat、Greedy 和原生映射/执行器源码不修改。
+
+单独重跑第三组可用共享队列入口的 `--variants no_outcome_update`，并用上次保存的
+`selected_scene_source.json` 固定十个场景。`--workers 25` 是并发上限；仅十个任务时
+实际并发为十。不同并发和随机模型请求会影响耗时与成功率，需在结果中注明。
+
+修正验证：51 项消融适配器和原生门状态共识测试通过，覆盖纯观察不清票、结果去重、
+交互后证据新鲜度、跨 episode 重置、M1 超时不直接执行，以及真实决策节点复核。
+
+原始实验基线为 `154aa0226e7ce42bcbc8b3efe31bfd1990ab5a36`，标签
+`codex/experiment-baseline-20260917`。旧适配器为 `de80fa41441209910e4851051960dafa80362a88`。
+旧结果对应设计版本 1，不能直接放入本版本的消融表。仍只使用 Full + 三个对照：
+
+| `--variant` | 实际干预 | 共同保留 | 建议名称 |
 | --- | --- | --- | --- |
-| `full` | 使用原始 runner 和全部原始节点 | 完整方法 | Full |
-| `no_interaction_graph` | M2 输入改为扁平对象记忆；移除房间关系、边、显式交互效果、关系提示与图导出的预评分；候选压缩使用距离和原有类型配额 | 同一模型、对象类别/位置/状态、任务、交互执行、结果更新 | w/o Graph-guided Reasoning |
-| `no_task_decision` | M2 换成最近可行交互规则：优先交互，无交互时选择最近探索/导航候选；不请求 M2 模型 | 图、M1、执行器、结果更新；共用启动扫描、可靠目标和交互后续动作优先门控 | w/o Task-conditioned Selection |
-| `no_outcome_update` | mapping 不消费交互命令/结果以修改图或建立乐观地图覆盖；决策不保留结果驱动的开门后穿越、刷新门控和结果信念 | 正常 RGB-D/GT 可见观测、M1 属性更新、OCC 更新、执行成功/失败回报、冷却、目标完成判定 | w/o Outcome-driven Update |
+| `full` | 完整算法 | — | Full |
+| `no_interaction_graph` | 候选节点仅保存类别、位置、几何与可见性等 flat object memory；移除关系、交互状态和操作历史；重新生成候选；M2 不接收状态或关系提示 | 同一 M2 模型、目标语义、局部导航和执行器 | Flat Object Memory |
+| `no_task_decision` | 在 Full 相同的候选筛选/压缩之后，以交互优先、距离最近替换 M2 选择，不调用 M2 | 图、M1、候选池及配额、可靠目标优先、执行与结果更新 | Greedy Interaction Selection |
+| `no_outcome_update` | mapping 不消费命令/结果以修改图或建立乐观覆盖；M1 不接收结果状态标签；决策清除结果驱动的后续动作和结果信念 | 持续 M1、可见对象观测、OCC、执行生命周期与失败冷却 | Perception-only Update |
 
-`no_interaction_graph` 的范围是**高层关系图推理**。底层候选生成、可达性检查和执行仍复用原图，
-公共的目标到达与交互后续动作门控也保留。因此不能将本版本写成“系统完全不构建交互图”，
-也不能仅凭这一对照证明整套感知/建图组件的独立贡献。它衡量的是：在相同感知和可执行动作接口下，
-显式关系信息比扁平对象记忆多带来多少收益。
+## 干预边界
 
-`no_outcome_update` 不冻结世界。开门后的空间仍可由下一次传感器观测发现；
-关闭的是动作结果直接推动语义状态/后续计划的路径。静态门洞经 OCC 确认的通行候选仍保留。
-当前基线以 backend interaction result 驱动更新，这个消融不应被描述成独立的视觉 M3 审计消融。
+**Flat** 在候选节点收到图时就清除关系、开闭/可达状态、drawer scan 等交互记忆，
+不是仅从 M2 prompt 隐藏字段。生成器把门/容器视为状态未知的操作提议，不利用包含关系
+定位目标，也不根据成功历史自动穿门。M2 历史上下文排除 INTERACT 记录。
+当前动作生命周期、失败/重复调度保护仍保留。底层 mapper 和局部执行器仍维护原生信息，
+用于碰撞检查、操作前 M1 观测和物理执行；这些交互状态不进入 flat 规划记忆。
+因此应表述为“移除规划层的结构化交互状态表示”，不能写成整个系统没有任何图/状态。
+这是结构与交互状态记忆的联合消融，不能将差异全部归因于边结构。
 
-## 运行
+**Greedy** 保留 Full 的 model 分支，只替换 selector，避免旧版 rule 分支在 curation 之前
+选择导致候选池不同。公共启动扫描、可靠目标到达、结果驱动穿门、空候选 fallback 和
+最新快照复核保持不变。Full 的 curator 仍可使用目标语义，故该组不能声称完全去掉
+任务条件；它衡量的是任务条件的 M2 选择在共用候选集合之上的增益。
+贪心优先当前可行交互，不代表访问所有对象，也没有成功率必然更高的理论保证。
 
-新入口复用 `configs/evaluation/benchmark_batch.json`、原 evaluator、动态预算、录制、模型入口、
-观测轮次倍率和进程清理。以下命令仅检查配置并输出计划，不创建文件、不启动 ROS/模型/仿真：
+**Perception-only** 保留正常感知更新，状态不会冻结。执行完成事件只用于清除过期的
+在途 M1 请求/缓存并安排新观测，不读取 success/post_state 来确定物理状态。
+旧版只关闭 mapping 回调，遗漏了 M1 的 `record_authoritative` 写入，本版本补齐隔离。
+门被 M1 与 OCC 联合确认打开后，可以独立生成穿门目标，不要求存在交互成功历史；
+复用原生静态门洞的视觉共识、连通性和几何检查，临时转换仅存在于候选计算中。
+执行器回报仍用于结束当前动作与失败冷却。本组不是 M3 验证消融，也不是忽略所有反馈。
+
+## 持续 M1：四组必须共用配置
+
+原生 M1 并非只处理 unknown：已知对象默认可在 120 秒后再次分析；uncertain portal
+使用较短间隔，门的稳定状态另有 300 个 evaluator step 的冷却。状态变化需要 3 个不同视角
+确认。`success_refresh_interval_s <= 0` 会禁止同签名的周期刷新，不能用 0 表示持续分析。
+
+新增 `--m1-refresh-profile continuous`：已知对象刷新间隔 30 秒、门状态冷却 60 step，
+保留可见性、视角确认、请求去重、队列和超时限制。这是新实验的初始调度值，尚未证明最优；
+它表示可见对象的有界周期复查，不是逐帧查询所有对象。`baseline` 仍复用原始设置，
+Full + baseline 直接使用原始 runner。
+
+新实验四组都使用 continuous，不能只给第三组增加观测预算。相同调度不代表实际调用数
+相同：Full 有结果信息，可能减少后续视觉确认；必须另报 M1 请求数、tokens、等待耗时。
+持续 M1 可估计当前开闭状态，但无法仅从“抽屉现已关上”恢复“已完成打开—扫描—关闭”，
+因此核心比较是动作条件的状态/事件更新相对于感知重建的及时性与完整性。
+
+## 运行与记录
+
+60 个 mixed 场景为场景 0–59，对应 benchmark episode 2000–2059。
+新版公共配置：`scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json`。
+保留动态 200–2000 步、20 workers、观测倍率 1、无录制，新增共同 continuous M1 与独立输出目录。
+
+以下仅验证计划，不创建文件或启动仿真：
 
 ```bash
-/home/ldl/conda_envs/mlspaces/bin/python \
-  /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_benchmark_ablation.py \
-  --variant no_interaction_graph --workers 1 --episode-indices 10 --max-steps 20 --dry-run
+/home/ldl/conda_envs/mlspaces/bin/python /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_benchmark_ablation.py --variant full --config /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json --dry-run
 ```
 
-另外三个取值为 `full`、`no_task_decision`、`no_outcome_update`。
-实际运行时去掉 `--dry-run`；正式实验不要沿用示例中的单场 20 步限制。
-通过相同的 `--config` 和 `--episode-indices` 为四组指定相同任务；每组使用独立输出目录。
-其他参数与原入口一致：`--workers`、`--max-steps`、`--recording/--no-recording`、`--output-dir`。
-当前入口每次创建新目录，不复用已存在的运行目录。
+四组分别替换 `--variant`，每次创建独立目录。正式运行不应混用旧版 Full 数据；
+并发启动不同组时需要独立 master 端口和相同资源安排。
+`ablation_manifest.json` 记录 design_revision=2、M1 profile/实际覆盖值、基线 SHA、
+当前 Git 状态、配置、命令和适配文件哈希。原生 ROS/算法源码与 launch 不改动；
+适配代码及生成的 launch/runner 存于本轮输出目录。原 YAML 模块名不能代替 manifest 判断干预。
 
-每轮输出包括 `ablation_manifest.json`（变体、基线 SHA、实际 Git HEAD/状态、配置、启动命令、
-适配文件哈希）、`launch_config.json` 和原批量评测产物。消融组在 `ablation/` 内保存
-适配代码副本、ROS launch 和 runner；原始源码和 launch 文件不做修改。
-runner 哈希包含适配代码身份，节点 `~module_ablation` 参数和 ROS 日志记录实际变体。
-原 YAML 的 M1/M2/M3 字段用于共用配置加载；消融的实际干预应以 manifest 和节点参数为准。
+## 如何判断 Full 的贡献
 
-## 如何呈现贡献
+主表保持四行：SR、SPL、有效交互精度、重复/无关交互数、路径/动作成本、M1/M2 调用及墙钟耗时。
+使用同 episode/seed/初态/成功条件/动态预算，固定模型参数、并发度与录制开关。
 
-主表保持四行。主指标沿用论文和当前 evaluator 的 SR、SPL、ISR、Interaction Coverage，
-同时区分正式 `success`、`task_success` 和 `nav_success`，不能混用分母或目标条件。
-在同一批结果内分别统计 channel、container、mixed，以及必要交互数量；这些是结果分组，不新增消融组。
+- Full vs Flat：关注跨房间、容器搜索和多步状态依赖场景，报告失败原因、绕行与重复操作。
+- Full vs Greedy：检验相当 SR 下能否减少冗余交互与行动成本，不预设 Full 的所有指标更优。
+  同时报全体场景和双方共同成功场景上的成本；提前失败可使总成本降低，不能据此称更高效。
+  Greedy 节省 M2 推理，Full 即使物理行动更高效也未必墙钟更短。
+- Full vs Perception-only：统计动作完成到状态确认/下一步推进的延迟、重新观测次数、重复操作，
+  以及“物理状态恢复但事件历史不可恢复”的案例。不把重复操作失败全部解释为视觉准确率问题。
 
-- 图推理：重点看多房间、隐藏目标和多步依赖任务。若 SR/SPL 下降且无关交互或绕行增多，
-  才能把收益解释为关系表示支持的规划，而非模型规模或候选可执行性变化。
-- 任务选择：重点看相似容器、多可选门和有干扰交互的任务。结合错误对象交互、冗余交互和路径长度，
-  判断模型是否将交互用在了目标搜索上。该组 M2 调用减少，墙钟时间需单独报告。
-- 结果更新：重点看开门后穿越、打开容器后搜索及连续交互。结合交互成功后仍未完成任务、
-  重复选择、停滞和恢复次数，判断结果是否转化成了后续导航进展。
-
-后面提到的诊断计数可从 trace/events 派生；本新增代码没有实现新的汇总指标，不能当作已生成的结果。
-操作控制器完全共用，物理交互成功率的变化也可能来自对象选择和状态维护，不等于控制能力变化。
-
-四组固定 manifest、episode/seed、初始状态、传感器限制、目标成功条件、预算和观测上限、
-模型版本及推理参数、并发和录制开关。采用同 episode 配对比较，并报告完成比例与异常数量。
-正式实验建议对四组都重复相同的三轮，报告均值和配对不确定性；不得挑选某组最好的一轮。
-本次只进行了轻量测试，没有产生算法性能结论。
+结论需由配对结果支持；三组可以验证完整系统各部分的必要性，不能严格识别模块间的统计
+交互效应。新诊断指标尚需从事件日志汇总，本次没有生成正式性能结果或宣称 Full 更优。
 
 ## 轻量验证
 
+加载 `/home/ldl/conda_envs/ros-noetic/setup.bash`，设置 TMPDIR 为
+`/home/ldl/tmp/interactive-nav-ablation-v2`、XDG_CACHE_HOME 为
+`/home/ldl/.cache/interactive-nav-ablation-v2`，运行：
+
 ```bash
-cd /home/ldl/molmospaces-exp-setting
-source /home/ldl/conda_envs/ros-noetic/setup.bash
-TMPDIR=/home/ldl/tmp/interactive-nav-ablation-check \
-XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-ablation-check \
-PYTHONDONTWRITEBYTECODE=1 \
-/home/ldl/conda_envs/mlspaces/bin/python -m pytest \
-  scripts/InteractiveNav/ablations/tests -q -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 /home/ldl/conda_envs/mlspaces/bin/python -m pytest scripts/InteractiveNav/ablations/tests -q -p no:cacheprovider
 ```
 
-测试包含扁平记忆在 HTTP 请求中的实际传输、无关系评分泄漏、最近规则、输入不变性、
-原决策节点的动作选择/成功反馈生命周期、感知/OCC 回调保留、运行快照与清理，以及四组 dry-run。
-ROS transport、模型响应和启动进程使用替身，不需要 roscore、GPU 或在线模型。
-仅测试 ROS 节点的模块需要 Conda ROS；未加载 ROS 时该模块会 skip。
+测试使用原生候选生成器、决策节点和 M1 调度/共识逻辑，替换 ROS transport、在线模型和进程。
+覆盖 flat 状态隔离、四组 M1 配置一致性、Full/Greedy 候选池一致性、仅感知穿门、
+结果标签隔离与周期刷新去重。实际仿真性能仍需四组配对评测验证。
 
-2026-09-17 检查结果：28 项新增测试 + 100 项原有相关回归，合计 128 项通过；
-三组生成的完整 launch 均通过实际 ROS loader 解析，Python AST 和 Shell 语法检查通过。
-日志：`/home/ldl/outputs/interactive-nav/ablation-check-20260917/pytest-reviewed.log`。
+2026-09-17 版本 2 初始验证：39 项适配器测试及 114 项原生相关回归，共 153 项通过。
+四组完整 launch 经 ROS loader 解析，确认对象 M1 实际参数为 30 秒 / 60 step；
+四组 60 场景 dry-run、Python AST、生成 runner 的 Shell 语法检查通过。
+上述是版本 2 开始评测前的验证记录；版本 3 修正与重跑说明见本文开头。

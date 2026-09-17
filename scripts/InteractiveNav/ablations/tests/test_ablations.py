@@ -47,8 +47,8 @@ def test_flat_request_removes_relations_but_preserves_object_semantics_and_execu
                                     "decision_history": [{"candidate_id": "old", "status": "FAILED",
                                                           "room_id": "room_a", "result": {"room_id": "room_b"}}]})
     assert payload["mission"]["target"]["name"] == "apple"
-    assert payload["object_memory"][0]["interaction_state"] == "closed"
-    assert payload["candidates"][0]["state"] == "closed"
+    assert "interaction_state" not in payload["object_memory"][0]
+    assert "state" not in payload["candidates"][0]
     assert payload["candidates"][0]["subject_semantic_type"] == "door"
     forbidden = {"graph", "edges", "effect", "connected_room_ids", "room_id", "room_object_reasoning",
                  "pre_score", "decision_hint", "candidate_pre_scores", "target_room_id"}
@@ -181,7 +181,10 @@ def test_generated_launch_uses_only_explicit_wrappers_and_valid_shell(tmp_path, 
     assert any(inc.get("file") == str(tmp_path / "semantic_decision.launch") for inc in nav.iter("include"))
     decision = ET.fromstring(artifacts[tmp_path / "semantic_decision.launch"])
     wrapped = [node.get("type") for node in decision.iter("node") if node.get("launch-prefix")]
-    assert wrapped == ["semantic_rule_decision_node.py"]
+    expected = {"semantic_rule_decision_node.py"}
+    if variant in {"no_interaction_graph", "no_outcome_update"}:
+        expected.add("semantic_candidate_node.py")
+    assert set(wrapped) == expected
     assert (tmp_path / "semantic_mapping_py.launch" in artifacts) == (variant == "no_outcome_update")
     assert "adapter_sha256=" in artifacts[tmp_path / "runner.sh"]
     assert 'module2: "mllm_score"' in artifacts[tmp_path / "runner.sh"]
