@@ -38,6 +38,10 @@
 - **[2026/02/11]** 🔥 **MolmoSpaces** Code for scene conversion, grasp generation, teleoperation, and benchmark evaluation.
 
 
+## Interactive navigation simulator
+
+The `interactive-nav/sim` branch includes standalone [Full GT trajectory collection](docs/full_gt_collection.md): fixed-rate base and handle poses, synchronized first-person/rear-above images, top-down trajectories, and rule-based instructions. It does not require the experimental navigation algorithms or ROS.
+
 ## Installation
 
 Installing `molmospaces` is easy!
