@@ -242,10 +242,12 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
     cfg.num_workers = 1
     cfg.num_threads = 1
     cfg.use_passive_viewer = False
-    cfg.use_filament = False
+    if "use_filament" in type(cfg).model_fields:
+        cfg.use_filament = False
     cfg.record_videos = False
     cfg.task_sampler_config.task_sampler_class = SceneOnlyTaskSampler
     cfg.task_sampler_config.house_inds = []
+    cfg.task_sampler_config.house_variant = args.variant
     cfg.task_sampler_config.samples_per_house = 1
     cfg.task_sampler_config.randomize_lighting = False
     cfg.task_sampler_config.randomize_textures = False
@@ -279,6 +281,8 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
         if hasattr(cam, "fov_noise_degrees"):
             cam.fov_noise_degrees = None
 
+    if hasattr(args, "image_width"):
+        cfg.camera_config.img_resolution = (args.image_width, args.image_height)
     return cfg
 
 
@@ -294,9 +298,9 @@ def load_scene_context(args: argparse.Namespace, house_ind: int) -> LoadedContex
     sampler = cfg.task_sampler_config.task_sampler_class(cfg)
     try:
         sampler._increment_task_and_reset_house(force_advance_scene=False, house_index=house_ind)
-        original_scene_path = Path(sampler._current_house_scene_path(variant=args.variant))
+        original_scene_path = Path(sampler._current_house_scene_path())
         scene_path = prepare_writable_scene_path(original_scene_path)
-        sampler.update_scene(scene_path=scene_path, variant=args.variant)
+        sampler.update_scene(scene_path=scene_path)
         env = sampler.env
         if env.current_scene_metadata is None:
             env._scene_metadata = get_scene_metadata(scene_path) or get_scene_metadata(original_scene_path)
@@ -321,7 +325,9 @@ def load_scene_context(args: argparse.Namespace, house_ind: int) -> LoadedContex
 
 
 def prepare_writable_scene_path(scene_path: Path) -> str:
-    assets_root = Path(os.environ.get("MLSPACES_ASSETS_DIR", str(REPO_ROOT / "assets")))
+    from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+
+    assets_root = Path(ASSETS_DIR)
     cache_root = Path(
         os.environ.get("MLSPACES_CACHE_DIR", str(Path.home() / ".cache/molmo-spaces-resources"))
     )
@@ -446,7 +452,8 @@ def prepare_writable_scene_path(scene_path: Path) -> str:
     ensure_symlink(dst_scene, scene_path)
 
     resolved_scene_path = usable_source(scene_path)
-    for sibling in resolved_scene_path.parent.glob(f"{resolved_scene_path.stem}*"):
+    asset_stem = resolved_scene_path.stem.removesuffix("_ceiling").removesuffix("_map")
+    for sibling in resolved_scene_path.parent.glob(f"{asset_stem}*"):
         if sibling == resolved_scene_path:
             continue
         if sibling.is_dir() and not sibling.name.endswith("_assets"):
@@ -454,7 +461,7 @@ def prepare_writable_scene_path(scene_path: Path) -> str:
         sibling_dst = dst_scene.parent / sibling.name
         ensure_symlink(sibling_dst, sibling)
 
-    scene_assets_dir = resolved_scene_path.parent / f"{resolved_scene_path.stem}_assets"
+    scene_assets_dir = resolved_scene_path.parent / f"{asset_stem}_assets"
     if scene_assets_dir.exists():
         dst_assets_dir = dst_scene.parent / scene_assets_dir.name
         ensure_symlink(dst_assets_dir, scene_assets_dir)

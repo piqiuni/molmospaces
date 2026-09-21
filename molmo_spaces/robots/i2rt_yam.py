@@ -8,7 +8,6 @@ from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
 from molmo_spaces.env.sensors import TCPPoseSensor
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
-from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
 from molmo_spaces.robots.abstract import Robot
 
 if TYPE_CHECKING:
@@ -29,6 +28,9 @@ class I2rtYamRobot(Robot):
             mj_data, config.robot_config.robot_namespace
         )
         self._kinematics = MlSpacesKinematics(config.robot_config)
+
+        # Only robots using Warp IK require the optional mujoco_warp package.
+        from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
 
         self._parallel_kinematics = SimpleWarpKinematics(config.robot_config)
 
