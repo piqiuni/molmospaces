@@ -70,3 +70,8 @@ __pycache__/
 !/scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py
 !/scripts/InteractiveNav/check_simulator_scope_parity.py
 !/scripts/InteractiveNav/simulator_scope.txt
+!/scripts/InteractiveNav/collect_full_gt.py
+!/scripts/InteractiveNav/render_full_gt.py
+!/scripts/InteractiveNav/navigation_posture.py
+!/scripts/InteractiveNav/collection/
+/outputs/
