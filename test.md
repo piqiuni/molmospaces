@@ -136,7 +136,7 @@ PY
 - 配置入口：`scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf`，详细说明见同目录 `README.md`。单场命令只需输出目录与 episode index；可用第三个参数传入 Bash 覆盖配置。
 - 默认动态预算、上限 2000；关闭 `events.jsonl` 与离线六宫格 PNG，保存精简且 gzip 压缩的 `step_boundaries.jsonl.gz`。保留完整图 6 数据与终止摘要，旧 JSONL 仍可重绘。
 - 每场保存 `config/effective_config.env`、四份算法 YAML、ROS 日志配置；不复制凭据内容。Python ROS 日志默认 WARN、每文件 5 MiB 加 2 份轮转，控制台日志不是严格总量配额。
-- M2 使用五步逻辑提示词与独立 `selection_reasoning_effort=low`，1536 token 总上限、12 秒超时。仅消费最终 JSON；需区分请求推理模式与后端实际返回 reasoning token。
+- M2 使用五步逻辑提示词与独立 `selection_reasoning_effort=low`，1536 token 总上限、30 秒超时；超时仅重试 1 次，退避 1 秒（最大等待约 61 秒）。`SEMANTIC_M2_ENDPOINT` / `SEMANTIC_M2_MODEL_NAME` 可把 M2 切到更强的 OpenAI-compatible 文本模型，不改变视觉 M1/M3；未设置时沿用共享模型。仅消费最终 JSON；需区分请求推理模式与后端实际返回 reasoning token。
 - 历史对照（实际 applied action）：Container 动态 650、成功 202；Mixed 动态 1000、首次失败 1000、复跑成功 685；旧 Channel 动态 650、历史失败 1000。这不是动态预算下的新仿真结果。
 
 ```bash
@@ -2330,6 +2330,289 @@ python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
 输出包含整体及各角色的准确率、有效响应率、逐题耗时、token、reasoning token、可见输出 TPS，并同时生成 CSV。
 视觉属性和交互反馈只输入目标 `2D bbox` 裁切；交互反馈只使用交互后的单张目标图。
 
+### 模块 2：历史决策离线 replay
+
+无需启动 ROS 或仿真，可将已保存的 `mllm_metrics.jsonl` 与
+`debug/raw/step_boundaries.jsonl.gz` 连接成只含公开感知信息的 M2 测试集：
+
+```bash
+DATASET=/home/ldl/outputs/interactive-nav/m2-replay/<RUN_NAME>
+TMPDIR=/home/ldl/tmp/m2-replay-extract \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-replay-extract \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py extract \
+  --input-root /home/ldl/outputs/interactive-nav/<EVAL_RUN>/evaluation \
+  --output-dir "$DATASET"
+```
+
+输出包括 `cases.jsonl`、带 SHA256 的 `manifest.json` 和
+`annotations.template.jsonl`。旧录像未保存 policy 内部的精确
+`recent_decisions`，这类 case 会标记为 `reconstructed_public_context` 及缺失字段；
+不得将其描述为逐字节请求复现。模型输入经过递归隐私审计，不包含
+`target_instance_id`、oracle plan、required interaction 或 recorder 的
+`gt_observations`。
+
+仅测试 M2 并与原模型输出或人工标注对比：
+
+```bash
+OUT=/home/ldl/outputs/interactive-nav/m2-replay-results/<MODEL_NAME>
+TMPDIR=/home/ldl/tmp/m2-replay-run \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-replay-run \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py replay \
+  --dataset "$DATASET" \
+  --output-dir "$OUT" \
+  --endpoint http://127.0.0.1:8000/v1 \
+  --model <MODEL_NAME> \
+  --timeout-s 30 \
+  --max-retries 1 \
+  --annotations "$DATASET/annotations.template.jsonl"
+```
+
+`recorded_top1_agreement` 只表示相对历史 policy 的行为一致性，不是准确率。
+填写 `acceptable_top1_ids`、`preferred_ranking` 或 `forbidden_ids` 后，才会生成
+`acceptable_top1_accuracy`、`preferred_mrr` 和 `forbidden_top1_rate` 等正确性指标。
+可通过 `--prompt-file` 比较提示词，通过 `--case-id`、`--limit` 运行小切片。
+
+若要只替换 M2 文本模型，先确认目标服务的 `/v1/models` 中确实暴露该模型，
+再在本地未提交的 dotenv 中设置（不会改变 M1/M3）：
+
+```bash
+SEMANTIC_M2_ENDPOINT=https://<strong-model-host>/v1
+SEMANTIC_M2_MODEL_NAME=<served-model-id>
+SEMANTIC_M2_API_KEY_ENV=SEMANTIC_M2_API_KEY
+SEMANTIC_M2_TIMEOUT_S=30
+SEMANTIC_M2_TIMEOUT_RETRY_COUNT=1
+SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S=1
+```
+
+当前开发机可用的本地服务/权重仍是 `qwen3.6-35b-a3b-fp8`；没有第二个更强的本地
+文本模型可供切换，因此已有 high-reasoning replay 只证明同一权重的协议/行为稳定性，
+不能写成“更强模型提升”。接入远端或新权重后，用同一 `cases.jsonl` 和人工标注再比较。
+
+#### M2 并发镜像与同提示词模型对比（2026-09-22）
+
+本轮使用 166 条公开历史快照。以 episode 分组冻结 dev/holdout 后，由独立
+subagent 盲审规则生成标签；标签不读取历史回答或本轮预测。主指标只计能够
+区分优劣的多候选请求：dev 30、holdout 72；46 条单候选另报，18 条歧义/证据
+冲突不计主分数。该分数是公开策略规则接受率，不是人工真值准确率或导航 SR。
+规则与数据集见 `/home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/`。
+
+冻结的候选提示词为
+`scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt`。
+它仅用于显式指定的 replay。开发集选择后，原/优化提示词分别在完整 166 条上
+运行；独立 holdout 为 51/72 → 53/72，尚不足以确认闭环收益。同一优化提示词下，
+Qwen / GPT / Gemini 的 holdout 分别为 53/72、58/72、60/72；Gemini 的 4 条
+开门后穿越阶段样本仅通过 2 条，需与整体探索排序分数一起看。GPT 有 1 条
+服务过载失败，保留在评分分母；Gemini 恢复后正式请求 166/166 有效。
+完整结果、逐条输出和复算脚本位于
+`/home/ldl/outputs/interactive-nav/m2-mirror-20260922/report.md`。
+
+本地高并发测试（需先有健康的 Qwen 服务）：
+
+```bash
+TMPDIR=/home/ldl/tmp/m2-mirror-20260922 \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-mirror-20260922 \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py replay \
+  --dataset /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv \
+  --annotations /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/annotations.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --endpoint http://127.0.0.1:8000/v1 --model qwen3.6-35b-a3b-fp8 \
+  --concurrency 32 --timeout-s 90 --max-retries 1 --max-tokens 1536 --reasoning-effort off \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-mirror-local-new-run
+```
+
+远端配置文件使用 `url`、`key`、`model1`、`model2` 字段，凭据只在进程内读取。
+以下命令对两个模型合计限流：8 并发、任意滚动 60 秒最多 28 次请求，重试也
+占用配额。若服务配额按模型独立计算，可分别使用 `--model-key model1` 和
+`--model-key model2` 启动独立进程，各自设为 8 并发、26 RPM；本轮用户后续
+确认按模型独立配额执行。先用 `--limit 1` 和独立输出目录做协议预检。
+
+```bash
+TMPDIR=/home/ldl/tmp/m2-mirror-20260922 \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-mirror-20260922 \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_mirror_compare.py \
+  --env-file /home/ldl/.env \
+  --dataset /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv \
+  --annotations /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/annotations.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --concurrency 8 --requests-per-minute 28 --timeout-s 90 --max-retries 1 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-mirror-remote-new-run
+```
+
+若本机继承了 SOCKS 代理但环境无 `socksio`，且该服务可直连，可仅在本次命令前
+加 `env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy`。
+本轮 Gemini 早期两次返回 `User location is not supported for the API use`，
+用户恢复服务后预检通过，再执行正式 166-case 测试。预检错误只记录为服务故障，
+不混入恢复后的正式模型成绩。
+
+#### M2 公共事实上下文与 Qwen 消融（2026-09-22）
+
+在线 M2 保持提示词不变，新增初始/当前位置、实际房间访问序列、最近30次决策、
+房间/门/容器几何和房间前沿统计；房间关键物体只保留名称，不发送可见性标记、
+规则房间评分或房间—目标匹配结论。默认候选池为最多12个去重前沿加全部有效交互/
+导航候选；`model_policy.candidate_pool_mode=legacy` 保留旧裁剪策略作消融。
+`include_pre_scores` 默认false；后置执行守卫并未关闭，离线主指标只评原始模型选择。
+在线机器人坐标按位姿时间戳通过TF转换到图坐标系，转换失败标为未知，不假设坐标系
+一致；不改变导航执行位姿。房间前沿统计按实际提取时间检查新鲜度，旧状态重发不会
+刷新有效期，缺失/过期统计不伪装成零。
+
+历史重建禁止使用请求之后的图、反馈或完整场景GT。旧日志中请求开始时间仍是估计值，
+图版本精确对齐不等于原HTTP请求完整恢复；图版本较旧、历史不完整、前沿长度下界均
+须标记。最近30条是上限，不能将实际只有数条的记录凑满。新在线请求直接保存
+`public_request` 和 `request_started_ts`，后续不必再依赖异步快照拼接。
+
+以下命令从仓库根目录运行；新运行请选择新的输出目录，冻结输入/标签禁止覆盖。
+
+```bash
+export TMPDIR=/home/ldl/tmp/m2-context-20260922
+export XDG_CACHE_HOME=/home/ldl/.cache/m2-context-20260922
+export HF_HOME=/home/ldl/.cache/m2-context-20260922/hf
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_dataset.py \
+  --cases /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv/cases.jsonl \
+  --log-root /home/ldl/outputs/interactive-nav/custom-task-t-20260917012600-dw5wv/evaluation \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/dataset
+
+/home/ldl/qwen36-fp8/venv/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py prepare \
+  --records /home/ldl/outputs/interactive-nav/m2-context-new/dataset/enriched_records.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --tokenizer /home/ldl/qwen36-fp8/model/Qwen3.6-35B-A3B-FP8 \
+  --max-model-len 16384 --max-tokens 1536 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/inputs
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_labels.py \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs/label_inputs.jsonl \
+  --split /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/split.json \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/labels
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py run \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --concurrency 32 --timeout-s 120 --max-tokens 1536 --max-retries 1 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/run
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_report.py \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --run /home/ldl/outputs/interactive-nav/m2-context-new/run \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --guard-shadow \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/report
+```
+
+运行前确认Qwen服务的实际上下文窗口与 `--max-model-len` 一致；prepare会对所有消融
+共同检查token预算，不静默截断。`compact_control` 是同一新候选池的简化事实对照，
+不是旧HTTP请求；`legacy_candidate_pool` 是旧池策略的重算，不等同历史已发送候选。
+去近期决策/轨迹消融仍保留候选历史摘要/房间到访状态，分别测事件明细与轨迹顺序的
+额外贡献。标签为预测盲的公开策略proxy，禁止将其接受率称为导航成功率。
+主报告使用固定的非单候选、可评分样本分母，另列单候选、歧义样本、严格/滞后图版本、
+阶段合同和schema错误；不要把runner包含单候选的汇总接受率作为主指标。各条件只采样
+一次，微小差异不构成稳定收益证据，阶段合同与历史成功记录冲突需在线闭环验证。
+
+远端模型使用相同冻结输入时，先导出完整上下文这一组；导出只给标签ID加与请求一致的
+命名空间，不重建候选、不改评分规则。以下命令只读取既有数据，导出目录必须不存在：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py export-arm \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --arm full_context \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs
+```
+
+启动前在选用的Python中检查 `httpx` 和代理所需的 `socksio` 导入。当前基础环境
+`/home/ldl/miniconda3/bin/python` 已有这两个依赖；此处只读取冻结请求，不用它重新
+计算候选预评分。凭据在runner进程内读取，不要打印 `.env` 或把URL/key放进命令行。
+例如GPT保守运行如下，Gemini另用 `--model-key model2 --concurrency 2` 和独立新输出目录：
+
+```bash
+/home/ldl/miniconda3/bin/python -m scripts.InteractiveNav.evaluation.m2_mirror_compare \
+  --env-file /home/ldl/.env \
+  --dataset /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/cases.jsonl \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/annotations.jsonl \
+  --prompt-file /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/prompt.txt \
+  --model-key model1 --concurrency 2 --requests-per-minute 20 \
+  --timeout-s 120 --max-retries 1 --max-tokens 1536 --reasoning-effort off \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/gpt
+```
+
+每个模型只启动一个pool，Gemini不要叠加多个2并发进程；timeout重试也计入滑动60秒
+请求额度。保留客户端启动失败诊断，与真实网络请求分开审计；不得用事后重跑替换
+正式模型的错误回答。新旧Qwen耗时比较须同时报告服务并发负载、窗口和限流等待。
+各模型分别未超限并不保证共享网关配额未超限；也可能受token吞吐或服务端并发限制。
+若要同进程共享额度，可以省略 `--model-key`，使用 `--concurrency 4` 给两个模型各2个
+worker，并共用 `--requests-per-minute 20`。遇到429应保留失败并降低压力，不能仅凭
+客户端未超过28RPM就认定服务错误；本runner只自动重试timeout，不自动重试429。
+
+所有模型完整结束后，用同一份冻结标签比较原始回答；下列入口拒绝不完整结果，自动
+从Qwen九组输出中只取full_context，保留模型/服务失败在固定主分母中：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_context_model_report \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs \
+  --run qwen=/home/ldl/outputs/interactive-nav/m2-context-new/run/predictions.jsonl \
+  --run gpt=/home/ldl/outputs/interactive-nav/m2-context-new/gpt/model1/predictions.jsonl \
+  --run gemini=/home/ldl/outputs/interactive-nav/m2-context-new/gemini/model2/predictions.jsonl \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/model_report
+```
+
+#### M2 语义提示词与建议摘要的成对测试（2026-09-22）
+
+入口 `scripts/InteractiveNav/evaluation/m2_semantic_experiment.py` 只做离线镜像，
+不修改在线默认提示词或候选。11 组为 B、新语义链 P1、起点近房 P2、探索历史 P3、
+相关容器优先 P4、承载物 P5、融合 P6，以及相对 P6 的阶段摘要、区域摘要、备用动作
+多样性与三者组合。每组重复两次、随机交错，共用一个 32 并发池，不给各组分别开池。
+
+先冻结预测盲的新检查和独立人工探针，再冻结全部请求。下列新输出路径不得已存在：
+
+```bash
+export TMPDIR=/home/ldl/tmp/m2-semantic-new
+export XDG_CACHE_HOME=/home/ldl/.cache/m2-semantic-new
+export HF_HOME=/home/ldl/.cache/m2-semantic-new/hf
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_checks \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-remote-20260922/inputs \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/checks
+
+/home/ldl/qwen36-fp8/venv/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_experiment prepare \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-remote-20260922/inputs \
+  --records /home/ldl/outputs/interactive-nav/m2-context-20260922/dataset/enriched_records.jsonl \
+  --checks /home/ldl/outputs/interactive-nav/m2-semantic-new/checks \
+  --prompt-dir scripts/InteractiveNav/configs/semantic_decision/prompts/m2_semantic_20260922 \
+  --tokenizer /home/ldl/qwen36-fp8/model/Qwen3.6-35B-A3B-FP8 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --repeats 2 --seed 20260922 --max-model-len 16384 --max-tokens 1536
+
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost \
+  /home/ldl/conda_envs/mlspaces/bin/python -u -m scripts.InteractiveNav.evaluation.m2_semantic_experiment run \
+  --inputs /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/run \
+  --concurrency 32 --timeout-s 120 --max-retries 1 --max-tokens 1536
+
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_report \
+  --inputs /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --run /home/ldl/outputs/interactive-nav/m2-semantic-new/run \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/report
+```
+
+本次冻结集为历史 166 条和人工探针 18 条，共 4,048 次请求；历史主评分仍是原来的
+130 条（dev 38、历史 holdout 92），两次合并分母为 260，但不是 260 个独立场景。
+人工探针、新策略相对排序检查、旧 Top1 接受率分别报告，均不等同闭环导航 SR。
+旧 holdout 已被查看，不能再称新盲测集。阶段冲突只作诊断，不把历史执行成功当成
+当前物理穿越完成。历史区域摘要缺少同坐标系候选关联，不能证明空间去重收益；
+承载物和受控起点距离在历史集没有适用检查，只能用人工探针检查偏好遵循。
+
+准备过程会核验提示词、标签及检查文件哈希，并对实际 wire 文本检查完整 token
+预算；任何超限均在调用模型前失败，不截断或剔除样本。建议摘要 v2 通过引用原始
+历史去重，不删原始上下文。运行保留所有服务/格式错误，只按预定策略重试 timeout。
+阶段/区域组同时改变摘要和指令，不能解释成纯提示词单因素实验。
+
 ### 模块 3：历史图像视觉操作规划
 
 使用运行时同一提示词与输出 schema，测试门操作方式和多抽屉中心点：
@@ -2492,27 +2775,49 @@ MPLCONFIGDIR=/home/ldl/.cache/matplotlib \
 回放使用当前 `semantic_map` 配置、历史公开门观测和已确认的 graph overlay，
 按记录的 step 顺序处理；不复现 ROS 的完整异步回调顺序，也不能替代闭环导航验收。
 
-## 目标等价离线重评分
+## 目标等价离线重评分（分层协议 v2）
 
-对已完成的批量评估使用独立的新口径：同容器内同类实例，或同房间、支持关系兼容的
-0.30 m 内同类近邻。仍要求原评估器已经验证替代实例的公开观测和到达距离。
-同房间但距离较远的目标不自动放宽，需要另行证明必要门交互一致且两者均非容器目标。
+对已完成的批量评估使用独立的分层口径，不覆盖原始严格结果。每个 episode 同时报告
+`exact_instance_success`、`category_goal_success`、
+`interaction_contract_goal_success` 和 `interactive_episode_success`：
+
+- 同容器内、同类别且位于冻结容器体积内的实例可以计 Category；只有数据集声明的
+  `identity_contract`，或经过审核的 candidate-specific interaction plan，才可以再计
+  Contract/Interactive。
+- 同房间、同类别且支持关系兼容的 0.30 m 内近邻（例如约 0.275 m 的 CD）只计
+  Category，不把距离当作交互契约证据。
+- 同房间同类目标（包括原目标在容器、候选在台面的情况）可计 Category；共享同一扇门
+  仍需门拓扑审计，且共享通道不能证明完整 container/full interaction contract。
+- 旧 benchmark 没有 identity contract 时安全降级为 Category-only；不要把事后类别
+  成功写回原始 `success`。
+不同房间或已知不同容器的目标不自动放宽；若要把门/容器交互也视为等价，仍需候选级
+交互计划证据。
 
 ```bash
 EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
-python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
   --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
-  --scene-dir /home/ldl/molmo-spaces-resources/scenes/procthor-10k-val/20251217_with_occupancy \
+  --scene-dir /home/ldl/molmospaces/assets/scenes/procthor-10k-val \
   --near-radius-m 0.30 \
-  --output-dir "$EVAL_RUN/goal_equivalence_v1"
+  --output-dir "$EVAL_RUN/goal_equivalence_v2"
 ```
 
 输出 `report.md`、`report.json`（逐场改分理由与证据 SHA256）、`rescored_results.json`。
 输出目录必须不存在；原始 summary/result、benchmark、交互完成事实不变，不启动仿真。
-Nav SR 与交互任务 SR 分别展示；CD 未开抽屉只改 Nav SR。`spl_original_reference`
-使用原目标参考路径，不能当作重新计算等价目标最短路后的标准 SPL。Total Cost 同步去除
-新成功场景的失败惩罚。详情见 `evaluation/evaluation_protocol.md` 的 post-hoc 小节。
+报告同时展示四层 SR；严格的 `nav_success`、`success`、SPL 和 Total Cost 完全保留，
+不会因为类别放宽而去除失败惩罚。`category_spl` 保持为空，因为没有 candidate-specific
+参考路径，`spl_original_reference` 也不能当作等价目标最短路后的标准 SPL。
+
+对旧 benchmark 进行 Contract/Interactive 晋级必须提供经过人工审核的审计文件（包含
+benchmark SHA256、candidate 名、plan ID 和完整 `required_interaction_ids`），例如：
+
+```bash
+python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
+  --benchmark <BENCHMARK_JSON> --scene-dir <SCENE_DIR> \
+  --identity-contract-audit <REVIEWED_AUDIT_JSON> \
+  --output-dir "$EVAL_RUN/goal_equivalence_v2_reviewed"
+```
 
 最小回归：
 
@@ -2560,8 +2865,8 @@ raise SystemExit(pytest.main(sys.argv[1:]))
 EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
 python scripts/InteractiveNav/audit_mixed_benchmark_run.py "$EVAL_RUN/evaluation" \
-  --goal-rescore-dir "$EVAL_RUN/goal_equivalence_v1" \
-  --output-dir "$EVAL_RUN/mixed_quality_audit_v1_verified"
+  --goal-rescore-dir "$EVAL_RUN/goal_equivalence_v2" \
+  --output-dir "$EVAL_RUN/mixed_quality_audit_v2_verified"
 ```
 
 输出目录必须不存在。`exclusions.json` 列出本次运行的隔离清单，`report.json`
@@ -2575,3 +2880,175 @@ TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
   scripts/InteractiveNav/test_audit_mixed_benchmark_run.py \
   scripts/InteractiveNav/test_rescore_benchmark_goals.py -q -p no:cacheprovider
 ```
+# 2026-09-21：评测失败重试与模型服务归属
+
+## 初始化姿态回归（2026-09-21）
+
+V3 benchmark 回放在环境的初始 500 次稳定化之前恢复 episode 的机器人关节、
+底盘姿态及静止控制目标；常规任务的初始化钩子为空。碰撞和稳定化步数保持原值，
+稳定化之后仍由原有回放逻辑恢复完整场景状态。
+
+仅初始化测试入口：`scripts/InteractiveNav/profile_scene_initialization.py --episode INDEX --output DIR`。
+使用 mlspaces Python、`MUJOCO_GL=egl`，并将 TMPDIR、缓存与输出放在 `/home/ldl`。
+正式回归不要传诊断用的 `--settle-steps` 或 `--isolate-robot-during-settle`。
+脚本只调用 sample_task/task.reset，不运行导航策略；输出 timings.json、physics.jsonl
+和 state_audit.json。状态检查范围为机器人底盘／关节和 episode 指定物体的位置／朝向，
+不是完整导航性能回归。
+
+本机实测：house 13 的 episode 3、2006 初始化分别为 9.47、9.43 秒，house 2
+episode 0 为 8.68 秒；三场均执行 500 个稳定化物理步且状态审计通过。
+结果目录：`/home/ldl/outputs/interactive-nav/init-fixed-h13-e3-r2`、
+`init-fixed-h13-e2006-r1`、`init-fixed-h2-e0-r1`（后两者同一父目录）。
+
+统一入口为 `python scripts/InteractiveNav/run_benchmark_eval.py --config <config.json>`。
+使用已有模型服务时直接运行；自定义任务需要在同一实例启动模型时增加
+`--start-qwen`。它按 `CUDA_VISIBLE_DEVICES`（未设置时按 GPU 枚举）启动每卡一个
+Qwen 副本，统一入口 `http://127.0.0.1:8010/v1`。副本只在批次开始时启动，
+场景不能重启服务；服务进程退出会中断批次并保留结果，结束时只清理本轮服务。
+自定义任务 wrapper 保留平台 EGL、缓存及资产环境准备，并调用同一入口。
+
+默认首轮结束后重试运行不完整场景一次；`--retry-rounds N` 可指定重试轮数。
+导航失败但正常完成的场景不重试。每轮 `retry_queue_N.json` 保存剩余场景，
+通过批处理的 `--resume` 复用已完成结果并为异常场景新建 attempt，最终汇总保留完整采样集。
+重试耗尽仍有缺失／异常结果时入口返回非零。每轮复用首次启动生成的
+`runner_snapshot.sh`，启动前执行 `bash -n`，避免共享 shell 在执行中被编辑。
+运行期间仍应避免修改 Python 算法和依赖配置；此快照不是整个仓库快照。
+
+历史 episode 2150 的 10800 秒超时：只推进到约 655 步，后段部分相邻观测
+间隔约 150 秒，另有约 22 秒的区间。297 条模型请求中 288 条无错误、9 条超时。
+超时中断栈位于抽屉物理交互、关节驱动、机器人锁定的 `mujoco.mj_forward`。
+因此不能用恒定 1.5 秒/步估算该场景；物理计算与同步延迟各自占比仍需定向测量。
+当前不修改物理交互语义或扩大 3 小时超时限制。
+
+### 交互过程计时与锁定回调对照
+
+在统一 eval 入口前设置 `INTERACTIVE_NAV_PROFILE_INTERACTION=1`，即可在每个
+attempt 的 `eval/interaction_profiles/<decision_index>/` 保存 `steps.jsonl`
+（before_step、观测/task.step、after_step 的起止计时）、`calls.json`
+（函数调用数、自身耗时、累计耗时）和 `calls.pstats`。函数累计时间存在嵌套，不能
+直接相加。cProfile 只覆盖当前同步交互线程，且引入额外计时开销。
+
+`INTERACTIVE_NAV_COALESCE_ROBOT_LOCK=1` 可选择合并物理子步边界的重复机器人
+锁定回调；默认关闭，设置 `0` 恢复原逻辑。保留第一次子步前和每次物理子步后的
+锁定及 forward，不修改物理步长、控制增益或抽屉扫描策略。环境变量须在启动 Python
+前设置；基线与候选均开启相同计时，用独立输出目录和同一配置比较。
+
+单场测量使用 `--workers 1 --episode-indices 1445 --no-recording --retry-rounds 0`；
+三场对照使用 `--workers 3 --episode-indices 1445 1095 1280`，其余配置保持不变。
+需要同时启动本机模型时增加 `--start-qwen`，已有服务则不增加。比较时同时核对
+交互对象、内部步骤、关节轨迹、接触统计和任务结果；导航路径与机器并发负载变化时，
+不得将总运行时间差全部归因于交互优化。
+
+### 固定位置的交互专项测试
+
+`scripts/InteractiveNav/run_fixed_interaction_test.py` 是独立诊断入口，不代替正式
+导航评测：直接在指定交互位姿初始化机器人，关闭所选柜子的抽屉，固定完整
+drawer_scan，不运行导航、ROS 或 Qwen，也不因找到目标提前结束。保留原生平滑
+交互控制器、robot control/physics 和前后两次传感器观测；不计算导航奖励/终止。
+
+输入 manifest 是 JSON 列表，每项包含 `episode`、历史 `smooth_interactions/*.json`
+的 `macro_path`，可选 `pose_xyyaw`。未指定 pose 时读取历史结果的
+`approach_goal_xyyaw`；优先用历史 trace 的 `actual_pose_xyyaw` 显式指定实际到达位姿，
+而非把导航期望位置当作实际位置。源文件只提供关节身份、交互位姿和公开扫描参数，不能声称
+恢复了未保存的历史完整物理状态。场景仍从同一 benchmark 初始化，两版使用相同
+固定初态。初始化后同步控制器保持目标到当前关节/底盘位置，不重置机器人的固定位置。
+一个 worker 对应一场；每轮等待全部场景就绪后同步开始计时。
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+PYTHONDONTWRITEBYTECODE=1 python scripts/InteractiveNav/run_fixed_interaction_test.py \
+  --benchmark /home/ldl/path/to/benchmark.json \
+  --manifest /home/ldl/path/to/fixed_cases.json \
+  --output /home/ldl/outputs/interactive-nav/fixed-new-run --workers 3
+```
+
+`--prepare-only` 仅检查两版初态与模型一致性，不执行交互。输出目录必须不存在。
+`--view-only` 先做低视角/回位短测试，不开抽屉，不能作为 drawer scan 加速结果。
+`--adaptive` 对照实验性的中间滑动关节位置收敛策略，两轮都开启重复锁定合并。
+该模式使用独立的 `effect_comparison.json` 验收，不再声称物理轨迹逐位相等：检查
+观察帧/顺序、目标可见性、逐抽屉/阶段兜底、采样接触、观测及最终状态偏差、回位、
+物理步与耗时。任一条件不通过即返回非零。它不能代替完整导航 SR/SPL 回归；
+正式入口的 `INTERACTIVE_NAV_INTERMEDIATE_POSITION_ONLY` 默认关闭。
+`--position-forward` 是另一项独立实验：保留所有物理步，只将锁姿时的完整 forward
+替换为位置更新；仍使用严格轨迹比较，不能与 `--adaptive` 混用。
+`--baseline-from <既有运行目录>` 可只读复用成功基线，要求 `run_config.json`、manifest
+和基线模式匹配，并重新校验候选初态；输出明确记录引用来源，耗时不是同轮重跑的基线。
+入口与正式评测一样在 reset 后恢复 benchmark 的物体/关节状态，再关闭所选抽屉。
+每版保存 `ready.json`、`initial_state.npy`、`model_hashes.json`、完整轨迹
+`trajectory.npz`、`execution.json`、`summary.json` 和 `profile/`。两版模型或完整
+MuJoCo integration state 的哈希、控制器类型或保持目标不同时，优化轮不会开始。
+结束后复查这些初态条件，并检查阶段/内部步数、
+物理子步数、成功状态、所有关节位置/速度、接触数及最终状态；轨迹容差为 1e-8，
+不一致时返回非零，不接受等价加速结论。计时不包括场景加载、初态准备和首次渲染。
+配置开关由子进程显式设置，不依赖用户 shell 是否设置优化变量。
+
+`--force-frequency-factor 2` / `4` 必须搭配 `--baseline-from`，只降低额外交互力控
+循环的物理频率，不能与 adaptive/position-forward 混用。普通机器人控制周期、
+policy 周期和物理步长不变；力控 PD 每物理步更新一次，其频率同步降低。
+每段重放基线实际推进的仿真时长，末尾不足整步的余量用较短 timestep 补足，
+不因提前收敛而缩短该段；稳定窗口按秒换算，原成功/兜底判据保持。
+`frequency_drives.jsonl` 检查逐段时钟、物理步数和 MuJoCo 警告，
+`frequency_config.json` 记录范围和步长。使用保守效果比较，不能要求不同积分步长
+下轨迹逐位相同，也不能把通过专项测试表述为完整导航性能不变。
+同机可同时启动两组各 3 worker 的命令，分别指定 factor 2/4 和独立输出目录。
+若基线是历史 3 并发而候选合计 6 并发，耗时比仅供诊断，不能视为严格吞吐加速比。
+
+`--lock-experiment camera_batch|geometry_only|combined` 测试不改物理时序的额外计算优化。
+该模式的基线已经开启 coalesced lock 和 position-forward；候选分别暂缓力控段内
+相机刷新至段末、只刷新锁姿后必需的几何/碰撞数据，或组合两者。具有 flex 的模型
+不走精简几何路径。该模式不可与频率或 adaptive 等实验混用。
+只读复用上一轮通过的优化波次时，增加 `--baseline-wave optimized`；不支持把尚未
+验证的 lock/frequency 实验候选当作普通基线。默认仍可省略 baseline-from 跑新基线。
+新生成的 lock 实验保存 `observation_hashes.json`，两版均存在时必须逐数组一致，
+涵盖相机图像/深度以及其他数组型观测。严格比较还包括完整 frames.jsonl，
+避免仅状态相同而可见性不同的情况漏检。历史基线缺少图像哈希时不声称像素级等价。
+`--lock-experiment reference` 不启用任何新增优化，只保留 position-forward 基线，
+用于同状态渲染/观测哈希的重复性对照。
+
+### 2026-09-22：M2 在线 Mixed 0–29 配对实验
+
+配置模板：`scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json`。
+使用 v1.2 总表索引 2000–2029，共 8 × 30 = 240 次评测；动态预算 min200/cap2000，
+不录制视频，保留决策、交互与请求追踪。G0 是历史上下文兼容基线，仍保留当前
+TF、房间包围归属和执行修正，不等同于逐字复原历史 HTTP 请求。
+
+| 组 | 上下文 | 候选池 | 提示词 |
+| --- | --- | --- | --- |
+| G0 | 历史兼容，recent8 | legacy | B |
+| G1 | 新公共事实，recent30 | legacy | B |
+| G2 | 新公共事实，recent30 | 全动作＋最多12前沿 | B |
+| G3 | 同 G2 | 同 G2 | P1 目标语义链 |
+| G4 | 同 G2 | 同 G2 | P2 初始位置邻近 |
+| G5 | 同 G2 | 同 G2 | P3 新房间与历史 |
+| G6 | 同 G2 | 同 G2 | P4 相关容器优先 |
+| G7 | 同 G2 | 同 G2 | P6 综合偏好 |
+
+G0→G1 比较上下文，G1→G2 比较整个候选池策略（不只是数量），G3–G7 与 G2 比较提示词。
+Mixed 局部编号 `% 3` 分配到三个 lane，同一场景全部组合留在同一 lane，固定种子交错。
+每 lane 15 workers / 80 jobs。本机 lane0/1 共用已有 `8000` TP=2 Qwen，**不得加
+`--start-qwen` 或重启共享模型服务**；仿真分别用 EGL 0/1、ROS 19000/19100 起始端口。
+远端 lane2 是一张卡，任务内启动 TP=1 Qwen＋仿真，模型上下文统一16384、无 MTP。
+M2 timeout120、超时重试1、reasoning off、max_tokens1536；ROS starvation300。
+正常算法失败不重试择优；基础设施/不完整结果另入 failure_queue，保留原 attempt。
+
+冻结 manifest 后，通过统一入口分别启动（输出与缓存均须放在 `/home/ldl`）：
+
+```bash
+python scripts/InteractiveNav/run_m2_experiment_lane.py \
+  --prepare-experiment scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922
+python scripts/InteractiveNav/run_benchmark_eval.py \
+  --experiment-manifest /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922/manifest.json \
+  --experiment-lane 0
+python scripts/InteractiveNav/run_benchmark_eval.py \
+  --experiment-manifest /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922/manifest.json \
+  --experiment-lane 1
+volc ml_task submit \
+  -c scripts/InteractiveNav/configs/custom_task/m2_online_mixed0_29_8arm_remote.yaml
+```
+
+总体监控入口 `scripts/InteractiveNav/evaluation/m2_online_monitor.py --run-dir <RUN>`，
+每30秒写 `overall.log` 和原子更新的 `overall_status.json`；可用 `tail -f <RUN>/overall.log`。
+展示每组已完成 n 个的平均指标，同时保留计划分母30。ICS 取 episode `success`，
+NavSR 单列，不使用 aggregate `success_rate` 冒充正式成功。未完成分母下的成功率只是
+临时下界；infra、排队、heartbeat过期与正常算法失败分开显示。新增输出不纳入 Git。

@@ -581,9 +581,29 @@ def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
     return float(sum(bool(value) for value in values) / len(values))
 
 
-def _rate_with_fallback(rows: list[dict[str, Any]], key: str, fallback_key: str) -> float | None:
-    values = [row.get(key, row.get(fallback_key)) for row in rows]
-    values = [value for value in values if value is not None]
+def _rate_with_fallback(
+    rows: list[dict[str, Any]],
+    key: str,
+    fallback_key: str,
+    *,
+    fallback_requires_nav: bool = False,
+) -> float | None:
+    # A few transitional result writers emitted the new key with ``null``;
+    # treat that exactly like an absent key while preserving an explicit False.
+    values = []
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            value = row.get(fallback_key)
+            # Legacy ``success`` was occasionally written after a target
+            # claim even when native navigation had failed.  Do not let that
+            # stale combination become an Interactive layer success when the
+            # new field is absent/null; an explicit new field remains
+            # authoritative.
+            if fallback_requires_nav and row.get("nav_success") is False:
+                value = False
+        if value is not None:
+            values.append(value)
     if not values:
         return None
     return float(sum(bool(value) for value in values) / len(values))
@@ -706,6 +726,21 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             rows, "interaction_conditioned_success", "success"
         ),
         "nav_success_rate": paper_sr,
+        "exact_instance_success_rate": _rate_with_fallback(
+            rows, "exact_instance_success", "nav_success"
+        ),
+        "category_goal_success_rate": _rate_with_fallback(
+            rows, "category_goal_success", "nav_success"
+        ),
+        "interaction_contract_goal_success_rate": _rate_with_fallback(
+            rows, "interaction_contract_goal_success", "nav_success"
+        ),
+        "interactive_episode_success_rate": _rate_with_fallback(
+            rows,
+            "interactive_episode_success",
+            "interaction_conditioned_success",
+            fallback_requires_nav=True,
+        ),
         "required_interaction_success_rate": paper_isr,
         "sequence_success_rate": _rate(rows, "sequence_success"),
         "non_interaction_success_rate": _rate(rows, "non_interaction_success"),

@@ -352,6 +352,7 @@ def verify_target_goal_claim(
     private_distances_m: Mapping[str, float],
     distance_threshold_m: float,
     allow_open_container_anchor: bool = False,
+    candidate_selection: str = "nearest",
 ) -> GoalClaimVerification:
     """Verify one policy declaration against public evidence and private range.
 
@@ -370,10 +371,14 @@ def verify_target_goal_claim(
     threshold = float(distance_threshold_m)
     if not math.isfinite(threshold) or threshold <= 0.0:
         return GoalClaimVerification(False, "invalid_distance_threshold")
-    # Match the native NavToObj endpoint: select the currently nearest target
-    # candidate first, then require public evidence for that *same* opaque
-    # instance.  Accepting any historically visible candidate would silently
-    # change ``any_candidate`` episodes into a different success definition.
+    if candidate_selection not in {"nearest", "nearest_published"}:
+        return GoalClaimVerification(False, "invalid_candidate_selection")
+    # The strict endpoint matches native NavToObj: select the currently nearest
+    # target first, then require evidence for that same opaque instance.  A
+    # category endpoint has different semantics: it may select the nearest
+    # *published* same-category candidate.  Otherwise an unobserved object that
+    # happens to be a few centimetres nearer can block a valid public claim for
+    # the object the policy actually found.
     finite_distances: list[tuple[float, str]] = []
     for instance_id, raw_distance in private_distances_m.items():
         try:
@@ -384,6 +389,13 @@ def verify_target_goal_claim(
             finite_distances.append((distance, str(instance_id)))
     if not finite_distances:
         return GoalClaimVerification(False, "private_distance_unavailable")
+    if candidate_selection == "nearest_published":
+        published_ids = evidence.observed_instance_ids
+        finite_distances = [
+            item for item in finite_distances if item[1] in published_ids
+        ]
+        if not finite_distances:
+            return GoalClaimVerification(False, "no_published_target_evidence")
     # ``min(..., key=distance)`` deliberately preserves the candidate mapping's
     # insertion order on an exact distance tie, matching ``target_metrics``.
     distance, nearest_instance_id = min(

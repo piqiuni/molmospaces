@@ -214,7 +214,7 @@ def run(evaluation, rescore_dir, output):
               "aggregates": aggregates, "exclusions": exclusions,
               "active_log_counts": dict(log_counts), "active_log_affected_episodes": log_affected, "episodes": audits}
     lines = ["# Mixed 任务质量审计与剔除后重评分", "",
-             "沿用 goal_equivalence_v1；审计所有 mixed 场景（含成功），原始结果、benchmark 不修改。",
+             "沿用 goal_equivalence_v2 分层目标协议；审计所有 mixed 场景（含成功），原始结果、benchmark 不修改。",
              "这是事后质量条件子集，不是算法性能提升，也不是新的无偏全量 benchmark 成绩。", "",
              "## 分母和评分", "",
              "scene_valid 排除已有 runtime-ineligible 与严格原目标未开容器即成功的必要性反例；",

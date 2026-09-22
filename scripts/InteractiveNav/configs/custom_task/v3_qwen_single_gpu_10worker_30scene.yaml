@@ -1,0 +1,35 @@
+TaskName: "interactive_nav_qwen_1gpu_10w30s_regression"
+Description: "Non-preemptible single GPU; batch-owned Qwen, 10 workers, 30 scenes"
+Entrypoint: "BENCHMARK_LAUNCHER_CONFIG=scripts/InteractiveNav/configs/evaluation/benchmark_single_gpu_10w30s.json bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04"
+ResourceQueueName: "c20250503"
+Framework: "PyTorchDDP"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.3xlarge"
+ActiveDeadlineSeconds: 86400
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+Preemptible: false
+Priority: 6
+RetryOptions:
+  EnableRetry: false
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets: ["Failed"]
+EnableTensorBoard: false
+Storages:
+  - Type: "TosFuse"
+    MountPath: "/tos"
+    Bucket: "c20250503"
+    Prefix: /
+  - Type: "Vepfs"
+    MountPath: "/home/ldl"
+    SubPath: "/c20250503/250404017"
+    ReadOnly: false
+  - Type: "Vepfs"
+    MountPath: "/vepfs-wxy"
+    SubPath: "/c20250503/240401046"
+    ReadOnly: false

@@ -11,7 +11,7 @@
   "min_steps": 200,
   "step_budget_mode": "dynamic",
   "ros_observation_turn_multiplier": 1,
-  "ros_command_starvation_timeout_s": 60,
+  "ros_command_starvation_timeout_s": 90,
   "semantic_attribute_request_timeout_s": 30,
   "scene_timeout_s": 10800,
   "base_master_port": 17000,

@@ -12,7 +12,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=${INTERACTIVE_NAV_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 RUN_DIR=${1:?"usage: $0 <run-output-dir> <episode-index>"}
 EPISODE_INDEX=${2:?"usage: $0 <run-output-dir> <episode-index>"}
@@ -81,7 +81,7 @@ for required_mllm_setting in \
 done
 printf '%s\n' "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 printf '%s\n' "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
-printf '%s\n' "[v3-eval] m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS} request_timeout_s=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S} ros_action_timeout_s=${ROS_ACTION_TIMEOUT_S} step_ready=${ROS_STEP_READY_BARRIER_ENABLED} ros_command_starvation_timeout_s=${ROS_COMMAND_STARVATION_TIMEOUT_S} ros_observation_turn_multiplier=${ROS_OBSERVATION_TURN_MULTIPLIER}"
+printf '%s\n' "[v3-eval] m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS} request_timeout_s=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S} m2_timeout_s=${SEMANTIC_M2_TIMEOUT_S} m2_timeout_retry_count=${SEMANTIC_M2_TIMEOUT_RETRY_COUNT} m2_timeout_retry_backoff_s=${SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S} ros_action_timeout_s=${ROS_ACTION_TIMEOUT_S} step_ready=${ROS_STEP_READY_BARRIER_ENABLED} ros_command_starvation_timeout_s=${ROS_COMMAND_STARVATION_TIMEOUT_S} ros_observation_turn_multiplier=${ROS_OBSERVATION_TURN_MULTIPLIER}"
 if [[ "${FAST_EVAL}" == true ]]; then
   printf '%s\n' "[v3-eval] fast_eval=true recorder_enabled=false step_capture_ack_barrier=false"
 else
@@ -89,48 +89,7 @@ else
 fi
 printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m semantic_xy_overview_inset=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}"
 
-recover_managed_qwen() {
-  [[ "${QWEN_SERVICE_MODE:-}" == managed ]] || return 0
-
-  local qwen_root=/home/ldl/qwen36-fp8
-  local runtime_dir=${QWEN36_RUNTIME_DIR:-/home/ldl/tmp/qwen36-mtp3-service}
-  local log_dir=${QWEN36_LOG_DIR:-/home/ldl/outputs/qwen36-mtp3-service}
-  local manager=${QWEN_MANAGE_SCRIPT:-${qwen_root}/manage_qwen36_mtp3.sh}
-  local lock_file=${runtime_dir}/service-recovery.lock
-  local recovery_fd
-
-  managed_qwen_healthy() {
-    local port
-    for port in 8000 8001 8010; do
-      curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1 || return 1
-    done
-  }
-
-  managed_qwen_healthy && return 0
-  command -v flock >/dev/null 2>&1 || {
-    printf '%s\n' "Managed Qwen service is unhealthy and flock is unavailable" >&2
-    return 1
-  }
-  mkdir -p "${runtime_dir}" "${log_dir}"
-  exec {recovery_fd}>"${lock_file}"
-  if flock -n "${recovery_fd}"; then
-    if ! managed_qwen_healthy; then
-      printf '%s\n' "[v3-eval] managed Qwen service unhealthy; restarting managed replicas and load balancer"
-      "${manager}" restart
-    fi
-  fi
-  for _ in $(seq 1 360); do
-    if managed_qwen_healthy; then
-      printf '%s\n' "[v3-eval] managed Qwen replicas and load balancer healthy"
-      return 0
-    fi
-    sleep 1
-  done
-  printf '%s\n' "Managed Qwen service recovery timed out" >&2
-  return 1
-}
-
-recover_managed_qwen
+# Model services belong to the batch launcher, never to an episode worker.
 
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}" "${RUNTIME_TMPDIR}" "${RUNTIME_XDG_CACHE_HOME}"
 if [[ "${FAST_EVAL}" != true ]]; then
@@ -155,7 +114,7 @@ export PYTHONUNBUFFERED=1
 # Preserve resolved non-secret settings and the exact algorithm YAMLs for replay.
 mkdir -p "${RUN_DIR}/config"
 cp "${DEFAULT_EVAL_CONFIG}" "${RUN_DIR}/config/defaults.conf"
-CONFIG_KEYS=(ARTIFACT_WRITE_QUEUE_SIZE DYNAMIC_CHANNEL_INTERACTION_STEPS DYNAMIC_CONTAINER_INTERACTION_STEPS DYNAMIC_CONTAINER_JOINT_STEPS DYNAMIC_PATH_FREE_M DYNAMIC_STEPS_PER_PATH_M DYNAMIC_STEP_QUANTUM EXPLORE_PY_CONFIG_OVERRIDE FAST_EVAL MAX_STEPS METHOD MIN_STEPS NAV_CONFIG_OVERRIDE OFFLINE_SAVE_COMPOSITE_FRAMES POLICY RECORDER RECORDER_COMPACT_STEPS RECORDER_COMPRESS_STEPS RECORDER_DRAIN_HELPER RECORDER_DRAIN_POLL_S RECORDER_DRAIN_PROGRESS_S RECORDER_DRAIN_STALL_TIMEOUT_S RECORDER_DRAIN_TIMEOUT_S RECORDER_SAVE_EVENTS RECORDER_SHUTDOWN_GRACE_S RECORD_HEAD_CAMERA ROS_ACTION_TIMEOUT_S ROS_COMMAND_STARVATION_TIMEOUT_S ROS_LOG_BACKUP_COUNT ROS_LOG_LEVEL ROS_LOG_MAX_BYTES ROS_MASTER_URI ROS_OBSERVATION_TURN_MULTIPLIER ROS_SETUP ROS_STEP_READY_BARRIER_ENABLED ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S ROS_STEP_READY_TIMEOUT_S ROS_STEP_READY_TOPIC ROS_STEP_READY_WARMUP_SKIP_FRAMES RUNTIME_TMPDIR RUNTIME_XDG_CACHE_HOME RUN_ROS_MASTER_URI SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S SEMANTIC_DECISION_OVERRIDE SEMANTIC_MAPPING_OVERRIDE SEMANTIC_MODEL_ENV_FILE SHARED_MPLCONFIGDIR STEP_BUDGET_MODE STEP_CAPTURE_ACK_TIMEOUT_S STEP_FRAME_QUEUE_SIZE STEP_SYNC_IMAGE_CACHE_SIZE STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC STEP_SYNC_QUEUE_SIZE TOPDOWN_ROS_ONLY VIDEO_BUILDER VIDEO_FPS VIDEO_FRAME_JOB_QUEUE_SIZE VIDEO_FRAME_QUEUE_OVERFLOW VIDEO_HISTORY_SIZE VIDEO_OCC_CROP_MARGIN_M VIDEO_PANEL_WIDTH_PX VIDEO_SEMANTIC_XY_OVERVIEW_INSET VIDEO_SNAPSHOT_CATEGORICAL_FORMAT VIDEO_SNAPSHOT_GRID_MAX_DIM VIDEO_SNAPSHOT_JPEG_QUALITY VIDEO_STEP_SAMPLE_EVERY)
+CONFIG_KEYS=(ARTIFACT_WRITE_QUEUE_SIZE DYNAMIC_CHANNEL_INTERACTION_STEPS DYNAMIC_CONTAINER_INTERACTION_STEPS DYNAMIC_CONTAINER_JOINT_STEPS DYNAMIC_PATH_FREE_M DYNAMIC_STEPS_PER_PATH_M DYNAMIC_STEP_QUANTUM EXPLORE_PY_CONFIG_OVERRIDE FAST_EVAL MAX_STEPS METHOD MIN_STEPS NAV_CONFIG_OVERRIDE OFFLINE_SAVE_COMPOSITE_FRAMES POLICY RECORDER RECORDER_COMPACT_STEPS RECORDER_COMPRESS_STEPS RECORDER_DRAIN_HELPER RECORDER_DRAIN_POLL_S RECORDER_DRAIN_PROGRESS_S RECORDER_DRAIN_STALL_TIMEOUT_S RECORDER_DRAIN_TIMEOUT_S RECORDER_SAVE_EVENTS RECORDER_SHUTDOWN_GRACE_S RECORD_HEAD_CAMERA ROS_ACTION_TIMEOUT_S ROS_COMMAND_STARVATION_TIMEOUT_S ROS_LOG_BACKUP_COUNT ROS_LOG_LEVEL ROS_LOG_MAX_BYTES ROS_MASTER_URI ROS_OBSERVATION_TURN_MULTIPLIER ROS_SETUP ROS_STEP_READY_BARRIER_ENABLED ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S ROS_STEP_READY_TIMEOUT_S ROS_STEP_READY_TOPIC ROS_STEP_READY_WARMUP_SKIP_FRAMES RUNTIME_TMPDIR RUNTIME_XDG_CACHE_HOME RUN_ROS_MASTER_URI SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S SEMANTIC_DECISION_OVERRIDE SEMANTIC_MAPPING_OVERRIDE SEMANTIC_M2_TIMEOUT_S SEMANTIC_M2_TIMEOUT_RETRY_COUNT SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S SEMANTIC_M2_MODEL_NAME SEMANTIC_M2_REASONING_EFFORT SEMANTIC_MODEL_ENV_FILE SHARED_MPLCONFIGDIR STEP_BUDGET_MODE STEP_CAPTURE_ACK_TIMEOUT_S STEP_FRAME_QUEUE_SIZE STEP_SYNC_IMAGE_CACHE_SIZE STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC STEP_SYNC_QUEUE_SIZE TOPDOWN_ROS_ONLY VIDEO_BUILDER VIDEO_FPS VIDEO_FRAME_JOB_QUEUE_SIZE VIDEO_FRAME_QUEUE_OVERFLOW VIDEO_HISTORY_SIZE VIDEO_OCC_CROP_MARGIN_M VIDEO_PANEL_WIDTH_PX VIDEO_SEMANTIC_XY_OVERVIEW_INSET VIDEO_SNAPSHOT_CATEGORICAL_FORMAT VIDEO_SNAPSHOT_GRID_MAX_DIM VIDEO_SNAPSHOT_JPEG_QUALITY VIDEO_STEP_SAMPLE_EVERY)
 for config_key in BENCHMARK TOPDOWN_REQUIRE_FULL_SCENE RUN_DIR EPISODE_INDEX EVAL_CONFIG "${CONFIG_KEYS[@]}"; do
   printf '%s=%q\n' "${config_key}" "${!config_key-}"
 done >"${RUN_DIR}/config/effective_config.env"
@@ -208,6 +167,7 @@ set -u
 # ROS setup files may restore a default master URI; keep this episode's
 # explicitly isolated master after sourcing.
 export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
+ROS_PACKAGE_PATH=${ROS_PACKAGE_PATH:-}
 export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
 export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${PYTHONPATH:-}"
 
@@ -418,10 +378,8 @@ fi
 if [[ "${FAST_EVAL}" != true && "${RECORD_HEAD_CAMERA}" == true ]]; then
   EVAL_ARGS+=(--record-video)
 fi
-set +e
-PYTHONUNBUFFERED=1 MUJOCO_GL=egl "${PYTHON_BIN}" -u "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
-EVAL_EXIT=$?
-set -e
+EVAL_EXIT=0
+PYTHONUNBUFFERED=1 MUJOCO_GL=egl "${PYTHON_BIN}" -u "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1 || EVAL_EXIT=$?
 
 if [[ "${FAST_EVAL}" == true ]]; then
   cleanup_process_group "${ROSLAUNCH_PID}" 20

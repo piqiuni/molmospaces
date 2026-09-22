@@ -2436,6 +2436,8 @@ class SemanticMappingNode:
             self.door_clear_mask_pub.publish(door_clear_mask)
         if planning_update is not None:
             self.planning_occupancy_grid_updates_pub.publish(planning_update)
+        # Graph coordinates are produced in this configured world frame.
+        graph_payload = {**graph_payload, "frame_id": self.world_frame}
         self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
         if room_attribute_request is not None:
             self.room_attribute_requests_pub.publish(

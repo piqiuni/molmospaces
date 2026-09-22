@@ -277,6 +277,18 @@ case "${METHOD}" in
     ;;
 esac
 
+# Module 2 (candidate/subgoal selection) has an independent wall-clock budget.
+# The shared SEMANTIC_MODEL_TIMEOUT_S below is intentionally kept for the
+# legacy/global client used by other modules; these M2-only defaults are
+# exported after method selection so an inherited SEMANTIC_M2_* value remains
+# an explicit user override.  The semantic node loads the selected dotenv with
+# override=True, so a deliberately configured value in that file wins too.
+if [[ "${START_SEMANTIC_DECISION:-false}" == true ]]; then
+  export SEMANTIC_M2_TIMEOUT_S="${SEMANTIC_M2_TIMEOUT_S:-30.0}"
+  export SEMANTIC_M2_TIMEOUT_RETRY_COUNT="${SEMANTIC_M2_TIMEOUT_RETRY_COUNT:-1}"
+  export SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S="${SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S:-1.0}"
+fi
+
 BYPASS_UNSAFE_OPEN_SWEEP=${BYPASS_UNSAFE_OPEN_SWEEP:-false}
 SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
 
@@ -332,6 +344,7 @@ set -u
 # Keep each batch worker on its explicitly isolated ROS master after sourcing
 # the workspace setup, while loading OpenCV/MuJoCo from the MolmoSpaces env.
 export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
+ROS_PACKAGE_PATH=${ROS_PACKAGE_PATH:-}
 export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
 export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run three ablations in one work-conserving pool, reusing the native evaluator."""
+"""Run selected Full/ablation variants in one work-conserving pool."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -21,9 +21,23 @@ from ablations import DESIGN_REVISION, VARIANTS
 from ablations.launch import render_artifacts, write_artifacts, artifact_digests
 
 
-def select_scenes(source, count):
-    rows = [r for r in source["episodes"] if 2000 <= r["episode_index"] <= 2059
-            and r.get("completed") and r.get("scoring_eligible")]
+def select_scenes(source, count, *, episode_start=2000, episode_stride=1,
+                  selection_mode="rank"):
+    """Select benchmark rows either by historical ranking or fixed stride.
+
+    The stride mode is used for the requested mixed-1000 diagnostic sample:
+    the mixed block begins at episode 2000, so stride 10 yields 2000..2990.
+    """
+    if episode_stride < 1 or episode_start < 0:
+        raise ValueError("episode_start and episode_stride must be positive")
+    wanted = {episode_start + episode_stride * i for i in range(count)}
+    rows = [r for r in source["episodes"]
+            if r.get("episode_index") in wanted
+            and r.get("completed", True) and r.get("scoring_eligible", True)]
+    if selection_mode == "stride":
+        return sorted(rows, key=lambda row: row["episode_index"])
+    if selection_mode != "rank":
+        raise ValueError(selection_mode)
     def rank(row):
         correct = row.get("correct_interaction_action_count", 0)
         attempts = row.get("interaction_action_count", 0)
@@ -74,7 +88,10 @@ def main():
     parser.add_argument("--scenes", type=int, default=10)
     parser.add_argument("--workers", type=int, default=25)
     parser.add_argument("--base-master-port", type=int, default=18000)
-    parser.add_argument("--variants", nargs="+", choices=VARIANTS[1:], default=list(VARIANTS[1:]))
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
+    parser.add_argument("--episode-start", type=int, default=2000)
+    parser.add_argument("--episode-stride", type=int, default=1)
+    parser.add_argument("--selection-mode", choices=("rank", "stride"), default="rank")
     parser.add_argument("--dry-run", action="store_true")
     cli = parser.parse_args()
     output = cli.output_dir.resolve()
@@ -83,7 +100,14 @@ def main():
     if cli.workers < 1 or cli.scenes < 1 or cli.base_master_port + cli.workers > 65536:
         parser.error("invalid worker/scene count or port range")
     source = json.loads(cli.selection_source.read_text())
-    selected = select_scenes(source, cli.scenes)
+    if isinstance(source, list):
+        # A benchmark JSON is also a valid deterministic selection source.  Its
+        # list position is the canonical episode index; no historical scores
+        # are consulted in fixed-stride mode.
+        source = {"episodes": [{"episode_index": i} for i in range(len(source))]}
+    selected = select_scenes(source, cli.scenes, episode_start=cli.episode_start,
+                             episode_stride=cli.episode_stride,
+                             selection_mode=cli.selection_mode)
     if len(selected) != cli.scenes:
         parser.error("not enough eligible mixed scenes")
     config = json.loads(cli.config.read_text())
@@ -97,7 +121,8 @@ def main():
     jobs = [(variant, row["episode_index"]) for row in ordered for variant in variants]
     manifest = {"design_revision": DESIGN_REVISION, "created_at": batch.utc_now(),
                 "config": config, "selection_source": str(cli.selection_source.resolve()),
-                "selection_rule": "eligible mixed; success, required interaction, task success, correct/attempt, correct count, index",
+                "selection_rule": ("fixed mixed stride" if cli.selection_mode == "stride"
+                                   else "eligible mixed; success, required interaction, task success, correct/attempt, correct count, index"),
                 "selected_full_rows": selected, "jobs": jobs, "full_launched": False,
                 "scheduling": "one shared queue; fixed port per slot; immediate refill across variants",
                 "m1_refresh_profile": config.get("m1_refresh_profile", "continuous")}

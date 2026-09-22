@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import queue
 import threading
 from pathlib import Path
@@ -104,6 +105,8 @@ def _capture_robot_lock(task_env) -> dict[str, Any] | None:
             "base_ctrl": base_ctrl,
             "base_hold_target": base_hold_target,
             "groups": groups,
+            "_position_forward": os.environ.get("INTERACTIVE_NAV_LOCK_POSITION_FORWARD") == "1",
+            "_geometry_forward": os.environ.get("INTERACTIVE_NAV_LOCK_GEOMETRY_FORWARD") == "1",
             # Private to this macro; never reuse robot views across model/data resets.
             "_view_cache": (
                 getattr(task_env, "current_model", None),
@@ -155,7 +158,17 @@ def _apply_robot_lock(task_env, snapshot: dict[str, Any] | None) -> None:
                 group.ctrl = ctrl.copy()
             except (AttributeError, ValueError):
                 pass
-        mujoco.mj_forward(task_env.current_model, task_env.current_data)
+        # The force loop reads positions/contact geometry before its next
+        # mj_step; that step computes velocity/acceleration dynamics itself.
+        model, data = task_env.current_model, task_env.current_data
+        if snapshot.get("_geometry_forward", False) and not model.nflex:
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            mujoco.mj_camlight(model, data)
+            mujoco.mj_collision(model, data)
+        else:
+            forward = mujoco.mj_fwdPosition if snapshot.get("_position_forward", False) else mujoco.mj_forward
+            forward(model, data)
         try:
             task_env.camera_manager.registry.update_all_cameras(task_env)
         except AttributeError:
@@ -1182,6 +1195,8 @@ class AtomicForceInteractionController:
                 "task_step_index": next_step,
                 "progress": float(transition.get("progress", next_step / transition_steps)),
                 "fallback": bool(transition.get("fallback", False)),
+                "position_only_settle": bool(transition.get("position_only_settle", False)),
+                "position_only_contact_guarded": bool(transition.get("position_only_contact_guarded", False)),
                 "physics_substeps": int(transition.get("physics_substeps", 0)),
             }
         )

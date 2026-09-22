@@ -152,9 +152,11 @@ waits still receive a distinct index.  Results expose both `step_count`
 `no_fresh_action_count` and the full `policy_termination` diagnostic.
 
 A single or intermittent no-fresh return never ends an episode.  By default,
-60 continuous wall-clock seconds without a fresh action or evaluator-consumed
+90 continuous wall-clock seconds without a fresh action or evaluator-consumed
 interaction ends it as `ros_bridge_command_starvation`; any real command resets
-that interval.  `--ros-command-starvation-timeout-s 0` disables this wall guard.
+that interval.  The 90-second default leaves headroom for one 30-second M2
+timeout, a 1-second backoff, and one bounded retry.
+`--ros-command-starvation-timeout-s 0` disables this wall guard.
 An independent default hard limit of four observation turns per applied-action
 budget prevents an unbounded loop even when the wall guard is disabled; configure
 it with `--ros-observation-turn-multiplier`.
@@ -325,7 +327,7 @@ decision node may record an episode-local `command_outcome_belief` from its own
 requested action; this prevents duplicate open commands but is not a simulator
 state read.  The default ROS configuration remains `rule_verified`.
 
-## Post-hoc goal-equivalence scoring (v1)
+## Post-hoc goal-equivalence scoring (v2)
 
 `rescore_benchmark_goals.py` produces a separate, versioned result set. It does
 not mutate the released benchmark, the original results, the online v17 terminal
@@ -333,10 +335,15 @@ verifier, or the policy's observations. Report this as a changed evaluation
 definition, not an algorithm improvement or a replacement for frozen-instance SR.
 
 Only an eligible, completed episode with a saved category-level `verified`
-success claim can be promoted. That existing verifier requires public observation
-evidence for the same opaque instance and robot-to-object distance below 1.5 m.
-The alternative must have the same metadata category. Explicit unique/attribute
-grounding is not relaxed automatically. Equivalence is accepted when either:
+success claim can enter the relaxed layers. That existing verifier requires
+public observation evidence for the same opaque instance and robot-to-object
+distance below 1.5 m. The alternative must have the same metadata category.
+Explicit unique/attribute grounding is not relaxed automatically. The report
+keeps four independent endpoints: `exact_instance_success`,
+`category_goal_success`, `interaction_contract_goal_success`, and
+`interactive_episode_success`.
+
+Category equivalence is accepted when either:
 
 - The alternative's metadata ancestor is the target container and its frozen
   position lies inside the closed-container AABB, excluding the top 1 cm; room
@@ -345,25 +352,24 @@ grounding is not relaxed automatically. Equivalence is accepted when either:
 - Its planar position is within 0.30 m of the original target, room IDs match,
   and both have the same support/parent or both are outside known containers.
   This is a target-to-target tolerance; the robot's arrival threshold is unchanged.
+- It is another same-category object in the same observed room. This includes
+  a target inside a container and a found object on a surface, but excludes a
+  known different-container substitution and inconsistent container geometry.
 
-Room-wide equivalence is not enabled by the CLI. It would additionally require
-both targets to be non-container objects and an independent proof that their
-necessary door interactions are identical. Same room ID alone does not prove
-this. Objects in another room, another required container, or without verified
-public evidence remain failures.
+An accepted same-container, near, or same-room candidate is **Category-only**
+unless the dataset's frozen `identity_contract` or a reviewed candidate-specific
+interaction-plan audit proves the complete interaction contract. A shared room or
+door topology is not, by itself, that proof. Objects in another room, a known
+different required container, or without verified public evidence remain failures.
 
-`nav_success`/`task_success` and paper SR use the revised target predicate.
-`success`/`interaction_conditioned_success` still require the original required
-interaction, sequence, and applicable non-interaction checks. In particular,
-finding a nearby CD without opening the required drawer improves Nav SR but not
-interaction-conditioned SR. Interaction precision, eligibility, executed path,
-steps, and terminal log facts do not change. Total Cost removes the original
-failure-penalty term for newly successful navigation episodes.
-
-The reported `spl_original_reference` reweights success using the original
-frozen target's reference path. It is a fixed-reference comparison, **not** a
-recomputed standard SPL for the expanded goal set. Recomputing that shortest
-path would require a separate oracle/geodesic evaluation.
+The original `nav_success`, `task_success`, `success`,
+`interaction_conditioned_success`, SPL, Total Cost, interaction precision,
+eligibility, executed path, steps, and terminal facts are never rewritten.
+Thus finding a nearby CD without opening the required drawer can raise
+`category_goal_success` while leaving the strict navigation and
+interaction-conditioned scores unchanged. No Category-SPL is computed because
+the candidate-specific reference path is unavailable; `spl_original_reference`
+is only a fixed-reference diagnostic.
 
 Legacy v17 identity recovery uses scene metadata/XML, the deterministic sorted
 registry construction, and a cross-check against the recorded full channel

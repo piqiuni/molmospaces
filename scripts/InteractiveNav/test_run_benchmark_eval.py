@@ -14,6 +14,102 @@ launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
 
+def test_retry_queue_excludes_completed_algorithm_failures(tmp_path):
+    for index, row in [(0, {"completed": True, "success": False}),
+                       (5, {"completed": False, "success": True, "exit_code": 2})]:
+        directory = tmp_path / f"episode_{index:04d}"
+        directory.mkdir()
+        (directory / "batch_task_summary.json").write_text(json.dumps(row))
+    assert launcher.incomplete_indices(tmp_path, [0, 5, 10]) == [5, 10]
+
+
+def test_qwen_respects_visible_gpu_selection(monkeypatch):
+    assert launcher.visible_devices({"CUDA_VISIBLE_DEVICES": "3,7"}) == ["3", "7"]
+    monkeypatch.setattr(launcher.subprocess, "check_output", lambda *a, **k: "3, GPU-abc\n7, GPU-def\n")
+    assert launcher.visible_devices({"CUDA_VISIBLE_DEVICES": "GPU-abc"}) == ["3"]
+    with pytest.raises(RuntimeError):
+        launcher.visible_devices({"CUDA_VISIBLE_DEVICES": ""})
+
+
+def test_qwen_failure_does_not_restart(tmp_path):
+    class DeadProcess:
+        returncode = 1
+        def poll(self):
+            return 1
+    service = launcher.QwenService(tmp_path, {})
+    service.processes = [("gpu0", DeadProcess())]
+    with pytest.raises(RuntimeError, match="No restart"):
+        service.check()
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_qwen_starts_single_vllm_instance_for_all_gpus(tmp_path, monkeypatch, count):
+    import eval_qwen_service as qwen
+    class Socket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def bind(self, address):
+            pass
+    monkeypatch.setattr(qwen.socket, "socket", Socket)
+    service = qwen.QwenService(tmp_path, {"CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(count))})
+    commands = []
+    environments = []
+    monkeypatch.setattr(service, "_spawn",
+                        lambda label, command, env: (commands.append(command), environments.append(env)))
+    monkeypatch.setattr(service, "_ready", lambda *args: None)
+    service.start(None)
+    assert len(commands) == 1
+    assert commands[0][0:2] == ["bash", "/home/ldl/qwen36-fp8/serve_qwen36_fp8_remote.zsh"]
+    assert environments[0]["QWEN36_GPU_IDS"] == ",".join(str(i) for i in range(count))
+    assert environments[0]["QWEN36_TP_SIZE"] == "1"
+    assert environments[0]["QWEN36_DP_SIZE"] == str(count)
+    assert environments[0]["QWEN36_API_SERVER_COUNT"] == "1"
+    assert service.endpoint == "http://127.0.0.1:8000/v1"
+    assert service.tensor_parallel_size == 1
+    assert service.data_parallel_size == count
+
+
+def test_single_endpoint_is_not_round_robin():
+    import eval_qwen_service as qwen
+    assert qwen.endpoint_for_port(8000) == "http://127.0.0.1:8000/v1"
+
+
+def test_launcher_runs_deferred_retry_and_retains_full_selection(tmp_path, monkeypatch):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config.update(workers=1, base_master_port=0, episode_indices=[0, 5])
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    output = tmp_path / "run"
+    commands = []
+    class Batch:
+        returncode = 0
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            for index in [0, 5]:
+                directory = output / f"episode_{index:04d}"
+                directory.mkdir(exist_ok=True)
+                (directory / "batch_task_summary.json").write_text(json.dumps({
+                    "episode_index": index, "completed": index == 0 or len(commands) == 2,
+                    "runner_exit_code": 0 if index == 0 or len(commands) == 2 else 4}))
+        def poll(self):
+            return 0
+        def wait(self, **kwargs):
+            return 0
+    monkeypatch.setattr(sys, "argv", ["eval", "--config", str(config_path), "--output-dir", str(output)])
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(launcher.subprocess, "Popen", Batch)
+    monkeypatch.setattr(launcher, "cleanup", lambda *a: None)
+    monkeypatch.setattr(launcher.signal, "signal", lambda *a: None)
+    assert launcher.main() == 0
+    assert len(commands) == 2
+    assert "--resume" not in commands[0] and "--resume" in commands[1]
+    assert json.loads((output / "retry_queue_0.json").read_text()) == [5]
+    assert json.loads((output / "retry_queue_1.json").read_text()) == []
+    assert (output / "runner_snapshot.sh").exists()
+
+
 def test_command_pins_runtime_and_budget(tmp_path):
     config = json.loads(launcher.DEFAULT_CONFIG.read_text())
     command, indices = launcher.build_command(config, tmp_path)
@@ -103,7 +199,7 @@ def test_resume_reuses_existing_output_and_appends_batch_log(tmp_path, monkeypat
     output.mkdir()
     (output / "batch.log").write_text("previous batch\n")
     config = json.loads(launcher.DEFAULT_CONFIG.read_text())
-    config.update(workers=1, base_master_port=0, resume=True)
+    config.update(workers=1, base_master_port=0, resume=True, retry_rounds=0, progress_interval_s=0.1)
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     monkeypatch.setattr(
@@ -116,7 +212,8 @@ def test_resume_reuses_existing_output_and_appends_batch_log(tmp_path, monkeypat
         "argv",
         [str(launcher.__file__), "--config", str(config_path), "--output-dir", str(output)],
     )
-    assert launcher.main() == 0
+    # An empty batch exiting zero cannot make the missing episode complete.
+    assert launcher.main() == 1
     assert (output / "batch.log").read_text() == "previous batch\nresumed batch\n"
     assert (output / "tmp").is_dir()
     assert (output / "cache").is_dir()

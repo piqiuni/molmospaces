@@ -111,7 +111,12 @@ model:
   # Empty makes the executor use SEMANTIC_MODEL_NAME from the secure env file
   # instead of overriding it with the default config's local model name.
   model: ""
-  timeout_s: 12.0
+  # M2 is text-only and may use a stronger/slower OpenAI-compatible model than
+  # visual M1/M3 through SEMANTIC_M2_*.  Keep its wall-clock budget independent
+  # and retry only one explicit timeout with a short exponential backoff.
+  timeout_s: 30.0
+  timeout_retry_count: 1
+  timeout_retry_backoff_s: 1.0
   # M2 reasons internally through evidence/dependencies/compatibility; only the
   # final compact ranking JSON enters the executor. Tokens include reasoning.
   selection_reasoning_effort: "low"

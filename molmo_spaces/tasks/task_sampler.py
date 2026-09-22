@@ -424,6 +424,9 @@ class BaseMujocoTaskSampler:
     def _create_robot(self, mj_data: MjData) -> Robot:
         return self.config.robot_config.robot_factory(mj_data, self.config)
 
+    def _initialize_before_settle(self, mj_data: MjData) -> None:
+        """Optional replay-specific state preparation before scene settling."""
+
     def setup_cameras(self, env: CPUMujocoEnv, deterministic_only: bool = False) -> None:
         """Set up all cameras defined in the camera system config.
 
@@ -780,6 +783,7 @@ class BaseMujocoTaskSampler:
             robot_factory=self._create_robot,
             mj_model=model,
             mj_base_scene_path=scene_path,
+            pre_settle_initializer=self._initialize_before_settle,
         )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")

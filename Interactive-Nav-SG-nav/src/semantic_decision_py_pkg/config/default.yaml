@@ -167,12 +167,17 @@ model:
   model: "qwen3.6-35b-a3b"
   protocol: "openai_chat"
   timeout_s: 3.0
+  timeout_retry_count: 0
+  timeout_retry_backoff_s: 1.0
   reasoning_effort: "off"
   metrics_path: ""
   max_graph_nodes: 80
   max_graph_edges: 160
   max_tokens: 256
   selection_granularity: "candidate"
+  candidate_pool_mode: "all_actions_12_frontiers"
+  candidate_max_frontier_candidates: 12
+  # The total/type quotas below only apply to candidate_pool_mode: legacy.
   candidate_top_k: 8
   navigate_quota: 1
   interaction_quota: 3

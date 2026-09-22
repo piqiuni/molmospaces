@@ -12,7 +12,9 @@ from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGenerator,
     CandidateGeneratorConfig,
 )
-from semantic_decision_py_pkg.model_policy import compact_graph
+from semantic_decision_py_pkg.model_policy import public_decision_graph_context
+from semantic_decision_py_pkg.frontier_context import observed_room_frontier_summary
+from semantic_decision_py_pkg.public_robot_context import graph_robot_pose_context
 from semantic_decision_py_pkg.navigation_clearance import ArrivalClearanceGrid
 from semantic_decision_py_pkg.frontier_terminal_contract import (
     summarize_frontier_filtering,
@@ -73,8 +75,7 @@ class SemanticCandidateNode:
         self.clearance_map_max_age_s = float(executor_config.get("rear_goal_local_costmap_max_age_s", 0.75))
         self.clearance_maps = {}
         self.clearance_lock = threading.RLock()
-        if self.navigation_clearance_enabled:
-            self.tf_listener = tf.TransformListener()
+        self.tf_listener = tf.TransformListener()
         policy_config = rospy.get_param("~policy", {}) or {}
         ablation_config = rospy.get_param("~ablation", {}) or {}
         configured_backend = str(policy_config.get("backend", "rule")).casefold()
@@ -397,6 +398,9 @@ class SemanticCandidateNode:
             )
         )
         self.explorer_status: dict = {}
+        self.explorer_status_received_ts = 0.0
+        self.explorer_proposals_received_ts = 0.0
+        self.frontier_context_max_age_s = max(0.1, float(config.get("frontier_context_max_age_s", 5.0)))
         self.explorer_proposal_stream: dict = {}
         self.has_proposal_stream = False
         self.graph: dict = {}
@@ -589,12 +593,13 @@ class SemanticCandidateNode:
         return admitted
 
     def _explorer_callback(self, message: String) -> None:
-        if self.has_proposal_stream:
-            return
         try:
-            self.explorer_status = json.loads(message.data)
+            payload = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        if isinstance(payload, dict):
+            self.explorer_status = payload
+            self.explorer_status_received_ts = time.time()
 
     def _proposal_callback(self, message: String) -> None:
         try:
@@ -604,6 +609,7 @@ class SemanticCandidateNode:
         if not isinstance(payload, dict):
             return
         self.explorer_proposal_stream = payload
+        self.explorer_proposals_received_ts = time.time()
         self.has_proposal_stream = True
 
     def _graph_callback(self, message: String) -> None:
@@ -665,10 +671,34 @@ class SemanticCandidateNode:
             self.target_context = payload
 
     def _odom_callback(self, message: Odometry) -> None:
+        self.robot_position_frame_id = str(message.header.frame_id or "")
         self.robot_frame = str(message.header.frame_id or self.map_frame)
         self.robot_xy = (
             float(message.pose.pose.position.x),
             float(message.pose.pose.position.y),
+        )
+        self.robot_z = float(getattr(message.pose.pose.position, "z", 0.0))
+        self.robot_pose_stamp = getattr(message.header, "stamp", None)
+
+    def _model_robot_pose_context(self, graph: dict) -> dict:
+        source_frame = str(getattr(self, "robot_position_frame_id", "") or "")
+        graph_frame = str(graph.get("frame_id") or "")
+        xy = getattr(self, "robot_xy", None)
+        xyz = [*xy, getattr(self, "robot_z", 0.0)] if xy is not None else None
+        stamp = getattr(self, "robot_pose_stamp", None)
+        stamp_sec = float(stamp.to_sec()) if stamp is not None else None
+        transform = None
+        error = ""
+        if source_frame and graph_frame and source_frame.lstrip("/") != graph_frame.lstrip("/"):
+            try:
+                transform = self.tf_listener.lookupTransform(
+                    graph_frame, source_frame, stamp if stamp is not None else rospy.Time(0),
+                )
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as exc:
+                error = f"transform_unavailable:{type(exc).__name__}"
+        return graph_robot_pose_context(
+            xyz, source_frame, graph_frame, source_stamp_sec=stamp_sec,
+            transform=transform, transform_error=error,
         )
 
     def _room_segment_grid_callback(self, message: OccupancyGrid) -> None:
@@ -813,6 +843,21 @@ class SemanticCandidateNode:
             navigation_frontier_exhausted and interaction_frontier_exhausted
         )
         self.sequence += 1
+        now = time.time()
+        max_age = getattr(self, "frontier_context_max_age_s", 5.0)
+        status = self.explorer_status
+        status_time = status.get("frontier_computed_ts")
+        status_fresh = bool(status_time and 0 <= now - float(status_time) <= max_age)
+        frontier_source = status if status_fresh and "frontier_clusters" in status else explorer_input
+        source_time = (
+            frontier_source.get("frontier_computed_ts")
+            if "frontier_clusters" in frontier_source
+            else frontier_source.get("timestamp")
+        )
+        frontier_context = observed_room_frontier_summary(
+            frontier_source, self.graph,
+            fresh=bool(source_time and 0 <= now - float(source_time) <= max_age),
+        )
         payload = {
             "schema_version": 1,
             "sequence": self.sequence,
@@ -820,6 +865,9 @@ class SemanticCandidateNode:
             "episode_id": episode_id,
             "graph_revision": self.graph.get("graph_revision", 0),
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
+            "robot_position_frame_id": getattr(self, "robot_position_frame_id", "") or None,
+            **self._model_robot_pose_context(self.graph),
+            **frontier_context,
             "target_context": dict(self.target_context),
             "exploration_context": {
                 "ready": ready,
@@ -853,7 +901,7 @@ class SemanticCandidateNode:
                 if self.has_proposal_stream
                 else "explore_py_status_compatibility",
             },
-            "graph_context": compact_graph(self.graph),
+            "graph_context": public_decision_graph_context(self.graph),
             "candidate_count": len(candidates),
             "clearance_rejections": getattr(self.generator, "clearance_rejections", []),
             "clearance_recoveries": getattr(self.generator, "clearance_recoveries", []),

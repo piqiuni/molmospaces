@@ -112,7 +112,10 @@ def recorded_candidate(manifest, opaque_id):
     return observations
 
 
-def episode_decision(episode, result, result_path, attempt, scenes, radius, benchmark_hash):
+def episode_decision(
+    episode, result, result_path, attempt, scenes, radius, benchmark_hash,
+    contract_audit=None,
+):
     decision = {"accepted": False, "reason": "no_verified_alternative_claim"}
     if not result.get("goal_definition_relaxed_success"):
         return decision
@@ -166,16 +169,71 @@ def episode_decision(episode, result, result_path, attempt, scenes, radius, benc
         identity_evidence["last_recorded_center"] = observations[-1]["center"]
         if min(discrepancies) > 0.15:
             return dict(decision, reason="candidate_geometry_disagrees_with_registry", identity_evidence=identity_evidence)
-    decision = equivalent_target(target=target, candidate_name=candidate_name, objects=metadata["objects"],
-                                 positions=positions, near_radius_m=radius)
+    interaction_requirements_equal = False
+    contract_audit_evidence = None
+    if isinstance(contract_audit, dict):
+        plan_id = str(contract_audit.get("plan_id") or "")
+        audited_ids = [str(value) for value in contract_audit.get("required_interaction_ids", [])]
+        plan = next(
+            (
+                row for row in episode["interactive_nav"].get("oracle_plans", [])
+                if str(row.get("plan_id") or "") == plan_id
+            ),
+            None,
+        )
+        recorded_ids = [] if plan is None else [
+            str(value) for value in plan.get("required_interaction_ids", [])
+        ]
+        interaction_requirements_equal = bool(
+            contract_audit.get("reviewed") is True
+            and str(contract_audit.get("candidate_name") or "") == candidate_name
+            and plan is not None
+            and audited_ids == recorded_ids
+        )
+        contract_audit_evidence = {
+            "reviewed": contract_audit.get("reviewed") is True,
+            "candidate_name_matches": str(contract_audit.get("candidate_name") or "") == candidate_name,
+            "plan_id": plan_id,
+            "plan_found": plan is not None,
+            "required_interaction_ids_match": audited_ids == recorded_ids,
+            "evidence": contract_audit.get("evidence"),
+            "accepted": interaction_requirements_equal,
+        }
+    decision = equivalent_target(
+        target=target,
+        candidate_name=candidate_name,
+        objects=metadata["objects"],
+        positions=positions,
+        near_radius_m=radius,
+        interaction_requirements_equal=interaction_requirements_equal,
+    )
     decision["identity_evidence"] = identity_evidence
+    if contract_audit_evidence is not None:
+        decision["contract_audit_evidence"] = contract_audit_evidence
     return decision
 
 
 def aggregate(rows):
     n = len(rows)
-    def rate(key):
-        return sum(row.get(key) is True for row in rows) / n if n else None
+    def rate(key, *fallback_keys, fallback_requires_nav=False):
+        values = []
+        for row in rows:
+            primary = row.get(key) if row.get(key) is not None else None
+            value = primary
+            if value is None:
+                for fallback_key in fallback_keys:
+                    if row.get(fallback_key) is not None:
+                        value = row.get(fallback_key)
+                        break
+            if fallback_requires_nav and primary is None:
+                # Pre-layer rows sometimes contain a stale ``success`` claim
+                # alongside nav_success=false.  Preserve the historical field
+                # but keep the derived Interactive layer conservative.
+                if row.get("nav_success") is False:
+                    value = False
+            if value is not None:
+                values.append(value)
+        return sum(bool(value) for value in values) / len(values) if values else None
     def mean(key):
         values = [float(row[key]) for row in rows if row.get(key) is not None]
         return sum(values) / len(values) if values else None
@@ -183,6 +241,17 @@ def aggregate(rows):
         "episodes": n, "nav_successes": sum(r.get("nav_success") is True for r in rows),
         "interaction_conditioned_successes": sum(r.get("success") is True for r in rows),
         "nav_sr": rate("nav_success"), "interaction_conditioned_sr": rate("success"),
+        "exact_instance_sr": rate("exact_instance_success", "nav_success"),
+        "category_goal_sr": rate("category_goal_success", "nav_success"),
+        "interaction_contract_goal_sr": rate(
+            "interaction_contract_goal_success", "nav_success"
+        ),
+        "interactive_episode_sr": rate(
+            "interactive_episode_success",
+            "interaction_conditioned_success",
+            "success",
+            fallback_requires_nav=True,
+        ),
         "required_interaction_sr": rate("required_interaction_success"),
         "spl_original_reference": mean("spl"), "mean_total_cost": mean("episode_total_cost"),
         "mean_interaction_precision": mean("interaction_precision_episode"),
@@ -190,7 +259,7 @@ def aggregate(rows):
     }
 
 
-def run(evaluation, benchmark, scenes, output, radius):
+def run(evaluation, benchmark, scenes, output, radius, contract_audit_path=None):
     if output.exists():
         raise ValueError(f"Refusing to overwrite existing rescore directory: {output}")
     source_summary = evaluation / "summary.json"
@@ -199,6 +268,15 @@ def run(evaluation, benchmark, scenes, output, radius):
     if isinstance(episodes, dict):
         episodes = episodes["episodes"]
     benchmark_hash = sha256(benchmark)
+    contract_audit = None
+    if contract_audit_path is not None:
+        contract_audit = read_json(contract_audit_path)
+        if contract_audit.get("schema_version") != "interactive_nav_contract_audit_v1":
+            raise ValueError("Unsupported identity-contract audit schema")
+        if contract_audit.get("benchmark_sha256") != benchmark_hash:
+            raise ValueError("Identity-contract audit benchmark hash mismatch")
+        if not isinstance(contract_audit.get("episodes"), dict):
+            raise ValueError("Identity-contract audit episodes must be an object")
     strict, rescored, audits = [], [], []
     seen = set()
     for summary_row in source["episodes"]:
@@ -214,7 +292,11 @@ def run(evaluation, benchmark, scenes, output, radius):
         result = document["result"]
         if result["episode_index"] != index or result["case_id"] != episodes[index]["interactive_nav"]["case_id"]:
             raise ValueError(f"Episode {index} identity mismatch")
-        decision = episode_decision(episodes[index], result, result_path, attempt, scenes, radius, benchmark_hash)
+        decision = episode_decision(
+            episodes[index], result, result_path, attempt, scenes, radius,
+            benchmark_hash,
+            None if contract_audit is None else contract_audit["episodes"].get(str(index)),
+        )
         revised = rescore_result(result, decision)
         strict.append(result)
         rescored.append(revised)
@@ -222,8 +304,10 @@ def run(evaluation, benchmark, scenes, output, radius):
                        "source_result": str(result_path), "source_sha256": sha256(result_path),
                        "original_nav_success": result.get("nav_success"),
                        "original_interaction_conditioned_success": result.get("success"),
-                       "nav_success": revised.get("nav_success"),
-                       "interaction_conditioned_success": revised.get("success"),
+                       "exact_instance_success": revised.get("exact_instance_success"),
+                       "category_goal_success": revised.get("category_goal_success"),
+                       "interaction_contract_goal_success": revised.get("interaction_contract_goal_success"),
+                       "interactive_episode_success": revised.get("interactive_episode_success"),
                        **revised["goal_equivalence"]})
     groups = {}
     for group in ("all", "channel", "container", "mixed"):
@@ -238,34 +322,57 @@ def run(evaluation, benchmark, scenes, output, radius):
         "schema_version": PROTOCOL, "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_summary": str(source_summary), "source_summary_sha256": sha256(source_summary),
         "benchmark": str(benchmark), "benchmark_sha256": benchmark_hash,
+        "contract_audit": (
+            None
+            if contract_audit_path is None
+            else {"path": str(contract_audit_path), "sha256": sha256(contract_audit_path)}
+        ),
         "implementation_sha256": {str(p.relative_to(ROOT)): sha256(p) for p in (
             Path(__file__), Path(__file__).parent / "evaluation/goal_equivalence.py")},
-        "rules": {"same_container": True, "near_planar_radius_m": radius,
-                  "same_room": "audit_only_pending_equal_door_requirements_proof",
-                  "interaction_requirements": "unchanged", "spl_reference": "original_frozen_target_not_recomputed"},
+        "rules": {"same_container": "category; contract requires frozen or candidate-specific plan proof",
+                  "near_planar_radius_m": radius,
+                  "near_same_category": "category_only_without_explicit_contract",
+                  "same_room": "same-category category-only when room and parent/container evidence are consistent",
+                  "shared_door": "does_not_prove_full_interaction_contract",
+                  "different_known_container": "not_equivalent_without_explicit_contract",
+                  "strict_metrics": "preserved",
+                  "spl_reference": "not_computed_without_candidate_specific_reference"},
         "aggregates": groups, "decision_counts": dict(Counter(r["reason"] for r in audits)),
         "promoted_episode_indices": [r["episode_index"] for r in audits if r["promoted"]],
+        "interaction_contract_promoted_episode_indices": [
+            r["episode_index"] for r in audits if r["interaction_contract_promoted"]
+        ],
+        "interactive_episode_promoted_episode_indices": [
+            r["episode_index"] for r in audits if r["interactive_episode_promoted"]
+        ],
         "episodes": audits,
     }
-    lines = ["# 目标等价重评分（独立于原始严格实例评分）", "",
-             f"同容器同类目标，或同房间且支持关系兼容的 {radius:.2f} m 内近邻目标；仍要求原评估器已验证公开观测与到达距离。",
-             "同房间规则仅列为待审计候选，不自动启用。交互要求、顺序、无效场景排除均保持不变。", "",
-             "SPL 使用原目标参考路径，仅作 fixed-reference 对照，不是新等价目标集的标准 SPL。", "",
-             "| 分组 | N | Nav SR 原→新 | 交互任务 SR 原→新 | 原参考 SPL 原→新 | Total Cost 原→新 |",
+    lines = ["# 分层目标与交互契约重评分（不改写原始严格指标）", "",
+             f"同容器同类目标可进入相同交互契约；同房间同类目标（含容器内目标与台面目标）可计 Category，{radius:.2f} m 近邻也可计 Category。",
+             "共享房间或同一道门不自动证明 container/full contract；仍要求公开观测、到达距离及候选对应的完整交互计划。", "",
+             "原 `nav_success`、`success`、SPL 与 Total Cost 保持不变。类别候选没有重算最短路径，因此不生成 Category-SPL。", "",
+             "| 分组 | N | Exact SR | Category SR | Contract SR | Interactive SR |",
              "|---|---:|---:|---:|---:|---:|"]
     def number(value):
         return "N/A" if value is None else f"{value:.4f}"
     for name, group in groups.items():
         for scope in ("all", "eligible"):
-            old, new = group[f"strict_{scope}"], group[f"revised_{scope}"]
-            fields = []
-            for key in ("nav_sr", "interaction_conditioned_sr", "spl_original_reference", "mean_total_cost"):
-                fields.append(f"{number(old[key])} → {number(new[key])}")
+            new = group[f"revised_{scope}"]
+            fields = [number(new[key]) for key in (
+                "exact_instance_sr", "category_goal_sr",
+                "interaction_contract_goal_sr", "interactive_episode_sr",
+            )]
             lines.append(f"| {name}/{scope} | {new['episodes']} | " + " | ".join(fields) + " |")
-    lines.extend(["", "## 改分场景", "", "| Episode | 理由 | Nav | 交互任务 |", "|---|---|---|---|"])
+    lines.extend(["", "## 类别目标新增成功场景", "",
+                  "| Episode | 理由 | Category | Contract | Interactive |",
+                  "|---|---|---|---|---|"])
     for audit in audits:
         if audit["promoted"]:
-            lines.append(f"| {audit['episode_index']} | {audit['reason']} | 成功 | {'成功' if audit['interaction_conditioned_success'] else '未完成必要交互/顺序'} |")
+            lines.append(
+                f"| {audit['episode_index']} | {audit['reason']} | 成功 | "
+                f"{'成功' if audit['interaction_contract_goal_success'] else '失败'} | "
+                f"{'成功' if audit['interactive_episode_success'] else '失败'} |"
+            )
     unresolved = [r for r in audits if r["public_claim_verified"] and not r["accepted"]]
     lines.extend(["", "未接受的替代目标：", ""])
     lines.extend(f"- {r['episode_index']}: `{r['reason']}`" for r in unresolved)
@@ -284,11 +391,22 @@ def main():
     parser.add_argument("--scene-dir", type=Path, required=True, help="Directory containing val_N_metadata.json and val_N.xml")
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory; never overwrites existing results")
     parser.add_argument("--near-radius-m", type=float, default=0.30)
+    parser.add_argument(
+        "--identity-contract-audit",
+        type=Path,
+        help=(
+            "Optional reviewed candidate-to-oracle-plan audit for legacy benchmarks "
+            "that predate target.identity_contract."
+        ),
+    )
     args = parser.parse_args()
     if not math.isfinite(args.near_radius_m) or args.near_radius_m <= 0:
         parser.error("--near-radius-m must be finite and positive")
-    report = run(args.evaluation_dir.resolve(), args.benchmark.resolve(), args.scene_dir.resolve(),
-                 args.output_dir.resolve(), args.near_radius_m)
+    report = run(
+        args.evaluation_dir.resolve(), args.benchmark.resolve(), args.scene_dir.resolve(),
+        args.output_dir.resolve(), args.near_radius_m,
+        None if args.identity_contract_audit is None else args.identity_contract_audit.resolve(),
+    )
     print(json.dumps({"report": str(args.output_dir / "report.md"),
                       "promoted": report["promoted_episode_indices"],
                       "decision_counts": report["decision_counts"],

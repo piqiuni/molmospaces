@@ -135,3 +135,73 @@ def test_snapshot_values_are_not_mutated_by_repeated_locks():
     for name, values in expected.items():
         for actual, original in zip(snapshot['groups'][name], values):
             np.testing.assert_array_equal(actual, original)
+
+
+@pytest.mark.parametrize('contact', [False, True])
+@pytest.mark.parametrize('mode', ['position', 'geometry'])
+def test_position_forward_preserves_physics_and_camera_trajectory(contact, mode):
+    outcomes = []
+    for enabled in (False, True):
+        env, _, cameras = make_env()
+        if contact:
+            env.current_data.qpos[0] = env.current_data.ctrl[0] = .39
+            mujoco.mj_forward(env.current_model, env.current_data)
+        snapshot = bridge._capture_robot_lock(env)
+        snapshot['_position_forward'] = enabled
+        snapshot['_geometry_forward'] = enabled and mode == 'geometry'
+        trajectory, results = [], []
+        def lock():
+            bridge._apply_robot_lock(env, snapshot)
+            d = env.current_data
+            trajectory.append(np.concatenate([d.qpos, d.qvel, d.ctrl, [d.ncon]]).copy())
+        for target in (.35, 0., .6):
+            results.append(runtime.drive_joint_group_to_targets(
+                env.current_model, env.current_data, {'hinge': target},
+                runtime.ForceDriveConfig(max_physics_substeps=100, coalesce_robot_lock=True),
+                robot_lock_callback=lock))
+        outcomes.append((results, np.asarray(trajectory), np.asarray(cameras), env.current_data.qacc.copy()))
+    assert outcomes[0][0] == outcomes[1][0]
+    for a, b in zip(outcomes[0][1:], outcomes[1][1:]):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_batched_cameras_preserve_force_states_and_final_camera():
+    from contextlib import nullcontext
+    from scripts.InteractiveNav.fixed_interaction_compute import BatchForceCameras
+    outcomes = []
+    original_drive = runtime.drive_joint_group_to_targets
+    for batch in (False, True):
+        env, _, cameras = make_env()
+        snapshot = bridge._capture_robot_lock(env)
+        snapshot['_position_forward'] = True
+        states = []
+        def lock():
+            bridge._apply_robot_lock(env, snapshot)
+            states.append(env.current_data.qpos.copy())
+        with BatchForceCameras(runtime, env) if batch else nullcontext():
+            result = runtime.drive_joint_group_to_targets(
+                env.current_model, env.current_data, {'hinge': .35},
+                runtime.ForceDriveConfig(max_physics_substeps=80, coalesce_robot_lock=True),
+                robot_lock_callback=lock)
+        assert runtime.drive_joint_group_to_targets is original_drive
+        assert len(cameras) == (1 if batch else result['physics_substeps'] + 1)
+        outcomes.append((np.array(states), cameras[-1], env.current_data.qvel.copy()))
+    for a, b in zip(*outcomes):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_batched_cameras_restore_callbacks_and_flush_on_failure(monkeypatch):
+    from scripts.InteractiveNav.fixed_interaction_compute import BatchForceCameras
+    env, _, cameras = make_env()
+    registry = env.camera_manager.registry
+    original_update = registry.update_all_cameras
+    def fail():
+        registry.update_all_cameras(env)
+        raise RuntimeError('test failure')
+    monkeypatch.setattr(runtime, 'drive_joint_group_to_targets', fail)
+    with pytest.raises(RuntimeError, match='test failure'):
+        with BatchForceCameras(runtime, env):
+            runtime.drive_joint_group_to_targets()
+    assert runtime.drive_joint_group_to_targets is fail
+    assert registry.update_all_cameras is original_update
+    assert len(cameras) == 1

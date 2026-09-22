@@ -35,6 +35,7 @@ from scripts.InteractiveNav.evaluation.benchmark_types import (
     PolicyObservation,
     PublicEpisode,
 )
+from scripts.InteractiveNav.evaluation.goal_status import PublicGoalEvidenceLedger
 
 
 def _public_episode() -> PublicEpisode:
@@ -56,6 +57,117 @@ def _episode(requirement: str, validation: dict[str, float | None]) -> dict[str,
             "generation_validation": {"navigation_validation": validation},
         }
     }
+
+
+def test_live_category_filter_uses_same_private_relation_gate_for_nested_objects() -> None:
+    """Cross-room/different-container objects never enter the relaxed ledger."""
+
+    class _Object:
+        def __init__(self, name: str, position: list[float]) -> None:
+            self.name = name
+            self.position = np.asarray(position, dtype=float)
+
+    metadata = {
+        "egg_selected": {"category": "Egg", "parent": "fridge_a", "room_id": 2},
+        "egg_same_fridge": {"category": "Egg", "parent": "fridge_a", "room_id": 2},
+        "egg_surface": {"category": "Egg", "parent": "table", "room_id": 2},
+        "egg_other_room": {"category": "Egg", "parent": "fridge_b", "room_id": 3},
+        "fridge_a": {"category": "Fridge", "parent": "", "room_id": 2},
+        "fridge_b": {"category": "Fridge", "parent": "", "room_id": 3},
+        "table": {"category": "Table", "parent": "", "room_id": 2},
+    }
+    positions = {
+        "egg_selected": [0.0, 0.0, 1.0],
+        "egg_same_fridge": [0.2, 0.0, 0.5],
+        "egg_surface": [4.0, 0.0, 0.4],
+        "egg_other_room": [0.1, 0.0, 0.5],
+    }
+
+    class _Manager:
+        scene_metadata = {"objects": metadata}
+
+        def object_metadata(self, name: str):
+            return metadata.get(name, {})
+
+        def get_object_by_name(self, name: str):
+            return _Object(name, positions[name])
+
+        def list_top_level_objects(self):
+            return [_Object(name, positions[name]) for name in positions]
+
+        def get_annotation_category(self, obj):
+            return metadata[obj.name]["category"]
+
+        def category_from_name(self, name: str):
+            return metadata.get(name, {}).get("category", "")
+
+    target = {
+        "selected_instance": "egg_selected",
+        "category": "egg",
+        "container_name": "fridge_a",
+        "grounding": {"unique": False, "attributes": {}},
+        "container_aabb_center": [0.0, 0.0, 0.8],
+        "container_aabb_size": [1.0, 1.0, 1.5],
+    }
+    task = SimpleNamespace(env=SimpleNamespace(object_managers=[_Manager()], current_batch_index=0))
+    episode = {"interactive_nav": {"target": target}}
+    names = benchmark_runner._category_goal_source_names(task=task, episode=episode)
+    assert set(names) >= set(positions)
+    accepted, decisions = benchmark_runner._live_category_candidate_filter(
+        task=task, episode=episode, source_names=names
+    )
+    assert set(accepted) == {"egg_selected", "egg_same_fridge", "egg_surface"}
+    assert decisions["egg_same_fridge"]["reason"] == "same_container"
+    assert decisions["egg_surface"]["reason"] == "same_room_category"
+    assert decisions["egg_other_room"]["reason"] == "not_equivalent"
+
+
+def test_relaxed_category_verification_fails_closed_without_relation_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy runtime cannot promote a non-selected object by distance alone."""
+
+    evidence = PublicGoalEvidenceLedger(
+        episode_id="episode-1", target_instance_ids=["obj-selected", "obj-alt"]
+    )
+    evidence.record_frame(
+        {
+            "target_context": {"episode_id": "episode-1"},
+            "observations": [{"instance_id": "obj-alt"}],
+        },
+        capture_step=4,
+    )
+    runtime = SimpleNamespace(
+        perception=SimpleNamespace(episode_id="episode-1"),
+        category_goal_evidence=evidence,
+        category_target_source_by_opaque_id={
+            "obj-selected": "selected",
+            "obj-alt": "alternative",
+        },
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_private_target_distances_m",
+        lambda *args, **kwargs: {"obj-alt": 0.1, "obj-selected": 0.2},
+    )
+    verification = benchmark_runner._verify_relaxed_category_goal_status(
+        task=SimpleNamespace(),
+        runtime=runtime,
+        episode={
+            "interactive_nav": {
+                "target": {"selected_instance": "selected"},
+                "success_criteria": {"distance": {"threshold_m": 0.5}},
+            }
+        },
+        payload={
+            "status": "SUCCEEDED",
+            "mission_mode": "object_goal",
+            "detail": {"reason": "target_goal_succeeded"},
+            "target_context": {"episode_id": "episode-1"},
+        },
+    )
+    assert not verification.accepted
+    assert verification.reason == "category_relation_unavailable"
 
 
 def _result_row(**overrides: object) -> dict[str, object]:

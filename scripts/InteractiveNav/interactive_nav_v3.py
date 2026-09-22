@@ -518,6 +518,54 @@ def _validate_common_v3_episode(
         ):
             raise ValueError("Oracle plan must observe exactly one runtime target candidate")
 
+    identity_contract = target.get("identity_contract")
+    if identity_contract is not None:
+        if is_point_goal or not isinstance(identity_contract, dict):
+            raise ValueError("identity_contract is supported only for object goals")
+        if identity_contract.get("mode") != "interaction_contract_any":
+            raise ValueError("identity_contract.mode must be interaction_contract_any")
+
+        def identity_names(key: str) -> list[str]:
+            raw = identity_contract.get(key)
+            if not isinstance(raw, list) or not raw:
+                raise ValueError(f"identity_contract.{key} must be a non-empty list")
+            names = [str(value) for value in raw]
+            if any(not value for value in names) or len(set(names)) != len(names):
+                raise ValueError(f"identity_contract.{key} must contain unique non-empty names")
+            return names
+
+        instruction_candidates = identity_names("instruction_consistent_candidates")
+        contract_candidates = identity_names("contract_candidates")
+        raw_distractors = identity_contract.get("cross_contract_distractors", [])
+        if not isinstance(raw_distractors, list):
+            raise ValueError("identity_contract.cross_contract_distractors must be a list")
+        cross_contract_distractors = [str(value) for value in raw_distractors]
+        if len(set(cross_contract_distractors)) != len(cross_contract_distractors):
+            raise ValueError("identity_contract.cross_contract_distractors must be unique")
+        instruction_set = set(instruction_candidates)
+        contract_set = set(contract_candidates)
+        distractor_set = set(cross_contract_distractors)
+        if selected_instance not in contract_set:
+            raise ValueError("selected target must belong to identity contract")
+        if not contract_set.issubset(instruction_set):
+            raise ValueError("contract candidates must be instruction-consistent")
+        if contract_set.intersection(distractor_set):
+            raise ValueError("contract candidates and cross-contract distractors overlap")
+        if instruction_set != contract_set | distractor_set:
+            raise ValueError("identity contract must classify every instruction-consistent candidate")
+
+        covered_targets: set[str] = set()
+        for plan in plans:
+            terminal_targets = plan.get("terminal_target_instances")
+            if not isinstance(terminal_targets, list) or not terminal_targets:
+                raise ValueError("identity-contract plans require terminal_target_instances")
+            terminal_set = {str(value) for value in terminal_targets}
+            if not terminal_set.issubset(contract_set):
+                raise ValueError("oracle plan terminal target lies outside the interaction contract")
+            covered_targets.update(terminal_set)
+        if covered_targets != contract_set:
+            raise ValueError("oracle plans do not cover every interaction-contract candidate")
+
     return {
         "payload": payload,
         "task": task,

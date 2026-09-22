@@ -13,6 +13,32 @@ sys.modules[SPEC.name] = batch
 SPEC.loader.exec_module(batch)
 
 
+def test_default_command_starvation_budget_covers_one_m2_timeout_retry(
+    tmp_path, monkeypatch
+):
+    benchmark = tmp_path / "benchmark.json"
+    benchmark.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT_PATH),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--benchmark",
+            str(benchmark),
+            "--episode-indices",
+            "0",
+        ],
+    )
+
+    args = batch.parse_args()
+
+    m2_worst_case_s = 30.0 + 1.0 + 30.0
+    assert args.ros_command_starvation_timeout_s == 90.0
+    assert args.ros_command_starvation_timeout_s > m2_worst_case_s
+
+
 def _recovery_args(tmp_path):
     output_dir = tmp_path / "round"
     output_dir.mkdir(parents=True)
@@ -248,6 +274,7 @@ def test_derived_endpoint_dotenv_preserves_base_settings_and_overrides_endpoint(
     source = tmp_path / "base.env"
     source.write_text(
         "SEMANTIC_MODEL_NAME=qwen-local\nSEMANTIC_MODEL_TIMEOUT_S=30\n"
+        "SEMANTIC_M2_TIMEOUT_S=45\nSEMANTIC_M2_TIMEOUT_RETRY_COUNT=2\n"
         "SEMANTIC_MODEL_ENDPOINT=http://old.invalid/v1\n",
         encoding="utf-8",
     )
@@ -259,7 +286,22 @@ def test_derived_endpoint_dotenv_preserves_base_settings_and_overrides_endpoint(
     contents = derived.read_text(encoding="utf-8")
     assert "SEMANTIC_MODEL_NAME=qwen-local" in contents
     assert "SEMANTIC_MODEL_TIMEOUT_S=30" in contents
+    assert "SEMANTIC_M2_TIMEOUT_S=45" in contents
+    assert "SEMANTIC_M2_TIMEOUT_RETRY_COUNT=2" in contents
     assert contents.rstrip().endswith("SEMANTIC_MODEL_ENDPOINT=http://127.0.0.1:8001/v1")
+
+
+def test_m2_timeout_retry_defaults_are_explicit_and_overridable(monkeypatch):
+    assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_S"] == "30.0"
+    assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_RETRY_COUNT"] == "1"
+    assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S"] == "1.0"
+
+    monkeypatch.setenv("SEMANTIC_M2_TIMEOUT_S", "45")
+    monkeypatch.setenv("SEMANTIC_M2_TIMEOUT_RETRY_COUNT", "2")
+    monkeypatch.setenv("SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S", "0.5")
+    assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_S") == "45"
+    assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_RETRY_COUNT") == "2"
+    assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S") == "0.5"
 
 
 def test_worker_endpoint_and_egl_assignment_are_round_robin():
@@ -381,6 +423,65 @@ def test_summary_marks_unreported_plans_as_incomplete_and_not_successful(tmp_pat
     assert missing[0]["completed"] is False
     assert missing[0]["success"] is False
     assert missing[0]["scoring_eligible"] is False
+
+
+def test_summary_layer_counts_use_null_aware_legacy_fallbacks(tmp_path):
+    output_dir = tmp_path / "round"
+    output_dir.mkdir()
+    args = SimpleNamespace(
+        output_dir=output_dir,
+        benchmark=tmp_path / "mixed.json",
+        runner=SCRIPT_PATH,
+        runner_shell="bash",
+        workers=2,
+        base_master_port=12600,
+        max_steps=2000,
+        step_budget_mode="fixed",
+        semantic_attribute_request_timeout_s=20.0,
+        ros_command_starvation_timeout_s=90.0,
+        ros_observation_turn_multiplier=1.5,
+        scene_timeout_s=7200.0,
+        fast_eval=True,
+        model_endpoints=None,
+        mujoco_egl_devices=None,
+        semantic_model_env_file=None,
+        resource_telemetry=False,
+        resource_sample_interval_s=2.0,
+        resume=False,
+    )
+    plans = [
+        batch.EpisodePlan(0, 0, 0, 12600, output_dir / "episode_0000"),
+        batch.EpisodePlan(1, 1, 1, 12601, output_dir / "episode_0001"),
+    ]
+    # The first row represents a transitional writer that emitted null layer
+    # fields; the second preserves the old stale-success/nav-failure shape.
+    results = [
+        {
+            "episode_index": 0,
+            "completed": True,
+            "nav_success": True,
+            "interaction_conditioned_success": True,
+            "success": True,
+            "exact_instance_success": None,
+            "category_goal_success": None,
+            "interaction_contract_goal_success": None,
+            "interactive_episode_success": None,
+        },
+        {
+            "episode_index": 1,
+            "completed": True,
+            "nav_success": False,
+            "interaction_conditioned_success": True,
+            "success": True,
+        },
+    ]
+
+    aggregate = batch.write_summary(args, plans, results)
+
+    assert aggregate["exact_instance_success_count"] == 1
+    assert aggregate["category_goal_success_count"] == 1
+    assert aggregate["interaction_contract_goal_success_count"] == 1
+    assert aggregate["interactive_episode_success_count"] == 1
 
 
 def test_summary_recovers_one_valid_current_attempt_and_counts_it_formally(tmp_path):

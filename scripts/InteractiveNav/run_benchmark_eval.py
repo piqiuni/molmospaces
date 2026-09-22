@@ -14,10 +14,25 @@ import socket
 import subprocess
 import threading
 import time
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from eval_qwen_service import QwenService, endpoint_for_port, visible_devices
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO / "scripts/InteractiveNav/configs/evaluation/benchmark_batch.json"
 OWNER_KEY = "INTERACTIVE_NAV_EVAL_RUN_ID"
+
+
+def incomplete_indices(output, indices):
+    pending = []
+    for index in indices:
+        try:
+            row = json.loads((output / f"episode_{index:04d}/batch_task_summary.json").read_text())
+        except (OSError, ValueError):
+            row = {}
+        if row.get("completed") is not True:
+            pending.append(index)
+    return pending
 
 
 def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
@@ -251,8 +266,34 @@ def main() -> int:
     parser.add_argument("--recording", action=argparse.BooleanOptionalAction, default=None,
                         help="完整录制（默认开启）；--no-recording 使用 fast eval")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--start-qwen", action="store_true", help="Start one multi-GPU Qwen service once for this batch")
+    parser.add_argument("--retry-rounds", type=int, default=None, help="Deferred rounds for incomplete episodes (default 1)")
+    parser.add_argument("--experiment-manifest", type=Path, help="Frozen multi-arm online experiment manifest")
+    parser.add_argument("--experiment-lane", type=int, choices=(0, 1, 2), help="One 15-worker experiment lane")
     args = parser.parse_args()
+    if args.experiment_manifest is not None:
+        if args.experiment_lane is None:
+            parser.error("--experiment-manifest requires --experiment-lane")
+        if any(value is not None for value in (args.workers, args.max_steps, args.output_dir, args.episode_indices, args.recording)) or args.retry_rounds not in (None, 0):
+            parser.error("Experiment resources/outputs are frozen in the manifest; normal overrides/retries are disabled")
+        from run_m2_experiment_lane import run_lane
+        return run_lane(args.experiment_manifest, args.experiment_lane, config_path=args.config,
+                        dry_run=args.dry_run, start_qwen=args.start_qwen)
+    if args.experiment_lane is not None:
+        parser.error("--experiment-lane requires --experiment-manifest")
     config = json.loads(args.config.read_text())
+    retry_rounds = args.retry_rounds if args.retry_rounds is not None else int(config.get("retry_rounds", 1))
+    if retry_rounds < 0:
+        parser.error("--retry-rounds must be non-negative")
+    start_qwen = args.start_qwen or config.get("start_qwen", False)
+    if start_qwen:
+        devices = visible_devices(os.environ)
+        qwen_port = int(os.environ.get("QWEN36_PORT", "8000"))
+        # One API endpoint is backed by one vLLM instance. vLLM's internal
+        # DP/TP scheduler owns all visible GPUs; the eval client does no LB.
+        config["model_endpoints"] = [endpoint_for_port(qwen_port)]
+        if not args.dry_run:
+            config["mujoco_egl_devices"] = list(range(len(devices)))
     for key in ("workers", "max_steps", "episode_indices", "recording"):
         value = getattr(args, key)
         if value is not None:
@@ -268,7 +309,14 @@ def main() -> int:
             sock.bind(("127.0.0.1", port))
     resume = bool(config.get("resume", False))
     output.mkdir(parents=True, exist_ok=resume)
+    runner = REPO / "scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh"
+    snapshot = output / "runner_snapshot.sh"
+    if not (resume and snapshot.exists()):
+        snapshot.write_bytes(runner.read_bytes())
+    subprocess.run(["bash", "-n", str(snapshot)], check=True)
+    command += ["--runner", str(snapshot)]
     environment = os.environ.copy()
+    environment["INTERACTIVE_NAV_SCRIPT_DIR"] = str(runner.parent)
     for key, suffix in (("TMPDIR", "tmp"), ("XDG_CACHE_HOME", "cache")):
         directory = output / suffix
         directory.mkdir(exist_ok=resume)
@@ -292,22 +340,48 @@ def main() -> int:
           "[eval] Ctrl+C 停止并清理本轮任务；详细日志见各场景 attempt 目录。", flush=True)
     started = time.monotonic()
     process = None
+    service = QwenService(output, environment, port=int(os.environ.get("QWEN36_PORT", "8000"))) if start_qwen else None
+    returncode = 1
     try:
+        if service:
+            print("[eval] 启动单实例 Qwen 服务；所有可见 GPU 由同一个 vLLM API 内部调度，统一入口 8000。", flush=True)
+            service.start(stop)
         with (output / "batch.log").open("ab" if resume else "wb") as log:
-            process = subprocess.Popen(command, cwd=REPO, env=environment, stdout=log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-            while True:
-                print(progress(output, indices, started), flush=True)
-                if process.poll() is not None or stop.wait(config["progress_interval_s"]):
+            for round_index in range(retry_rounds + 1):
+                round_command = list(command)
+                if round_index and "--resume" not in round_command:
+                    round_command.append("--resume")
+                process = subprocess.Popen(round_command, cwd=REPO, env=environment, stdout=log,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+                while True:
+                    print(progress(output, indices, started), flush=True)
+                    if service:
+                        service.check()
+                    if process.poll() is not None or stop.wait(config["progress_interval_s"]):
+                        break
+                if stop.is_set():
                     break
+                pending = incomplete_indices(output, indices)
+                (output / f"retry_queue_{round_index}.json").write_text(json.dumps(pending))
+                returncode = process.returncode or (1 if pending else 0)
+                if not pending:
+                    break
+                print(f"[eval] 第 {round_index + 1} 轮结束，{len(pending)} 个运行异常／未完成场景进入尾部重试队列。", flush=True)
+    except (RuntimeError, InterruptedError) as exc:
+        print(f"[eval] {exc}", flush=True)
+        returncode = 1
     finally:
-        cleanup(str(output), force)
-        if process is not None:
-            process.wait(timeout=10)
+        try:
+            cleanup(str(output), force)
+            if process is not None:
+                process.wait(timeout=10)
+        finally:
+            if service:
+                service.close()
     print(f"[eval] {'已手动停止' if stop.is_set() else '已结束'}；日志：{output / 'batch.log'}", flush=True)
     print(completion_report(output, indices, time.monotonic() - started,
-                            stopped=stop.is_set(), returncode=process.returncode), flush=True)
-    return 130 if stop.is_set() else process.returncode
+                            stopped=stop.is_set(), returncode=returncode), flush=True)
+    return 130 if stop.is_set() else returncode
 
 
 if __name__ == "__main__":

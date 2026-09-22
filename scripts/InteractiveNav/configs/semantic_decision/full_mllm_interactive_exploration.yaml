@@ -129,14 +129,15 @@ policy:
   repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
-  # The local Qwen service may data-parallel across both GPUs; 12 s keeps a
-  # large real-navigation margin
-  # while preventing a stalled endpoint from freezing a scene for 30 seconds.
-  timeout_s: 12.0
+  # Module 2 is text-only and can use a stronger/slower model through
+  # SEMANTIC_M2_*.  Keep its request budget independent from visual M1/M3.
+  timeout_s: 30.0
+  timeout_retry_count: 1
+  timeout_retry_backoff_s: 1.0
   # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover
   # from a local Qwen response that starts to serialize long candidate context
   # instead of silently truncating its JSON and falling back to rules.
-  max_tokens: 384
+  max_tokens: 1536
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   skill_timeout_s: 12.0

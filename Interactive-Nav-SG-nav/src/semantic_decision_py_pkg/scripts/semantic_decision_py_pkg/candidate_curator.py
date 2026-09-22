@@ -18,6 +18,8 @@ NON_NAVIGATION_BEHAVIOR_TYPES = ("SCAN",)
 
 @dataclass
 class CandidateCuratorConfig:
+    pool_mode: str = "all_actions_12_frontiers"
+    max_frontier_candidates: int = 12
     candidate_top_k: int = 8
     navigate_quota: int = 1
     interaction_quota: int = 3
@@ -443,11 +445,10 @@ def _container_tokens(candidate: BehaviorCandidate) -> set[str]:
 
 
 def _contains_semantic_term(tokens: set[str], vocabulary: set[str]) -> bool:
-    return any(
-        term == token or term in token or token in term
-        for token in tokens
-        for term in vocabulary
-    )
+    # Explicit dataset aliases are safe; arbitrary substrings make "potty"
+    # match "pot" and "pantry" match "pan".
+    aliases = {"irishpotato": "potato"}
+    return bool({aliases.get(token, token) for token in tokens} & vocabulary)
 
 
 def _semantic_container_compatibility(
@@ -964,6 +965,9 @@ class CandidateCurator:
     ) -> CandidateCurationResult:
         graph = graph or {}
         history_by_key = history_by_key or {}
+        expanded_pool = self.config.pool_mode == "all_actions_12_frontiers"
+        if self.config.pool_mode not in {"legacy", "all_actions_12_frontiers"}:
+            raise ValueError(f"Unsupported candidate pool mode: {self.config.pool_mode}")
         entered_room_ids = {
             room_id
             for room_id in (_known_room_id(value) for value in (entered_room_ids or []))
@@ -977,7 +981,8 @@ class CandidateCurator:
         )
         omitted: dict[str, str] = {}
         if (
-            self.config.suppress_semantic_container_mismatch
+            not expanded_pool
+            and self.config.suppress_semantic_container_mismatch
             and bool((target_context or {}).get("enabled"))
             and accepted
         ):
@@ -1031,7 +1036,7 @@ class CandidateCurator:
         max_expected_visible_area = max(
             expected_visible_area_by_id.values(), default=0.0
         )
-        if max_expected_visible_area > 0.0:
+        if not expanded_pool and max_expected_visible_area > 0.0:
             minimum_visible_area = max_expected_visible_area * max(
                 0.0,
                 min(1.0, float(self.config.explore_min_visible_gain_ratio)),
@@ -1064,7 +1069,7 @@ class CandidateCurator:
             )
             < max(1, int(self.config.repeat_guard_low_gain_limit))
         ]
-        if non_repeated_explore:
+        if not expanded_pool and non_repeated_explore:
             for candidate in explore_pool:
                 if candidate not in non_repeated_explore:
                     omitted[candidate.candidate_id] = "history_low_gain_suppressed"
@@ -1151,6 +1156,33 @@ class CandidateCurator:
                 candidate.candidate_id,
             ),
         )
+        if expanded_pool:
+            selected, frontier_ranking = self._select_public_pool(
+                accepted, graph, history_key_by_id, omitted
+            )
+            ranked_ids_by_type = {
+                behavior_type: [
+                    candidate.candidate_id
+                    for candidate in (
+                        frontier_ranking
+                        if behavior_type == "EXPLORE"
+                        else sorted(pools[behavior_type], key=lambda item: item.candidate_id)
+                    )
+                ]
+                for behavior_type in SUPPORTED_BEHAVIOR_TYPES
+            }
+            return CandidateCurationResult(
+                candidates=selected,
+                rejected=rejected,
+                omitted=omitted,
+                quality_by_id=quality_by_id,
+                quality_terms_by_id=quality_terms_by_id,
+                history_key_by_id=history_key_by_id,
+                ranked_ids_by_type=ranked_ids_by_type,
+                mandatory_ids=[candidate.candidate_id for candidate in mandatory],
+                decision_hint_by_id=decision_hint_by_id,
+                entered_room_ids=sorted(entered_room_ids),
+            )
         selected: list[BehaviorCandidate] = []
         selected_ids: set[str] = set()
         selected_history_keys: set[str] = set()
@@ -1244,6 +1276,73 @@ class CandidateCurator:
             entered_room_ids=sorted(entered_room_ids),
             reserved_new_room_ids=reserved_new_room_ids,
         )
+
+    def _select_public_pool(
+        self,
+        candidates: list[BehaviorCandidate],
+        graph: dict[str, Any],
+        history_key_by_id: dict[str, str],
+        omitted: dict[str, str],
+    ) -> tuple[list[BehaviorCandidate], list[BehaviorCandidate]]:
+        """Keep all executable actions and a semantic-prior-free frontier pool."""
+
+        def frontier_order(candidate: BehaviorCandidate) -> tuple[Any, ...]:
+            metadata = candidate.metadata or {}
+            distance = candidate.features.get(
+                "path_length_m", candidate.features.get("distance_m", 0.0)
+            )
+            return (
+                -_expected_visible_unknown_area(candidate),
+                -max(0.0, float(metadata.get("unknown_component_area_m2", 0.0) or 0.0)),
+                -max(0.0, float(metadata.get("frontier_length_m", 0.0) or 0.0)),
+                max(0.0, float(distance or 0.0)),
+                candidate.candidate_id,
+            )
+
+        actions = sorted(
+            (
+                candidate
+                for candidate in candidates
+                if _normalized_behavior_type(candidate) in {"NAVIGATE", "INTERACT"}
+            ),
+            key=lambda item: item.candidate_id,
+        )
+        frontier_pool = sorted(
+            (
+                candidate
+                for candidate in candidates
+                if _normalized_behavior_type(candidate) == "EXPLORE"
+            ),
+            key=frontier_order,
+        )
+        seen_clusters: set[str] = set()
+        seen_regions: set[str] = set()
+        by_room: dict[str, list[BehaviorCandidate]] = {}
+        for candidate in frontier_pool:
+            metadata = candidate.metadata or {}
+            cluster = str(metadata.get("source_cluster_id") or metadata.get("cluster_id") or "")
+            region = history_key_by_id[candidate.candidate_id]
+            if (cluster and cluster in seen_clusters) or region in seen_regions:
+                omitted[candidate.candidate_id] = "duplicate_frontier_region"
+                continue
+            if cluster:
+                seen_clusters.add(cluster)
+            seen_regions.add(region)
+            by_room.setdefault(candidate_room_id(candidate, graph), []).append(candidate)
+
+        # Round-robin rooms instead of letting one room consume all 12 slots.
+        # Within each room only measured geometric gain and distance are used.
+        room_order = sorted(by_room, key=lambda room: frontier_order(by_room[room][0]))
+        ranked_frontiers = [
+            by_room[room][index]
+            for index in range(max((len(pool) for pool in by_room.values()), default=0))
+            for room in room_order
+            if index < len(by_room[room])
+        ]
+        frontier_limit = max(0, int(self.config.max_frontier_candidates))
+        for candidate in ranked_frontiers[frontier_limit:]:
+            omitted[candidate.candidate_id] = "frontier_pool_limit"
+        return actions + ranked_frontiers[:frontier_limit], ranked_frontiers
 
     def _score_pool(
         self,

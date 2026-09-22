@@ -61,6 +61,8 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
     reproject_post_interaction_traversal_candidate,
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+from semantic_decision_py_pkg.room_context import room_context_for_xy
+from semantic_decision_py_pkg.frontier_context import eligible_room_frontier_counts
 from semantic_decision_py_pkg.rule_policy import (
     RulePolicy,
     RulePolicyConfig,
@@ -605,6 +607,13 @@ class SemanticRuleDecisionNode:
                 model=str(model_config.get("model", "qwen3.6-35b-a3b")),
                 protocol=str(model_config.get("protocol", "openai_chat")),
                 timeout_s=float(model_config.get("timeout_s", 3.0)),
+                timeout_retry_count=max(
+                    0, int(model_config.get("timeout_retry_count", 0))
+                ),
+                timeout_retry_backoff_s=max(
+                    0.0,
+                    float(model_config.get("timeout_retry_backoff_s", 1.0)),
+                ),
                 temperature=float(model_config.get("temperature", 0.0)),
                 max_tokens=int(model_config.get("max_tokens", 96)),
                 reasoning_effort=str(model_config.get("selection_reasoning_effort", model_config.get("reasoning_effort", "off"))),
@@ -618,6 +627,10 @@ class SemanticRuleDecisionNode:
                 history_region_size_m=float(
                     model_config.get("history_region_size_m", 1.0)
                 ),
+                include_pre_scores=bool(model_config.get("include_pre_scores", False)),
+                context_profile=str(model_config.get("context_profile", "public_facts_v2")),
+                prompt_file=str(model_config.get("prompt_file", "")),
+                recent_decision_limit=int(model_config.get("recent_decision_limit", 30)),
                 pre_score_guard_margin=float(
                     model_config.get("pre_score_guard_margin", 0.75)
                 ),
@@ -625,6 +638,8 @@ class SemanticRuleDecisionNode:
         )
         self.candidate_curator = CandidateCurator(
             CandidateCuratorConfig(
+                pool_mode=str(model_config.get("candidate_pool_mode", "all_actions_12_frontiers")),
+                max_frontier_candidates=int(model_config.get("candidate_max_frontier_candidates", 12)),
                 candidate_top_k=int(model_config.get("candidate_top_k", 8)),
                 navigate_quota=int(model_config.get("navigate_quota", 1)),
                 interaction_quota=int(model_config.get("interaction_quota", 3)),
@@ -763,6 +778,9 @@ class SemanticRuleDecisionNode:
         # an EXPLORE decision that fails at a doorway must not make the child
         # room look visited on the next ranking cycle.
         self.entered_room_ids: set[str] = set()
+        self.initial_robot_xy: list[float] | None = None
+        self.initial_position_source: dict = {}
+        self.room_visit_history: list[dict] = []
         self.last_selected_group_id = ""
         self.last_selected_history_key = ""
         self.active_candidate_id = ""
@@ -909,6 +927,9 @@ class SemanticRuleDecisionNode:
                 self.group_history.clear()
                 self.region_history.clear()
                 self.entered_room_ids.clear()
+                self.initial_robot_xy = None
+                self.initial_position_source = {}
+                self.room_visit_history.clear()
                 self.last_selected_group_id = ""
                 self.last_selected_history_key = ""
                 self.model_circuit_breaker = ModelCircuitBreaker(
@@ -2183,8 +2204,8 @@ class SemanticRuleDecisionNode:
             candidate_history=region_history,
             history_region_size_m=self.candidate_curator.config.region_size_m,
             room_frontier_lengths=room_frontier_lengths,
-            pre_scores=curation.quality_by_id,
-            pre_score_terms=curation.quality_terms_by_id,
+            pre_scores=curation.quality_by_id if self.model_policy.config.include_pre_scores else None,
+            pre_score_terms=curation.quality_terms_by_id if self.model_policy.config.include_pre_scores else None,
             decision_hints=curation.decision_hint_by_id,
         )
         self.model_policy.last_candidate_groups = projected_groups
@@ -2220,7 +2241,14 @@ class SemanticRuleDecisionNode:
                 target_context=candidate_snapshot.get("target_context") or {},
                 graph=candidate_snapshot.get("graph_context") or {},
                 robot_context={
+                    **self._trajectory_context(candidate_snapshot),
                     "robot_xy": candidate_snapshot.get("robot_xy"),
+                    "position_frame_id": candidate_snapshot.get("robot_position_frame_id"),
+                    **{
+                        key: candidate_snapshot[key]
+                        for key in ("robot_graph_xy", "robot_graph_frame_id", "robot_graph_pose_source")
+                        if key in candidate_snapshot
+                    },
                     "exploration_context": candidate_snapshot.get(
                         "exploration_context"
                     ),
@@ -2229,6 +2257,12 @@ class SemanticRuleDecisionNode:
                     "group_history": group_history,
                     "candidate_history": region_history,
                     "room_frontier_lengths": room_frontier_lengths,
+                    "observed_room_frontier_lengths": candidate_snapshot.get("observed_room_frontier_lengths"),
+                    "room_frontier_counts": eligible_room_frontier_counts(
+                        eligible, candidate_snapshot.get("graph_context") or {},
+                    ),
+                    "observed_room_frontier_counts": candidate_snapshot.get("observed_room_frontier_counts"),
+                    "room_frontier_statistics": candidate_snapshot.get("room_frontier_statistics"),
                     "candidate_pre_scores": dict(curation.quality_by_id),
                     "candidate_pre_score_terms": dict(
                         curation.quality_terms_by_id
@@ -2247,6 +2281,9 @@ class SemanticRuleDecisionNode:
                     ],
                     "candidate_pool_count": len(eligible),
                     "curated_candidate_count": len(model_candidates),
+                    "m2_candidate_pool_mode": self.candidate_curator.config.pool_mode,
+                    "m2_candidate_top_k": self.candidate_curator.config.candidate_top_k,
+                    "m2_candidate_max_frontier_candidates": self.candidate_curator.config.max_frontier_candidates,
                     "mandatory_candidate_ids": list(curation.mandatory_ids),
                     "candidate_options": projected_groups,
                     "selection_granularity": (
@@ -2500,6 +2537,15 @@ class SemanticRuleDecisionNode:
             "active_candidate_id": self.active_candidate_id,
             "policy_backend": self.policy_backend,
             "ablation": self.ablation.to_dict(),
+            "model_name": self.model_policy.config.model,
+            "model_request_context": dict(getattr(self.model_policy, "last_request_context", {})),
+            "model_timeout_s": self.model_policy.config.timeout_s,
+            "model_timeout_retry_count": min(
+                3, max(0, int(self.model_policy.config.timeout_retry_count))
+            ),
+            "model_timeout_retry_backoff_s": max(
+                0.0, float(self.model_policy.config.timeout_retry_backoff_s)
+            ),
             "model_error": self.model_policy.last_error,
             "model_result_source": self.model_policy.last_result_source,
             "model_metrics": dict(self.model_policy.last_metrics),
@@ -2723,6 +2769,57 @@ class SemanticRuleDecisionNode:
 
     def _update_entered_rooms(self, candidate_snapshot: dict) -> None:
         self.entered_room_ids.update(self._physical_room_ids(candidate_snapshot))
+        has_graph_pose = "robot_graph_xy" in candidate_snapshot
+        xy = list(candidate_snapshot.get("robot_graph_xy" if has_graph_pose else "robot_xy") or [])[:2]
+        if len(xy) != 2:
+            return
+        graph = candidate_snapshot.get("graph_context") or {}
+        position_frame = candidate_snapshot.get("robot_graph_frame_id" if has_graph_pose else "robot_position_frame_id")
+        graph_frame = graph.get("frame_id")
+        if position_frame and graph_frame and str(position_frame).lstrip("/") != str(graph_frame).lstrip("/"):
+            return
+        step = self._observation_step(candidate_snapshot)
+        if getattr(self, "initial_robot_xy", None) is None:
+            self.initial_robot_xy = [float(value) for value in xy]
+            self.initial_position_source = {
+                "kind": "first_graph_pose_observation" if has_graph_pose else "first_candidate_observation",
+                "observation_step": step,
+                "candidate_sequence": candidate_snapshot.get("sequence"),
+            }
+            if has_graph_pose:
+                self.initial_position_source.update(
+                    frame_id=position_frame,
+                    pose_source=dict(candidate_snapshot.get("robot_graph_pose_source") or {}),
+                )
+        # One shared containment resolver avoids overlapping AABBs producing
+        # an arbitrary set order; revisits such as A -> B -> A are preserved.
+        context = room_context_for_xy(graph, xy)
+        room_id = context.get("room_id")
+        if room_id in (None, ""):
+            return
+        room_id = str(room_id)
+        room_id = room_id if room_id.startswith("room_") else f"room_{room_id}"
+        if not hasattr(self, "room_visit_history"):
+            self.room_visit_history = []
+        if not self.room_visit_history or self.room_visit_history[-1]["room_id"] != room_id:
+            self.room_visit_history.append({
+                "room_id": room_id,
+                "entry_step": step,
+                "entry_xy": [float(value) for value in xy],
+                "source": "robot_aabb_containment",
+            })
+
+    def _trajectory_context(self, candidate_snapshot: dict) -> dict:
+        with self.state_lock:
+            step = self._observation_step(candidate_snapshot)
+            return {
+                "initial_xy": list(self.initial_robot_xy) if self.initial_robot_xy is not None else None,
+                "initial_position_source": dict(self.initial_position_source),
+                "room_visit_history": [
+                    dict(entry) for entry in self.room_visit_history
+                    if int(entry.get("entry_step", 0)) <= step
+                ],
+            }
 
     def _entered_rooms_snapshot(self) -> set[str]:
         with self.state_lock:
@@ -2874,25 +2971,33 @@ class SemanticRuleDecisionNode:
     def _history_context(self, candidate_snapshot: dict) -> tuple[list[dict], list[dict]]:
         self._refresh_history_metrics(candidate_snapshot)
         observation_step = self._observation_step(candidate_snapshot)
+        model_config = getattr(getattr(self, "model_policy", None), "config", None)
+        history_limit = int(getattr(model_config, "recent_decision_limit", 30))
         with self.state_lock:
             recent = [
                 {
+                    "decision_id": str(entry.get("decision_id") or ""),
+                    "step": int(entry.get("observation_step", 0) or 0),
                     "group_id": str(entry.get("group_id") or ""),
                     "history_key": str(entry.get("history_key") or ""),
                     "candidate_id": str(entry.get("candidate_id") or ""),
                     "behavior_type": str(entry.get("behavior_type") or ""),
                     "result": str(entry.get("result") or "PENDING"),
+                    "failure_reason": str(entry.get("failure_reason") or ""),
+                    "target_id": str(entry.get("target_id") or ""),
+                    "target_room_id": entry.get("target_room_id"),
+                    "goal_xy": entry.get("goal_xy"),
                     "steps_ago": max(
                         0, observation_step - int(entry.get("observation_step", 0) or 0)
                     ),
-                    "frontier_length_delta_m": round(
-                        float(entry.get("frontier_length_delta_m", 0.0) or 0.0), 2
-                    ),
-                    "frontier_shrink_m": round(
-                        float(entry.get("frontier_shrink_m", 0.0) or 0.0), 2
-                    ),
+                    **({
+                        key: round(float(entry[key]), 2)
+                        for key in ("frontier_length_delta_m", "frontier_shrink_m")
+                        if entry.get(key) is not None
+                    } if entry.get("frontier_metrics_evaluated") else {}),
                 }
-                for entry in list(self.decision_history)[-8:]
+                for entry in list(self.decision_history)[-history_limit:]
+                if history_limit
             ]
             groups = []
             for group_id, stats in sorted(self.group_history.items()):
@@ -3031,6 +3136,9 @@ class SemanticRuleDecisionNode:
                 "candidate_id": selected.candidate_id,
                 "candidate_fingerprint": candidate_fingerprint(selected),
                 "behavior_type": selected.behavior_type,
+                "target_id": selected.target_id,
+                "target_room_id": (selected.metadata or {}).get("target_room_id") or (selected.metadata or {}).get("room_id"),
+                "goal_xy": list(selected.goal_xyyaw or [])[:2],
                 "observation_step": observation_step,
                 "frontier_length_before_m": self._group_frontier_length(
                     group_id,
@@ -3075,6 +3183,7 @@ class SemanticRuleDecisionNode:
             == "preempted_by_target"
         )
         entry["result"] = status
+        entry["failure_reason"] = str((payload.get("detail") or {}).get("reason") or "")
         entry["neutral_preempt"] = neutral_preempt
         group_id = str(entry.get("group_id") or "")
         history_key = str(entry.get("history_key") or "")

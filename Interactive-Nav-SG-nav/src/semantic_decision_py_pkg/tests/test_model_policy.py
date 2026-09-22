@@ -1,4 +1,6 @@
-from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
+import pytest
+
+from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate, CandidateGenerator
 from semantic_decision_py_pkg.model_policy import (
     ModelCircuitBreaker,
     ModelPolicyClient,
@@ -12,6 +14,7 @@ from semantic_decision_py_pkg.model_policy import (
     build_room_object_reasoning_context,
     compact_graph,
     compact_semantic_graph,
+    public_decision_graph_context,
 )
 from semantic_mllm_py_pkg.client import MLLMResponse
 
@@ -176,7 +179,13 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
     graph = compact_semantic_graph(
         {
             "nodes": [
-                {"id": "room_1", "type": "room", "label": "kitchen", "centroid": [0, 0, 0]},
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "label": "kitchen",
+                    "centroid": [0, 0, 0],
+                    "aabb_size": [2.0, 2.0, 1.0],
+                },
                 {
                     "id": "portal_1",
                     "type": "portal",
@@ -203,8 +212,15 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
             {
                 "id": "room_1",
                 "type": "kitchen",
+                "centroid_xy": [0.0, 0.0],
+                "aabb_center_xy": None,
+                "aabb_size_xy": [2.0, 2.0],
+                "eligible_frontier_length_m": None,
+                "observed_frontier_length_m": None,
+                "eligible_frontier_count": None,
+                "observed_frontier_count": None,
                 "anchor_objects": [
-                    {"type": "refrigerator", "visible": False}
+                    {"type": "refrigerator"}
                 ],
             }
         ],
@@ -215,6 +231,7 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
                 "state": "closed",
                 "interaction_available": True,
                 "connects": ["room_1", "room_2"],
+                "center_xy": None,
             }
         ],
         "containers": [
@@ -224,10 +241,81 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
                 "state": "closed",
                 "interaction_available": True,
                 "room_id": "room_1",
+                "center_xy": None,
             }
         ],
         "current_room": "room_1",
     }
+
+
+@pytest.mark.parametrize("max_graph_nodes", [1, 80])
+def test_model_current_room_uses_same_containment_as_candidates(max_graph_nodes) -> None:
+    graph = {
+        "nodes": [
+            {
+                "id": "room_6",
+                "type": "room",
+                "room_id": 6,
+                "centroid": [0.0, 2.5, 0.0],
+                "aabb_center": [0.0, 2.5, 0.0],
+                "aabb_size": [2.0, 2.0, 1.0],
+            },
+            {
+                "id": "room_7",
+                "type": "room",
+                "room_id": 7,
+                "centroid": [3.0, 0.0, 0.0],
+                "aabb_center": [3.0, 0.0, 0.0],
+                "aabb_size": [8.0, 2.0, 1.0],
+            },
+        ]
+    }
+    robot_xy = (0.0, 0.0)
+    candidates = CandidateGenerator().generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "same_room",
+                    "goal_xyyaw": [0.5, 0.0, 0.0],
+                    "frontier_point": [0.5, 0.0],
+                    "raw_features": {"distance_m": 0.5},
+                }
+            ]
+        },
+        graph,
+        robot_xy=robot_xy,
+    )
+    client = ModelPolicyClient(
+        ModelPolicyConfig(mode="disabled", max_graph_nodes=max_graph_nodes)
+    )
+    request = client.build_request(
+        candidates,
+        {"enabled": True, "target_name": "toilet"},
+        graph,
+        {"robot_xy": robot_xy},
+    )
+
+    assert candidates[0].metadata["robot_room_id"] == 7
+    assert request["candidates"][0]["robot_room_id"] == "room_7"
+    assert request["robot"]["current_room"] == "room_7"
+    assert request["graph"]["current_room"] == "room_7"
+
+
+@pytest.mark.parametrize("aabb_size", [None, [2.0, 2.0, 1.0]])
+def test_model_current_room_does_not_fall_back_to_nearest_centroid(aabb_size) -> None:
+    room = {"id": "room_1", "type": "room", "centroid": [0.0, 0.0, 0.0]}
+    if aabb_size is not None:
+        room["aabb_size"] = aabb_size
+    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+    request = client.build_request(
+        [make_candidate("frontier", 0.0, 1.0)],
+        {},
+        {"nodes": [room]},
+        {"robot_xy": [3.0, 0.0]},
+    )
+
+    assert "current_room" not in request["robot"]
+    assert "current_room" not in request["graph"]
 
 
 def test_semantic_graph_exposes_inferred_room_attributes_and_unassigned_anchors() -> None:
@@ -261,12 +349,9 @@ def test_semantic_graph_exposes_inferred_room_attributes_and_unassigned_anchors(
 
     assert graph["rooms"][0]["type"] == "kitchen"
     assert graph["rooms"][0]["observed_type"] == "unknown_room"
-    assert graph["rooms"][0]["room_attribute_scores"] == {
-        "kitchen": 2.0,
-        "livingroom": 0.2,
-    }
-    assert graph["unassigned_anchor_objects"] == [
-        {"type": "refrigerator", "visible": True}
+    assert "room_attribute_scores" not in graph["rooms"][0]
+    assert graph["remembered_objects_without_room"] == [
+        {"type": "refrigerator", "id": "container_fridge", "observed_xy": None}
     ]
 
 
@@ -296,6 +381,13 @@ def test_semantic_graph_marks_graph_only_portal_child_as_unobserved() -> None:
             "potential_room": True,
             "observed_free_space": False,
             "source_portal_id": "portal_door_1",
+            "centroid_xy": [1.0, 0.0],
+            "aabb_center_xy": None,
+            "aabb_size_xy": None,
+            "eligible_frontier_length_m": None,
+            "observed_frontier_length_m": None,
+            "eligible_frontier_count": None,
+            "observed_frontier_count": None,
         }
     ]
     reasoning = build_room_object_reasoning_context(
@@ -333,7 +425,7 @@ def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
     assert request["candidates"][0]["unknown_component_area_m2"] == 22.75
     assert request["candidates"][0]["expected_visible_unknown_area_m2"] == 14.5
     assert request["candidates"][0]["nearby_semantic_nodes"] == [
-        {"type": "refrigerator", "distance_m": 0.8, "visible": True}
+        {"type": "refrigerator", "distance_m": 0.8}
     ]
     assert "expected_visible_unknown_area_m2" in request["instruction"]
     assert "distance breaks ties" in request["instruction"]
@@ -368,7 +460,10 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
         "mode": "object_goal",
         "target": {"name": "apple", "visible": False, "labels": ["apple"]},
     }
-    assert request["robot"] == {}
+    assert request["robot"] == {
+        "current_xy": [1.0, 2.0], "initial_xy": None,
+        "position_frame_id": None, "room_visit_history": [],
+    }
     assert request["candidates"] == [
         {
             "id": "interaction:fridge:open",
@@ -612,8 +707,110 @@ def test_circuit_breaker_resets_timeout_streak_after_non_timeout_failure() -> No
     assert breaker.consecutive_timeouts == 0
 
 
+def test_m2_retries_one_timeout_then_records_success_metrics(monkeypatch) -> None:
+    client = ModelPolicyClient(
+        ModelPolicyConfig(
+            mode="http",
+            model="strong-text-model",
+            timeout_s=30.0,
+            timeout_retry_count=1,
+            timeout_retry_backoff_s=0.25,
+        )
+    )
+    candidate = make_candidate("frontier:a", 0.0, 1.0)
+    payload = client.build_request([candidate], {}, {})
+    calls = []
+    sleeps = []
+
+    def fake_request_json(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return MLLMResponse(payload=None, latency_s=30.0, error="timed out")
+        return MLLMResponse(
+            payload={
+                "ranked_ids": [candidate.candidate_id],
+                "reason": "INFORMATION_GAIN",
+                "confidence": "medium",
+            },
+            latency_s=0.2,
+            prompt_tokens=20,
+            completion_tokens=5,
+            total_tokens=25,
+        )
+
+    monkeypatch.setattr(client._mllm_client, "request_json", fake_request_json)
+    monkeypatch.setattr(
+        "semantic_decision_py_pkg.model_policy.time.sleep", sleeps.append
+    )
+
+    response = client._request(payload, metrics_context={"episode_index": 7})
+
+    assert response["ranked_ids"] == [candidate.candidate_id]
+    assert len(calls) == 2
+    assert sleeps == [0.25]
+    assert calls[0]["metrics_context"]["m2_request_attempt"] == 1
+    assert calls[0]["metrics_context"]["m2_is_timeout_retry"] is False
+    assert calls[1]["metrics_context"]["m2_request_attempt"] == 2
+    assert calls[1]["metrics_context"]["m2_is_timeout_retry"] is True
+    assert client.last_error == ""
+    assert client.last_metrics["model"] == "strong-text-model"
+    assert client.last_metrics["request_attempts"] == 2
+    assert client.last_metrics["timeout_retry_count"] == 1
+    assert client.last_metrics["attempts"][0]["timeout"] is True
+    assert client.last_metrics["attempts"][1]["timeout"] is False
+
+
+def test_m2_does_not_retry_non_timeout_error(monkeypatch) -> None:
+    client = ModelPolicyClient(
+        ModelPolicyConfig(
+            mode="http",
+            timeout_retry_count=2,
+            timeout_retry_backoff_s=0.0,
+        )
+    )
+    candidate = make_candidate("frontier:a", 0.0, 1.0)
+    payload = client.build_request([candidate], {}, {})
+    calls = []
+
+    def fake_request_json(**kwargs):
+        calls.append(kwargs)
+        return MLLMResponse(payload=None, latency_s=0.01, error="HTTP 401")
+
+    monkeypatch.setattr(client._mllm_client, "request_json", fake_request_json)
+
+    assert client._request(payload) is None
+    assert len(calls) == 1
+    assert client.last_error == "HTTP 401"
+    assert client.last_metrics["request_attempts"] == 1
+    assert client.last_metrics["timeout_retry_count"] == 0
+
+
+def test_m2_timeout_retries_are_hard_capped(monkeypatch) -> None:
+    client = ModelPolicyClient(
+        ModelPolicyConfig(
+            mode="http",
+            timeout_retry_count=99,
+            timeout_retry_backoff_s=0.0,
+        )
+    )
+    candidate = make_candidate("frontier:a", 0.0, 1.0)
+    payload = client.build_request([candidate], {}, {})
+    calls = []
+
+    def fake_request_json(**kwargs):
+        calls.append(kwargs)
+        return MLLMResponse(payload=None, latency_s=1.0, error="deadline exceeded")
+
+    monkeypatch.setattr(client._mllm_client, "request_json", fake_request_json)
+
+    assert client._request(payload) is None
+    assert len(calls) == 4
+    assert client.last_metrics["timeout_retry_limit"] == 3
+    assert client.last_metrics["timeout_retry_count"] == 3
+
+
 def test_model_request_exposes_pre_score_and_route_hint_without_geometry() -> None:
-    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled", include_pre_scores=True))
     portal = BehaviorCandidate(
         candidate_id="interaction:portal_12:open",
         behavior_type="INTERACT",
@@ -645,7 +842,7 @@ def test_model_request_exposes_pre_score_and_route_hint_without_geometry() -> No
     assert option["pre_score"] == 1.825
     assert option["pre_score_terms"] == {"topology_priority": 1.35}
     assert option["decision_hint"] == "NEXT_ROUTE_PORTAL"
-    assert request["schema_version"] == 4
+    assert request["schema_version"] == 5
     assert "NEXT_ROUTE_PORTAL when observed topology establishes a prerequisite route" in request["instruction"]
     assert "goal_xyyaw" not in str(request)
     assert "private_joint" not in str(request)
@@ -932,14 +1129,14 @@ def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_pos
     option = next(item for item in client.last_candidate_groups if item["id"] == new_room.candidate_id)
     assert option["room_status"] == "unentered_new_room"
     assert option["potential_room"] is True
-    assert option["room_target_affinity"] == 1.0
+    assert "room_target_affinity" not in option
     request = client.build_request(
         [new_room],
         {"enabled": True, "target_name": "apple"},
         {},
         {"entered_room_ids": ["room_1"]},
     )
-    assert request["robot"]["entered_rooms"] == ["room_1"]
+    assert request["robot"]["room_visit_history"] == []
     assert "compatible or unknown unentered rooms" in request["instruction"]
 
     traversal = BehaviorCandidate(
@@ -974,7 +1171,7 @@ def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_pos
     assert selected is traversal
 
 
-def test_two_stage_room_object_context_links_apple_to_observed_kitchen_fridge() -> None:
+def test_request_leaves_room_target_reasoning_to_model() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     fridge = BehaviorCandidate(
         candidate_id="interaction:fridge:open",
@@ -1037,39 +1234,19 @@ def test_two_stage_room_object_context_links_apple_to_observed_kitchen_fridge() 
     )
 
     reasoning = request["room_object_reasoning"]
-    assert request["schema_version"] == 4
-    assert reasoning["stage"] == "observed_room_target_plausibility"
-    assert reasoning["target"] == {
-        "name": "apple",
-        "visible": False,
-        "semantic_class": "food",
-        "plausible_room_types": ["kitchen", "dining_room"],
-        "plausible_container_types": [
-            "refrigerator",
-            "fridge",
-            "cabinet",
-            "pantry",
-            "cupboard",
-        ],
-        "labels": ["apple"],
-    }
-    kitchen = next(room for room in reasoning["observed_rooms"] if room["id"] == "room_kitchen")
-    assert kitchen["anchor_objects"] == [{"type": "refrigerator", "visible": False}]
-    assert kitchen["target_plausibility"] == {
-        "matches_semantic_prior": True,
-        "evidence": [
-            "room_type:kitchen",
-            "anchor_object:refrigerator",
-            "container:refrigerator",
-        ],
-    }
-    assert reasoning["observed_portals"] == [
+    assert request["schema_version"] == 5
+    assert reasoning == {}
+    kitchen = next(room for room in request["graph"]["rooms"] if room["id"] == "room_kitchen")
+    assert kitchen["anchor_objects"] == [{"type": "refrigerator"}]
+    assert "target_plausibility" not in kitchen
+    assert request["graph"]["portals"] == [
         {
             "id": "portal_kitchen_bedroom",
             "type": "portal",
             "state": "open",
             "interaction_available": True,
             "connects": ["room_kitchen", "room_bedroom"],
+            "center_xy": None,
         }
     ]
     stages = ["1. EVIDENCE", "2. DEPENDENCIES", "3. COMPATIBILITY", "4. PROGRESS", "5. VALIDATE"]
@@ -1103,3 +1280,162 @@ def test_room_object_reasoning_context_caps_observed_graph_evidence() -> None:
     assert len(reasoning["observed_rooms"]) == ROOM_OBJECT_REASONING_MAX_ROOMS
     assert len(reasoning["observed_portals"]) == ROOM_OBJECT_REASONING_MAX_PORTALS
     assert len(reasoning["observed_containers"]) == ROOM_OBJECT_REASONING_MAX_CONTAINERS
+
+
+def test_public_context_keeps_full_structural_graph_geometry_and_unknown_frontiers() -> None:
+    graph = {
+        "frame_id": "map", "graph_revision": 42, "capture_step": 100,
+        "nodes": [{"id": f"object_{i}", "type": "object", "label": "apple"} for i in range(90)] + [
+            {
+                "id": "room_1", "type": "room", "room_id": 1,
+                "centroid": [2, 3, 0], "aabb_center": [3, 3, 0], "aabb_size": [8, 6, 1],
+                "attributes": {"room_attribute": "kitchen", "room_attribute_source": "mllm_room_attribute_inference", "room_attribute_confidence": 0.9, "room_attribute_scores": {"kitchen": 2}},
+            },
+            {"id": "room_2", "type": "room"},
+            {"id": "portal_1", "type": "portal", "centroid": [6, 3, 1]},
+            {"id": "container_1", "type": "container", "label": "refrigerator", "room_id": 1},
+            {"id": "toilet_memory", "type": "object", "label": "toilet", "centroid": [15, 5, 0], "observation_count": 2, "is_currently_visible": False, "attributes": {"last_observation_frame_index": 19, "max_visible_pixels": 12}},
+        ],
+    }
+    compact = compact_semantic_graph(graph, {
+        "robot_xy": [2, 3], "room_frontier_lengths": {"room_1": 1.2},
+        "observed_room_frontier_lengths": {"room_1": 3.4},
+    }, max_nodes=1)
+    room = compact["rooms"][0]
+    assert len(compact["rooms"]) == 2
+    assert room["centroid_xy"] == [2, 3]
+    assert room["aabb_center_xy"] == [3, 3]
+    assert room["aabb_size_xy"] == [8, 6]
+    assert room["eligible_frontier_length_m"] == 1.2
+    assert room["observed_frontier_length_m"] == 3.4
+    assert compact["rooms"][1]["eligible_frontier_length_m"] is None
+    assert room["room_attribute_source"] == "mllm_room_attribute_inference"
+    assert "room_attribute_scores" not in room
+    assert room["anchor_objects"] == [{"type": "refrigerator"}]
+    assert compact["portals"][0]["center_xy"] == [6, 3]
+    memory = compact["remembered_objects_without_room"][0]
+    assert memory["observed_xy"] == [15, 5]
+    assert memory["observation_count"] == 2
+    assert memory["last_observation_frame_index"] == 19
+    assert "visible" not in memory
+    assert compact["graph_revision"] == 42
+    assert compact["frame_id"] == "map"
+
+
+def test_robot_context_keeps_revisits_and_thirty_actual_decisions() -> None:
+    history = [{"decision_id": f"d{i}", "step": i} for i in range(40)]
+    visits = [{"room_id": room, "entry_step": step, "entry_xy": [step, 0]} for step, room in enumerate([1, 2, 1])]
+    request = ModelPolicyClient().build_request(
+        [make_candidate("frontier", 0, 1)], {}, {},
+        {"robot_xy": [4, 5], "initial_xy": [1, 2], "initial_position_source": {"kind": "first_candidate_observation", "observation_step": 0}, "room_visit_history": visits, "decision_history": history},
+    )
+    assert request["robot"]["initial_xy"] == [1, 2]
+    assert request["robot"]["current_xy"] == [4, 5]
+    assert request["robot"]["position_frame_id"] is None
+    assert [v["room_id"] for v in request["robot"]["room_visit_history"]] == ["room_1", "room_2", "room_1"]
+    assert request["recent_decisions"] == history[-30:]
+
+
+def test_pre_score_ablation_never_restores_semantic_guesses() -> None:
+    candidate = make_candidate("frontier", 0, 1)
+    candidate.metadata.update({"room_target_affinity": 1, "room_target_affinity_reason": "room_target_semantic_match"})
+    context = {
+        "candidate_pre_scores": {"frontier": 3},
+        "candidate_pre_score_terms": {"frontier": {"distance": -1}},
+        "candidate_decision_hints": {"frontier": "PLAUSIBLE_TARGET_CONTAINER"},
+    }
+    requests = [ModelPolicyClient(ModelPolicyConfig(include_pre_scores=enabled)).build_request([candidate], {"enabled": True, "target_name": "toilet"}, {}, context) for enabled in (False, True)]
+    assert requests[0]["instruction"] == requests[1]["instruction"]
+    for request in requests:
+        option = request["candidates"][0]
+        assert "room_target_affinity" not in option
+        assert "room_target_affinity_reason" not in option
+        assert "decision_hint" not in option
+        assert request["room_object_reasoning"] == {}
+    assert "pre_score" not in requests[0]["candidates"][0]
+    assert requests[1]["candidates"][0]["pre_score"] == 3
+    context["candidate_decision_hints"]["frontier"] = "NEW_ROOM_FRONTIER_HIGH_CONFIDENCE_MISMATCH"
+    candidate.metadata["room_status"] = "unentered_high_confidence_mismatch"
+    option = ModelPolicyClient().build_request([candidate], {}, {}, context)["candidates"][0]
+    assert option["decision_hint"] == "NEW_ROOM_FRONTIER"
+    assert option["room_status"] == "unentered_new_room"
+
+
+def test_metrics_freeze_exact_public_request_before_network(monkeypatch) -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="http"))
+    payload = client.build_request([make_candidate("frontier", 0, 1)], {}, {})
+    captured = {}
+    def fake_request(payload_arg, metrics_context=None):
+        captured.update(metrics_context)
+        payload_arg["robot"]["current_xy"] = [99, 99]
+        return {"ranked_ids": ["frontier"]}
+    monkeypatch.setattr(client, "_request_http", fake_request)
+    client._request(payload, metrics_context={"candidate_sequence": 3})
+    assert captured["public_request"]["robot"]["current_xy"] is None
+    assert captured["public_request"]["instruction"] == payload["instruction"]
+    assert captured["request_started_ts"] > 0
+    assert captured["candidate_sequence"] == 3
+
+
+def test_online_graph_snapshot_keeps_geometry_after_eighty_objects_and_redacts_private_fields():
+    graph = {
+        "frame_id": "map", "capture_step": 21,
+        "nodes": [{"id": f"o{i}", "type": "object", "label": "apple"} for i in range(90)] + [
+            {"id": "room_1", "type": "room", "room_id": 1, "centroid": [0, 0, 0], "aabb_center": [0, 0, 0], "aabb_size": [4, 4, 1], "attributes": {"room_attribute": "kitchen", "room_attribute_confidence": 0.9, "room_attribute_source": "mllm", "private_gt": "secret"}},
+            {"id": "portal_gt_door_1", "type": "portal", "label": "private_doorframe", "centroid": [1, 0, 0], "attributes": {"instance_id": "door_1", "source_object_name": "secret"}},
+            *[{"id": f"fridge{i}", "type": "object", "label": "refrigerator", "room_id": 1, "aabb_size": [2, 2, 2]} for i in range(7)],
+            {"id": "tv", "type": "object", "label": "tv", "room_id": 1},
+        ],
+    }
+    snapshot = public_decision_graph_context(graph)
+    request = ModelPolicyClient().build_request([make_candidate("frontier", 0, 1)], {}, snapshot, {"robot_xy": [0, 0]})
+    public_graph = request["graph"]
+    assert public_graph["current_room"] == "room_1"
+    assert public_graph["rooms"][0]["aabb_size_xy"] == [4, 4]
+    assert public_graph["rooms"][0]["room_attribute_source"] == "mllm"
+    assert public_graph["rooms"][0]["anchor_objects"] == [{"type": "refrigerator"}, {"type": "tv"}]
+    assert public_graph["portals"][0]["center_xy"] == [1, 0]
+    assert public_graph["frame_id"] == "map"
+    assert "secret" not in str(snapshot)
+    assert "private_doorframe" not in str(snapshot)
+
+
+def test_unknown_history_metrics_are_not_fabricated_as_zero_and_frontier_scope_survives():
+    candidate = make_candidate("frontier", 0, 1)
+    request = ModelPolicyClient().build_request([candidate], {}, {}, {
+        "candidate_history": {"frontier": {"selection_count": 2, "last_result": "FAILED", "last_selected_step": 10, "low_gain_repeat_count": None}},
+        "frontier_statistics_source": {"scope": "logged_raw_candidate_pool_lower_bound", "complete": False},
+    })
+    assert request["candidates"][0]["history"] == {"selection_count": 2, "last_result": "FAILED"}
+    assert request["graph"]["frontier_statistics"] == {"scope": "logged_raw_candidate_pool_lower_bound", "complete": False}
+    request = ModelPolicyClient().build_request([candidate], {}, {}, {
+        "candidate_history": {"frontier": {"selection_count": 0, "last_selected_steps_ago": 0, "low_gain_repeat_count": 0, "last_frontier_shrink_m": 0}},
+    })
+    assert request["candidates"][0]["history"]["last_frontier_shrink_m"] == 0
+    assert request["candidates"][0]["history"]["low_gain_repeat_count"] == 0
+
+
+@pytest.mark.parametrize("graph_xy, expected_room", [([8, -2], "room_2"), (None, None)])
+def test_online_graph_pose_controls_robot_room_without_changing_candidate_target_room(graph_xy, expected_room):
+    graph = {"frame_id": "map", "nodes": [
+        {"id": "room_1", "type": "room", "aabb_center": [1, 2, 0], "aabb_size": [2, 2, 1]},
+        {"id": "room_2", "type": "room", "aabb_center": [8, -2, 0], "aabb_size": [2, 2, 1]},
+    ]}
+    candidate = make_candidate("frontier", 0, 1)
+    candidate.metadata.update(robot_room_id=1, target_room_id=1)
+    request = ModelPolicyClient().build_request([candidate], {}, graph, {
+        "robot_xy": [1, 2], "position_frame_id": "odom", "robot_graph_xy": graph_xy,
+        "robot_graph_frame_id": "map", "robot_graph_pose_source": {"source_xy": [1, 2], "source_frame_id": "odom"},
+    })
+    assert request["robot"].get("current_room") == expected_room
+    assert request["robot"]["current_xy"] == graph_xy
+    assert request["candidates"][0].get("robot_room_id") == expected_room
+    assert request["candidates"][0]["room_id"] == "room_1"
+    assert candidate.metadata["robot_room_id"] == 1
+
+
+def test_explicit_conflicting_frames_without_transform_have_no_robot_room():
+    graph = {"frame_id": "map", "nodes": [{"id": "room_1", "type": "room", "aabb_center": [0, 0, 0], "aabb_size": [2, 2, 1]}]}
+    request = ModelPolicyClient().build_request([make_candidate("frontier", 0, 1)], {}, graph, {"robot_xy": [0, 0], "position_frame_id": "odom"})
+    assert "current_room" not in request["robot"]
+    assert "current_room" not in request["graph"]

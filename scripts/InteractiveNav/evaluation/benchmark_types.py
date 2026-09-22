@@ -184,6 +184,18 @@ class EpisodeResult:
     goal_definition_relaxed_success: bool = False
     goal_definition_relaxed_instance_id: str | None = None
     goal_definition_relaxed_reason: str | None = None
+    # Layered goal semantics.  Exact/category/contract/interactive answers are
+    # deliberately independent so a nearby same-category observation cannot
+    # erase a missing fridge/drawer interaction.  Legacy episodes without a
+    # frozen candidate contract can still report category success; contract
+    # promotion then remains false until a private post-hoc audit proves it.
+    goal_metric_protocol: str = "interactive_nav_goal_equivalence_v2"
+    exact_instance_success: bool = False
+    category_goal_success: bool = False
+    interaction_contract_goal_success: bool = False
+    interactive_episode_success: bool = False
+    category_goal_instance_id: str | None = None
+    goal_success_layers: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -336,6 +336,8 @@ class ExplorePyNode:
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
+        self.frontier_computed_ts = None
+        self.frontier_computed_frame_id = None
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
@@ -461,6 +463,8 @@ class ExplorePyNode:
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
+        self.frontier_computed_ts = None
+        self.frontier_computed_frame_id = None
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
@@ -950,6 +954,8 @@ class ExplorePyNode:
         )
         self.state.update_seen_clusters(clusters)
         self.latest_clusters = clusters
+        self.frontier_computed_ts = time.time()
+        self.frontier_computed_frame_id = self.latest_grid.spec.frame_id
         if not clusters:
             if publish_selection:
                 self.last_selected_cluster = None
@@ -965,6 +971,9 @@ class ExplorePyNode:
 
     def build_status_payload(self):
         payload = {
+            "timestamp": time.time(),
+            "frame_id": getattr(self, "frontier_computed_frame_id", None),
+            "frontier_computed_ts": getattr(self, "frontier_computed_ts", None),
             "ready": self.latest_grid is not None and self.robot_xy is not None,
             "external_behavior_control": self.external_behavior_control,
             "initial_scan_complete": self.initial_spin_done,

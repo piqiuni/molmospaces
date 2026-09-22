@@ -570,6 +570,10 @@ def test_round_summary_merges_batch_manifest_latest_attempt_and_runtime_diagnost
     assert completed_row["outcomes"] == {
         "task_success": True,
         "nav_success": True,
+        "exact_instance_success": True,
+        "category_goal_success": True,
+        "interaction_contract_goal_success": True,
+        "interactive_episode_success": True,
         "required_interaction_success": True,
         "sequence_success": True,
     }

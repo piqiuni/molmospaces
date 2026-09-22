@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import math
+import os
 from typing import Any, Callable, Mapping
 
 import mujoco
@@ -24,6 +25,13 @@ class ForceDriveConfig:
     slide_max_effort: float = 160.0
     open_fraction_threshold: float = 0.67
     assume_success: bool = True
+    # Opt in while comparing against the same code with legacy callback timing.
+    coalesce_robot_lock: bool = os.environ.get("INTERACTIVE_NAV_COALESCE_ROBOT_LOCK") == "1"
+    intermediate_position_only: bool = os.environ.get("INTERACTIVE_NAV_INTERMEDIATE_POSITION_ONLY") == "1"
+    position_only_settle: bool = False
+    # Diagnostic replay: preserve a recorded drive duration despite a new dt.
+    replay_duration_seconds: float | None = None
+    replay_stable_seconds: float | None = None
 
 
 class ForceInteractionError(RuntimeError):
@@ -1048,6 +1056,16 @@ def advance_articulation_force(
         ),
         assume_success=False,
     )
+    position_only = bool(
+        config.intermediate_position_only and 0.0 < alpha < 1.0
+        and all(env.current_model.joint(name).type[0] == mujoco.mjtJoint.mjJNT_SLIDE
+                for name in targets)
+    )
+    if position_only:
+        # These waypoints are traversed, not observed endpoints. Keep the same
+        # position tolerance and budget; do not wait for velocity to settle.
+        # The driver already zeros commanded joint velocities on return.
+        step_config = replace(step_config, position_only_settle=True)
     drive = drive_joint_group_to_targets(
         env.current_model,
         env.current_data,
@@ -1070,6 +1088,8 @@ def advance_articulation_force(
         "targets": targets,
         "physics_substeps": int(drive.get("physics_substeps", 0)),
         "fallback": fallback,
+        "position_only_settle": position_only,
+        "position_only_contact_guarded": bool(drive.get("position_only_contact_guarded", False)),
         "joint_infos": _joint_infos_for_group(
             env.current_model, env.current_data, list(plan["group"]["joints"])
         ),
@@ -1434,12 +1454,29 @@ def drive_joint_group_to_targets(
     initial_contacts = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
     max_contact_count = int(initial_contacts["count"])
     minimum_contact_distance = initial_contacts["minimum_distance"]
+    original_timestep = float(model.opt.timestep)
+    replay_duration = config.replay_duration_seconds
+    if replay_duration is not None and (not math.isfinite(replay_duration) or replay_duration <= 0):
+        raise ValueError("Replay duration must be finite and positive")
+    if config.replay_stable_seconds is not None and (
+        not math.isfinite(config.replay_stable_seconds) or config.replay_stable_seconds <= 0
+    ):
+        raise ValueError("Replay stability duration must be finite and positive")
+    drive_steps = (max(1, int(config.max_physics_substeps)) if replay_duration is None
+                   else max(1, int(math.ceil(replay_duration / original_timestep - 1e-10))))
+    start_sim_time = float(data.time)
+    stable_seconds = 0.0
     try:
-        for substep in range(max(1, int(config.max_physics_substeps))):
-            if robot_lock_callback is not None:
+        for substep in range(drive_steps):
+            if replay_duration is not None:
+                model.opt.timestep = min(original_timestep, replay_duration - substep * original_timestep)
+            # The previous iteration already restored the robot and refreshed
+            # derived state after mj_step. Only read-only checks intervene.
+            if robot_lock_callback is not None and (substep == 0 or not config.coalesce_robot_lock):
                 robot_lock_callback()
             data.xfrc_applied[:, :] = 0.0
-            all_stable = True
+            positions_stable = True
+            velocities_stable = True
             for spec in specs:
                 current = float(data.qpos[spec["qpos_addr"]])
                 velocity = float(data.qvel[spec["dof_addr"]])
@@ -1454,10 +1491,8 @@ def drive_joint_group_to_targets(
                     data.xfrc_applied[spec["body_id"], :3] += world_axis * effort
                 else:
                     data.xfrc_applied[spec["body_id"], 3:] += world_axis * effort
-                all_stable = all_stable and (
-                    abs(error) <= config.position_tolerance
-                    and abs(velocity) <= config.velocity_tolerance
-                )
+                positions_stable = positions_stable and abs(error) <= config.position_tolerance
+                velocities_stable = velocities_stable and abs(velocity) <= config.velocity_tolerance
             mujoco.mj_step(model, data)
             if robot_lock_callback is not None:
                 robot_lock_callback()
@@ -1471,14 +1506,26 @@ def drive_joint_group_to_targets(
                     if minimum_contact_distance is None
                     else min(minimum_contact_distance, contact_distance)
                 )
+            # Any robot/target contact latches the conservative settle rule for
+            # this entire drive, including contacts first created by this step.
+            position_only = config.position_only_settle and max_contact_count == 0
+            all_stable = positions_stable and (position_only or velocities_stable)
             if all_stable:
                 stable_substeps += 1
-                if stable_substeps >= max(1, int(config.stable_substeps)):
+                stable_seconds += float(model.opt.timestep)
+                required_stable = 1 if position_only else max(1, int(config.stable_substeps))
+                enough_stability = (stable_substeps >= required_stable if config.replay_stable_seconds is None
+                                    else stable_seconds + 1e-12 >= config.replay_stable_seconds)
+                if enough_stability:
                     reached = True
-                    break
+                    if replay_duration is None:
+                        break
             else:
                 stable_substeps = 0
+                stable_seconds = 0.0
+                reached = False
     finally:
+        model.opt.timestep = original_timestep
         data.xfrc_applied[:, :] = 0.0
         for spec in specs:
             data.qvel[spec["dof_addr"]] = 0.0
@@ -1508,10 +1555,12 @@ def drive_joint_group_to_targets(
         "method": "xfrc_applied_group_pd",
         "success": bool(reached),
         "physics_substeps": int(completed_substeps),
+        "simulated_seconds": float(data.time) - start_sim_time,
         "stable_substeps": int(stable_substeps),
         "robot_target_contacts_before": initial_contacts,
         "robot_target_contacts_after": final_contacts,
         "robot_target_max_contact_count": int(max_contact_count),
+        "position_only_contact_guarded": bool(config.position_only_settle and max_contact_count > 0),
         "robot_target_min_contact_distance": minimum_contact_distance,
         "joints": joints,
         "config": asdict(config),

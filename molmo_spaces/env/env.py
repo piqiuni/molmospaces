@@ -150,6 +150,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         mj_model: MjModel,
         mj_base_scene_path: str,
         parallelize: bool = True,
+        pre_settle_initializer: Callable[[MjData], None] | None = None,
     ) -> None:
         super().__init__(exp_config, mj_model)
 
@@ -157,6 +158,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         self._robot_factory = robot_factory
         self._n_batch = exp_config.task_sampler_config.task_batch_size
         self._parallelize = parallelize
+        self._pre_settle_initializer = pre_settle_initializer
 
         # Initialize empty - will be populated when scene is loaded
         self._mj_datas = None
@@ -195,6 +197,8 @@ class CPUMujocoEnv(BaseMujocoEnv):
         # data for each batch
         self._mj_datas = [MjData(mj_model) for _ in range(self._n_batch)]
         for mj_data in self._mj_datas:
+            if self._pre_settle_initializer is not None:
+                self._pre_settle_initializer(mj_data)
             mujoco.mj_forward(mj_model, mj_data)
             for _ in range(
                 self.config.task_sampler_config.sim_settle_timesteps

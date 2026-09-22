@@ -75,6 +75,12 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
     "VIDEO_FPS": "15",
     "RECORD_HEAD_CAMERA": "false",
     "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS": "384",
+    # M2 candidate selection is text-only and has an independent bounded
+    # timeout/retry contract.  A caller can override these with exported
+    # SEMANTIC_M2_* values or in the selected dotenv file.
+    "SEMANTIC_M2_TIMEOUT_S": "30.0",
+    "SEMANTIC_M2_TIMEOUT_RETRY_COUNT": "1",
+    "SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S": "1.0",
     "ROS_ACTION_TIMEOUT_S": "0.2",
     "ROS_STEP_READY_BARRIER_ENABLED": "true",
     "ROS_STEP_READY_TOPIC": "/semantic_decision/step_ready",
@@ -188,6 +194,12 @@ EPISODE_RESULT_SUMMARY_FIELDS = (
     "goal_definition_relaxed_success",
     "goal_definition_relaxed_instance_id",
     "goal_definition_relaxed_reason",
+    "exact_instance_success",
+    "category_goal_success",
+    "interaction_contract_goal_success",
+    "interactive_episode_success",
+    "category_goal_instance_id",
+    "goal_success_layers",
     "timing_summary",
 )
 
@@ -240,8 +252,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ros-command-starvation-timeout-s",
         type=float,
-        default=60.0,
-        help="Continuous no-fresh-command wall time before the V3 evaluator stops.",
+        default=90.0,
+        help=(
+            "Continuous no-fresh-command wall time before the V3 evaluator stops. "
+            "The default leaves headroom for one 30 s M2 timeout, 1 s backoff, "
+            "and one bounded retry."
+        ),
     )
     parser.add_argument(
         "--ros-observation-turn-multiplier",
@@ -603,9 +619,11 @@ def derive_episode_model_env_file(
 ) -> Path:
     """Copy the local model config and append an episode-specific endpoint.
 
-    ``python-dotenv`` loads this file with ``override=True`` in the semantic
-    stack, so the final setting wins without replacing the model name, timeout,
-    or any local-only configuration in the source file.
+    The semantic stack loads this file with ``override=True``, so the final
+    endpoint wins without replacing the model name, shared timeout, M2-only
+    timeout/retry settings, or any local-only configuration in the source file.
+    The launcher supplies 30 s / one retry / 1 s backoff defaults when the
+    source file leaves the M2 keys unset.
     """
 
     source_text = source_env_file.read_text(encoding="utf-8")
@@ -1573,6 +1591,33 @@ def numeric_mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _summary_layer_success(
+    row: Mapping[str, Any],
+    key: str,
+    *fallback_keys: str,
+    fallback_requires_nav: bool = False,
+) -> bool:
+    """Read a layered outcome while tolerating pre-layer/partial summaries.
+
+    Result writers before the goal-equivalence protocol did not emit the four
+    layer fields, and a few interrupted writers emitted them as ``null``.  A
+    null is therefore treated like an absent field, while an explicit Boolean
+    remains authoritative.  Legacy ``success`` can be stale after a failed
+    navigation claim, so the Interactive fallback is additionally gated by
+    ``nav_success`` when that field is explicitly false.
+    """
+
+    value = row.get(key)
+    if value is None:
+        for fallback_key in fallback_keys:
+            value = row.get(fallback_key)
+            if value is not None:
+                break
+        if fallback_requires_nav and row.get("nav_success") is False:
+            value = False
+    return bool(value) if value is not None else False
+
+
 def missing_plan_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any]:
     """Represent a planned episode whose worker never reported a wrapper result."""
 
@@ -1657,6 +1702,30 @@ def write_summary(
         "goal_definition_relaxed_success_count": sum(
             bool(row.get("goal_definition_relaxed_success")) for row in completed
         ),
+        "exact_instance_success_count": sum(
+            _summary_layer_success(row, "exact_instance_success", "nav_success")
+            for row in completed
+        ),
+        "category_goal_success_count": sum(
+            _summary_layer_success(row, "category_goal_success", "nav_success")
+            for row in completed
+        ),
+        "interaction_contract_goal_success_count": sum(
+            _summary_layer_success(
+                row, "interaction_contract_goal_success", "nav_success"
+            )
+            for row in completed
+        ),
+        "interactive_episode_success_count": sum(
+            _summary_layer_success(
+                row,
+                "interactive_episode_success",
+                "interaction_conditioned_success",
+                "success",
+                fallback_requires_nav=True,
+            )
+            for row in completed
+        ),
         "mean_runner_elapsed_sec": numeric_mean(completed, "elapsed_sec"),
         "mean_evaluator_elapsed_sec": numeric_mean(completed, "elapsed_seconds"),
         "mean_step_count": numeric_mean(completed, "step_count"),
@@ -1730,6 +1799,10 @@ def write_summary(
         "nav_success",
         "required_interaction_success",
         "goal_definition_relaxed_success",
+        "exact_instance_success",
+        "category_goal_success",
+        "interaction_contract_goal_success",
+        "interactive_episode_success",
         "terminal_reason",
         "step_count",
         "interaction_action_count",

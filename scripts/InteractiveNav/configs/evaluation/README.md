@@ -62,7 +62,8 @@ interaction or public perception. Recording remains 15 FPS with exact steps.
 M2 settings live in `../semantic_decision/object_goal_v3_full_mllm.yaml`:
 `model.selection_reasoning_effort=low` overrides the shared `.env` reasoning
 default for M2 only; `model.max_tokens=1536` includes reasoning and final JSON,
-and the request timeout stays 12 seconds. The prompt follows evidence,
+and the request timeout is 30 seconds with one timeout-only retry after a
+1-second backoff (worst-case request wait about 61 seconds). The prompt follows evidence,
 dependencies, compatibility, progress and final validation. Only the final
 ranking JSON is consumed. Backend reasoning support must be checked separately;
 requesting it does not prove that the server produced reasoning tokens.

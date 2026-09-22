@@ -620,7 +620,8 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
                         f"data_split={self.episode_spec.data_split}."
                     )
                     continue
-                pos_close = np.allclose(body.position, pose[0:3], atol=1e-3)
+                # World-coordinate magnitude must not loosen the 1 mm replay tolerance.
+                pos_close = np.allclose(body.position, pose[0:3], atol=1e-3, rtol=0.0)
                 orn_diff = R.from_quat(body.quat).inv() * R.from_quat(pose[3:7])
                 orn_close = orn_diff.magnitude() < 1e-2
 

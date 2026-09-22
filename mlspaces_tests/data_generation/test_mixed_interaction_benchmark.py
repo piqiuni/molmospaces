@@ -356,6 +356,50 @@ def test_unified_validator_accepts_production_mixed_and_preserves_minimal_true()
     ] is True
 
 
+def test_identity_contract_can_group_same_container_targets() -> None:
+    episode = production_mixed_example()
+    payload = episode["interactive_nav"]
+    target = payload["target"]
+    target["identity_contract"] = {
+        "mode": "interaction_contract_any",
+        "instruction_consistent_candidates": [
+            "pencil_target_29_0", "pencil_same_container_29_1",
+        ],
+        "contract_candidates": [
+            "pencil_target_29_0", "pencil_same_container_29_1",
+        ],
+        "cross_contract_distractors": [],
+    }
+    payload["oracle_plan"]["terminal_target_instances"] = [
+        "pencil_target_29_0", "pencil_same_container_29_1",
+    ]
+    payload["oracle_plans"][0]["terminal_target_instances"] = [
+        "pencil_target_29_0", "pencil_same_container_29_1",
+    ]
+
+    validated = v3.validate_mixed_v3_episode(episode)
+
+    assert validated["interactive_nav"]["target"]["identity_contract"][
+        "contract_candidates"
+    ] == ["pencil_target_29_0", "pencil_same_container_29_1"]
+
+
+def test_identity_contract_requires_candidate_specific_terminal_plans() -> None:
+    episode = production_mixed_example()
+    payload = episode["interactive_nav"]
+    payload["target"]["identity_contract"] = {
+        "mode": "interaction_contract_any",
+        "instruction_consistent_candidates": [
+            "pencil_target_29_0", "pencil_same_room_29_1",
+        ],
+        "contract_candidates": ["pencil_target_29_0"],
+        "cross_contract_distractors": ["pencil_same_room_29_1"],
+    }
+
+    with pytest.raises(ValueError, match="terminal_target_instances"):
+        v3.validate_mixed_v3_episode(episode)
+
+
 def test_mixed_validator_rejects_path_that_does_not_cross_required_door() -> None:
     episode = production_mixed_example()
     episode["interactive_nav"]["generation_validation"]["navigation_validation"][
