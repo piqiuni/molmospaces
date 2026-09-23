@@ -16,7 +16,7 @@ import threading
 import time
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from eval_qwen_service import QwenService, endpoint_for_port, visible_devices
+from eval_qwen_service import QwenLBService, QwenService, endpoint_for_port, visible_devices
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO / "scripts/InteractiveNav/configs/evaluation/benchmark_batch.json"
@@ -39,12 +39,19 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
     indices = config.get("episode_indices")
     if indices is None:
         episode_stride = int(config.get("episode_stride", 1))
+        episode_stride_offset = int(config.get("episode_stride_offset", 0))
         if episode_stride < 1:
             raise ValueError("episode_stride must be positive")
+        if not 0 <= episode_stride_offset < episode_stride:
+            raise ValueError("episode_stride_offset must be within episode_stride")
         indices = [
             i
             for lo, hi in config["episode_ranges"]
-            for i in range(lo, hi + 1, episode_stride)
+            for i in range(
+                lo + ((episode_stride_offset - lo) % episode_stride),
+                hi + 1,
+                episode_stride,
+            )
         ]
     if not indices or len(indices) != len(set(indices)):
         raise ValueError("episode_ranges must be nonempty and must not overlap")
@@ -65,6 +72,62 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
     if config.get("resume", False):
         command += ["--resume"]
     return command + ["--resource-telemetry", "--allow-failures"], indices
+
+
+def check_mujoco_gpu_inventory(config: dict, environment=None) -> list[str] | None:
+    """Validate the EGL assignment against the GPUs present at launch time.
+
+    Shared-Qwen experiments do not pass ``--start-qwen`` and therefore used to
+    skip the only GPU discovery performed by this launcher.  A stale static
+    device list could consequently start a full comparison with all simulators
+    on two cards while Qwen occupied all four.  GPU-bound configs are checked by
+    default; ``check_mujoco_gpu_inventory: false`` can be used only for a
+    deliberately device-less/externally managed run.  Configs can optionally
+    require a minimum card count.  The resolved inventory is persisted in
+    ``launch_config.json`` below.
+    """
+    check = config.get("check_mujoco_gpu_inventory")
+    if check is None:
+        check = bool(config.get("mujoco_egl_devices"))
+    if not check:
+        return None
+    devices = [str(device) for device in visible_devices(environment or os.environ)]
+    required = int(config.get("required_mujoco_gpu_count", 0))
+    if config.get("auto_assign_mujoco_egl_devices", False):
+        requested = list(devices)
+        config["mujoco_egl_devices"] = requested
+    else:
+        requested = [str(device) for device in config.get("mujoco_egl_devices", [])]
+    if required < 0:
+        raise ValueError("required_mujoco_gpu_count must be non-negative")
+    if required and len(devices) < required:
+        raise RuntimeError(
+            f"Need at least {required} visible GPUs for MuJoCo EGL, found {devices}"
+        )
+    if not requested:
+        raise RuntimeError("GPU inventory check requires mujoco_egl_devices")
+    missing = [device for device in requested if device not in devices]
+    if missing:
+        raise RuntimeError(
+            f"Configured MuJoCo EGL GPU IDs {missing} are not available; "
+            f"visible GPUs are {devices}"
+        )
+    if required and len(set(requested)) < required:
+        raise RuntimeError(
+            f"Configured MuJoCo EGL assignment uses {sorted(set(requested))}, "
+            f"but {required} unique GPUs are required"
+        )
+    config["gpu_preflight"] = {
+        "visible_devices": devices,
+        "requested_mujoco_egl_devices": requested,
+        "required_mujoco_gpu_count": required,
+        "worker_count": int(config.get("workers", 0)),
+        "workers_per_gpu_if_even": (
+            int(config.get("workers", 0)) / len(set(requested))
+            if requested else None
+        ),
+    }
+    return devices
 
 
 def progress(output: Path, indices: list[int], started: float) -> str:
@@ -286,18 +349,26 @@ def main() -> int:
     if retry_rounds < 0:
         parser.error("--retry-rounds must be non-negative")
     start_qwen = args.start_qwen or config.get("start_qwen", False)
+    qwen_mode = config.get("qwen_service_mode", "single")
+    if qwen_mode not in ("single", "lb"):
+        parser.error(f"unknown qwen_service_mode: {qwen_mode}")
     if start_qwen:
         devices = visible_devices(os.environ)
-        qwen_port = int(os.environ.get("QWEN36_PORT", "8000"))
-        # One API endpoint is backed by one vLLM instance. vLLM's internal
-        # DP/TP scheduler owns all visible GPUs; the eval client does no LB.
+        qwen_port = (int(os.environ.get("QWEN36_LB_PORT", "8010")) if qwen_mode == "lb"
+                     else int(os.environ.get("QWEN36_PORT", "8000")))
         config["model_endpoints"] = [endpoint_for_port(qwen_port)]
         if not args.dry_run:
-            config["mujoco_egl_devices"] = list(range(len(devices)))
+            # Keep the physical IDs returned by NVML; they need not be a
+            # contiguous range when CUDA_VISIBLE_DEVICES selects a subset.
+            config["mujoco_egl_devices"] = list(devices)
     for key in ("workers", "max_steps", "episode_indices", "recording"):
         value = getattr(args, key)
         if value is not None:
             config[key] = value
+    # Shared-Qwen runs normally do not enter QwenService.start(), so perform
+    # the explicit GPU preflight before constructing the simulator command.
+    # This is intentionally opt-in to preserve single-GPU and CPU-only configs.
+    check_mujoco_gpu_inventory(config, os.environ)
     name = datetime.datetime.now().strftime("eval-%Y%m%d_%H%M%S_%f")
     output = (args.output_dir or Path(config["output_root"]) / name).resolve()
     command, indices = build_command(config, output)
@@ -340,11 +411,27 @@ def main() -> int:
           "[eval] Ctrl+C 停止并清理本轮任务；详细日志见各场景 attempt 目录。", flush=True)
     started = time.monotonic()
     process = None
-    service = QwenService(output, environment, port=int(os.environ.get("QWEN36_PORT", "8000"))) if start_qwen else None
+    service_class = QwenLBService if qwen_mode == "lb" else QwenService
+    service = service_class(
+        output,
+        environment,
+        **({"lb_port": qwen_port,
+            "backend_ports": (
+                tuple(int(port.strip()) for port in os.environ["QWEN36_BACKEND_PORTS"].split(","))
+                if os.environ.get("QWEN36_BACKEND_PORTS")
+                else (int(os.environ.get("QWEN36_GPU0_PORT", "8000")),
+                      int(os.environ.get("QWEN36_GPU1_PORT", "8001")))
+            )}
+           if qwen_mode == "lb" else {"port": qwen_port}),
+        target_concurrency=config["workers"],
+    ) if start_qwen else None
     returncode = 1
     try:
         if service:
-            print("[eval] 启动单实例 Qwen 服务；所有可见 GPU 由同一个 vLLM API 内部调度，统一入口 8000。", flush=True)
+            if qwen_mode == "lb":
+                print(f"[eval] 启动每卡一个单卡 Qwen 和 least-inflight LB；统一入口 {qwen_port}。", flush=True)
+            else:
+                print("[eval] 启动单实例 Qwen 服务；所有可见 GPU 由同一个 vLLM API 内部调度，统一入口 8000。", flush=True)
             service.start(stop)
         with (output / "batch.log").open("ab" if resume else "wb") as log:
             for round_index in range(retry_rounds + 1):

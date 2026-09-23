@@ -78,10 +78,10 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
     # M2 candidate selection is text-only and has an independent bounded
     # timeout/retry contract.  A caller can override these with exported
     # SEMANTIC_M2_* values or in the selected dotenv file.
-    "SEMANTIC_M2_TIMEOUT_S": "30.0",
+    "SEMANTIC_M2_TIMEOUT_S": "12.0",
     "SEMANTIC_M2_TIMEOUT_RETRY_COUNT": "1",
     "SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S": "1.0",
-    "ROS_ACTION_TIMEOUT_S": "0.2",
+    "ROS_ACTION_TIMEOUT_S": "0.4",
     "ROS_STEP_READY_BARRIER_ENABLED": "true",
     "ROS_STEP_READY_TOPIC": "/semantic_decision/step_ready",
     "ROS_STEP_READY_WARMUP_SKIP_FRAMES": "0",
@@ -129,6 +129,7 @@ _V3_EVALUATOR_PROTOCOL_FILES = (
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "goal_status.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "ros_policy_termination.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "trusted_interaction_skill.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "scene_distractor_filter.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_runtime.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_bridge.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "container_scene_probe.py",
@@ -246,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semantic-attribute-request-timeout-s",
         type=float,
-        default=30.0,
+        default=15.0,
         help="M1 request timeout forwarded to each V3 runner; independent of M2/M3.",
     )
     parser.add_argument(
@@ -255,7 +256,7 @@ def parse_args() -> argparse.Namespace:
         default=90.0,
         help=(
             "Continuous no-fresh-command wall time before the V3 evaluator stops. "
-            "The default leaves headroom for one 30 s M2 timeout, 1 s backoff, "
+            "The default leaves headroom for one 12 s M2 timeout, 1 s backoff, "
             "and one bounded retry."
         ),
     )
@@ -622,7 +623,7 @@ def derive_episode_model_env_file(
     The semantic stack loads this file with ``override=True``, so the final
     endpoint wins without replacing the model name, shared timeout, M2-only
     timeout/retry settings, or any local-only configuration in the source file.
-    The launcher supplies 30 s / one retry / 1 s backoff defaults when the
+    The launcher supplies 12 s / one retry / 1 s backoff defaults when the
     source file leaves the M2 keys unset.
     """
 

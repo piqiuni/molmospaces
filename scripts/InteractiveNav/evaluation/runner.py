@@ -47,6 +47,7 @@ from .metrics import (
     target_metrics,
 )
 from .policies import MolmoSpacesPolicyAdapter, ScriptedOraclePolicy, build_builtin_policy
+from .scene_distractor_filter import apply_same_category_distractor_filter
 from .types import EpisodeResult, InteractionRecord, PolicyAction, PolicyObservation
 
 
@@ -67,11 +68,12 @@ class EvaluationConfig:
     sim_dt_ms: float = 10.0
     record_video: bool = False
     video_fps: float = 5.0
-    ros_action_timeout_s: float = 0.2
+    ros_action_timeout_s: float = 0.4
     ros_observation_topic: str = "/molmo_spaces/head_camera/image"
     ros_action_topic: str = "/molmo_spaces/action"
     camera_names: list[str] = field(default_factory=lambda: ["head_camera"])
     image_resolution: tuple[int, int] | None = (320, 240)
+    remove_same_category_distractors: bool = True
 
     def validate(self) -> None:
         if self.workers < 1:
@@ -123,9 +125,43 @@ class V3JsonEvalTaskSampler(JsonEvalTaskSampler):
 
     runtime_compatibility: dict[str, Any]
 
-    def __init__(self, exp_config: Any, episode_spec: EpisodeSpec, interactive_nav: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        exp_config: Any,
+        episode_spec: EpisodeSpec,
+        interactive_nav: dict[str, Any],
+        *,
+        remove_same_category_distractors: bool = True,
+    ) -> None:
         self._interactive_nav = interactive_nav
+        self.distractor_filter = apply_same_category_distractor_filter(
+            episode_spec,
+            interactive_nav,
+            enabled=remove_same_category_distractors,
+        )
         super().__init__(exp_config, episode_spec)
+
+    def add_auxiliary_objects(self, spec: Any) -> None:
+        """Remove same-category base bodies, including static target-like bodies."""
+        body_names: set[str] = set()
+        current_body = spec.worldbody.first_body()
+        while current_body is not None:
+            if current_body.name:
+                body_names.add(str(current_body.name))
+            current_body = spec.worldbody.next_body(current_body)
+        extra = apply_same_category_distractor_filter(
+            self.episode_spec,
+            self._interactive_nav,
+            enabled=bool(self.distractor_filter.get("enabled", True)),
+            candidate_names=body_names,
+        )
+        names = sorted(
+            set(self.distractor_filter.get("removed_object_names", []))
+            | set(extra.get("removed_object_names", []))
+        )
+        self.distractor_filter["removed_object_names"] = names
+        self.distractor_filter["removed_object_count"] = len(names)
+        super().add_auxiliary_objects(spec)
 
     def randomize_scene(self, env: Any, robot_view: Any) -> None:
         model = env.current_model
@@ -165,6 +201,7 @@ class V3JsonEvalTaskSampler(JsonEvalTaskSampler):
                 name: pose for name, pose in poses.items() if name in bodies
             }
         self.runtime_compatibility = {
+            "same_category_distractor_filter": self.distractor_filter,
             "runtime_body_count": len(bodies),
             "runtime_joint_count": len(joints),
             "dropped_noncritical_object_pose_count": len(missing_poses),
@@ -405,7 +442,12 @@ def evaluate_episode(
         )
     if config.image_resolution is not None:
         spec.img_resolution = tuple(int(value) for value in config.image_resolution)
-    sampler = V3JsonEvalTaskSampler(replay_config, spec, nav)
+    sampler = V3JsonEvalTaskSampler(
+        replay_config,
+        spec,
+        nav,
+        remove_same_category_distractors=config.remove_same_category_distractors,
+    )
     task = None
     policy = None
     trace: list[dict[str, Any]] = []
@@ -695,7 +737,7 @@ def parse_args() -> EvaluationConfig:
     parser.add_argument("--force-target-fraction", type=float, default=1.0)
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--video-fps", type=float, default=5.0)
-    parser.add_argument("--ros-action-timeout-s", type=float, default=0.2)
+    parser.add_argument("--ros-action-timeout-s", type=float, default=0.4)
     parser.add_argument("--ros-observation-topic", default="/molmo_spaces/head_camera/image")
     parser.add_argument("--ros-action-topic", default="/molmo_spaces/action")
     parser.add_argument(
@@ -712,6 +754,12 @@ def parse_args() -> EvaluationConfig:
         default=[320, 240],
         help="Runtime policy image resolution; use --image-resolution 640 480 to replay the recorded size.",
     )
+    parser.add_argument(
+        "--remove-same-category-distractors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove non-target instances of the target category during episode initialization.",
+    )
     args = parser.parse_args()
     return EvaluationConfig(
         benchmark=args.benchmark, output_dir=args.output_dir, policy=args.policy, workers=args.workers,
@@ -722,6 +770,7 @@ def parse_args() -> EvaluationConfig:
         ros_observation_topic=args.ros_observation_topic, ros_action_topic=args.ros_action_topic,
         camera_names=list(args.camera_names),
         image_resolution=tuple(args.image_resolution),
+        remove_same_category_distractors=args.remove_same_category_distractors,
     )
 
 

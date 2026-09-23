@@ -1,0 +1,54 @@
+\paragraph{Required-interaction completion rate.}
+Let $\mathcal{P}_i$ contain the valid interaction plans of episode $i$,
+$R_{ip}$ the required interaction IDs in plan $p$, and $G_i$ the IDs whose
+expected physical effects were observed. Among episodes with required
+interactions, we report the episode-macro completion fraction
+\begin{equation}
+\mathrm{ISR}_i=\max_{p\in\mathcal{P}_i}\frac{|G_i\cap R_{ip}|}{|R_{ip}|}.
+\end{equation}
+\begin{equation}
+\mathrm{ISR}=\frac{1}{N_{\mathrm{req}}}\sum_{i:\mathrm{required}}\mathrm{ISR}_i.
+\end{equation}
+An episode that completes one of two required effects receives $1/2$ rather
+than zero; the separate full-plan success indicator remains binary. Episodes
+without required interactions do not enter the ISR denominator.
+
+\paragraph{Interaction precision.}
+Let $\mathcal C_i$ be the set of evaluator-private interaction classes
+annotated for episode $i$, where a class consists of an interaction domain
+(channel or container) and an object category. Let $A_i$ denote the number of
+interaction attempts and $V_i^{\mathrm{class}}$ the number of attempts that
+successfully produce a new physical effect on an object in $\mathcal C_i$.
+The object need not be the particular instance in the reference plan. A
+multi-joint interaction counts once per attempt; a failed or effect-free
+repeat does not contribute to $V_i^{\mathrm{class}}$. We define
+\begin{equation}
+\mathrm{IP}_i =
+\begin{cases}
+V_i^{\mathrm{class}}/A_i, & A_i>0,\\
+1, & A_i=0\ \text{and }\texttt{interaction\_requirement}=\texttt{unnecessary},\\
+0, & \text{otherwise},
+\end{cases}
+\qquad
+\mathrm{IP}=\frac{1}{N}\sum_{i=1}^{N}\mathrm{IP}_i.
+\end{equation}
+Interacting with another object during exploration contributes to $A_i$;
+an interaction outside $\mathcal C_i$ receives no IP credit, but is not by
+itself considered an error. IP measures target-class interaction completion
+density, not the optimality of exploration under partial observability.
+
+\paragraph{Total cost.}
+Let $L_i$ be the executed base path length, $E_i$ the number of failed or
+effect-free repeated attempts (counting each attempt once), and $S_i$ the
+reported navigation success indicator (strict by default). Our all-episode cost is
+\begin{equation}
+\mathrm{Cost}_i=L_i+\lambda A_i+\mu E_i+\kappa(1-S_i),
+\qquad
+\mathrm{TotalCost}=\frac{1}{N}\sum_{i=1}^{N}\mathrm{Cost}_i.
+\end{equation}
+We fix $\lambda=0.3$, $\mu=1$, and $\kappa=5$ in the default evaluation
+protocol. Exploration interactions outside $\mathcal C_i$ pay the ordinary
+attempt cost $\lambda$ but are not added to $E_i$ solely for being outside
+the target class. We report success rate alongside cost, since early failures
+may otherwise appear cheap. IP and cost use metric schema v2; the partial-completion ISR uses schema
+v3. ISR values from v2 and v3 must not be pooled without rescoring.

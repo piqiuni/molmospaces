@@ -328,9 +328,9 @@ simulator observation (common step/stamp)
 |------|------|
 | `SR` | 最终任务成功率，沿用 `NavToObj` 的距离阈值加 head-camera 可见性条件 |
 | `SPL` | 成功加权路径效率，失败为 0，成功时按参考路径长度与实际路径长度的比值加权 |
-| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 |
-| `Interaction Precision` | 执行过的交互中，有多少是有效交互 |
-| `Total Cost` | 总代价，首版使用 `path_length + λ * interaction_count` |
+| `Interaction Success Rate` | 逐场景计算必要交互效果完成数 / 必要交互数，再对需要交互的场景平均；多方案取最佳完成比例 |
+| `Interaction Precision` | 全部交互尝试中，完成目标交互对象类别中新效果的比例；同类其他实例也计入 |
+| `Total Cost` | `L_exec + λ*A + μ*E + κ*(1-S)`；`E` 只包含失败或无新效果重复尝试 |
 
 其中 `reachability`、`visibility` 和 `enablement` 是 benchmark 设计与论文叙事中的交互收益类型：
 
@@ -338,7 +338,7 @@ simulator observation (common step/stamp)
 - 容器交互主要体现 `visibility`：打开冰箱、柜门或抽屉后，原本不可见的目标变得可见。
 - 混合交互中的 `enablement` 是中间机制：某个交互不一定直接暴露目标，但会使后续交互或后续导航变得可执行。
 
-这些收益类型不作为主表中的三个独立指标，而作为 `Interaction Success Rate` 的判定依据。报告结果时应按 `all`、`channel`、`container`、`mixed`、`no-interaction` 等 split 展开；无交互样本用于惩罚不必要交互，其 `Interaction Success Rate` 可以记为 `N/A`，但 `Interaction Precision` 和 `Total Cost` 仍然有意义。
+这些收益类型不作为主表中的三个独立指标，而作为 `Interaction Success Rate` 的判定依据。报告结果时应按 `all`、`channel`、`container`、`mixed`、`no-interaction` 等 split 展开；无交互样本用于考察交互克制，其 `Interaction Success Rate` 可以记为 `N/A`。IP 只衡量目标类别交互的完成密度；探索其他对象支付操作成本，但不自动计入 Total Cost 的错误罚分。
 
 ---
 

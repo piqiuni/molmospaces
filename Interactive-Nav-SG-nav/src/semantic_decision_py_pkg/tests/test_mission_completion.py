@@ -772,3 +772,20 @@ def test_visible_arrived_target_requires_live_complete_public_evidence():
                          ("target_goal_distance_m", float("nan"))]:
         invalid = {**candidate, "metadata": {**candidate["metadata"], field: value}}
         assert not TargetMissionTracker.visible_arrived_target(invalid)
+
+
+def test_target_claim_requires_current_perception_and_graph_distance():
+    from semantic_decision_py_pkg.mission_completion import TargetMissionTracker
+
+    candidate = {"behavior_type": "NAVIGATE", "metadata": {
+        "target_goal": True, "target_reliably_observed": True,
+        "target_visible_now": True, "target_require_current_visibility": False,
+        "target_object_distance_m": 1.2,
+        "target_success_distance_threshold_m": 1.5,
+    }}
+    assert TargetMissionTracker.claim_ready(candidate)
+    candidate["metadata"]["target_visible_now"] = False
+    assert not TargetMissionTracker.claim_ready(candidate)
+    candidate["metadata"]["target_visible_now"] = True
+    candidate["metadata"]["target_object_distance_m"] = 5.0
+    assert not TargetMissionTracker.claim_ready(candidate)

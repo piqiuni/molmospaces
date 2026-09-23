@@ -15,6 +15,7 @@ from scripts.InteractiveNav import run_m2_experiment_lane as lane
 
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO / "scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json"
+SIX_ARM_TEMPLATE = REPO / "scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_6arm_2task_20w.json"
 
 
 def _manifest(tmp_path=None):
@@ -39,6 +40,33 @@ def test_fixed_plan_is_240_unique_jobs_balanced_and_scene_paired():
     assert lane.normalize_manifest(_manifest())["planned_jobs"] == jobs
 
 
+def test_six_arm_two_task_plan_has_three_full_scene_arms_per_task():
+    manifest = lane.normalize_manifest(json.loads(SIX_ARM_TEMPLATE.read_text()))
+    jobs = manifest["planned_jobs"]
+    assert len(jobs) == len({job["job_id"] for job in jobs}) == 180
+    assert Counter(job["lane_id"] for job in jobs) == {0: 90, 1: 90}
+    assert Counter(job["arm"] for job in jobs) == {f"G{i}": 30 for i in range(6)}
+    for index in range(30):
+        assert {job["arm"] for job in jobs if job["mixed_index"] == index} == set(lane.SIX_ARM_DESIGN)
+    assert {job["arm"] for job in jobs if job["lane_id"] == 0} == {"G0", "G1", "G2"}
+    assert {job["arm"] for job in jobs if job["lane_id"] == 1} == {"G3", "G4", "G5"}
+    assert lane.normalize_manifest(manifest) == manifest
+
+
+def test_six_arm_config_balances_simulation_over_four_gpus():
+    manifest = lane.normalize_manifest(json.loads(SIX_ARM_TEMPLATE.read_text()))
+    for member in manifest["lanes"]:
+        config = lane._config(manifest, member, None)
+        assert config["workers"] == 20
+        assert config["mujoco_egl_devices"] == ["0", "1", "2", "3"]
+        assert config["required_mujoco_gpu_count"] == 4
+        assert config["episode_indices"] == list(range(2000, 2030))
+    broken = deepcopy(manifest)
+    broken["arms"][1]["environment"]["SEMANTIC_M2_RECENT_DECISION_LIMIT"] = "30"
+    with pytest.raises(ValueError, match="violates frozen design"):
+        lane.normalize_manifest(broken)
+
+
 @pytest.mark.parametrize("fault", ["wrong_budget", "wrong_profile", "overlap_ports", "same_gpu", "root_cache", "unknown_env", "remote_endpoint", "wrong_job"])
 def test_rejects_unsafe_or_unpaired_manifest(fault):
     result = _manifest()
@@ -61,7 +89,7 @@ def test_model_overrides_force_qwen_and_do_not_remap_egl():
     assert overrides["SEMANTIC_MODEL_ENDPOINT"] == overrides["SEMANTIC_M2_ENDPOINT"] == "http://127.0.0.1:8000/v1"
     assert overrides["SEMANTIC_M2_MODE"] == "http"
     assert overrides["SEMANTIC_M2_PROTOCOL"] == "openai_chat"
-    assert overrides["SEMANTIC_M2_TIMEOUT_S"] == "120"
+    assert overrides["SEMANTIC_M2_TIMEOUT_S"] == "12"
     assert overrides["SEMANTIC_M2_MODEL_NAME"] == lane.MODEL_NAME
     assert current["egl_device_id"] == "1"
     assert all(overrides[key] == "1" for key in lane.THREAD_KEYS)
@@ -82,7 +110,7 @@ def test_duplicate_dotenv_keys_removed_and_wrapper_overrides_inherited_default(t
     wrapper.write_text(lane.wrapper_text(snapshot, overrides))
     environment = {**os.environ, "SEMANTIC_M2_TIMEOUT_S": "30", "SEMANTIC_MODEL_ENV_FILE": str(env_path)}
     actual = json.loads(subprocess.check_output(["bash", str(wrapper)], env=environment, text=True))
-    assert actual["SEMANTIC_M2_TIMEOUT_S"] == "120"
+    assert actual["SEMANTIC_M2_TIMEOUT_S"] == "12"
     assert actual["SEMANTIC_M2_ENDPOINT"] == "http://127.0.0.1:8000/v1"
     assert actual["SEMANTIC_M2_PROMPT_FILE"] == overrides["SEMANTIC_M2_PROMPT_FILE"]
 
@@ -99,7 +127,7 @@ def test_real_dotenv_loader_and_model_merge_use_expected_profile(tmp_path, monke
     for key in overrides: monkeypatch.setenv(key, overrides[key])
     module.load_env_file(env_file, override=False)
     result = module.apply_model_env_overrides({"timeout_s": 30})
-    assert result["timeout_s"] == 120
+    assert result["timeout_s"] == 12
     assert result["context_profile"] == "historical_compat_v1"
     assert result["candidate_pool_mode"] == "legacy"
     assert result["recent_decision_limit"] == 8
@@ -156,6 +184,8 @@ def test_model_identity_and_context_capacity_validation():
     assert result["healthy"] is True
     with pytest.raises(RuntimeError): lane.validate_model_inventory({"data": [{"id": "wrong"}]})
     with pytest.raises(RuntimeError): lane.validate_model_inventory({"data": [{"id": lane.MODEL_NAME, "max_model_len": 10240}]})
+    assert lane.validate_model_inventory({"data": [{"id": lane.MODEL_NAME, "max_model_len": 10240}]},
+                                         minimum_context=10240)["healthy"] is True
 
 
 def test_official_dry_run_does_not_create_output_or_start_services(tmp_path):

@@ -186,7 +186,7 @@ class ModelPolicyConfig:
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "qwen3.6-35b-a3b"
     protocol: str = "openai_chat"
-    timeout_s: float = 3.0
+    timeout_s: float = 12.0
     # M2 retries only requests that ended in an explicit timeout.  Schema,
     # authentication, HTTP and other model errors return immediately so a bad
     # request cannot be amplified into repeated traffic.

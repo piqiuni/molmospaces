@@ -48,6 +48,7 @@ def test_drawer_scan_transient_open_counts_after_the_drawer_is_closed(monkeypatc
 
     assert score.required_interaction_success is True
     assert score.sequence_success is True
+    assert score.required_interaction_completion_fraction == 1.0
 
 
 def test_terminal_open_fraction_is_still_required_without_transient_evidence(monkeypatch) -> None:
@@ -70,6 +71,52 @@ def test_terminal_open_fraction_is_still_required_without_transient_evidence(mon
     )
 
     assert score.required_interaction_success is False
+    assert score.required_interaction_completion_fraction == 0.0
+
+
+def test_isr_credits_one_of_two_required_effects_without_completing_the_chain(monkeypatch) -> None:
+    episode = _episode()
+    episode["interactive_nav"]["interactions"].insert(0, {
+        "interaction_id": "door_1", "prerequisites": [],
+    })
+    episode["interactive_nav"]["oracle_plans"][0]["required_interaction_ids"] = [
+        "door_1", "drawer_2",
+    ]
+    monkeypatch.setattr(
+        benchmark_metrics, "joint_open_fraction",
+        lambda _env, item: 1.0 if item["interaction_id"] == "door_1" else 0.0,
+    )
+    score = benchmark_metrics.score_interactions(object(), episode, [{
+        "classification": "required_valid", "success": True,
+        "resolved_interaction_id": "door_1", "metadata": {},
+    }])
+
+    assert score.required_interaction_success is False
+    assert score.required_interaction_completion_fraction == 0.5
+    assert score.completed_required_interaction_count == 1
+    assert score.required_interaction_count == 2
+
+
+def test_isr_uses_best_of_alternative_required_plans(monkeypatch) -> None:
+    episode = _episode()
+    episode["interactive_nav"]["interactions"].append({
+        "interaction_id": "fridge_1", "prerequisites": [],
+    })
+    episode["interactive_nav"]["oracle_plans"].append({
+        "plan_id": "alternative", "required_interaction_ids": ["fridge_1"],
+    })
+    monkeypatch.setattr(
+        benchmark_metrics, "joint_open_fraction",
+        lambda _env, item: 1.0 if item["interaction_id"] == "fridge_1" else 0.0,
+    )
+    score = benchmark_metrics.score_interactions(object(), episode, [{
+        "classification": "required_valid", "success": True,
+        "resolved_interaction_id": "fridge_1", "metadata": {},
+    }])
+
+    assert score.required_interaction_success is True
+    assert score.required_interaction_completion_fraction == 1.0
+    assert score.required_interaction_count == 1
 
 
 def _paper_episode(requirement: str = "required") -> dict:
@@ -79,6 +126,8 @@ def _paper_episode(requirement: str = "required") -> dict:
             "interactions": [
                 {
                     "interaction_id": "door_1",
+                    "type": "channel_hinged_door",
+                    "object_category": "Door",
                     "prerequisites": [],
                 }
             ],
@@ -114,6 +163,10 @@ def test_paper_ip_counts_effects_per_attempt_and_error_union() -> None:
                 "classification": "invalid",
                 "success": False,
                 "resolved_interaction_id": "wrong_object",
+                "metadata": {
+                    "resolved_object_category": "fridge",
+                    "resolved_object_domain": "container",
+                },
             },
         ],
     )
@@ -135,6 +188,86 @@ def test_paper_ip_defines_required_and_unnecessary_zero_attempt_cases() -> None:
     assert unnecessary.interaction_precision_episode == 1.0
     assert required.error_interaction_attempt_count == 0
     assert unnecessary.error_interaction_attempt_count == 0
+
+
+def test_paper_ip_credits_successful_exploration_of_target_class_without_oracle_id() -> None:
+    score = benchmark_metrics.paper_interaction_attempt_score(
+        _paper_episode(),
+        [
+            {"success": True, "resolved_object_name": "other_door", "metadata": {
+                "resolved_object_category": "door", "resolved_object_domain": "channel",
+            }},
+            {"success": True, "resolved_object_name": "other_door", "metadata": {
+                "resolved_object_category": "door", "resolved_object_domain": "channel",
+            }},
+            {"success": True, "resolved_object_name": "other_fridge", "metadata": {
+                "resolved_object_category": "Fridge", "resolved_object_domain": "container",
+            }},
+            {"success": False, "resolved_object_name": "door_1", "metadata": {
+                "requested_interaction_ids": ["door_1"],
+            }},
+        ],
+    )
+
+    assert score.valid_interaction_attempt_count == 1
+    assert score.non_target_class_interaction_attempt_count == 1
+    assert score.failed_interaction_attempt_count == 1
+    assert score.repeated_interaction_attempt_count == 1
+    assert score.error_interaction_attempt_count == 2
+    assert score.interaction_precision_episode == pytest.approx(0.25)
+
+
+def test_paper_cost_charges_other_class_exploration_only_once() -> None:
+    score = benchmark_metrics.paper_interaction_attempt_score(
+        _paper_episode(),
+        [{"success": True, "resolved_object_name": "fridge_a", "metadata": {
+            "resolved_object_category": "Fridge", "resolved_object_domain": "container",
+        }}],
+    )
+    cost, breakdown = benchmark_metrics.paper_episode_total_cost(
+        nav_success=True,
+        navigation_path_length_m=2.0,
+        interaction_score=score,
+        config=benchmark_metrics.PaperMetricConfig(),
+    )
+    assert score.interaction_precision_episode == 0.0
+    assert score.error_interaction_attempt_count == 0
+    assert breakdown["error_interaction_surcharge"] == 0.0
+    assert cost == pytest.approx(2.3)
+
+
+def test_paper_ip_requires_a_new_physical_effect_for_another_target_class_instance() -> None:
+    score = benchmark_metrics.paper_interaction_attempt_score(
+        _paper_episode(),
+        [{"success": True, "resolved_object_name": "other_door", "metadata": {
+            "resolved_object_category": "Door", "resolved_object_domain": "channel",
+            "physical_state_changed": False,
+        }}],
+    )
+    assert score.valid_interaction_attempt_count == 0
+    assert score.interaction_precision_episode == 0.0
+
+
+def test_paper_ip_mixed_uses_the_union_of_target_classes() -> None:
+    episode = _paper_episode()
+    episode["interactive_nav"]["interactions"].append({
+        "interaction_id": "fridge_1", "type": "container_hinged_door",
+        "object_category": "Fridge",
+    })
+    score = benchmark_metrics.paper_interaction_attempt_score(
+        episode,
+        [
+            {"success": True, "resolved_object_name": "other_door", "metadata": {
+                "resolved_object_category": "Door", "resolved_object_domain": "channel",
+            }},
+            {"success": True, "resolved_object_name": "other_fridge", "metadata": {
+                "resolved_object_category": "fridge", "resolved_object_domain": "container",
+            }},
+        ],
+    )
+    assert score.valid_interaction_attempt_count == 2
+    assert score.interaction_precision_episode == 1.0
+    assert score.error_interaction_attempt_count == 0
 
 
 def test_paper_failed_required_attempt_is_not_mislabelled_irrelevant() -> None:

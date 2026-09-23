@@ -8,7 +8,7 @@
   "step_budget_mode": "dynamic",
   "ros_observation_turn_multiplier": 1,
   "ros_command_starvation_timeout_s": 90,
-  "semantic_attribute_request_timeout_s": 30,
+  "semantic_attribute_request_timeout_s": 15,
   "scene_timeout_s": 7200,
   "base_master_port": 17000,
   "conda_env": "/home/ldl/conda_envs/mlspaces",

@@ -30,7 +30,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "interactive_nav_v3_round_summary_v5"
-PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v1"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v3"
 _WORKER_INDEX_RE = re.compile(r"^worker[_-]?(?P<index>\d+)")
 _PRE_SCORE_MARKERS = {
     "pre_score_guard",
@@ -957,6 +957,15 @@ def _summarise_artifact(
             "required_interaction_success": _optional_bool(
                 result.get("required_interaction_success")
             ),
+            "required_interaction_completion_fraction": _finite_number(
+                result.get("required_interaction_completion_fraction")
+            ),
+            "completed_required_interaction_count": _optional_int(
+                result.get("completed_required_interaction_count")
+            ),
+            "required_interaction_count": _optional_int(
+                result.get("required_interaction_count")
+            ),
             "interaction_precision": _finite_number(
                 result.get("interaction_precision_episode")
             ),
@@ -975,6 +984,9 @@ def _summarise_artifact(
             ),
             "task_irrelevant_interaction_attempt_count": _optional_int(
                 result.get("task_irrelevant_interaction_attempt_count")
+            ),
+            "non_target_class_interaction_attempt_count": _optional_int(
+                result.get("non_target_class_interaction_attempt_count")
             ),
             "failed_interaction_attempt_count": _optional_int(
                 result.get("failed_interaction_attempt_count")
@@ -1137,7 +1149,7 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
     This module deliberately does not reconstruct these values from action
     traces.  In particular, public interaction attempts do not contain the
-    evaluator-private required/irrelevant/repeat classification needed for IP
+    evaluator-private category, physical-effect and retry facts needed for IP
     and Total Cost.
     """
 
@@ -1148,7 +1160,10 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     required_rows = [
         row for row in rows if row.get("interaction_requirement") == "required"
     ]
-    isr, isr_denominator, isr_missing = _strict_paper_rate(
+    isr, isr_denominator, isr_missing = _strict_paper_mean(
+        required_rows, "required_interaction_completion_fraction"
+    )
+    full_required_rate, _, _ = _strict_paper_rate(
         required_rows, "required_interaction_success"
     )
     ip, ip_denominator, ip_missing = _strict_paper_mean(
@@ -1189,6 +1204,7 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "success_rate": sr,
         "mean_spl": spl,
         "required_interaction_success_rate": isr,
+        "full_required_interaction_success_rate": full_required_rate,
         "interaction_precision": ip,
         "mean_total_cost": total_cost,
         # Explicit denominators make N/A (for example ISR on unnecessary-only

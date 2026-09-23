@@ -15,7 +15,10 @@ target:
 candidate:
   navigation_clearance_enabled: true
   # V3 object-goal constraints.
-  target_require_current_visibility: false
+  # A target claim must be backed by the current perception frame.  Historical
+  # graph evidence is still useful for planning, but cannot terminate an
+  # episode after the robot has moved away from the target.
+  target_require_current_visibility: true
   target_require_same_room: false
   target_allow_connected_room: true
   target_min_visible_pixels: 128
@@ -114,7 +117,7 @@ model:
   # M2 is text-only and may use a stronger/slower OpenAI-compatible model than
   # visual M1/M3 through SEMANTIC_M2_*.  Keep its wall-clock budget independent
   # and retry only one explicit timeout with a short exponential backoff.
-  timeout_s: 30.0
+  timeout_s: 12.0
   timeout_retry_count: 1
   timeout_retry_backoff_s: 1.0
   # M2 reasons internally through evidence/dependencies/compatibility; only the
@@ -129,7 +132,7 @@ model:
   pre_score_guard_margin: 0.75
   skill_timeout_s: 12.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 12.0
+  verification_timeout_s: 10.0
   verification_max_output_tokens: 256
 
 completion:

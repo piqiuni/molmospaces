@@ -84,7 +84,7 @@
     "step_budget_mode": "dynamic",
     "ros_observation_turn_multiplier": 1,
     "ros_command_starvation_timeout_s": 300,
-    "semantic_attribute_request_timeout_s": 30,
+    "semantic_attribute_request_timeout_s": 15,
     "scene_timeout_s": 10800,
     "base_master_port": 19000,
     "conda_env": "/home/ldl/conda_envs/mlspaces",
@@ -101,7 +101,7 @@
     "retry_rounds": 0
   },
   "common_environment": {
-    "SEMANTIC_M2_TIMEOUT_S": "120",
+    "SEMANTIC_M2_TIMEOUT_S": "12",
     "SEMANTIC_M2_TIMEOUT_RETRY_COUNT": "1",
     "SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S": "1",
     "SEMANTIC_M2_REASONING_EFFORT": "off",

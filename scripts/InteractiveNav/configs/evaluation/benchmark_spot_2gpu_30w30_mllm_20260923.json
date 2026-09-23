@@ -1,0 +1,29 @@
+{
+  "output_root": "/home/ldl/outputs/interactive-nav",
+  "benchmark": "/home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json",
+  "start_qwen": true,
+  "required_mujoco_gpu_count": 2,
+  "workers": 30,
+  "max_steps": 2000,
+  "min_steps": 200,
+  "step_budget_mode": "dynamic",
+  "ros_observation_turn_multiplier": 2.0,
+  "ros_command_starvation_timeout_s": 90,
+  "semantic_attribute_request_timeout_s": 15,
+  "scene_timeout_s": 10800,
+  "base_master_port": 19600,
+  "conda_env": "/home/ldl/conda_envs/mlspaces",
+  "python_bin": "/home/ldl/conda_envs/mlspaces/bin/python",
+  "semantic_model_env_file": ".env",
+  "model_endpoints": ["http://127.0.0.1:8000/v1"],
+  "mujoco_egl_devices": ["0", "1"],
+  "progress_interval_s": 10,
+  "recording": false,
+  "episode_indices": [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29
+  ],
+  "retry_rounds": 1,
+  "resume": false
+}

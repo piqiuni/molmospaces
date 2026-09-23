@@ -1,0 +1,35 @@
+TaskName: inav-m2-6arm-a-4gpu20w-20260923
+Description: Mixed 0-29 M2 paired online arms G0/G1/G2, 90 scenes, 20 workers, owned TP1 DP4 Qwen
+Entrypoint: "RUN_ROOT=/home/ldl/outputs/interactive-nav/m2-online-6arm-4gpu20w-20260923/task_a M2_EXPERIMENT_MANIFEST=/home/ldl/outputs/interactive-nav/m2-online-6arm-4gpu20w-20260923/manifest.json M2_EXPERIMENT_LANE=0 QWEN36_MAX_MODEL_LEN=10240 QWEN36_TP_SIZE=1 QWEN36_DP_SIZE=4 QWEN36_MAX_NUM_SEQS=16 QWEN36_API_SERVER_COUNT=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+ImageUrl: vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04
+ResourceQueueName: c20250503
+Framework: PyTorchDDP
+TaskRoleSpecs:
+  - RoleName: worker
+    RoleReplicas: 1
+    Flavor: ml.pni2.14xlarge
+ActiveDeadlineSeconds: 86400
+DelayExitTimeSeconds: 0
+AccessType: Private
+Preemptible: false
+Priority: 6
+RetryOptions:
+  EnableRetry: false
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets: [Failed]
+EnableTensorBoard: false
+Storages:
+  - Type: TosFuse
+    MountPath: /tos
+    Bucket: c20250503
+    Prefix: /
+  - Type: Vepfs
+    MountPath: /home/ldl
+    SubPath: /c20250503/250404017
+    ReadOnly: false
+  - Type: Vepfs
+    MountPath: /vepfs-wxy
+    SubPath: /c20250503/240401046
+    ReadOnly: false

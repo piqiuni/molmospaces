@@ -16,6 +16,16 @@ Internally the pipeline is split into replaceable nodes:
 
 The default object detector backend is `mock_empty`, and `no_detection` is available when a test should explicitly publish no detections.
 
+Module-1 visual inference has per-object, per-episode limits in `config/default.yaml`:
+`attribute_inference.max_calls_per_object` defaults to 10 real model submissions,
+with 2 slots reserved for decision-triggered targeted views. The first failed
+or queue-expired request can be retried at most twice
+(`max_failure_retries_per_object: 2`); a successful response resets that failure
+streak, but not the total call count. Superseded queued requests do not consume
+model-call slots. Once the limit is reached, targeted requests return a failure
+status instead of submitting another model call; these limits do not apply to
+the separate room inference lane.
+
 ## Two-level object detection design
 
 `object_detection_node.py` is now split into two internal stages:

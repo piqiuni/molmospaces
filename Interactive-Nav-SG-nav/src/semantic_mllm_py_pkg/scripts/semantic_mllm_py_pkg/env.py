@@ -46,7 +46,7 @@ def client_config_from_env(
         model=model or os.environ.get("SEMANTIC_MODEL_NAME", "qwen3.6-35b-a3b"),
         protocol=os.environ.get("SEMANTIC_MODEL_PROTOCOL", "openai_chat"),
         command=os.environ.get("SEMANTIC_MODEL_COMMAND", ""),
-        timeout_s=float(os.environ.get("SEMANTIC_MODEL_TIMEOUT_S", "20") or 20.0),
+        timeout_s=float(os.environ.get("SEMANTIC_MODEL_TIMEOUT_S", "15") or 15.0),
         temperature=float(os.environ.get("SEMANTIC_MODEL_TEMPERATURE", "0") or 0.0),
         max_tokens=int(os.environ.get("SEMANTIC_MODEL_MAX_TOKENS", "384") or 384),
         reasoning_effort=os.environ.get("SEMANTIC_MODEL_REASONING_EFFORT", "off"),

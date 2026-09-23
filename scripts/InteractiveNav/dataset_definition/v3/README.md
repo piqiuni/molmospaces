@@ -437,8 +437,8 @@ v3 的 `generation_validation` 用于数据生成质量审计，不等同于 pol
 | `SPL` | episode | 成功加权路径效率，参考路径取允许必要交互后的可行计划路径 |
 | `Interaction Success Rate` | required episode | 关键交互效果是否完成 |
 | `Shortcut Benefit / Regret` | beneficial episode | 相对开门 oracle 的路径代价收益或策略额外代价 |
-| `Interaction Precision` | interaction event | 执行过的交互中，有多少是有效交互 |
-| `Total Cost` | episode | `path_length + λ * interaction_count`，后续可扩展不同交互类型权重 |
+| `Interaction Precision` | episode | 全部交互尝试中，完成目标交互对象类别中新效果的比例（不同实例可计入） |
+| `Total Cost` | episode | `L_exec + λ*A + μ*E + κ*(1-S)`；`E` 是失败或无新效果重复尝试，其他探索交互只计尝试成本 |
 
 `reachability`、`visibility` 和 `enablement` 不作为主表中的独立指标；它们是 `Interaction Success Rate` 的判定语义：
 
@@ -446,7 +446,7 @@ v3 的 `generation_validation` 用于数据生成质量审计，不等同于 pol
 - `container`：关键容器交互是否让目标满足可见性条件。
 - `mixed-required`：必要交互链是否按 prerequisite / oracle 语义完成，并最终服务目标可达和可见。
 - `mixed-beneficial`：目标仍可通过绕行完成；重点报告是否利用捷径、SPL、Total Cost 与相对 oracle regret。
-- `no-interaction`：`Interaction Success Rate` 记为 `N/A`，但任何多余交互都会影响 `Interaction Precision` 和 `Total Cost`。
+- `no-interaction`：`Interaction Success Rate` 记为 `N/A`；所有交互尝试都会计入 IP 分母和 Total Cost，未知环境中的正常探索不自动计入错误罚分。
 
 推荐报告 split：
 

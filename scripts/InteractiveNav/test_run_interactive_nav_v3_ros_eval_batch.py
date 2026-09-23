@@ -34,7 +34,7 @@ def test_default_command_starvation_budget_covers_one_m2_timeout_retry(
 
     args = batch.parse_args()
 
-    m2_worst_case_s = 30.0 + 1.0 + 30.0
+    m2_worst_case_s = 12.0 + 1.0 + 12.0
     assert args.ros_command_starvation_timeout_s == 90.0
     assert args.ros_command_starvation_timeout_s > m2_worst_case_s
 
@@ -208,7 +208,7 @@ def test_resume_refuses_completed_summary_when_planned_contract_changes(tmp_path
     assert batch.existing_completed_summary(plan, changed_steps) is None
 
     changed_timeout = SimpleNamespace(**vars(args))
-    changed_timeout.semantic_attribute_request_timeout_s = 30.0
+    changed_timeout.semantic_attribute_request_timeout_s = 15.0
     assert batch.existing_completed_summary(plan, changed_timeout) is None
 
     args.benchmark.write_text("[\"different-frozen-benchmark\"]\n", encoding="utf-8")
@@ -292,7 +292,7 @@ def test_derived_endpoint_dotenv_preserves_base_settings_and_overrides_endpoint(
 
 
 def test_m2_timeout_retry_defaults_are_explicit_and_overridable(monkeypatch):
-    assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_S"] == "30.0"
+    assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_S"] == "12.0"
     assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_RETRY_COUNT"] == "1"
     assert batch._RUNNER_ENV_DEFAULTS["SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S"] == "1.0"
 
@@ -302,6 +302,14 @@ def test_m2_timeout_retry_defaults_are_explicit_and_overridable(monkeypatch):
     assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_S") == "45"
     assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_RETRY_COUNT") == "2"
     assert batch._resolved_runner_setting("SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S") == "0.5"
+
+
+def test_ros_action_wait_defaults_to_point_four_seconds(monkeypatch):
+    monkeypatch.delenv("ROS_ACTION_TIMEOUT_S", raising=False)
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.4"
+
+    monkeypatch.setenv("ROS_ACTION_TIMEOUT_S", "0.6")
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.6"
 
 
 def test_worker_endpoint_and_egl_assignment_are_round_robin():

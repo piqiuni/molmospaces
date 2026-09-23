@@ -1,5 +1,7 @@
 import json
 import threading
+import time
+from collections import defaultdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +12,10 @@ pytest.importorskip("rospy")
 import interaction_attribute_inference_node as attribute_module
 from interaction_attribute_inference_node import InteractionAttributeInferenceNode
 from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
+from semantic_mapping_py_pkg.room_inference_backends import (
+    WeightedRoomAttributeInferencer,
+    room_evidence_signature,
+)
 
 
 class RecordingQueue:
@@ -48,6 +54,96 @@ class RecordingClient:
                 "confidence": 0.9,
             },
         )
+
+
+def test_room_request_signature_and_failure_refresh_cooldown(monkeypatch) -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.room_pending = {}
+    node.room_completed = {}
+    node.room_failures = {
+        "room_1": {"signature": "same", "failed_at": 100.0}
+    }
+    node.room_last_request = {}
+    node.room_min_interval_s = 2.0
+    node.room_failure_refresh_interval_s = 30.0
+    node.room_success_refresh_interval_s = 120.0
+    node.room_request_sequence = 0
+    node.room_generations = {}
+    node.current_episode_id = "episode"
+
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 129.0)
+    assert node._try_reserve_room("room_1", "same") is None
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 130.0)
+    assert node._try_reserve_room("room_1", "same") is not None
+    node.room_pending.clear()
+    node.room_failures.clear()
+    node.room_completed["room_1"] = {
+        "signature": "same", "completed_at": 130.0
+    }
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 249.0)
+    assert node._try_reserve_room("room_1", "same") is None
+    assert node._try_reserve_room("room_1", "new_box") is not None
+    node.room_pending.clear()
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 250.0)
+    assert node._try_reserve_room("room_1", "same") is not None
+
+    objects = [{"object_id": "stove_1", "name": "stove", "category": "appliance", "type": "object"}]
+    box = {"center_xy": [0.0, 1.0], "size_xy": [3.0, 4.0]}
+    assert node._room_signature(1, objects, box) == room_evidence_signature(1, box, objects)
+
+
+def test_failed_room_call_uses_rule_fallback_and_waits_for_refresh():
+    from collections import defaultdict
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode"
+    node.room_counts = defaultdict(int)
+    node.room_generations = {"room_1": 0}
+    node.room_pending = {"room_1": {
+        "episode_id": "episode", "signature": "box-and-members",
+        "generation": 0, "request_sequence": 1,
+    }}
+    node.room_last_request = {}
+    node.room_completed = {}
+    node.room_failures = {}
+    node.room_min_interval_s = 2.0
+    node.room_failure_refresh_interval_s = 30.0
+    node.room_success_refresh_interval_s = 120.0
+    node.room_request_timeout_s = 15.0
+    node.room_max_output_tokens = 96
+    node.room_request_sequence = 1
+    node.room_fallback_enabled = True
+    node.room_fallback_inferencer = WeightedRoomAttributeInferencer(
+        {"kitchen": {"stove": 1.0}}
+    )
+    node.client = SimpleNamespace(
+        config=SimpleNamespace(model="qwen"),
+        request_json=lambda **_kwargs: SimpleNamespace(error="timeout", payload=None),
+    )
+    patches = []
+    node._publish_room_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    node._publish_status = lambda: None
+    started = time.monotonic()
+
+    node._infer_room(
+        room_key="room_1", room_id=1, room_node_id="room_1",
+        room_box={"center_xy": [0.0, 0.0], "size_xy": [4.0, 4.0]},
+        objects=[{"object_id": "stove_1", "name": "stove", "confidence": 1.0}],
+        episode_id="episode", capture_step=7, stamp=10.0,
+        signature="box-and-members", generation=0, request_sequence=1,
+        enqueued_at=started, deadline_monotonic=started + 15.0,
+    )
+
+    assert patches[0]["room_attribute"] == "kitchen"
+    assert patches[0]["fallback"] is True
+    assert patches[0]["room_attribute_status"] == "ready"
+    assert node.room_failures["room_1"]["error"] == "timeout"
+    assert node._try_reserve_room("room_1", "box-and-members") is None
+    node.room_failures["room_1"]["failed_at"] -= 31.0
+    node.room_last_request["room_1"] -= 3.0
+    assert node._try_reserve_room("room_1", "box-and-members") is not None
 
 
 def test_targeted_m1_survives_bbox_bucket_change_until_explicit_cancel():
@@ -1221,5 +1317,259 @@ def test_m1_request_expired_in_local_queue_is_not_sent() -> None:
     assert node.filter_counts["expired"] == 1
     assert node.filter_counts["failed"] == 0
     assert node.last_request == {}
+    assert node.m1_failure_streaks == {"object_1": 1}
     assert published[-1]["attribute_status"] == "failed"
     assert published[-1]["error"] == "queue_deadline_expired_before_send"
+
+
+def _budget_test_node() -> InteractionAttributeInferenceNode:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.request_sequence = 0
+    node.generations = {}
+    node.pending = {}
+    node.completed = {}
+    node.last_request = {}
+    node.min_interval_s = 0.0
+    node.success_refresh_interval_s = 0.0
+    node.max_calls_per_object = 10
+    node.targeted_call_reserve = 2
+    node.max_failure_retries_per_object = 2
+    node.m1_call_counts = {}
+    node.m1_failure_streaks = {}
+    node.filter_counts = defaultdict(int)
+    node.request_queue = RecordingQueue()
+    node.visual_evidence_max_side_px = 0
+    node.max_output_tokens = 256
+    node.request_timeout_s = 1.0
+    node.client = RecordingClient()
+    node._publish_updates = lambda *args: None
+    node._publish_status = lambda: None
+    return node
+
+
+def test_sixty_distinct_m1_views_respect_the_total_cap_and_targeted_reserve() -> None:
+    node = _budget_test_node()
+    object_id = "obj_000090"
+    for frame in range(60):
+        reservation = node._try_reserve(object_id, f"view-{frame}")
+        if frame < 8:
+            assert reservation is not None
+            index, error = node._claim_m1_call(
+                object_id, "episode_1", reservation["generation"],
+                reservation["request_sequence"], targeted=False,
+            )
+            assert (index, error) == (frame + 1, "")
+            node._release(object_id, reservation["request_sequence"])
+        else:
+            assert reservation is None
+    assert node.m1_call_counts[object_id] == 8
+
+    for index in (9, 10):
+        reservation = node._force_reserve_targeted_refresh(
+            object_id, f"target-view-{index}", "episode_1",
+            {"request_id": f"refresh-{index}"},
+        )
+        assert reservation is not None
+        call_index, error = node._claim_m1_call(
+            object_id, "episode_1", reservation["generation"],
+            reservation["request_sequence"], targeted=True,
+        )
+        assert (call_index, error) == (index, "")
+        node._release(object_id, reservation["request_sequence"])
+    assert node.m1_call_counts[object_id] == 10
+    assert node._force_reserve_targeted_refresh(
+        object_id, "eleventh-view", "episode_1", {"request_id": "too-many"},
+    ) is None
+    assert node._try_reserve("different_object", "first-view") is not None
+
+
+def test_failed_m1_calls_stop_after_two_retries_even_with_new_views() -> None:
+    node = _budget_test_node()
+    calls = []
+
+    def failed_call(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(error="timed out", payload=None)
+
+    node.client.request_json = failed_call
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._infer(
+            object_id="fridge", detection={"name": "fridge"},
+            visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+            episode_id="episode_1", frame_id=str(index),
+            image_sequence=index + 1, stamp=10.0,
+            signature=f"view-{index}", enqueued_at=time.monotonic(),
+            targeted_refresh={}, **reservation,
+        )
+    assert len(calls) == 3
+    assert node.m1_call_counts["fridge"] == 3
+    assert node.m1_failure_streaks["fridge"] == 3
+    assert node._try_reserve("fridge", "fourth-view") is None
+    assert node._force_reserve_targeted_refresh(
+        "fridge", "targeted-fourth", "episode_1", {"request_id": "retry"},
+    ) is None
+
+    # The final guard also protects the model endpoint if a stale reservation
+    # was admitted before another worker used the last available slot.
+    node.request_sequence += 1
+    node.pending["fridge"] = {
+        "request_sequence": node.request_sequence,
+        "generation": node.generations.get("fridge", 0),
+        "episode_id": "episode_1",
+    }
+    node._infer(
+        object_id="fridge", detection={"name": "fridge"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1", frame_id="4", image_sequence=5,
+        stamp=10.0, signature="fourth-view", enqueued_at=time.monotonic(),
+        targeted_refresh={}, generation=node.generations.get("fridge", 0),
+        request_sequence=node.request_sequence,
+    )
+    assert len(calls) == 3
+    assert patches[-1]["error"] == "m1_failure_retry_exhausted"
+
+
+def test_success_resets_failed_m1_streak_but_not_call_count() -> None:
+    node = _budget_test_node()
+    original_call = node.client.request_json
+    attempts = 0
+
+    def retry_then_succeed(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts in (1, 2):
+            return SimpleNamespace(error="timed out", payload=None)
+        return original_call(**kwargs)
+
+    node.client.request_json = retry_then_succeed
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._infer(
+            object_id="fridge", detection={"name": "fridge"},
+            visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+            episode_id="episode_1", frame_id=str(index),
+            image_sequence=index + 1, stamp=10.0,
+            signature=f"view-{index}", enqueued_at=time.monotonic(),
+            targeted_refresh={}, **reservation,
+        )
+    assert attempts == 3
+    assert node.m1_call_counts["fridge"] == 3
+    assert node.m1_failure_streaks.get("fridge", 0) == 0
+    assert node._try_reserve("fridge", "new-view") is not None
+
+
+def test_targeted_refresh_reports_exhausted_budget_without_waiting_for_rgb() -> None:
+    node = _budget_test_node()
+    node.aliases = {"fridge": "fridge"}
+    node.m1_call_counts["fridge"] = 10
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.portal_state_consensus = PortalStateConsensus()
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "fridge", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "container",
+        "request_id": "decision:m1:001",
+    })))
+    assert node.targeted_refresh_requests == {}
+    assert patches[-1]["attribute_status"] == "failed"
+    assert patches[-1]["error"] == "m1_call_budget_exhausted"
+    assert patches[-1]["targeted_refresh_request_id"] == "decision:m1:001"
+
+
+def test_targeted_refresh_reports_exhausted_failure_retries() -> None:
+    node = _budget_test_node()
+    node.aliases = {"fridge": "fridge"}
+    node.m1_call_counts["fridge"] = 3
+    node.m1_failure_streaks["fridge"] = 3
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.portal_state_consensus = PortalStateConsensus()
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "fridge", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "container",
+        "request_id": "decision:m1:retry",
+    })))
+
+    assert node.targeted_refresh_requests == {}
+    assert patches[-1]["attribute_status"] == "failed"
+    assert patches[-1]["error"] == "m1_failure_retry_exhausted"
+
+
+def test_capped_portal_can_still_use_cached_authoritative_state() -> None:
+    node = _budget_test_node()
+    node.aliases = {"door": "door"}
+    node.m1_call_counts["door"] = 10
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.latest_image_sequence = 14
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
+    assert node.portal_state_consensus.record_authoritative(
+        "door", "open", capture_step=10
+    )
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "door", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "portal",
+        "request_id": "decision:m1:portal",
+    })))
+
+    assert "door" in node.targeted_refresh_requests
+    assert patches[-1]["attribute_status"] == "waiting_for_view"
+    assert node.m1_call_counts["door"] == 10
+
+
+def test_queue_deadline_expiry_counts_toward_retry_limit_not_call_limit() -> None:
+    node = _budget_test_node()
+    updates = []
+    node._publish_updates = lambda _episode, _stamp, patches: updates.extend(patches)
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._expire_attribute_request({
+            "object_id": "fridge", "episode_id": "episode_1",
+            "frame_id": str(index), "stamp": 10.0,
+            "signature": f"view-{index}", "targeted_refresh": {},
+            "enqueued_at": time.monotonic() - 2.0,
+            **reservation,
+        })
+    assert node.m1_call_counts == {}
+    assert node.m1_failure_streaks["fridge"] == 3
+    assert node._try_reserve("fridge", "new-view") is None
+    assert updates[-1]["error"] == "queue_deadline_expired_before_send"
+
+
+def test_m1_call_and_retry_budgets_reset_on_episode_change() -> None:
+    node = _budget_test_node()
+    node.m1_call_counts["fridge"] = 10
+    node.m1_failure_streaks["fridge"] = 3
+    node.room_request_queue = RecordingQueue()
+    node.room_last_request = {}
+    node.room_pending = {}
+    node.room_completed = {}
+    node.room_failures = {}
+    node.room_generations = {}
+    node.aliases = {}
+    node.targeted_refresh_requests = {}
+    node.target_visual_history = {}
+    node.portal_observation_streaks = {}
+    node.portal_state_consensus = PortalStateConsensus()
+
+    node._set_episode("episode_2")
+
+    assert node.m1_call_counts == {}
+    assert node.m1_failure_streaks == {}
+    assert node._try_reserve("fridge", "fresh-view") is not None

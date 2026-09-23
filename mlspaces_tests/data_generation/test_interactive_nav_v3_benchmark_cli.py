@@ -116,8 +116,10 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
     assert manifest["evaluation_config"]["paper_cost_error_surcharge"] == pytest.approx(1.2)
     assert manifest["evaluation_config"]["paper_cost_failure_penalty"] == pytest.approx(7.0)
     paper_metric_config = result["summary"]["paper_metric_config"]
-    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v1"
+    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v3"
+    assert paper_metric_config["interaction_success_definition"] == "episode_mean_of_best_required_plan_effect_completion_fraction"
     assert paper_metric_config["formula"] == "L_exec_m + lambda*A + mu*E + kappa*(1-S)"
+    assert paper_metric_config["error_definition"] == "failed_or_effect_free_repeated_attempts"
     assert paper_metric_config["interaction_attempt_cost"] == pytest.approx(0.4)
     assert paper_metric_config["error_interaction_surcharge"] == pytest.approx(1.2)
     assert paper_metric_config["failure_penalty"] == pytest.approx(7.0)

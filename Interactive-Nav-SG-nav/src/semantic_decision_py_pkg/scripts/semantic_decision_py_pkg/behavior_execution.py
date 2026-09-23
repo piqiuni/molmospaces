@@ -1681,7 +1681,7 @@ class ExecutionConfig:
     # the first capture and the physical bridge contract.
     container_m1_distinct_view_arrival_tolerance_m: float = 0.05
     container_m1_distinct_view_arrival_yaw_tolerance_rad: float = 0.08
-    verification_timeout_s: float = 30.0
+    verification_timeout_s: float = 10.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
     scan_timeout_s: float = 15.0

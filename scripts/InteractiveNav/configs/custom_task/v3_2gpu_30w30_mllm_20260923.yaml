@@ -1,0 +1,41 @@
+TaskName: "inav_2gpu_30w30_mllm_20260923"
+Description: "InteractiveNav 30 benchmark scenes; 30 workers; one 2-GPU Qwen DP service; MLLM timeout monitoring"
+Entrypoint: "RUN_ROOT=/home/ldl/outputs/interactive-nav/custom-task-2gpu-30w30-mllm-20260923 BENCHMARK_LAUNCHER_CONFIG=scripts/InteractiveNav/configs/evaluation/benchmark_spot_2gpu_30w30_mllm_20260923.json EVALUATION_OUTPUT_DIR=/home/ldl/outputs/interactive-nav/custom-task-2gpu-30w30-mllm-20260923/evaluation EXPECTED_EPISODES=30 QWEN36_MAX_MODEL_LEN=10240 QWEN36_TP_SIZE=1 QWEN36_MAX_NUM_SEQS=16 QWEN36_API_SERVER_COUNT=1 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+Tags: [InteractiveNav, benchmark, 2gpu, 30worker, mllm-timeout]
+UserCodePath:
+RemoteMountCodePath:
+Envs: []
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04"
+ImageCredential: {}
+ResourceQueueName: "c20250503"
+Framework: "PyTorchDDP"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.7xlarge"
+ActiveDeadlineSeconds: 86400
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+Preemptible: false
+Priority: 6
+RetryOptions:
+  EnableRetry: false
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets: ["Failed"]
+EnableTensorBoard: false
+TensorBoardStorage: {}
+Storages:
+  - Type: "TosFuse"
+    MountPath: "/tos"
+    Bucket: "c20250503"
+    Prefix: /
+  - Type: "Vepfs"
+    MountPath: "/home/ldl"
+    SubPath: "/c20250503/250404017"
+    ReadOnly: false
+  - Type: "Vepfs"
+    MountPath: "/vepfs-wxy"
+    SubPath: "/c20250503/240401046"
+    ReadOnly: false

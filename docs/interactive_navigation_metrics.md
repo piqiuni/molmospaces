@@ -1,8 +1,9 @@
 # Interactive Navigation Evaluation Metrics
 
-最后更新：2026-07-19
+最后更新：2026-09-23
 
-本文档固定当前交互式导航 benchmark 的评测指标定义。目标是保持论文主表简洁，同时让后续 `score_interactive_nav_run.py` 能按同一套口径实现可复现评测。
+本文档固定当前交互式导航 benchmark 的论文指标定义；实际计算入口为 `scripts/InteractiveNav/evaluation/benchmark_metrics.py`。
+可直接纳入论文主稿的 LaTeX 定义见 [`interactive_navigation_metrics_v2.tex`](interactive_navigation_metrics_v2.tex)。
 
 当前主指标固定为 5 个：
 
@@ -10,9 +11,9 @@
 |------|------|------|
 | `SR` | 越高越好 | 最终是否完成导航任务 |
 | `SPL` | 越高越好 | 成功前提下的路径效率 |
-| `Interaction Success Rate` | 越高越好 | 需要交互时，关键交互效果是否真的完成 |
-| `Interaction Precision` | 越高越好 | 执行过的交互中，有多少是有效交互 |
-| `Total Cost` | 越低越好 | 同时考虑导航距离与交互次数的总代价 |
+| `Interaction Success Rate` | 越高越好 | 逐场景计算必要交互效果的完成比例，再对需要交互的场景平均 |
+| `Interaction Precision` | 越高越好 | 全部交互尝试中，完成目标交互对象**类别**中新效果的比例 |
+| `Total Cost` | 越低越好 | 路径、所有交互尝试、失败/无新效果重复及任务失败的总代价 |
 
 `reachability`、`visibility` 和 `enablement` 不作为论文主表中的独立指标。它们是 benchmark 构建、episode 分层和 `Interaction Success Rate` 判定时使用的交互收益语义。
 
@@ -99,68 +100,66 @@ SPL = (1 / N) * sum_i SPL_i
 
 ## 4. Interaction Success Rate
 
-`Interaction Success Rate` 表示需要交互的 episode 中，关键交互效果是否完成。
+`Interaction Success Rate` 表示需要交互的 episode 中，**必要交互效果完成的比例**，允许部分完成得分。
 
 默认只在 `interaction_requirement == "required"` 且 `oracle_plan.required_interaction_ids` 非空的 episode 上计算。对无交互样本，该指标记为 `N/A`，不进入该指标的分母。
 
-单个 required episode：
+单个 required episode 有一个或多个有效的必要交互计划。对计划 `p`，记其必要交互 ID 集合为 `R_{i,p}`，已成功产生预期物理效果的 ID 集合为 `G_i`。对有多个可行计划的 episode，取完成比例最高的一条：
 
 ```text
-ISR_i = 1, if all required interactions are completed with their expected effects
-ISR_i = 0, otherwise
+ISR_i = max_p |G_i ∩ R_{i,p}| / |R_{i,p}|
 ```
 
-整体：
+整体逐 episode 等权平均，不将所有动作合并为一个动作池：
 
 ```text
 Interaction Success Rate = (1 / N_required) * sum_i ISR_i
 ```
 
-关键交互是否完成，以 GT `interaction_id` 和 `effect_types` 为基准：
+例如 mixed 场景需要开门与打开容器两个效果，仅完成门时记 `ISR_i = 1/2`，而不是 0。`required_interaction_success` 仍是完整必要计划是否完成的二值诊断量，用于其他任务成功判定；它不能直接代替论文 ISR。对交互非必需或必要计划为空的场景，ISR 记为 `N/A`。多方案场景中的一个方案即便含更少的必要效果，也只和该方案自身的必要项比较，不把其他备选方案中的交互算作必须全部完成。
 
-| effect type | 当前判定 |
+当前 evaluator 按 GT `interaction_id` 统计：对应交互操作成功，并在终态达到 0.8 开启比例，或有操作过程中的已完成效果记录，才计入 `G_i`。`effect_types` 描述必要交互服务的场景目标；ISR 不另行对每种 effect type 作独立的通行、可见性或下游动作验收。最终导航目标是否达成由 SR 单独衡量。
+
+| effect type | 场景目标（不作为 ISR 的额外验收条件） |
 |-------------|----------|
-| `restore_reachability` | 通道交互达到目标状态后，机器人能够通过该通道或到达通道后的目标区域 |
-| `reveal_target_object` | 容器交互达到目标状态后，目标对象满足可见性证据，例如 `visibility_fraction > threshold` 或 `visible_pixels > 0` |
-| `enable_interaction` | 该交互完成后，下游必要交互变得可到达、可执行或已经被成功完成 |
+| `restore_reachability` | 打开通道以恢复到目标区域的可达性 |
+| `reveal_target_object` | 打开容器以暴露目标对象 |
+| `enable_interaction` | 完成上游操作以使下游交互可执行 |
 | `reduce_navigation_cost` | 作为 beneficial/cost 类型标签，首版主要由 `SPL` 和 `Total Cost` 体现，不单独作为主表指标 |
 
 对不同任务类型，`Interaction Success Rate` 的语义如下：
 
 - `channel`：是否完成恢复可达性的关键通道交互。
 - `container`：是否完成提升目标可见性的关键容器交互。
-- `mixed`：是否完成必要交互链；中间通道交互可以体现 `enablement`，最终容器交互通常体现 `visibility`。
+- `mixed`：必要交互链完成了多少项；中间通道交互可以体现 `enablement`，最终容器交互通常体现 `visibility`。
 
 `Interaction Success Rate` 不等同于 `Oracle SR`。当前评测协议不设置“给 policy 已知 GT 交互计划”的条件，因此不报告 `Oracle SR` 作为主指标。Oracle plan 只用于 benchmark 生成验证、参考路径和 scorer 的 GT 判定。
 
 ## 5. Interaction Precision
 
-`Interaction Precision` 表示执行过的交互中，有多少是有效交互，用于惩罚乱开门、乱开容器、重复打开已经完成的对象等行为。
+`Interaction Precision`（IP）表示全部交互尝试中，有多少成功完成了**目标交互对象类别**中的新交互效果。类别取 benchmark 交互对象的 `object_category`（如 door、fridge、cabinet），同时区分 `channel` 和 `container` 领域；mixed 的目标类别取各领域目标类别的并集。类别匹配忽略大小写及下划线/连字符差异，不要求命中 oracle 的同一个对象实例或 joint ID。目标类别只用于 evaluator 私有评分，不公开给 policy。
 
 单个 episode 中：
 
 ```text
-Interaction Precision_i = V_i / A_i, if A_i > 0
-Interaction Precision_i = 1, if A_i = 0 and no GT interaction is required
-Interaction Precision_i = 0, if A_i = 0 and GT interaction is required
+Interaction Precision_i = V_class_i / A_i, if A_i > 0
+Interaction Precision_i = 1, if A_i = 0 and interaction_requirement is unnecessary
+Interaction Precision_i = 0, if A_i = 0 and interaction_requirement is not unnecessary
 ```
 
 其中：
 
 - `A_i` 是 policy 实际执行的交互尝试次数。
-- `V_i` 是有效交互尝试次数。
+- `V_class_i` 是完成目标类别中新效果的交互尝试次数；一次多关节宏只计一次。
 
-一次交互尝试计为有效，需要满足：
+一次交互尝试仅在目标类别匹配、物理操作成功（或已有私有记录证明某个目标关节效果已实现）、且该对象/关节此前未完成相同效果时计入分子。打开另一扇门或另一台冰箱可以得到类别交互信用；打开非目标类别的容器不会得到信用，但也不自动被定性为错误。失败尝试及对已完成对象的无新效果重复仍进入分母，不进入分子。IP 衡量目标类别交互的完成密度，不是部分可观测环境中的最优探索策略证明；应结合 SR 随预算变化及每类操作次数解读。
 
-1. 匹配 benchmark 中的某个 GT `interaction_id`。
-2. 交互方向与目标状态一致，例如需要打开时确实朝打开方向执行。
-3. 执行后达到该交互的 `target_state`，或满足对应 `effect_types` 的成功证据。
-4. 不是已经完成后的重复无效尝试。
+结果字段 `non_target_class_interaction_attempt_count` 记录已识别类别但不属于目标类别的尝试。保留的旧字段 `task_irrelevant_interaction_attempt_count` 在 v2 中是同一计数的兼容别名，不代表该探索行为一定无用，也不自动计入成本中的错误数。
 
 无交互 episode 也参与 `Interaction Precision`：
 
 - 如果 policy 没有交互，记为 1，表示正确克制。
-- 如果 policy 执行了任何交互，这些交互都计入 `A_i`，且通常为无效交互。
+- 如果 policy 执行了任何交互，这些交互都计入 `A_i`，但不因此被认定为不合理探索。
 
 整体指标默认使用 episode macro average：
 
@@ -171,17 +170,17 @@ Interaction Precision = (1 / N) * sum_i Interaction Precision_i
 scorer 可以额外输出 attempt-level precision：
 
 ```text
-Attempt Precision = sum_i V_i / sum_i A_i
+Attempt Precision = sum_i V_class_i / sum_i A_i
 ```
 
 但论文主表优先使用 episode macro average，避免交互次数极多的少数失败 episode 主导整体结论。
 
 ## 6. Total Cost
 
-`Total Cost` 衡量完成任务所付出的总代价，首版定义为：
+`Total Cost` 与 evaluator v3 口径一致（其 IP 与成本公式承袭 v2，ISR 改为逐场景必要效果完成率），包含所有 episode：
 
 ```text
-Cost_i = L_exec_i + lambda * A_i
+Cost_i = L_exec_i + lambda * A_i + mu * E_i + kappa * (1 - S_i)
 ```
 
 其中：
@@ -189,19 +188,21 @@ Cost_i = L_exec_i + lambda * A_i
 - `L_exec_i` 是实际 robot base 平面路径长度。
 - `A_i` 是交互尝试次数，成功、失败、重复交互都计入。
 - `lambda` 是交互代价权重，用于把一次交互折算成等效路径长度。
+- `E_i` 是失败或已无新效果的重复尝试数，同一尝试即使同时满足两项也只计一次；打开其他探索对象不会仅因对象不属于目标类别而计入 `E_i`。
+- `S_i` 是严格 NavToObj 成功指示；`mu` 和 `kappa` 分别是错误尝试及任务失败的固定惩罚。当前默认 `lambda=0.3`、`mu=1`、`kappa=5`。
 
-默认主表报告成功 episode 上的平均总代价：
+主表报告全部 episode 的平均总代价：
 
 ```text
-Total Cost = mean_i Cost_i, for episodes with S_i = 1
+Total Cost = (1 / N) * sum_i Cost_i
 ```
 
-这样可以避免“很早失败所以代价很低”的方法在 cost 指标上看起来更好。完整 scorer 仍应输出 all-episode cost 作为诊断字段，但论文主表中的 `Total Cost` 默认理解为 success-only cost。
+固定失败罚分并不能完全消除早停的低成本偏差，因此同时报告 SR、共同成功 episode 的成本与成功率随预算变化；不能单独用 Total Cost 判断规划能力。所有权重在评测前冻结：v1 与 v2 的 IP/Total Cost 不可直接比较，v2 与 v3 的 ISR 不可直接比较。
 
-首版使用统一 `lambda`。后续如果需要更细，可以扩展为：
+当前交互尝试使用统一 `lambda`。后续如果需要更细，可以扩展为：
 
 ```text
-Cost_i = L_exec_i + sum_j lambda(type_j, success_j)
+Cost_i = L_exec_i + sum_j lambda(type_j, success_j) + mu * E_i + kappa * (1 - S_i)
 ```
 
 例如为 door、container、failed interaction 设置不同权重。但这属于后续扩展，不进入当前主指标定义。
@@ -234,10 +235,10 @@ Cost_i = L_exec_i + sum_j lambda(type_j, success_j)
 - `SR`：正常计算。
 - `SPL`：正常计算，参考路径为普通导航参考路径。
 - `Interaction Success Rate`：记为 `N/A`，不进入分母。
-- `Interaction Precision`：无交互且无尝试为 1，有多余交互则降低。
+- `Interaction Precision`：无交互且无尝试为 1；有尝试但无目标类别时为 0，不以此判定探索决策错误。
 - `Total Cost`：正常计算，多余交互会通过 `lambda * A_i` 增加代价。
 
-因此，无交互样本不需要额外设计一个主指标；它们会通过 `Interaction Precision` 和 `Total Cost` 惩罚多余开门、乱开容器等行为。
+无交互样本也参与主指标：尝试会支付真实操作成本；IP 的分母记录了这些尝试，但不把未知环境中的首次检查定义为失败。
 
 ## 9. 与 Interactive Gibson 的关系
 

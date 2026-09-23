@@ -2522,8 +2522,13 @@ def test_refrigerator_fan_reserves_arrival_yaw_budget() -> None:
         "operational_front_face_m1_authorized"
     )
     assert math.isclose(
+        command["interaction_front_position_tolerance_rad"],
+        math.radians(25.0),
+        abs_tol=1e-9,
+    )
+    assert math.isclose(
         command["interaction_front_yaw_tolerance_rad"],
-        math.radians(15.0),
+        math.radians(25.0),
         abs_tol=1e-9,
     )
     assert math.isclose(

@@ -25,6 +25,7 @@ import urllib.request
 
 
 SCHEMA = "interactive_nav_m2_online_experiment_v1"
+SIX_ARM_SCHEMA = "interactive_nav_m2_online_experiment_v2"
 MODEL_NAME = "qwen3.6-35b-a3b-fp8"
 ARM_DESIGN = {
     "G0": ("historical_compat_v1", "legacy", "B", 8),
@@ -33,6 +34,15 @@ ARM_DESIGN = {
     **{f"G{i}": ("public_facts_v2", "all_actions_12_frontiers", prompt, 30)
        for i, prompt in enumerate(("P1", "P2", "P3", "P4", "P6"), 3)},
 }
+SIX_ARM_DESIGN = {
+    "G0": ("historical_compat_v1", "legacy", "B", 8),
+    "G1": ("public_facts_v2", "legacy", "B", 8),
+    "G2": ("public_facts_v2", "legacy", "B", 30),
+    "G3": ("public_facts_v2", "all_actions_12_frontiers", "B", 30),
+    "G4": ("public_facts_v2", "all_actions_12_frontiers", "P1", 30),
+    "G5": ("public_facts_v2", "all_actions_12_frontiers", "P6", 30),
+}
+SIX_ARM_LANES = {0: {"G0", "G1", "G2"}, 1: {"G3", "G4", "G5"}}
 THREAD_KEYS = {"OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"}
 DATA_PATH_KEYS = {"MLSPACES_CACHE_DIR", "MLSPACES_ASSETS_DIR", "NLTK_DATA"}
 MODEL_SUFFIXES = {"MODE", "COMMAND", "ENDPOINT", "API_KEY_ENV", "NAME", "PROTOCOL", "TIMEOUT_S",
@@ -86,7 +96,9 @@ def _source_files():
             *[decision / "semantic_decision_py_pkg" / name for name in (
                 "model_policy.py", "env_config.py", "candidate_curator.py", "behavior_candidates.py",
                 "public_robot_context.py", "room_context.py", "frontier_context.py")],
-            scripts / "evaluation/goal_status.py", scripts / "evaluation/goal_equivalence.py"]
+            scripts / "evaluation/goal_status.py", scripts / "evaluation/goal_equivalence.py",
+            scripts / "evaluation/scene_distractor_filter.py",
+            decision / "semantic_decision_py_pkg/mission_completion.py"]
 
 
 def prepare_manifest(template_path: Path, output_dir: Path) -> dict:
@@ -151,13 +163,18 @@ def _output_path(value):
 
 
 def normalize_manifest(document: dict, manifest_dir: Path | None = None) -> dict:
-    """Validate and expand the exact 8-arm x 30-scene design without writes."""
+    """Validate and expand the frozen 8-arm legacy or 6-arm two-task design."""
     result = deepcopy(document)
-    if result.get("schema_version") != SCHEMA or not result.get("experiment_id"):
+    schema = result.get("schema_version")
+    if schema not in {SCHEMA, SIX_ARM_SCHEMA} or not result.get("experiment_id"):
         raise ValueError("Invalid experiment manifest schema/identity")
+    six_arm = schema == SIX_ARM_SCHEMA
+    arm_design = SIX_ARM_DESIGN if six_arm else ARM_DESIGN
+    lane_ids = set(SIX_ARM_LANES) if six_arm else {0, 1, 2}
+    workers = 20 if six_arm else 15
     if result.get("mixed_indices") != list(range(30)) or int(result.get("episode_start", 2000)) != 2000:
         raise ValueError("This experiment must contain Mixed 0..29, global indices 2000..2029")
-    for key, expected in (("worker_count", 15), ("max_steps", 2000), ("min_steps", 200),
+    for key, expected in (("worker_count", workers), ("max_steps", 2000), ("min_steps", 200),
                           ("step_budget_mode", "dynamic"), ("recording", False)):
         if result.get(key, expected) != expected:
             raise ValueError(f"Frozen design requires {key}={expected}")
@@ -170,12 +187,12 @@ def normalize_manifest(document: dict, manifest_dir: Path | None = None) -> dict
     if result["worker_start_interval_s"] < 0 or result["infra_failure_pause_threshold"] < 1:
         raise ValueError("Invalid launch interval or infrastructure stop threshold")
     arms = result.get("arms", [])
-    if len(arms) != 8 or {arm.get("id") for arm in arms} != set(ARM_DESIGN):
-        raise ValueError("Expected exactly G0..G7")
+    if len(arms) != len(arm_design) or {arm.get("id") for arm in arms} != set(arm_design):
+        raise ValueError(f"Expected exactly {sorted(arm_design)}")
     for arm in arms:
         arm["environment"] = _environment(arm.get("environment", {}))
         merged = {**result["common_environment"], **arm["environment"]}
-        profile, pool, prompt, history = ARM_DESIGN[arm["id"]]
+        profile, pool, prompt, history = arm_design[arm["id"]]
         required = {"SEMANTIC_M2_CONTEXT_PROFILE": profile, "SEMANTIC_M2_CANDIDATE_POOL_MODE": pool,
                     "SEMANTIC_M2_RECENT_DECISION_LIMIT": str(history), "SEMANTIC_M2_CANDIDATE_TOP_K": "8",
                     "SEMANTIC_M2_CANDIDATE_MAX_FRONTIER_CANDIDATES": "12"}
@@ -189,15 +206,16 @@ def normalize_manifest(document: dict, manifest_dir: Path | None = None) -> dict
             raise ValueError("Every arm needs an explicit absolute frozen prompt file")
         arm.update(context=profile, pool=pool, prompt=prompt)
     lanes = result.get("lanes", [])
-    if len(lanes) != 3 or {lane.get("id") for lane in lanes} != {0, 1, 2}:
-        raise ValueError("Expected exactly lanes 0, 1, 2")
+    if len(lanes) != len(lane_ids) or {lane.get("id") for lane in lanes} != lane_ids:
+        raise ValueError(f"Expected exactly lanes {sorted(lane_ids)}")
     for lane in lanes:
         lane["output_dir"] = _output_path(lane["output_dir"])
         parsed = urlparse(lane["model_endpoint"])
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.username or parsed.password or not parsed.port or parsed.path != "/v1":
             raise ValueError("Each lane must use a loopback HTTP Qwen /v1 endpoint without credentials")
-        lane["egl_device_id"] = str(lane["egl_device_id"])
-        if not lane["egl_device_id"].isdigit() or not 1024 <= int(lane["base_master_port"]) <= 65521:
+        if not six_arm:
+            lane["egl_device_id"] = str(lane["egl_device_id"])
+        if (not six_arm and not lane["egl_device_id"].isdigit()) or not 1024 <= int(lane["base_master_port"]) <= 65515:
             raise ValueError("Invalid EGL ID or ROS port range")
         lane["environment"] = _environment(lane.get("environment", {}))
     for i, left in enumerate(lanes):
@@ -206,16 +224,18 @@ def normalize_manifest(document: dict, manifest_dir: Path | None = None) -> dict
             if a.is_relative_to(b) or b.is_relative_to(a):
                 raise ValueError("Lane output directories overlap")
     local = {lane["id"]: lane for lane in lanes}
-    if abs(int(local[0]["base_master_port"]) - int(local[1]["base_master_port"])) < 15:
+    if not six_arm and abs(int(local[0]["base_master_port"]) - int(local[1]["base_master_port"])) < workers:
         raise ValueError("Local ROS port ranges overlap")
-    if local[0]["egl_device_id"] == local[1]["egl_device_id"]:
+    if not six_arm and local[0]["egl_device_id"] == local[1]["egl_device_id"]:
         raise ValueError("Local simulation lanes must have distinct EGL devices")
     jobs = []
     for lane in sorted(lanes, key=lambda item: item["id"]):
+        selected_arms = SIX_ARM_LANES[lane["id"]] if six_arm else set(arm_design)
         lane_jobs = [{"job_id": f"{arm['id']}-mixed{index:04d}", "arm": arm["id"], "mixed_index": index,
                       "episode_index": 2000 + index, "lane_id": lane["id"],
                       "output_dir": str(Path(lane["output_dir"]) / arm["id"] / f"episode_{2000 + index:04d}")}
-                     for index in range(30) if index % 3 == lane["id"] for arm in sorted(arms, key=lambda item: item["id"])]
+                     for index in range(30) if six_arm or index % 3 == lane["id"]
+                     for arm in sorted(arms, key=lambda item: item["id"]) if arm["id"] in selected_arms]
         random.Random(result["seed"] + lane["id"]).shuffle(lane_jobs)
         jobs.extend(lane_jobs)
     supplied = result.get("planned_jobs")
@@ -266,20 +286,20 @@ def classify_incomplete(row):
             "retry_authorized": False}
 
 
-def validate_model_inventory(document):
+def validate_model_inventory(document, *, minimum_context=16384):
     found = next((item for item in document.get("data", []) if item.get("id") == MODEL_NAME), None)
     if found is None:
         raise RuntimeError("qwen_model_identity_mismatch")
     limit = found.get("max_model_len")
-    if limit is not None and int(limit) < 16384:
-        raise RuntimeError("qwen_context_window_below_16384")
+    if limit is not None and int(limit) < minimum_context:
+        raise RuntimeError(f"qwen_context_window_below_{minimum_context}")
     return {"healthy": True, "model": MODEL_NAME, "reported_max_model_len": limit, "checked_at": time.time()}
 
 
-def check_qwen(endpoint):
+def check_qwen(endpoint, *, minimum_context=16384):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(endpoint.rstrip("/") + "/models", timeout=3) as response:
-        return validate_model_inventory(json.load(response))
+        return validate_model_inventory(json.load(response), minimum_context=minimum_context)
 
 
 def lane_status(manifest, lane, jobs, results, active, state, started, *, error=None):
@@ -307,11 +327,14 @@ def _config(manifest, lane, fallback):
     config = deepcopy(source) if isinstance(source, dict) else json.loads(Path(source).read_text())
     config.update(manifest.get("config_overrides", {}))
     config.update(lane.get("config_overrides", {}))
-    config.update(benchmark=manifest.get("benchmark", config["benchmark"]), workers=15,
-                  episode_indices=[2000 + i for i in range(30) if i % 3 == lane["id"]],
+    six_arm = manifest["schema_version"] == SIX_ARM_SCHEMA
+    config.update(benchmark=manifest.get("benchmark", config["benchmark"]), workers=manifest["worker_count"],
+                  episode_indices=[2000 + i for i in range(30) if six_arm or i % 3 == lane["id"]],
                   max_steps=2000, min_steps=200, step_budget_mode="dynamic", recording=False, resume=False,
                   base_master_port=int(lane["base_master_port"]), model_endpoints=[lane["model_endpoint"]],
-                  mujoco_egl_devices=[lane["egl_device_id"]])
+                  mujoco_egl_devices=["0", "1", "2", "3"] if six_arm else [lane["egl_device_id"]])
+    if six_arm:
+        config.update(check_mujoco_gpu_inventory=True, required_mujoco_gpu_count=4)
     config["ros_command_starvation_timeout_s"] = max(300, float(config["ros_command_starvation_timeout_s"]))
     if lane.get("semantic_model_env_file"):
         config["semantic_model_env_file"] = lane["semantic_model_env_file"]
@@ -339,16 +362,18 @@ def run_lane(manifest_path: Path, lane_id: int, *, config_path=None, dry_run=Fal
         raise ValueError("Unknown experiment lane")
     jobs = [job for job in manifest["planned_jobs"] if job["lane_id"] == lane_id]
     config = _config(manifest, lane, config_path or baseline.DEFAULT_CONFIG)
+    if manifest["schema_version"] == SIX_ARM_SCHEMA and not dry_run:
+        baseline.check_mujoco_gpu_inventory(config)
     output = Path(lane["output_dir"])
-    if start_qwen and lane_id != 2:
+    if start_qwen and manifest["schema_version"] == SCHEMA and lane_id != 2:
         raise ValueError("Local lanes must share the existing Qwen service; --start-qwen is remote-only")
     if dry_run:
-        print(json.dumps({"experiment_id": manifest["experiment_id"], "lane_id": lane_id, "workers": 15,
+        print(json.dumps({"experiment_id": manifest["experiment_id"], "lane_id": lane_id, "workers": config["workers"],
                           "start_qwen": start_qwen, "config": config, "jobs": jobs,
                           "arm_overrides": {arm["id"]: arm_environment(manifest, lane, arm) for arm in manifest["arms"]},
                           "retry_policy": manifest["retry_policy"]}, ensure_ascii=False, indent=2))
         return 0
-    for port in range(config["base_master_port"], config["base_master_port"] + 15):
+    for port in range(config["base_master_port"], config["base_master_port"] + config["workers"]):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", port))
     output.mkdir(parents=True, exist_ok=False)
@@ -398,7 +423,9 @@ def run_lane(manifest_path: Path, lane_id: int, *, config_path=None, dry_run=Fal
     interrupted = False
     telemetry = batch.BatchResourceTelemetry(output, 5.0)
     service_health = {"healthy": None, "consecutive_failures": 0}
-    service = baseline.QwenService(output, os.environ, port=urlparse(lane["model_endpoint"]).port) if start_qwen else None
+    service = baseline.QwenService(output, os.environ, port=urlparse(lane["model_endpoint"]).port,
+                                   target_concurrency=config["workers"]) if start_qwen else None
+    minimum_context = 10240 if manifest["schema_version"] == SIX_ARM_SCHEMA else 16384
     def request_stop(*_):
         nonlocal interrupted
         interrupted = True
@@ -459,10 +486,10 @@ def run_lane(manifest_path: Path, lane_id: int, *, config_path=None, dry_run=Fal
                 starter.join(timeout=10)
             if startup_errors:
                 raise startup_errors[0]
-        service_health.update(check_qwen(lane["model_endpoint"]), consecutive_failures=0)
+        service_health.update(check_qwen(lane["model_endpoint"], minimum_context=minimum_context), consecutive_failures=0)
         next_health_check = time.monotonic() + 30
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            futures = [executor.submit(worker, worker_id) for worker_id in range(15)]
+        with ThreadPoolExecutor(max_workers=config["workers"]) as executor:
+            futures = [executor.submit(worker, worker_id) for worker_id in range(config["workers"])]
             while not all(future.done() for future in futures):
                 status = publish("running")
                 print(json.dumps({key: status[key] for key in ("lane_id", "planned", "reported", "completed", "failed", "queued", "per_arm")}), flush=True)
@@ -473,7 +500,7 @@ def run_lane(manifest_path: Path, lane_id: int, *, config_path=None, dry_run=Fal
                         errors.append(str(exc)); stop.set()
                 if time.monotonic() >= next_health_check:
                     try:
-                        service_health.update(check_qwen(lane["model_endpoint"]), consecutive_failures=0)
+                        service_health.update(check_qwen(lane["model_endpoint"], minimum_context=minimum_context), consecutive_failures=0)
                     except (OSError, ValueError, RuntimeError):
                         service_health.update(healthy=False, checked_at=time.time(),
                                               consecutive_failures=service_health["consecutive_failures"] + 1)

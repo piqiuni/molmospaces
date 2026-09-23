@@ -46,6 +46,11 @@ from semantic_mapping_py_pkg.messages import observation_stamp_seconds
 from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_nested_param
+from semantic_mapping_py_pkg.room_inference_backends import (
+    WeightedRoomAttributeInferencer,
+    normalized_room_box,
+    room_evidence_signature,
+)
 
 
 class InteractionAttributeInferenceNode:
@@ -109,6 +114,16 @@ class InteractionAttributeInferenceNode:
         self.worker_count = max(1, int(rospy.get_param("~worker_count", 1)))
         self.max_queue_size = max(
             self.worker_count, int(rospy.get_param("~max_queue_size", 8))
+        )
+        self.max_calls_per_object = max(
+            1, int(attribute_config.get("max_calls_per_object", 10))
+        )
+        self.targeted_call_reserve = min(
+            self.max_calls_per_object - 1,
+            max(0, int(attribute_config.get("targeted_call_reserve", 2))),
+        )
+        self.max_failure_retries_per_object = max(
+            0, int(attribute_config.get("max_failure_retries_per_object", 2)),
         )
         self.min_visible_fraction = max(
             0.0, float(rospy.get_param("~min_visible_fraction", 0.20))
@@ -266,6 +281,23 @@ class InteractionAttributeInferenceNode:
                 )
             ),
         )
+        # Failed room calls are refreshed by the same room lane, but with a
+        # cooldown so a timed-out backend cannot create a tight retry loop.
+        # The mapper keeps the room dirty and republishes it; this node is the
+        # single authority for admission/cooldown and therefore remains safe
+        # when multiple mapping publishers are present.
+        self.room_failure_refresh_interval_s = max(
+            0.0,
+            float(room_mllm_config.get("failure_refresh_interval_s", 30.0)),
+        )
+        self.room_fallback_enabled = bool(
+            room_mllm_config.get("fallback_enabled", True)
+        )
+        room_inference_config = get_nested_param(rospy, "room_inference", {}) or {}
+        self.room_fallback_inferencer = WeightedRoomAttributeInferencer(
+            get_nested_param(rospy, "object_room_priors", {}) or {},
+            min_confidence=float(room_inference_config.get("min_confidence", 0.2)),
+        )
         self.room_request_timeout_s = max(
             0.1, float(room_mllm_config.get("request_timeout_s", self.request_timeout_s))
         )
@@ -306,6 +338,7 @@ class InteractionAttributeInferenceNode:
             "stale": 0,
             "expired": 0,
             "failed": 0,
+            "budget_suppressed": 0,
             "filtered": 0,
             "missing_image": 0,
             "targeted_refresh_received": 0,
@@ -339,6 +372,8 @@ class InteractionAttributeInferenceNode:
         self.pending: dict[str, dict] = {}
         self.completed: dict[str, dict] = {}
         self.generations: dict[str, int] = {}
+        self.m1_call_counts: dict[str, int] = {}
+        self.m1_failure_streaks: dict[str, int] = {}
         self.aliases: dict[str, str] = {}
         self.targeted_refresh_sequence = 0
         self.targeted_refresh_requests: dict[str, dict] = {}
@@ -349,6 +384,7 @@ class InteractionAttributeInferenceNode:
         self.room_last_request: dict[str, float] = {}
         self.room_pending: dict[str, dict] = {}
         self.room_completed: dict[str, dict] = {}
+        self.room_failures: dict[str, dict] = {}
         self.room_generations: dict[str, int] = {}
         self.room_request_queue = LatestPriorityRequestQueue(self.room_max_queue_size)
         self.shutdown_event = threading.Event()
@@ -402,6 +438,12 @@ class InteractionAttributeInferenceNode:
             self.client.config.model,
             self.worker_count,
             self.room_worker_count,
+        )
+        rospy.loginfo(
+            "[interaction_attribute_inference] per_object_m1_calls=%d targeted_reserve=%d failure_retries=%d",
+            self.max_calls_per_object,
+            self.targeted_call_reserve,
+            self.max_failure_retries_per_object,
         )
         self._publish_status()
 
@@ -717,6 +759,13 @@ class InteractionAttributeInferenceNode:
                                 error=f"portal_state_consensus:{portal_request_reason}",
                             )
                     continue
+            if targeted_refresh is None:
+                with self.lock:
+                    if self._m1_budget_error_locked(object_id, targeted=False):
+                        self.filter_counts["budget_suppressed"] = (
+                            self.filter_counts.get("budget_suppressed", 0) + 1
+                        )
+                        continue
             with self.lock:
                 self.filter_counts["eligible"] += 1
             signature = self._state_signature(detection)
@@ -850,6 +899,22 @@ class InteractionAttributeInferenceNode:
                     targeted_refresh,
                 )
             if reservation is None:
+                if targeted_refresh is not None:
+                    with self.lock:
+                        budget_error = self._m1_budget_error_locked(
+                            object_id, targeted=True
+                        )
+                    if budget_error:
+                        self._reject_targeted_refresh_evidence(
+                            object_id=object_id,
+                            episode_id=episode_id,
+                            observation_stamp=observation_stamp,
+                            frame_id=frame_id,
+                            image_sequence=image_sequence,
+                            signature=signature,
+                            targeted_refresh=targeted_refresh,
+                            error=budget_error,
+                        )
                 continue
             enqueued_at = time.monotonic()
             request_timeout_s = (
@@ -1031,12 +1096,18 @@ class InteractionAttributeInferenceNode:
                 continue
             room_node_id = str(room.get("room_node_id") or f"room_{room_id}")
             objects = self._room_objects(room.get("objects"))
+            box = room.get("room_box")
+            if not isinstance(box, dict):
+                box = {}
+            room_box = normalized_room_box(
+                box.get("center_xy"), box.get("size_xy")
+            )
             if not objects:
                 with self.lock:
                     self.room_counts["filtered"] += 1
                 continue
             room_key = room_node_id or f"room_{room_id}"
-            signature = self._room_signature(room_id, objects)
+            signature = self._room_signature(room_id, objects, room_box)
             self._invalidate_room_if_state_changed(room_key, signature, episode_id)
             reservation = self._try_reserve_room(room_key, signature)
             if reservation is None:
@@ -1054,6 +1125,7 @@ class InteractionAttributeInferenceNode:
                     "priority": self._room_priority(objects),
                     "room_id": room_id,
                     "room_node_id": room_node_id,
+                    "room_box": room_box,
                     "objects": objects,
                     "episode_id": episode_id,
                     "capture_step": capture_step,
@@ -1149,24 +1221,8 @@ class InteractionAttributeInferenceNode:
         return sorted(normalized, key=lambda item: (item["object_id"], item["name"]))
 
     @staticmethod
-    def _room_signature(room_id: int, objects: list[dict]) -> str:
-        return json.dumps(
-            {
-                "room_id": int(room_id),
-                "objects": [
-                    {
-                        "object_id": item["object_id"],
-                        "name": item["name"].casefold(),
-                        "category": item["category"].casefold(),
-                        "type": item["type"].casefold(),
-                    }
-                    for item in objects
-                ],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
+    def _room_signature(room_id: int, objects: list[dict], room_box=None) -> str:
+        return room_evidence_signature(room_id, room_box, objects)
 
     @staticmethod
     def _room_priority(objects: list[dict]) -> float:
@@ -1188,6 +1244,7 @@ class InteractionAttributeInferenceNode:
             self.room_generations[room_key] = self.room_generations.get(room_key, 0) + 1
             self.room_pending.pop(room_key, None)
             self.room_last_request.pop(room_key, None)
+            self.room_failures.pop(room_key, None)
         discarded = self.room_request_queue.discard(room_key, request_sequence)
         self._publish_discarded_room_requests(
             discarded,
@@ -1205,6 +1262,14 @@ class InteractionAttributeInferenceNode:
                     self.room_success_refresh_interval_s <= 0.0
                     or now - float(completed.get("completed_at", 0.0))
                     < self.room_success_refresh_interval_s
+                ):
+                    return None
+            failed = self.room_failures.get(room_key)
+            if failed is not None and failed.get("signature") == signature:
+                if (
+                    self.room_failure_refresh_interval_s > 0.0
+                    and now - float(failed.get("failed_at", 0.0))
+                    < self.room_failure_refresh_interval_s
                 ):
                     return None
             if now - self.room_last_request.get(room_key, 0.0) < self.room_min_interval_s:
@@ -1245,6 +1310,68 @@ class InteractionAttributeInferenceNode:
             "error": str(error)[:240],
         }
 
+    def _room_fallback_patch(
+        self,
+        request_payload: dict,
+        objects: list[dict],
+        *,
+        error: str,
+        queue_lag_sec: float,
+        request_started: float,
+        enqueued_at: float,
+    ) -> dict | None:
+        """Create an immediately usable rule-based room result after failure."""
+
+        if not self.room_fallback_enabled:
+            return None
+        detections = []
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            category = str(item.get("category") or "")
+            detections.append(
+                {
+                    "node_id": str(
+                        item.get("object_id") or item.get("node_id") or ""
+                    ),
+                    "semantic_name": (
+                        category
+                        if name.casefold() in {"", "object", "unknown"} and category
+                        else name
+                    ),
+                    "category": category,
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                }
+            )
+        result = self.room_fallback_inferencer.infer(detections)
+        evidence_ids = [
+            str(item.get("node_id") or "")
+            for item in result.get("evidence") or []
+            if str(item.get("node_id") or "")
+        ][:2]
+        return {
+            "room_id": int(request_payload["room_id"]),
+            "room_node_id": str(request_payload["room_node_id"]),
+            "episode_id": str(request_payload.get("episode_id") or ""),
+            "stamp_sec": float(request_payload["stamp"]),
+            "observation_stamp_sec": float(request_payload["stamp"]),
+            "observation_capture_step": request_payload.get("capture_step"),
+            "observation_signature": str(request_payload["signature"]),
+            "room_attribute": str(result.get("room_attribute") or "unknown"),
+            "confidence": float(result.get("confidence", 0.0) or 0.0),
+            "evidence_object_ids": evidence_ids,
+            "source": "weighted_object_types_fallback",
+            "model_name": "",
+            "request_sequence": int(request_payload["request_sequence"]),
+            "room_attribute_status": "ready",
+            "fallback": True,
+            "error": str(error)[:240],
+            "queue_lag_sec": float(queue_lag_sec),
+            "response_lag_sec": max(0.0, time.monotonic() - request_started),
+            "total_lag_sec": max(0.0, time.monotonic() - float(enqueued_at)),
+        }
+
     def _publish_discarded_room_requests(
         self,
         requests: list[dict] | None,
@@ -1279,6 +1406,16 @@ class InteractionAttributeInferenceNode:
                 "room_counts": dict(self.room_counts),
                 "room_queue_size": len(self.room_request_queue),
                 "room_pending_requests": len(self.room_pending),
+                "room_failed_signatures": len(self.room_failures),
+                "m1_total_calls": sum(getattr(self, "m1_call_counts", {}).values()),
+                "m1_objects_at_call_limit": sum(
+                    count >= getattr(self, "max_calls_per_object", 10)
+                    for count in getattr(self, "m1_call_counts", {}).values()
+                ),
+                "m1_objects_retry_exhausted": sum(
+                    count > getattr(self, "max_failure_retries_per_object", 2)
+                    for count in getattr(self, "m1_failure_streaks", {}).values()
+                ),
                 "has_latest_image": self.latest_image is not None,
                 "latest_image_sequence": int(self.latest_image_sequence),
                 "latest_image_header_seq": int(
@@ -1312,10 +1449,13 @@ class InteractionAttributeInferenceNode:
             self.pending.clear()
             self.completed.clear()
             self.generations.clear()
+            getattr(self, "m1_call_counts", {}).clear()
+            getattr(self, "m1_failure_streaks", {}).clear()
             self.aliases.clear()
             self.room_last_request.clear()
             self.room_pending.clear()
             self.room_completed.clear()
+            self.room_failures.clear()
             self.room_generations.clear()
             self.targeted_refresh_requests.clear()
             self.target_visual_history.clear()
@@ -1518,18 +1658,56 @@ class InteractionAttributeInferenceNode:
             canonical_object_id = self.aliases.get(
                 request["object_id"], request["object_id"]
             )
-            self.targeted_refresh_sequence += 1
-            refresh_sequence = self.targeted_refresh_sequence
-            self.targeted_refresh_requests[canonical_object_id] = {
-                **request,
-                "request_key": canonical_object_id,
-                "refresh_sequence": refresh_sequence,
-                # Require an RGB image that arrived after this request, even
-                # if an old detection packet is still waiting to be consumed.
-                "minimum_image_sequence": int(self.latest_image_sequence),
-                "armed_at_monotonic": time.monotonic(),
-            }
-            self.filter_counts["targeted_refresh_armed"] += 1
+            budget_error = self._m1_budget_error_locked(
+                canonical_object_id, targeted=True
+            )
+            # A stable portal vote can still satisfy a later view without a
+            # model call; keep its existing cached-consensus path available.
+            consensus = getattr(self, "portal_state_consensus", None)
+            if budget_error and request["expected_node_type"] == "portal" and consensus:
+                if consensus.cached_stable_result(
+                    canonical_object_id,
+                    capture_step=request["minimum_capture_step"],
+                ) is not None:
+                    budget_error = ""
+            if budget_error and canonical_object_id not in self.pending:
+                self.request_sequence += 1
+                rejected_sequence = self.request_sequence
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                self.filter_counts["targeted_refresh_rejected"] += 1
+            else:
+                budget_error = ""
+            if not budget_error:
+                self.targeted_refresh_sequence += 1
+                refresh_sequence = self.targeted_refresh_sequence
+                self.targeted_refresh_requests[canonical_object_id] = {
+                    **request,
+                    "request_key": canonical_object_id,
+                    "refresh_sequence": refresh_sequence,
+                    # Require an RGB image that arrived after this request, even
+                    # if an old detection packet is still waiting to be consumed.
+                    "minimum_image_sequence": int(self.latest_image_sequence),
+                    "armed_at_monotonic": time.monotonic(),
+                }
+                self.filter_counts["targeted_refresh_armed"] += 1
+        if budget_error:
+            self._publish_updates(
+                requested_episode or current_episode,
+                time.time(),
+                [self._attribute_status_patch(
+                    {
+                        "object_id": canonical_object_id,
+                        "request_sequence": rejected_sequence,
+                        "targeted_refresh": request,
+                    },
+                    "failed",
+                    error=budget_error,
+                )],
+            )
+            self._publish_status()
+            return
         self._publish_updates(
             requested_episode, time.time(),
             [self._attribute_status_patch(
@@ -1885,6 +2063,11 @@ class InteractionAttributeInferenceNode:
         previous_snapshot: dict | None = None
         with self.lock:
             if episode_id and self.current_episode_id and episode_id != self.current_episode_id:
+                return None
+            if self._m1_budget_error_locked(object_id, targeted=True):
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
                 return None
             previous = self.pending.get(object_id)
             if previous is not None:
@@ -2508,6 +2691,52 @@ class InteractionAttributeInferenceNode:
         score += max(0.0, self.max_distance_m - distance_m)
         return score
 
+    def _m1_budget_error_locked(self, object_id: str, *, targeted: bool) -> str:
+        """Check the per-episode call cap and consecutive failure retry cap."""
+
+        max_calls = max(1, int(getattr(self, "max_calls_per_object", 10)))
+        reserve = min(
+            max_calls - 1, max(0, int(getattr(self, "targeted_call_reserve", 2)))
+        )
+        calls = getattr(self, "m1_call_counts", {}).get(object_id, 0)
+        failures = getattr(self, "m1_failure_streaks", {}).get(object_id, 0)
+        if calls >= max_calls:
+            return "m1_call_budget_exhausted"
+        if failures > max(0, int(getattr(self, "max_failure_retries_per_object", 2))):
+            return "m1_failure_retry_exhausted"
+        if not targeted and calls >= max_calls - reserve:
+            return "m1_discovery_budget_exhausted"
+        return ""
+
+    def _claim_m1_call(
+        self,
+        object_id: str,
+        episode_id: str,
+        generation: int,
+        request_sequence: int,
+        *,
+        targeted: bool,
+    ) -> tuple[int, str]:
+        """Charge only a real model submission, atomically across M1 workers."""
+
+        with self.lock:
+            if not self._is_current_request_locked(
+                object_id, episode_id, generation, request_sequence
+            ):
+                return 0, "stale"
+            error = self._m1_budget_error_locked(object_id, targeted=targeted)
+            if error:
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                return 0, error
+            counts = getattr(self, "m1_call_counts", None)
+            if counts is None:
+                counts = self.m1_call_counts = {}
+            call_index = counts.get(object_id, 0) + 1
+            counts[object_id] = call_index
+            return call_index, ""
+
     def _try_reserve(
         self, object_id: str, signature: str, *, portal_confirmation: bool = False
     ) -> dict | None:
@@ -2515,6 +2744,11 @@ class InteractionAttributeInferenceNode:
             return None
         now = time.monotonic()
         with self.lock:
+            if self._m1_budget_error_locked(object_id, targeted=False):
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                return None
             if object_id in self.pending:
                 return None
             completed = self.completed.get(object_id)
@@ -2586,6 +2820,10 @@ class InteractionAttributeInferenceNode:
             )
             if current:
                 self.pending.pop(object_id, None)
+                streaks = getattr(self, "m1_failure_streaks", None)
+                if streaks is None:
+                    streaks = self.m1_failure_streaks = {}
+                streaks[object_id] = streaks.get(object_id, 0) + 1
             self.filter_counts["expired"] = self.filter_counts.get("expired", 0) + 1
         if current:
             failure_payload = {
@@ -2635,27 +2873,52 @@ class InteractionAttributeInferenceNode:
             )
             if current:
                 self.room_pending.pop(room_key, None)
+                previous = self.room_failures.get(room_key) or {}
+                self.room_failures[room_key] = {
+                    "signature": str(request_payload.get("signature") or ""),
+                    "failed_at": now,
+                    "attempts": int(previous.get("attempts", 0) or 0) + 1,
+                    "error": "queue_deadline_expired_before_send",
+                    "request_sequence": request_sequence,
+                }
             self.room_counts["expired"] = self.room_counts.get("expired", 0) + 1
         if current:
             request_payload = dict(request_payload)
             enqueued_at = float(request_payload.get("enqueued_at", now) or now)
             stamp = float(request_payload.get("stamp", time.time()) or time.time())
-            self._publish_room_updates(
-                episode_id,
-                stamp,
-                [
-                    self._room_status_patch(
-                        request_payload,
-                        "failed",
-                        error="queue_deadline_expired_before_send",
-                    )
-                    | {
-                        "queue_lag_sec": max(0.0, now - enqueued_at),
-                        "response_lag_sec": 0.0,
-                        "total_lag_sec": max(0.0, now - enqueued_at),
-                    }
-                ],
-            )
+            try:
+                fallback_patch = self._room_fallback_patch(
+                    request_payload,
+                    request_payload.get("objects") or [],
+                    error="queue_deadline_expired_before_send",
+                    queue_lag_sec=max(0.0, now - enqueued_at),
+                    request_started=now,
+                    enqueued_at=enqueued_at,
+                )
+            except Exception as fallback_error:
+                rospy.logwarn_throttle(
+                    5.0, "room fallback inference failed: %s", fallback_error
+                )
+                fallback_patch = None
+            if fallback_patch is not None:
+                self._publish_room_updates(episode_id, stamp, [fallback_patch])
+            else:
+                self._publish_room_updates(
+                    episode_id,
+                    stamp,
+                    [
+                        self._room_status_patch(
+                            request_payload,
+                            "failed",
+                            error="queue_deadline_expired_before_send",
+                        )
+                        | {
+                            "queue_lag_sec": max(0.0, now - enqueued_at),
+                            "response_lag_sec": 0.0,
+                            "total_lag_sec": max(0.0, now - enqueued_at),
+                        }
+                    ],
+                )
         self._publish_status()
 
     def _worker_loop(self) -> None:
@@ -2955,6 +3218,19 @@ class InteractionAttributeInferenceNode:
                     "markdown, explanations, geometry, axes, ranges, trajectories, or extra keys.",
                 )
             )
+            call_index, budget_error = self._claim_m1_call(
+                object_id,
+                episode_id,
+                generation,
+                request_sequence,
+                targeted=bool(targeted_refresh),
+            )
+            if budget_error:
+                if budget_error == "stale":
+                    outcome_status = "stale"
+                else:
+                    outcome_error = budget_error
+                return
             model_call_started = True
             response = self.client.request_json(
                 role="attribute_inference",
@@ -2987,6 +3263,8 @@ class InteractionAttributeInferenceNode:
                     "observation_image_size": list(image_size or []),
                     "observation_image_stamp_key": list(image_stamp_key or []),
                     "request_sequence": request_sequence,
+                    "m1_object_call_index": call_index,
+                    "m1_object_call_limit": getattr(self, "max_calls_per_object", 10),
                     "queue_lag_sec": queue_lag_sec,
                     "targeted_refresh": bool(targeted_refresh),
                     "m1_evidence_image_count": panel_count,
@@ -3172,6 +3450,7 @@ class InteractionAttributeInferenceNode:
                     if model_call_started:
                         self.last_request[object_id] = time.monotonic()
                 if succeeded and current_request:
+                    getattr(self, "m1_failure_streaks", {}).pop(object_id, None)
                     self.completed[object_id] = {
                         "signature": signature,
                         "completed_at": time.monotonic(),
@@ -3181,6 +3460,11 @@ class InteractionAttributeInferenceNode:
                 elif (
                     current_request
                 ):
+                    if model_call_started or deadline_expired:
+                        streaks = getattr(self, "m1_failure_streaks", None)
+                        if streaks is None:
+                            streaks = self.m1_failure_streaks = {}
+                        streaks[object_id] = streaks.get(object_id, 0) + 1
                     publish_status = True
             if publish_status:
                 failure_payload = {
@@ -3227,6 +3511,7 @@ class InteractionAttributeInferenceNode:
         room_key: str,
         room_id: int,
         room_node_id: str,
+        room_box: dict,
         objects: list[dict],
         episode_id: str,
         capture_step: int | None,
@@ -3274,8 +3559,9 @@ class InteractionAttributeInferenceNode:
             response = self.client.request_json(
                 role="room_attribute_inference",
                 instruction=(
-                    "Infer the likely room attribute using only the supplied room ID and "
-                    "its currently known in-room object labels. Return exactly one compact, "
+                    "Infer the likely room attribute primarily from its in-room object labels; "
+                    "use the XY room box only as coarse size context, not as proof of room type. "
+                    "Return exactly one compact, "
                     "single-line JSON object with only room_id, room_attribute, confidence, "
                     "and evidence_object_ids. Include at most two strongest evidence_object_ids. "
                     "Do not assume an image was provided. Do not "
@@ -3285,6 +3571,7 @@ class InteractionAttributeInferenceNode:
                 ),
                 context={
                     "room_id": int(room_id),
+                    "room_box": room_box,
                     "capture_step": capture_step,
                     "objects": objects,
                     "episode_id": episode_id,
@@ -3339,6 +3626,7 @@ class InteractionAttributeInferenceNode:
             rospy.logwarn_throttle(5.0, "room attribute inference failed: %s", exc)
         finally:
             publish_status = False
+            fallback_patch = None
             with self.lock:
                 current_request = self._is_current_room_request_locked(
                     room_key, episode_id, generation, request_sequence
@@ -3353,9 +3641,43 @@ class InteractionAttributeInferenceNode:
                         "completed_at": time.monotonic(),
                         "request_sequence": request_sequence,
                     }
+                    self.room_failures.pop(room_key, None)
                 elif current_request:
+                    previous = self.room_failures.get(room_key) or {}
+                    self.room_failures[room_key] = {
+                        "signature": signature,
+                        "failed_at": time.monotonic(),
+                        "attempts": int(previous.get("attempts", 0) or 0) + 1,
+                        "error": str(outcome_error)[:240],
+                        "request_sequence": request_sequence,
+                    }
                     publish_status = True
-            if publish_status:
+                    if outcome_status != "stale":
+                        try:
+                            fallback_patch = self._room_fallback_patch(
+                                request_payload,
+                                objects,
+                                error=outcome_error or outcome_status,
+                                queue_lag_sec=queue_lag_sec,
+                                request_started=request_started,
+                                enqueued_at=enqueued_at,
+                            )
+                        except Exception as fallback_error:
+                            rospy.logwarn_throttle(
+                                5.0,
+                                "room fallback inference failed: %s",
+                                fallback_error,
+                            )
+            if fallback_patch is not None:
+                # Publish the fallback as a ready room patch.  The mapper
+                # records it as a fallback (and keeps the room dirty), while
+                # the failure cooldown admits a later MLLM refresh.
+                self._publish_room_updates(
+                    episode_id,
+                    float(stamp),
+                    [fallback_patch],
+                )
+            elif publish_status:
                 self._publish_room_updates(
                     episode_id,
                     float(stamp),

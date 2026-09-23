@@ -31,6 +31,31 @@ def test_qwen_respects_visible_gpu_selection(monkeypatch):
         launcher.visible_devices({"CUDA_VISIBLE_DEVICES": ""})
 
 
+def test_shared_qwen_gpu_preflight_checks_inventory_and_records_assignment(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1", "2", "3"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["1", "2", "3", "0"],
+    }
+    assert launcher.check_mujoco_gpu_inventory(config, {}) == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["visible_devices"] == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["workers_per_gpu_if_even"] == 15.0
+
+
+def test_shared_qwen_gpu_preflight_fails_before_two_card_run(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["0", "1"],
+    }
+    with pytest.raises(RuntimeError, match="at least 4 visible GPUs"):
+        launcher.check_mujoco_gpu_inventory(config, {})
+
+
 def test_qwen_failure_does_not_restart(tmp_path):
     class DeadProcess:
         returncode = 1
@@ -69,6 +94,65 @@ def test_qwen_starts_single_vllm_instance_for_all_gpus(tmp_path, monkeypatch, co
     assert service.endpoint == "http://127.0.0.1:8000/v1"
     assert service.tensor_parallel_size == 1
     assert service.data_parallel_size == count
+    assert service.max_num_seqs == 16
+    assert environments[0]["QWEN36_MAX_NUM_SEQS"] == "16"
+
+
+@pytest.mark.parametrize(
+    ("count", "target", "expected"),
+    [(1, 60, 60), (2, 60, 30), (4, 60, 16), (4, 100, 25)],
+)
+def test_qwen_concurrency_scales_with_gpus_and_eval_workers(
+    tmp_path, monkeypatch, count, target, expected
+):
+    import eval_qwen_service as qwen
+    class Socket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def bind(self, address):
+            pass
+    monkeypatch.setattr(qwen.socket, "socket", Socket)
+    service = qwen.QwenService(
+        tmp_path,
+        {"CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(count))},
+        target_concurrency=target,
+    )
+    environments = []
+    monkeypatch.setattr(service, "_spawn",
+                        lambda label, command, env: environments.append(env))
+    monkeypatch.setattr(service, "_ready", lambda *args: None)
+    service.start(None)
+    assert service.max_num_seqs == expected
+    assert environments[0]["QWEN36_MAX_NUM_SEQS"] == str(expected)
+
+
+def test_qwen_explicit_concurrency_override_wins(tmp_path, monkeypatch):
+    import eval_qwen_service as qwen
+    class Socket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def bind(self, address):
+            pass
+    monkeypatch.setattr(qwen.socket, "socket", Socket)
+    service = qwen.QwenService(
+        tmp_path,
+        {
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "QWEN36_MAX_NUM_SEQS": "23",
+        },
+        target_concurrency=60,
+    )
+    environments = []
+    monkeypatch.setattr(service, "_spawn",
+                        lambda label, command, env: environments.append(env))
+    monkeypatch.setattr(service, "_ready", lambda *args: None)
+    service.start(None)
+    assert service.max_num_seqs == 23
+    assert environments[0]["QWEN36_MAX_NUM_SEQS"] == "23"
 
 
 def test_single_endpoint_is_not_round_robin():
@@ -76,9 +160,94 @@ def test_single_endpoint_is_not_round_robin():
     assert qwen.endpoint_for_port(8000) == "http://127.0.0.1:8000/v1"
 
 
+def test_two_gpu_qwen_lb_launches_independent_backends(tmp_path, monkeypatch):
+    import eval_qwen_service as qwen
+    class Socket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def bind(self, address):
+            pass
+    monkeypatch.setattr(qwen.socket, "socket", Socket)
+    service = qwen.QwenLBService(tmp_path, {"CUDA_VISIBLE_DEVICES": "0,1",
+                                            "QWEN36_MAX_NUM_SEQS": "16"})
+    spawned = []
+    healthy = []
+    monkeypatch.setattr(service, "_spawn", lambda label, command, env:
+                        spawned.append((label, command, env)))
+    monkeypatch.setattr(service, "_ready", lambda ports, stop: healthy.append(ports))
+    service.start(None)
+    assert [label for label, _, _ in spawned] == ["gpu0", "gpu1", "lb"]
+    assert [env["QWEN36_GPU_IDS"] for _, _, env in spawned[:2]] == ["0", "1"]
+    assert [env["QWEN36_PORT"] for _, _, env in spawned[:2]] == ["8000", "8001"]
+    assert all(env["QWEN36_DP_SIZE"] == "1" for _, _, env in spawned[:2])
+    assert spawned[2][1][-2:] == ["--backends", "8000,8001"]
+    assert healthy == [(8000, 8001), [8010]]
+    assert service.endpoint == "http://127.0.0.1:8010/v1"
+    assert json.loads((tmp_path / "qwen-service/deployment.json").read_text())["total_max_num_seqs"] == 32
+
+
+def test_four_gpu_qwen_lb_routes_four_backends_on_distinct_ports(tmp_path, monkeypatch):
+    import eval_qwen_service as qwen
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def bind(self, address):
+            pass
+
+    monkeypatch.setattr(qwen.socket, "socket", Socket)
+    service = qwen.QwenLBService(
+        tmp_path,
+        {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "QWEN36_MAX_NUM_SEQS": "16"},
+        backend_ports=(8100, 8101, 8102, 8103),
+        lb_port=8000,
+        target_concurrency=60,
+    )
+    spawned = []
+    healthy = []
+    monkeypatch.setattr(service, "_spawn", lambda label, command, env:
+                        spawned.append((label, command, env)))
+    monkeypatch.setattr(service, "_ready", lambda ports, stop: healthy.append(ports))
+
+    service.start(None)
+
+    assert [label for label, _, _ in spawned] == ["gpu0", "gpu1", "gpu2", "gpu3", "lb"]
+    assert [env["QWEN36_GPU_IDS"] for _, _, env in spawned[:4]] == ["0", "1", "2", "3"]
+    assert [env["QWEN36_PORT"] for _, _, env in spawned[:4]] == ["8100", "8101", "8102", "8103"]
+    assert all(env["QWEN36_DP_SIZE"] == "1" for _, _, env in spawned[:4])
+    assert spawned[4][1][-2:] == ["--backends", "8100,8101,8102,8103"]
+    assert healthy == [(8100, 8101, 8102, 8103), [8000]]
+    assert service.endpoint == "http://127.0.0.1:8000/v1"
+    deployment = json.loads((tmp_path / "qwen-service/deployment.json").read_text())
+    assert deployment["devices"] == ["0", "1", "2", "3"]
+    assert deployment["total_max_num_seqs"] == 64
+
+
+def test_qwen_lb_rejects_mismatch_between_gpu_count_and_backend_ports(tmp_path):
+    import eval_qwen_service as qwen
+
+    service = qwen.QwenLBService(
+        tmp_path, {"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+        backend_ports=(8100, 8101), lb_port=8000,
+    )
+    with pytest.raises(RuntimeError, match="one backend port per GPU"):
+        service.start(None)
+
+
 def test_launcher_runs_deferred_retry_and_retains_full_selection(tmp_path, monkeypatch):
     config = json.loads(launcher.DEFAULT_CONFIG.read_text())
-    config.update(workers=1, base_master_port=0, episode_indices=[0, 5])
+    config.update(
+        workers=1,
+        base_master_port=0,
+        episode_indices=[0, 5],
+        check_mujoco_gpu_inventory=False,
+    )
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     output = tmp_path / "run"
@@ -129,6 +298,20 @@ def test_command_can_resume_matching_incomplete_batch(tmp_path):
     config["resume"] = True
     command, _ = launcher.build_command(config, tmp_path)
     assert "--resume" in command
+
+
+def test_command_supports_interleaved_stride_offset(tmp_path):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config.update({
+        "episode_ranges": [[0, 29]],
+        "episode_stride": 3,
+        "episode_stride_offset": 1,
+    })
+    _, indices = launcher.build_command(config, tmp_path)
+    assert indices == [1, 4, 7, 10, 13, 16, 19, 22, 25, 28]
+    config["episode_stride_offset"] = 3
+    with pytest.raises(ValueError, match="episode_stride_offset"):
+        launcher.build_command(config, tmp_path)
 
 
 def test_command_uniformly_samples_episode_range_by_stride(tmp_path):

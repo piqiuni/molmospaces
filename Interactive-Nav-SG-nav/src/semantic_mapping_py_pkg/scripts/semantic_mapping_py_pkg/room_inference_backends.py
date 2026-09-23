@@ -1,6 +1,54 @@
 from collections import defaultdict
+import json
+import math
 
 from .geometry_utils import normalize_label
+
+
+def normalized_room_box(center, size):
+    """Return a decimeter-quantized XY box for stable change detection."""
+
+    def xy(values):
+        try:
+            coords = [float(value) for value in list(values or [])[:2]]
+        except (TypeError, ValueError):
+            return []
+        if len(coords) != 2 or not all(math.isfinite(value) for value in coords):
+            return []
+        return [round(value, 1) for value in coords]
+
+    return {"center_xy": xy(center), "size_xy": xy(size)}
+
+
+def room_evidence_signature(room_id, room_box, objects):
+    """Key a room request on its XY box and in-room object membership."""
+
+    box = room_box if isinstance(room_box, dict) else {}
+    return json.dumps(
+        {
+            "room_id": int(room_id),
+            "room_box": normalized_room_box(
+                box.get("center_xy"), box.get("size_xy")
+            ),
+            "objects": sorted(
+                (
+                    {
+                        "object_id": str(item.get("object_id") or ""),
+                        "name": str(item.get("name") or "").casefold(),
+                        "category": str(item.get("category") or "").casefold(),
+                        "type": str(item.get("type") or "").casefold(),
+                    }
+                    for item in objects
+                ),
+                key=lambda item: (
+                    item["object_id"], item["name"], item["category"], item["type"]
+                ),
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 class RoomInferenceBackend:

@@ -170,9 +170,13 @@ class EpisodeResult:
     # restricted-policy result traces.
     paper_metric_schema_version: str = ""
     paper_metric_config: dict[str, Any] = field(default_factory=dict)
+    required_interaction_completion_fraction: float | None = None
+    completed_required_interaction_count: int = 0
+    required_interaction_count: int = 0
     valid_interaction_attempt_count: int = 0
     error_interaction_attempt_count: int = 0
     task_irrelevant_interaction_attempt_count: int = 0
+    non_target_class_interaction_attempt_count: int = 0
     failed_interaction_attempt_count: int = 0
     repeated_interaction_attempt_count: int = 0
     interaction_precision_episode: float | None = None

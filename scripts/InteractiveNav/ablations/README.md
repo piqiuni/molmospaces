@@ -74,6 +74,7 @@ Full + baseline 直接使用原始 runner。
 60 个 mixed 场景为场景 0–59，对应 benchmark episode 2000–2059。
 新版公共配置：`scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json`。
 保留动态 200–2000 步、20 workers、观测倍率 1、无录制，新增共同 continuous M1 与独立输出目录。
+论文指标从 `interactive_nav_v3_paper_metrics_v2` 起按目标交互对象类别统计 IP，Total Cost 的错误罚分只计失败或无新效果重复；v1 已存结果的 IP/Cost 不能与 v2 直接比较，配对消融须使用同一评分版本。
 
 以下仅验证计划，不创建文件或启动仿真：
 

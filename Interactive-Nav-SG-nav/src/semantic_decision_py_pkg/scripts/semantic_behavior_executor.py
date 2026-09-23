@@ -402,7 +402,7 @@ class SemanticBehaviorExecutor:
             0.1, float(model_config.get("skill_timeout_s", 4.0))
         )
         self.verification_timeout_s = max(
-            0.1, float(model_config.get("verification_timeout_s", 4.0))
+            0.1, float(model_config.get("verification_timeout_s", 10.0))
         )
         # M3 is now an audit after the sealed backend result.  Keep one short
         # wait for a post-action image and at most one M1 re-observation when
@@ -683,7 +683,7 @@ class SemanticBehaviorExecutor:
                 container_m1_distinct_view_arrival_yaw_tolerance_rad=(
                     self.container_m1_distinct_view_arrival_yaw_tolerance_rad
                 ),
-                verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
+                verification_timeout_s=float(config.get("verification_timeout_s", 10.0)),
                 explore_prepare_timeout_s=float(
                     config.get("explore_prepare_timeout_s", 10.0)
                 ),
@@ -9641,6 +9641,31 @@ class SemanticBehaviorExecutor:
             interaction_approach_attempts,
         )
 
+    @staticmethod
+    def _mark_same_anchor_resume(
+        attempt_history: list[dict],
+        *,
+        selected_attempt: dict | None,
+        selected_goal_option_index: int | None,
+        selected_goal: tuple[float, float, float],
+        updates: dict | None = None,
+    ) -> None:
+        """Record a same-anchor retry even when no interaction ledger exists yet."""
+
+        if attempt_history:
+            attempt = dict(attempt_history[-1])
+        else:
+            attempt = dict(selected_attempt or {})
+            attempt.setdefault("index", int(selected_goal_option_index or 0))
+            attempt.setdefault("goal_xyyaw", list(selected_goal))
+            attempt.setdefault("reachable", True)
+            attempt.setdefault("preflight_reason", "runtime_clearance_resume")
+            attempt.setdefault("navigation_attempt", 1)
+            attempt_history.append(attempt)
+        attempt["resume_same_anchor"] = True
+        attempt.update(dict(updates or {}))
+        attempt_history[-1] = attempt
+
     def _clear_container_inner_corridor_if_owned_locked(
         self, decision_id: str, candidate: dict | None
     ) -> None:
@@ -11423,9 +11448,16 @@ class SemanticBehaviorExecutor:
                         decision_id, clearance_candidate, goal_frame, clearance_goal, clearance_detail,
                     )
                     if recovered and navigation_is_current():
-                        interaction_approach_attempt_history[-1]["clearance_recheck_resend"] = True
-                        interaction_approach_attempt_history[-1]["resume_same_anchor"] = True
-                        interaction_approach_attempt_history[-1]["clearance_confirmation"] = clearance_detail
+                        self._mark_same_anchor_resume(
+                            interaction_approach_attempt_history,
+                            selected_attempt=selected_preflight_attempt,
+                            selected_goal_option_index=selected_goal_option_index,
+                            selected_goal=selected_goal,
+                            updates={
+                                "clearance_recheck_resend": True,
+                                "clearance_confirmation": clearance_detail,
+                            },
+                        )
                         self._schedule_navigation_successor(decision_id, candidate, selected_goal_option_index, interaction_approach_attempt_history)
                         return
                     if clearance_detail.get("clearance_confirmation_inconclusive"):
@@ -11443,7 +11475,12 @@ class SemanticBehaviorExecutor:
                     # Tighten the profile only after the transit goal has
                     # stopped and its worker has released the controller.
                     self.move_base.cancel_goal()
-                    interaction_approach_attempt_history[-1]["resume_same_anchor"] = True
+                    self._mark_same_anchor_resume(
+                        interaction_approach_attempt_history,
+                        selected_attempt=selected_preflight_attempt,
+                        selected_goal_option_index=selected_goal_option_index,
+                        selected_goal=selected_goal,
+                    )
                     self._schedule_navigation_successor(
                         decision_id, candidate, selected_goal_option_index,
                         interaction_approach_attempt_history,

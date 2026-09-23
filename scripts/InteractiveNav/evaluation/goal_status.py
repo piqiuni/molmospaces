@@ -284,6 +284,7 @@ class PublicGoalEvidenceLedger:
             str(value).strip() for value in target_instance_ids if str(value).strip()
         )
         self._frames: deque[PublicGoalEvidence] = deque(maxlen=max(1, int(max_frames)))
+        self._latest_capture_step: int | None = None
 
     def record_frame(
         self,
@@ -297,6 +298,10 @@ class PublicGoalEvidenceLedger:
         observations = payload.get("observations")
         if not isinstance(observations, Iterable) or isinstance(observations, (str, bytes, Mapping)):
             return ()
+        self._latest_capture_step = max(
+            int(capture_step),
+            self._latest_capture_step if self._latest_capture_step is not None else int(capture_step),
+        )
         observed: list[str] = []
         timestamp = float(time.time() if received_at_wall_time is None else received_at_wall_time)
         for raw in observations:
@@ -321,6 +326,11 @@ class PublicGoalEvidenceLedger:
     @property
     def frames(self) -> tuple[PublicGoalEvidence, ...]:
         return tuple(self._frames)
+
+    @property
+    def latest_capture_step(self) -> int | None:
+        """Latest published frame step, including frames without target observations."""
+        return self._latest_capture_step
 
     def has_reliable_target_evidence(self) -> bool:
         return bool(self._frames)
@@ -353,6 +363,8 @@ def verify_target_goal_claim(
     distance_threshold_m: float,
     allow_open_container_anchor: bool = False,
     candidate_selection: str = "nearest",
+    require_current_evidence: bool = False,
+    max_evidence_age_steps: int = 2,
 ) -> GoalClaimVerification:
     """Verify one policy declaration against public evidence and private range.
 
@@ -414,6 +426,11 @@ def verify_target_goal_claim(
     )
     if matching_frame is None:
         return GoalClaimVerification(False, "nearest_target_not_published")
+    if require_current_evidence:
+        latest_step = evidence.latest_capture_step
+        max_age = max(0, int(max_evidence_age_steps))
+        if latest_step is None or latest_step - matching_frame.capture_step > max_age:
+            return GoalClaimVerification(False, "target_perception_stale")
     return GoalClaimVerification(
         True,
         "verified_open_container_anchor" if allow_open_container_anchor else "verified",

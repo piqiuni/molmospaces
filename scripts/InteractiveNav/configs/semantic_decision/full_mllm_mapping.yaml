@@ -5,11 +5,19 @@ ablation:
 
 # The V3 launcher starts interaction_attribute_inference_node when
 # semantic_attribute_inference=true.  Its second, independent lane consumes
-# room + in-room object metadata only (no RGB/crop).
+# room + 0.1 m XY box + in-room object metadata only (no RGB/crop).
 room_mllm:
   enabled: true
   # Long simulator object IDs can make the compact evidence list exceed the
   # historical 96-token cap.  This lane is text-only and independently queued,
-  # so raise only its budget; successful results are then cached rather than
-  # retried on every mapping refresh.
+  # so raise only its budget; successful results are cached, while failures
+  # use a rule fallback and a bounded cooldown before refresh.
   max_output_tokens: 192
+  min_evidence_objects: 1
+  worker_count: 1
+  max_queue_size: 4
+  min_interval_s: 2.0
+  success_refresh_interval_s: 120.0
+  failure_refresh_interval_s: 30.0
+  fallback_enabled: true
+  request_timeout_s: 15.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from .behavior_candidates import BehaviorCandidate, target_observation_satisfies_arrival
@@ -631,6 +632,29 @@ class TargetMissionTracker:
         if not candidate or candidate.get("behavior_type") != "NAVIGATE":
             return False
         return target_observation_satisfies_arrival(candidate.get("metadata") or {})
+
+    @staticmethod
+    def claim_ready(candidate: dict[str, Any] | None) -> bool:
+        if not TargetMissionTracker.visible_arrived_target(candidate):
+            return False
+        metadata = candidate.get("metadata") or {}
+        if not metadata.get("target_visible_now"):
+            return False
+        if metadata.get("target_open_container_anchor_ready"):
+            if not metadata.get("containing_container_id") or metadata.get("target_navigation_required") is not False:
+                return False
+            try:
+                anchor_distance = float(metadata["target_open_container_anchor_distance_m"])
+                tolerance = float(metadata["direct_goal_tolerance_m"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            return math.isfinite(anchor_distance) and math.isfinite(tolerance) and 0 <= anchor_distance <= tolerance
+        try:
+            distance = float(metadata["target_object_distance_m"])
+            threshold = float(metadata["target_success_distance_threshold_m"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return math.isfinite(distance) and math.isfinite(threshold) and 0 <= distance < threshold
 
     @staticmethod
     def priority_target_candidate(

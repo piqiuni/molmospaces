@@ -166,7 +166,8 @@ model:
   api_key_env: "OPENAI_API_KEY"
   model: "qwen3.6-35b-a3b"
   protocol: "openai_chat"
-  timeout_s: 3.0
+  # Module 2 text-only candidate selection request budget.
+  timeout_s: 12.0
   timeout_retry_count: 0
   timeout_retry_backoff_s: 1.0
   reasoning_effort: "off"
@@ -294,7 +295,7 @@ executor:
   # The same server-status fence now protects every navigation successor.  The
   # capture key above remains a compatibility fallback for older overlays.
   move_base_successor_quiescence_timeout_s: 1.0
-  verification_timeout_s: 30.0
+  verification_timeout_s: 10.0
   explore_prepare_timeout_s: 3.0
   explore_finalize_timeout_s: 10.0
   explore_reservation_retry_sec: 0.25

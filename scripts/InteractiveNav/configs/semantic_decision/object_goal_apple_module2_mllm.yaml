@@ -45,7 +45,7 @@ model:
   stale_goal_yaw_tolerance_rad: 0.50
   # M2 is text-only and may use a stronger/slower model through
   # SEMANTIC_M2_*.  The launcher keeps this budget independent from M1/M3.
-  timeout_s: 30.0
+  timeout_s: 12.0
   timeout_retry_count: 1
   timeout_retry_backoff_s: 1.0
   max_tokens: 1536

@@ -136,6 +136,23 @@ For backward compatibility, result field `success` is the same as
 along with navigation success, required interaction success, sequence success,
 wrong interaction count, path length, and terminal reason.
 
+Paper metric schema `interactive_nav_v3_paper_metrics_v3` scores ISR as the
+episode mean of the completed-required-effect fraction for the best valid
+required plan. A scene completing one of two required effects receives 0.5;
+the existing `required_interaction_success` flag still records full-plan
+completion for task logic. Schema v2 ISR was an all-or-nothing episode rate,
+so v2 and v3 ISR are not comparable without rescoring the underlying
+interactions. The v3 schema scores interaction
+precision per episode as the number of attempts producing a new successful
+effect on an object in the target interaction **category** divided by all
+interaction attempts. Categories use evaluator-private `object_category` and
+channel/container domain; they do not require the target instance or joint ID.
+An unrelated successful exploration interaction has no IP credit, but is not
+automatically an error. The cost is `L_exec + lambda*A + mu*E + kappa*(1-S)`,
+where `E` counts failed or effect-free repeated attempts, never mere
+non-target-category exploration. Old v1 IP and Total Cost are not comparable
+to v2/v3, whose IP and cost definitions are identical.
+
 ### ROS step accounting and command liveness
 
 `--max-steps` and each dynamic `effective_max_steps` are budgets of evaluator-

@@ -30,7 +30,9 @@ class MLLMClientConfig:
     model: str = "qwen3.6-35b-a3b"
     protocol: str = "openai_chat"
     command: str = ""
-    timeout_s: float = 20.0
+    # Shared visual MLLM fallback (M1).  M2 and M3 pass their own budgets
+    # explicitly (12 s and 10 s respectively).
+    timeout_s: float = 15.0
     temperature: float = 0.0
     max_tokens: int = 384
     reasoning_effort: str = "off"

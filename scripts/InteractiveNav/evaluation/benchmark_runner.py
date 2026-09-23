@@ -72,6 +72,7 @@ from .benchmark_policies import (
     build_ros_bridge_policy,
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
+from .scene_distractor_filter import apply_same_category_distractor_filter
 from .goal_status import (
     GoalClaimVerification,
     PublicGoalEvidenceLedger,
@@ -152,6 +153,7 @@ class BenchmarkEvaluationConfig:
     video_fps: float = 5.0
     camera_names: list[str] = field(default_factory=lambda: ["head_camera"])
     image_resolution: tuple[int, int] | None = (640, 480)
+    remove_same_category_distractors: bool = True
     policy_dt_ms: float = 200.0
     ctrl_dt_ms: float = 10.0
     sim_dt_ms: float = 10.0
@@ -379,10 +381,44 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
         robot.set_stationary()
         robot.compute_control()
 
-    def __init__(self, exp_config: Any, episode_spec: EpisodeSpec, interactive_nav: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        exp_config: Any,
+        episode_spec: EpisodeSpec,
+        interactive_nav: dict[str, Any],
+        *,
+        remove_same_category_distractors: bool = True,
+    ) -> None:
         self._interactive_nav = interactive_nav
         self.runtime_compatibility = {}
+        self.distractor_filter = apply_same_category_distractor_filter(
+            episode_spec,
+            interactive_nav,
+            enabled=remove_same_category_distractors,
+        )
         super().__init__(exp_config, episode_spec)
+
+    def add_auxiliary_objects(self, spec: Any) -> None:
+        """Remove same-category base bodies, including static target-like bodies."""
+        body_names: set[str] = set()
+        current_body = spec.worldbody.first_body()
+        while current_body is not None:
+            if current_body.name:
+                body_names.add(str(current_body.name))
+            current_body = spec.worldbody.next_body(current_body)
+        extra = apply_same_category_distractor_filter(
+            self.episode_spec,
+            self._interactive_nav,
+            enabled=bool(self.distractor_filter.get("enabled", True)),
+            candidate_names=body_names,
+        )
+        names = sorted(
+            set(self.distractor_filter.get("removed_object_names", []))
+            | set(extra.get("removed_object_names", []))
+        )
+        self.distractor_filter["removed_object_names"] = names
+        self.distractor_filter["removed_object_count"] = len(names)
+        super().add_auxiliary_objects(spec)
 
     def set_joint_values(self, env: Any) -> None:
         # JsonEvalTaskSampler treats every articulated ``pickup_obj_name`` as a
@@ -425,6 +461,7 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
                 name: pose for name, pose in poses.items() if name in bodies
             }
         self.runtime_compatibility = {
+            "same_category_distractor_filter": self.distractor_filter,
             "runtime_body_count": len(bodies),
             "runtime_joint_count": len(joints),
             "dropped_noncritical_object_pose_count": len(missing_poses),
@@ -3006,6 +3043,27 @@ def _private_target_distances_m(
     return result
 
 
+def _verify_public_claim_context(
+    detail: Mapping[str, Any], *, allow_open_container_anchor: bool = False
+) -> GoalClaimVerification | None:
+    if not detail.get("target_visible_now"):
+        return GoalClaimVerification(False, "target_perception_not_current")
+    if not detail.get("target_reliably_observed"):
+        return GoalClaimVerification(False, "target_perception_unreliable")
+    if allow_open_container_anchor:
+        return None
+    try:
+        distance = float(detail["target_object_distance_m"])
+        threshold = float(detail["target_success_distance_threshold_m"])
+    except (KeyError, TypeError, ValueError):
+        return GoalClaimVerification(False, "graph_distance_unavailable")
+    if not math.isfinite(distance) or not math.isfinite(threshold) or threshold <= 0 or distance < 0:
+        return GoalClaimVerification(False, "graph_distance_unavailable")
+    if distance >= threshold:
+        return GoalClaimVerification(False, "graph_distance_failed")
+    return None
+
+
 def _verify_restricted_goal_status(
     *,
     task: Any,
@@ -3013,6 +3071,8 @@ def _verify_restricted_goal_status(
     episode: dict[str, Any],
     payload: dict[str, Any],
 ) -> GoalClaimVerification:
+    detail = payload.get("detail") if isinstance(payload, Mapping) else None
+    detail = detail if isinstance(detail, Mapping) else {}
     threshold = float(
         episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
     )
@@ -3022,8 +3082,6 @@ def _verify_restricted_goal_status(
     # bounded anchor contract together with the claim; keep the public evidence
     # and instance matching checks, but do not force a second motion toward the
     # hidden centre.
-    detail = payload.get("detail") if isinstance(payload, Mapping) else None
-    detail = detail if isinstance(detail, Mapping) else {}
     try:
         anchor_distance = float(
             detail.get("target_open_container_anchor_distance_m")
@@ -3033,33 +3091,20 @@ def _verify_restricted_goal_status(
         anchor_distance = float("nan")
         anchor_tolerance = float("nan")
     anchor_ready = bool(detail.get("target_open_container_anchor_ready"))
-    # A claim can race the graph merge by one frame: the candidate still has
-    # the stable last-interaction strategy and no navigation is required, but
-    # its explicit anchor-distance fields have not been copied yet.  Accept
-    # that equivalent shape only when the target is already reliable and tied
-    # to a containing object; ordinary target claims remain centre-distance
-    # strict.
-    raced_anchor_shape = bool(
-        detail.get("target_navigation_required") is False
-        and detail.get("containing_container_id")
-        and detail.get("target_reliably_observed")
-        and str(detail.get("approach_strategy") or "")
-        == "target_last_successful_interaction_pose"
-    )
     allow_open_container_anchor = bool(
-        (anchor_ready or raced_anchor_shape)
+        anchor_ready
         and detail.get("target_navigation_required") is False
         and detail.get("containing_container_id")
-        and (
-            raced_anchor_shape
-            or (
-                math.isfinite(anchor_distance)
-                and math.isfinite(anchor_tolerance)
-                and anchor_tolerance > 0.0
-                and anchor_distance <= anchor_tolerance + 1e-6
-            )
-        )
+        and math.isfinite(anchor_distance)
+        and math.isfinite(anchor_tolerance)
+        and anchor_tolerance > 0.0
+        and 0.0 <= anchor_distance <= anchor_tolerance + 1e-6
     )
+    graph_verification = _verify_public_claim_context(
+        detail, allow_open_container_anchor=allow_open_container_anchor
+    )
+    if graph_verification is not None:
+        return graph_verification
     return verify_target_goal_claim(
         payload,
         episode_id=runtime.perception.episode_id,
@@ -3067,6 +3112,8 @@ def _verify_restricted_goal_status(
         private_distances_m=_private_target_distances_m(task, runtime),
         distance_threshold_m=threshold,
         allow_open_container_anchor=allow_open_container_anchor,
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
     )
 
 
@@ -3082,6 +3129,11 @@ def _verify_relaxed_category_goal_status(
     evidence = runtime.category_goal_evidence
     if evidence is None or len(runtime.category_target_source_by_opaque_id) <= 1:
         return GoalClaimVerification(False, "category_goal_not_ambiguous")
+    detail = payload.get("detail") if isinstance(payload, Mapping) else None
+    detail = detail if isinstance(detail, Mapping) else {}
+    graph_verification = _verify_public_claim_context(detail)
+    if graph_verification is not None:
+        return graph_verification
     threshold = float(
         episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
     )
@@ -3096,6 +3148,8 @@ def _verify_relaxed_category_goal_status(
         ),
         distance_threshold_m=threshold,
         candidate_selection="nearest_published",
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
     )
     if not verification.accepted:
         return verification
@@ -3800,6 +3854,16 @@ def _consume_pending_ros_object_goal_interaction(
             # required effect is pending.  Preserve physical effects so the
             # paper's V/E accounting remains per attempted interaction.
             "effect_achieved_interaction_ids": successful_ids,
+            "resolved_object_category": joints[0].object_category if joints else None,
+            "resolved_object_domain": joints[0].domain if joints else None,
+            "physical_state_changed": (
+                any(
+                    result.open_fraction_before is not None
+                    and result.open_fraction_after is not None
+                    and result.open_fraction_after > result.open_fraction_before + 1e-3
+                    for result in joint_results
+                ) if joint_results else None
+            ),
             # Retain the matched task-relevant IDs even when approach gating
             # prevents force execution.  This private detail lets the paper
             # breakdown label such an attempt as failed rather than unrelated.
@@ -4084,6 +4148,7 @@ def _protocol_implementation_sha256() -> str:
         Path(__file__).with_name("goal_status.py"),
         Path(__file__).with_name("ros_policy_termination.py"),
         Path(__file__).with_name("trusted_interaction_skill.py"),
+        Path(__file__).with_name("scene_distractor_filter.py"),
         Path(__file__).resolve().parent.parent / "force_interaction_runtime.py",
         Path(__file__).resolve().parent.parent / "force_interaction_bridge.py",
         Path(__file__).resolve().parent.parent / "container_scene_probe.py",
@@ -4251,7 +4316,12 @@ def evaluate_episode(
             # on disk remains unchanged.
             _apply_ros_navigation_arm_posture(spec)
         replay = _build_replay_config(config, episode_dir, task_horizon=effective_max_steps)
-        sampler = V3BenchmarkTaskSampler(replay, spec, nav)
+        sampler = V3BenchmarkTaskSampler(
+            replay,
+            spec,
+            nav,
+            remove_same_category_distractors=config.remove_same_category_distractors,
+        )
         # Collection and this evaluator use a writable scene mirror.  Do not let
         # the upstream sampler attempt to mutate the shared resource cache.
         import molmo_spaces.tasks.task_sampler as task_sampler_module
@@ -4885,7 +4955,12 @@ def evaluate_episode(
                 prerequisite_satisfied=prereq_satisfied,
                 executor=None if runtime_joint is None else "force_locked",
                 simulated_seconds=float(simulated_seconds),
-                metadata={"resolver": resolver_meta, "executor": executor_meta},
+                metadata={
+                    "resolver": resolver_meta,
+                    "executor": executor_meta,
+                    "resolved_object_category": None if runtime_joint is None else runtime_joint.object_category,
+                    "resolved_object_domain": None if runtime_joint is None else runtime_joint.domain,
+                },
             ).to_dict()
             attempts.append(attempt)
             public_attempts.append(attempt)
@@ -5066,6 +5141,9 @@ def evaluate_episode(
             interaction_conditioned_success=interaction_conditioned_success,
             nav_success=nav_ok,
             required_interaction_success=terminal_score.required_interaction_success,
+            required_interaction_completion_fraction=terminal_score.required_interaction_completion_fraction,
+            completed_required_interaction_count=terminal_score.completed_required_interaction_count,
+            required_interaction_count=terminal_score.required_interaction_count,
             sequence_success=terminal_score.sequence_success,
             non_interaction_success=terminal_score.non_interaction_success,
             terminal_reason=terminal_reason,
@@ -5112,6 +5190,9 @@ def evaluate_episode(
             ),
             task_irrelevant_interaction_attempt_count=(
                 paper_interaction_score.task_irrelevant_interaction_attempt_count
+            ),
+            non_target_class_interaction_attempt_count=(
+                paper_interaction_score.non_target_class_interaction_attempt_count
             ),
             failed_interaction_attempt_count=(
                 paper_interaction_score.failed_interaction_attempt_count
@@ -5267,6 +5348,9 @@ def evaluate_episode(
             ),
             task_irrelevant_interaction_attempt_count=(
                 paper_interaction_score.task_irrelevant_interaction_attempt_count
+            ),
+            non_target_class_interaction_attempt_count=(
+                paper_interaction_score.non_target_class_interaction_attempt_count
             ),
             failed_interaction_attempt_count=(
                 paper_interaction_score.failed_interaction_attempt_count
@@ -5617,6 +5701,12 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--video-fps", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["head_camera"])
     parser.add_argument("--image-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=[640, 480])
+    parser.add_argument(
+        "--remove-same-category-distractors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove non-target instances of the target category during episode initialization.",
+    )
     parser.add_argument("--policy-dt-ms", type=float, default=200.0)
     parser.add_argument("--ctrl-dt-ms", type=float, default=10.0)
     parser.add_argument("--sim-dt-ms", type=float, default=10.0)
@@ -5808,6 +5898,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         video_fps=args.video_fps,
         camera_names=list(args.camera_names),
         image_resolution=tuple(args.image_resolution),
+        remove_same_category_distractors=args.remove_same_category_distractors,
         policy_dt_ms=args.policy_dt_ms,
         ctrl_dt_ms=args.ctrl_dt_ms,
         sim_dt_ms=args.sim_dt_ms,

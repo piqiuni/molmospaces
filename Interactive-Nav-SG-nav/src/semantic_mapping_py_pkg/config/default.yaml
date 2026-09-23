@@ -148,10 +148,9 @@ room_inference:
   min_confidence: 0.2
   evidence_window_sec: 5.0
 
-# Module-1's room lane is intentionally text-only: it receives a room ID and
-# the graph's in-room object labels, never RGB or a visual crop.  The existing
-# weighted object rules remain active while this asynchronous lane is pending
-# or low confidence.
+# Module-1's room lane is text-only: it receives a room ID, an XY box rounded
+# to 0.1 m, and in-room object labels, never RGB or a visual crop.  Weighted
+# object rules remain active while this lane is pending or low confidence.
 room_mllm:
   enabled: true
   min_evidence_objects: 1
@@ -159,7 +158,14 @@ room_mllm:
   worker_count: 1
   max_queue_size: 4
   min_interval_s: 2.0
+  # Refresh successful nearby rooms after this interval, even if unchanged.
   success_refresh_interval_s: 120.0
+  # A failed text request is not retried in a tight loop.  The mapper keeps
+  # the room dirty, publishes a rule fallback, and admits a refresh after this
+  # cooldown.
+  failure_refresh_interval_s: 30.0
+  fallback_enabled: true
+  request_timeout_s: 15.0
   max_output_tokens: 96
 
 # Module-1 visual evidence and decision-layer targeted refresh controls.
@@ -167,6 +173,13 @@ room_mllm:
 # waits for a later RGB + detection pair before submitting the high-priority
 # image-only request.
 attribute_inference:
+  # Per episode and detected object: at most ten real M1 model calls.
+  # Keep two slots for decision-triggered views after passive discovery.
+  max_calls_per_object: 10
+  targeted_call_reserve: 2
+  # The first failed/expired attempt may be retried twice; a successful
+  # result resets this streak, but never resets the total call budget.
+  max_failure_retries_per_object: 2
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
   # One M1 call may use earlier target views, but only when they are separated

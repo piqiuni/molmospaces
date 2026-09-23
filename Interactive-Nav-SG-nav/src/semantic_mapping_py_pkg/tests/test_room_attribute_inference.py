@@ -8,7 +8,29 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
-from semantic_mapping_py_pkg.room_inference_backends import WeightedRoomAttributeInferencer
+from semantic_mapping_py_pkg.room_inference_backends import (
+    WeightedRoomAttributeInferencer,
+    normalized_room_box,
+    room_evidence_signature,
+)
+
+
+def test_room_evidence_signature_tracks_box_and_members_not_visibility() -> None:
+    objects = [
+        {"object_id": "stove_1", "name": "Stove", "category": "appliance", "type": "object"},
+        {"object_id": "sink_1", "name": "sink", "category": "fixture", "type": "object"},
+    ]
+    room_box = normalized_room_box([1.234, 2.0, 0.1], [4.0, 5.0, 0.2])
+    signature = room_evidence_signature(2, room_box, objects)
+    assert signature == room_evidence_signature(
+        2,
+        normalized_room_box([1.2344, 2.0, 0.1], [4.0, 5.0, 0.2]),
+        [{**item, "currently_visible": True, "confidence": 0.2} for item in reversed(objects)],
+    )
+    assert signature != room_evidence_signature(
+        2, normalized_room_box([1.34, 2.0, 0.1], [4.0, 5.0, 0.2]), objects
+    )
+    assert signature != room_evidence_signature(2, room_box, objects[:-1])
 
 
 def test_weighted_object_types_choose_room_and_keep_evidence() -> None:

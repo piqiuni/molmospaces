@@ -1696,6 +1696,7 @@ class InteractionGraphStore:
                     patch.get("total_lag_sec", 0.0) or 0.0
                 ),
                 "room_attribute_error": str(patch.get("error") or ""),
+                "room_attribute_fallback": bool(patch.get("fallback", False)),
             }
         )
         if attribute_status == "ready":

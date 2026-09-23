@@ -81,8 +81,10 @@ def _path(value: str, root: Path) -> Path:
 
 def _cloud_state(document: dict[str, Any]) -> str:
     raw = str(document.get("state") or document.get("status") or "").strip().casefold()
-    return {"queue": "queued", "queued": "queued", "pending": "queued", "running": "running",
-            "failed": "failed", "error": "failed", "completed": "completed", "succeeded": "completed",
+    return {"queue": "queued", "queued": "queued", "pending": "queued", "staging": "queued",
+            "initialized": "queued", "running": "running",
+            "failed": "failed", "error": "failed", "exception": "failed",
+            "completed": "completed", "succeeded": "completed", "success": "completed",
             "stopped": "stopped", "cancelled": "stopped", "canceled": "stopped"}.get(raw, "unknown")
 
 
@@ -120,14 +122,16 @@ class CloudPoller:
         self.terminal = False
         self.error_count = 0
 
-    def poll(self, run_dir: Path, *, now: float | None = None, monotonic: float | None = None) -> bool:
+    def poll(self, run_dir: Path, *, now: float | None = None, monotonic: float | None = None,
+             status_path: Path | None = None) -> bool:
         now = time.time() if now is None else now
         monotonic = time.monotonic() if monotonic is None else monotonic
         if self.terminal or monotonic < self.next_poll or not run_dir.is_dir():
             return False
         self.next_poll = monotonic + self.interval_s
         stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
-        previous = read_json(run_dir / "task_status.json")
+        status_path = status_path or run_dir / "task_status.json"
+        previous = read_json(status_path)
         document = {key: previous[key] for key in ("state", "exit_code", "updated_at")
                     if previous.get("task_id") == self.task_id and key in previous}
         document.update(task_id=self.task_id, lane_id=self.lane_id, checked_at=stamp)
@@ -144,7 +148,8 @@ class CloudPoller:
             self.error_count += 1
             document["error_type"] = type(error).__name__
         document["error_count"] = self.error_count
-        _atomic_json(run_dir / "task_status.json", document)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json(status_path, document)
         return True
 
 
@@ -441,9 +446,10 @@ def snapshot(run_dir: Path, *, now: float | None = None, stale_after: float = 12
     if not jobs or any(not isinstance(jid, str) or not jid for jid in ids) or len(ids) != len(set(ids)):
         output.update(state="invalid_manifest", warning="planned_jobs missing/empty/duplicate IDs")
         return output
-    cloud = read_json(run_dir / "task_status.json")
+    legacy_cloud = read_json(run_dir / "task_status.json")
     lane_rows, lane_raw = {}, {}
     for lane in lanes:
+        cloud = read_json(run_dir / f"cloud_lane_{lane['id']}.json") or legacy_cloud
         display, raw = _lane_status(lane, run_dir, manifest.get("experiment_id"), now, stale_after, cloud)
         lane_rows[str(lane["id"])], lane_raw[str(lane["id"])] = display, raw
     active = {str(item.get("job_id")): item for raw in lane_raw.values() for item in raw.get("active") or [] if isinstance(item, dict)}
@@ -578,11 +584,20 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--cloud-task-id", help="Optional existing task; read-only volc query every 60 seconds")
     parser.add_argument("--cloud-lane-id", type=int, default=2)
+    parser.add_argument("--cloud-task", action="append", default=[], metavar="LANE:TASK_ID",
+                        help="Monitor a cloud task for a lane; may be repeated for multiple lanes")
     args = parser.parse_args()
     if args.interval_s <= 0 or args.stale_after_s <= 0:
         parser.error("interval and stale threshold must be positive")
     run_dir = args.run_dir.resolve()
-    cloud_poller = CloudPoller(args.cloud_task_id, args.cloud_lane_id) if args.cloud_task_id else None
+    cloud_pollers = []
+    if args.cloud_task_id:
+        cloud_pollers.append((CloudPoller(args.cloud_task_id, args.cloud_lane_id), None))
+    for spec in args.cloud_task:
+        lane_id, sep, task_id = spec.partition(":")
+        if not sep or not lane_id.isdigit() or not task_id or any(p.lane_id == int(lane_id) for p, _ in cloud_pollers):
+            parser.error("--cloud-task requires distinct LANE:TASK_ID pairs")
+        cloud_pollers.append((CloudPoller(task_id, int(lane_id)), run_dir / f"cloud_lane_{lane_id}.json"))
     progress_tracker = ProgressTracker()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -597,8 +612,8 @@ def main() -> int:
                 except BlockingIOError:
                     print("Another overall monitor already holds this run directory", file=sys.stderr)
                     return 2
-            if cloud_poller:
-                cloud_poller.poll(run_dir)
+            for cloud_poller, status_path in cloud_pollers:
+                cloud_poller.poll(run_dir, status_path=status_path)
             status = snapshot(run_dir, stale_after=args.stale_after_s, progress_tracker=progress_tracker)
             message = publish(run_dir, status, timezone_name=args.timezone) if run_dir.is_dir() else format_status(status, args.timezone)
             print(message, flush=True)

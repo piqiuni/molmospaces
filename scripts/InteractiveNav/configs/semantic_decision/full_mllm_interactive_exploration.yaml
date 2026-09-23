@@ -131,7 +131,7 @@ policy:
 model:
   # Module 2 is text-only and can use a stronger/slower model through
   # SEMANTIC_M2_*.  Keep its request budget independent from visual M1/M3.
-  timeout_s: 30.0
+  timeout_s: 12.0
   timeout_retry_count: 1
   timeout_retry_backoff_s: 1.0
   # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover
@@ -142,7 +142,7 @@ model:
   timeout_cooldown_s: 60.0
   skill_timeout_s: 12.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 12.0
+  verification_timeout_s: 10.0
   # Visual verification has a strict, compact JSON schema, but reserve enough
   # completion headroom so a local MLLM cannot cut off the enclosing object.
   verification_max_output_tokens: 256
