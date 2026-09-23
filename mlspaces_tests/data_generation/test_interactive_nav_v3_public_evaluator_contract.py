@@ -39,7 +39,7 @@ def test_public_goal_uses_language_aliases_without_selected_instance_leakage() -
     context = build_public_target_context(language, instruction="Find the selected refrigerator.")
 
     assert context["target_name"] == "the fridge"
-    assert context["object_labels"] == ["the fridge", "fridge", "refrigerator", "the"]
+    assert context["object_labels"] == ["the fridge", "fridge", "refrigerator"]
     assert "require_interaction" not in context
     assert "completion_requires_visibility" not in context
     serialized = json.dumps(context, sort_keys=True)

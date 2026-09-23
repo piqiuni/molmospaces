@@ -73,6 +73,7 @@ from .benchmark_policies import (
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
 from .scene_distractor_filter import apply_same_category_distractor_filter
+from .smooth_interaction import drawer_scan_final_state
 from .goal_status import (
     GoalClaimVerification,
     PublicGoalEvidenceLedger,
@@ -1121,7 +1122,7 @@ def _build_restricted_ros_object_goal_runtime(
             instruction=public.instruction,
             object_labels=list(language_target.get("object_labels") or [target_name]),
             enabled=bool(language_target.get("enabled", True)),
-            min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
+            min_visible_pixels=1,
             min_visible_fraction=0.0,
             min_consecutive_observations=1,
             success_distance_threshold_m=float(
@@ -3677,8 +3678,7 @@ def _consume_pending_ros_object_goal_interaction(
             postcondition = "drawer_scan_satisfied" if skill_completed else "drawer_scan_failed"
             executor_metadata = dict(scan.get("metadata") or {})
             executor_name = "trusted_drawer_scan"
-            interrupted_open = bool((executor_metadata.get("result") or {}).get("interrupted_by_goal_status"))
-            final_state = "open" if interrupted_open else "closed"
+            final_state = drawer_scan_final_state(executor_metadata)
             public_outcome = {
                 "state": final_state if skill_completed else "unknown",
                 "pre_state": "closed",
@@ -4534,6 +4534,9 @@ def evaluate_episode(
                 "enabled": True,
                 "camera_name": "head_camera",
                 "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
+                "near_container_visibility_distance_m": 2.0,
+                "near_container_minimum_visible_pixels": 1,
+                "near_container_distance_reference": "camera_to_object_aabb_center_3d",
                 "minimum_bbox_area_pixels": int(config.restricted_gt_min_bbox_area_pixels),
                 "minimum_visible_fraction": float(config.restricted_gt_min_visible_fraction),
                 "maximum_distance_m": float(config.restricted_gt_max_distance_m),

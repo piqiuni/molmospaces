@@ -194,6 +194,7 @@ class ModelPolicyConfig:
     timeout_retry_backoff_s: float = 1.0
     temperature: float = 0.0
     max_tokens: int = 256
+    context_window_tokens: int = 16384
     reasoning_effort: str = "off"
     image_detail: str = "low"
     max_graph_nodes: int = 80
@@ -1781,8 +1782,12 @@ class ModelPolicyClient:
                 '1. EVIDENCE: Read mission, room_object_reasoning and the observed graph. Separate observed visibility/connectivity from uncertain room labels, semantic priors and pre_score. Priors never prove containment. A potential room is unexplored topology, not observed free space. Never invent facts or select historical IDs.\n'
                 '2. DEPENDENCIES: Prefer a reliably observed TARGET_GOAL. Otherwise choose POST_INTERACTION_TRAVERSE after opening a portal, unless that exact candidate failed. Next prefer NEXT_ROUTE_PORTAL when observed topology establishes a prerequisite route. Do not infer route necessity from proximity.\n'
                 '3. COMPATIBILITY: Before ranking a container, check whether it can physically and semantically contain the requested target, or its observed effect enables the route. Strong size, function or storage-context incompatibility makes interaction extremely low priority: rank it below all useful frontiers, newly accessible rooms and plausible containers, regardless of proximity or pre_score. Do not treat every openable object as useful. Unknown plausible containers remain eligible; low likelihood is not a hard ban. Use only the supplied mission and observed semantics, never hidden object names or episode-specific assumptions. This is target search, not interaction coverage.\n'
+                'NEGATIVE PRIORITY: When the requested object is unrelated to a container storage function, explore another area or a promising closed doorway instead of approaching, inspecting or retrying that container. Being nearby, openable, or previously approached is not evidence of relevance. A failed face does not increase semantic relevance. Such containers are last-resort choices only when no useful alternative is listed.\n'
+                'POSITIVE CONTAINER PRIORITY: An unsearched, closed container with a strong ordinary storage relationship to the target is a direct target-discovery opportunity. Prefer opening and inspecting that compatible container over generic frontiers or revisiting explored rooms, unless a reliable target goal or a necessary route prerequisite takes priority. Do not wait until every frontier is exhausted. Mere capacity to fit the object is not a strong relationship; use public category, function and observed room context. Unknown relevance remains uncertain, not automatically incompatible.\n'
+                'CLOSED DOOR PRIORITY: Prefer an executable closed-door candidate that can reveal an unentered or unknown room over generic exploration in already entered rooms. Increase its interest when the associated room is compatible with the target; an unknown room is still valuable unexplored space. Use observed connectivity and room-entry history, not proximity alone. This does not prove the room contains the target. Never prefer known static, unavailable, already open or repeatedly failed portals without new evidence.\n'
                 'AFTER OPENING: Prioritize exploring the newly accessible, unentered room before unrelated container interactions in the old room. If a far-side traversal point failed, prefer a CURRENT frontier toward that doorway or new room; do not repeat the blocked point or infer that the room is exhausted. Unknown space is not proof of a clear path; the executor still checks known obstacles.\n'
                 '4. PROGRESS: Compare eligible candidates by expected target discovery. Prefer compatible or unknown unentered rooms over exhausted regions; treat high-confidence room mismatch as a fallback. Among comparable frontiers use expected_visible_unknown_area_m2, then unknown_component_area_m2; distance breaks ties. Do not repeat completed interactions. After failure or no information gain, diversify unless evidence changed; a failed approach alone does not rule out another listed viewpoint.\n'
+                'FAILURE MEMORY: A new frontier ID or room label near a failed position is not a new opportunity. Do not revisit the same failed region merely because its ID changed or an unrelated action occurred. Prefer a different reachable region, a compatible unsearched container, or a closed door that changes connectivity; retry only with new route or observation evidence.\n'
                 '5. VALIDATE: Check current candidate membership, unmet prerequisites and recent outcomes. Return only {"ranked_ids":[...],"reason":"...","confidence":"..."}, with ranked_ids first and no additional keys. Allowed reason: TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, NO_SEMANTIC_PREFERENCE. Allowed confidence: low, medium, high.\n'
             )
         if self._prompt_override:
@@ -1966,21 +1971,15 @@ class ModelPolicyClient:
     def _request_http(
         self, payload: dict[str, Any], metrics_context: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        context, output_tokens, budget_metrics = self._bounded_http_context(payload)
         response = self._mllm_client.request_json(
             role="subgoal_selection",
             instruction=str(payload.get("instruction") or ""),
-            context={
-                "mission": payload.get("mission") or {},
-                "robot": payload.get("robot") or {},
-                "graph": payload.get("graph") or {},
-                "room_object_reasoning": payload.get("room_object_reasoning") or {},
-                "candidates": payload.get("candidates") or [],
-                "recent_decisions": payload.get("recent_decisions") or [],
-            },
+            context=context,
             response_schema=build_subgoal_selection_response_schema(payload),
             timeout_s=self.config.timeout_s,
-            max_tokens=self.config.max_tokens,
-            metrics_context=metrics_context,
+            max_tokens=output_tokens,
+            metrics_context={**(metrics_context or {}), **budget_metrics},
         )
         self.last_metrics = response.metrics()
         if response.error:
@@ -1988,3 +1987,36 @@ class ModelPolicyClient:
         if not isinstance(response.payload, dict):
             raise ValueError("model HTTP response must be a JSON object")
         return response.payload
+
+    def _bounded_http_context(self, payload: dict[str, Any]) -> tuple[dict, int, dict]:
+        context = json.loads(json.dumps({key: payload.get(key) or default for key, default in (
+            ("mission", {}), ("robot", {}), ("graph", {}), ("room_object_reasoning", {}),
+            ("candidates", []), ("recent_decisions", []))}, ensure_ascii=False))
+        output_tokens = min(512, max(1, int(self.config.max_tokens)))
+        limit = int(self.config.context_window_tokens) - output_tokens - 1024
+        instruction_bytes = len(str(payload.get("instruction") or "").encode("utf-8"))
+        def size():
+            return instruction_bytes + len(json.dumps(context, ensure_ascii=False).encode("utf-8"))
+        original_size = size()
+        while size() > limit and context["recent_decisions"]:
+            context["recent_decisions"].pop(0)
+        if size() > limit:
+            context["room_object_reasoning"] = {}
+        while size() > limit:
+            graph_lists = [value for value in context["graph"].values() if isinstance(value, list) and value]
+            if not graph_lists:
+                break
+            max(graph_lists, key=lambda value: len(json.dumps(value, ensure_ascii=False))).pop()
+        if size() > limit:
+            context["graph"] = {}
+            context["robot"] = {key: value for key, value in context["robot"].items()
+                                if key in {"robot_xy", "room_id", "current_room_id"}}
+        if size() > limit:
+            raise ValueError("M2 context budget exceeded by mandatory mission/candidates; refusing oversized request")
+        return context, output_tokens, {
+            "m2_context_window_tokens": self.config.context_window_tokens,
+            "m2_input_utf8_bytes_before": original_size,
+            "m2_input_utf8_bytes_after": size(),
+            "m2_context_compacted": size() < original_size,
+            "m2_retained_candidate_count": len(context["candidates"]),
+        }

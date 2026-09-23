@@ -54,6 +54,23 @@ def node(monkeypatch):
     return decision.SemanticRuleDecisionNode()
 
 
+@pytest.mark.parametrize("behavior", ["", "EXPLORE", "NAVIGATE", "INTERACT"])
+def test_visible_arrived_target_claim_does_not_require_active_interaction(node, behavior):
+    node.require_goal_verification = True
+    node.mission_mode = "semantic_interaction_object_goal"
+    target = {"candidate_id": "target:public", "behavior_type": "NAVIGATE", "target_id": "public",
+              "metadata": {"target_goal": True, "target_reliably_observed": True,
+                           "target_visible_now": True, "target_object_distance_m": 0.7,
+                           "target_success_distance_threshold_m": 1.5}}
+    payload = snapshot(10, candidates=[target])
+    payload["target_context"] = {"enabled": True, "episode_id": "h5"}
+    node.active_behavior_type = behavior
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert node.pending_goal_claim is not None
+    assert not node.goal_complete
+    assert node.goal_status_pub.messages[-1]["status"] == "SUCCEEDED"
+
+
 def test_goal_claim_waits_for_matching_evaluator_ack(node):
     node.require_goal_verification = True
     node.mission_mode = "semantic_interaction_object_goal"
@@ -123,6 +140,74 @@ def snapshot(step, candidates=None, **context):
             **context,
         },
     }
+
+
+def test_spatial_failure_memory_survives_candidate_and_room_renaming(node):
+    frontier = BehaviorCandidate(candidate_id="frontier:old", behavior_type="EXPLORE",
+                                 source="frontier", target_id="old", target_name="frontier", goal_xyyaw=[1, 2, 0],
+                                 metadata={"room_id": 1, "frontier_point": [1, 2]})
+    payload = snapshot(10, [frontier.to_dict()])
+    node.latest_candidates_payload = payload
+    node._record_decision_selection("failed", frontier, "explore:room_1", payload, "", "")
+    feedback = {"decision_id": "failed", "status": "FAILED", "detail": {}}
+    node._record_decision_result(feedback)
+    node._record_decision_result(feedback)
+    assert node.frontier_failure_memory.entries[0]["failures"] == 1
+    frontier.candidate_id = "frontier:new"
+    frontier.metadata["room_id"] = 99
+    payload = snapshot(11, [frontier.to_dict()])
+    accepted, rejected = node._eligible_candidates_from_snapshot(payload, now=0, region_history={})
+    assert not accepted
+    assert rejected["frontier:new"] == "frontier_region_failure_cooldown"
+
+
+def test_successful_portal_unlocks_failed_frontier_regions(node):
+    node.frontier_failure_memory.record_failure([1, 2], "map", 1)
+    portal = BehaviorCandidate(candidate_id="interaction:door:open", behavior_type="INTERACT",
+                               source="graph", target_id="door", target_name="door", goal_xyyaw=[2, 3, 0],
+                               metadata={"node_type": "portal"})
+    payload = snapshot(10, [portal.to_dict()])
+    node.latest_candidates_payload = payload
+    node._record_decision_selection("door-open", portal, "door", payload, "", "")
+    node._record_decision_result({"decision_id": "door-open", "status": "SUCCEEDED"})
+    assert not node.frontier_failure_memory.entries
+
+
+def test_target_preemption_does_not_poison_frontier_memory(node):
+    frontier = BehaviorCandidate(candidate_id="frontier:cancel", behavior_type="EXPLORE",
+                                 source="frontier", target_id="cancel", target_name="frontier",
+                                 goal_xyyaw=[1, 2, 0])
+    payload = snapshot(10, [frontier.to_dict()])
+    node.latest_candidates_payload = payload
+    node._record_decision_selection("preempted", frontier, "explore:room_1", payload, "", "")
+    node._record_decision_result({"decision_id": "preempted", "status": "CANCELED",
+                                 "detail": {"reason": "preempted_by_target"}})
+    assert not node.frontier_failure_memory.entries
+
+
+def test_successful_model_selection_still_runs_repeat_guard(node, monkeypatch):
+    frontier = BehaviorCandidate(candidate_id="frontier:model", behavior_type="EXPLORE",
+                                 source="frontier", target_id="model", target_name="frontier",
+                                 goal_xyyaw=[1, 2, 0])
+    payload = snapshot(10, [frontier.to_dict()], navigation_frontier_count=1)
+    node.latest_candidates_payload = copy.deepcopy(payload)
+    node.policy_backend = "model"
+    calls = []
+
+    def select(candidates, **kwargs):
+        calls.append("model")
+        node.model_policy.last_result_source = "model"
+        return candidates[0]
+
+    def guard(selected, eligible, graph):
+        calls.append("repeat_guard")
+        return selected, ""
+
+    monkeypatch.setattr(node.model_policy, "select", select)
+    monkeypatch.setattr(node, "_apply_repeat_guard", guard)
+    node._decide_from_snapshot(payload)
+    assert calls == ["model", "repeat_guard"]
+    assert node.selected_pub.messages[-1]["candidate_id"] == frontier.candidate_id
 
 
 def fail(node, detail, step=426):

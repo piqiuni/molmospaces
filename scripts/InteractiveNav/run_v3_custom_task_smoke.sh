@@ -12,6 +12,9 @@ SHORT_TASK_ID="${TASK_ID##*-}"
 STATE_DIR="${RUN_ROOT}/task-state"
 QWEN_ROOT="${QWEN_ROOT:-/home/ldl/qwen36-fp8}"
 export QWEN_ROOT
+export QWEN36_MAX_MODEL_LEN="${QWEN36_MAX_MODEL_LEN:-16384}"
+export QWEN36_MAX_NUM_SEQS="${QWEN36_MAX_NUM_SEQS:-16}"
+export SEMANTIC_M2_CONTEXT_WINDOW_TOKENS="${QWEN36_MAX_MODEL_LEN}"
 PYTHON310_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include/python3.10
 PYTHON310_MULTIARCH_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include
 EGL_RUNTIME_LIB=/home/ldl/.cache/egl-runtime/usr/lib/x86_64-linux-gnu

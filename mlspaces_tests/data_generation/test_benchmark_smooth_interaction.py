@@ -4,6 +4,16 @@ import pytest
 from scripts.InteractiveNav.evaluation import smooth_interaction
 
 
+@pytest.mark.parametrize("result,expected", [
+    ({"stopped_on_public_target": True, "interrupted_by_goal_status": False}, "open"),
+    ({"interrupted_by_goal_status": True}, "open"),
+    ({"success": True}, "closed"),
+    ({}, "closed"),
+])
+def test_drawer_public_state_matches_retained_open_scan(result, expected):
+    assert smooth_interaction.drawer_scan_final_state({"result": result}) == expected
+
+
 def test_goal_terminal_interrupts_scan_without_closing_or_restoring_view(monkeypatch):
     class Controller:
         def __init__(self, **kwargs):

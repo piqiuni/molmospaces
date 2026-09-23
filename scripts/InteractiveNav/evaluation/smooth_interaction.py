@@ -6,6 +6,13 @@ import time
 from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
 
 
+def drawer_scan_final_state(execution: dict) -> str:
+    result = execution.get("result") or {}
+    if result.get("interrupted_by_goal_status") or result.get("stopped_on_public_target"):
+        return "open"
+    return "closed"
+
+
 def run_smooth_interaction(
     task: Any,
     command: dict,

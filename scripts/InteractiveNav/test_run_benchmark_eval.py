@@ -14,6 +14,15 @@ launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
 
+def test_launcher_defaults_to_ten_second_scene_spacing(tmp_path):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    command, _ = launcher.build_command(config, tmp_path)
+    assert command[command.index("--scene-start-interval-s") + 1] == "10.0"
+    config["scene_start_interval_s"] = 0
+    command, _ = launcher.build_command(config, tmp_path)
+    assert command[command.index("--scene-start-interval-s") + 1] == "0"
+
+
 def test_retry_queue_excludes_completed_algorithm_failures(tmp_path):
     for index, row in [(0, {"completed": True, "success": False}),
                        (5, {"completed": False, "success": True, "exit_code": 2})]:
@@ -79,6 +88,8 @@ def test_qwen_starts_single_vllm_instance_for_all_gpus(tmp_path, monkeypatch, co
     assert environments[0]["QWEN36_TP_SIZE"] == "1"
     assert environments[0]["QWEN36_DP_SIZE"] == str(count)
     assert environments[0]["QWEN36_API_SERVER_COUNT"] == "1"
+    assert environments[0]["QWEN36_MAX_MODEL_LEN"] == "16384"
+    assert environments[0]["QWEN36_MAX_NUM_SEQS"] == "16"
     assert service.endpoint == "http://127.0.0.1:8000/v1"
     assert service.tensor_parallel_size == 1
     assert service.data_parallel_size == count

@@ -15,6 +15,17 @@ BEHAVIOR_NAVIGATE = "NAVIGATE"
 BEHAVIOR_SCAN = "SCAN"
 
 
+def normalize_target_label(value: Any) -> str:
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(value or ""))
+    text = " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+    aliases = {
+        "cellphone": "cell phone", "mobile phone": "cell phone",
+        "cellular telephone": "cell phone", "cellulartelephone": "cell phone",
+        "fridge": "refrigerator", "couch": "sofa", "cupboard": "cabinet",
+    }
+    return aliases.get(text, text)
+
+
 def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
     """Public target evidence can establish arrival without another navigation pose."""
     if not all(metadata.get(key) for key in ("target_goal", "target_reliably_observed")):
@@ -671,14 +682,13 @@ class CandidateGenerator:
                 )
             )
             room_hops = self._room_hops(graph, robot_room_id, target_room_id)
-            if (
+            room_transition_blocked = (
                 require_same_room
                 and target_room_id is not None
                 and robot_room_id is not None
                 and int(target_room_id) != int(robot_room_id)
                 and not (allow_connected_room and room_hops is not None)
-            ):
-                continue
+            )
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.target_max_state_age_sec:
                 continue
@@ -848,6 +858,9 @@ class CandidateGenerator:
                 )
             except (TypeError, ValueError):
                 target_distance_satisfied = False
+            if room_transition_blocked and not (target_visible_now and target_distance_satisfied
+                    and success_distance_threshold is not None):
+                continue
             opened_container_anchor_ready = bool(
                 containing_container is not None
                 and previous_interaction_goal is not None
@@ -1016,12 +1029,12 @@ class CandidateGenerator:
             if value:
                 requested.append(value)
         requested_tokens = {
-            str(value).strip().casefold() for value in requested if str(value).strip()
+            normalize_target_label(value) for value in requested if normalize_target_label(value)
         }
         if not requested_tokens:
             return False
         observed = {
-            str(value).strip().casefold()
+            normalize_target_label(value)
             for value in (
                 node.get("label"),
                 node.get("name"),
@@ -1029,12 +1042,10 @@ class CandidateGenerator:
                 attributes.get("semantic_name"),
                 attributes.get("source_object_name"),
             )
-            if str(value or "").strip()
+            if normalize_target_label(value)
         }
         return any(
             requested == observed_value
-            or requested in observed_value
-            or observed_value in requested
             for requested in requested_tokens
             for observed_value in observed
         )

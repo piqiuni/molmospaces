@@ -19,6 +19,28 @@ from semantic_decision_py_pkg.model_policy import (
 from semantic_mllm_py_pkg.client import MLLMResponse
 
 
+def test_m2_budget_preserves_mission_candidates_and_input():
+    client = ModelPolicyClient(ModelPolicyConfig(context_window_tokens=4096, max_tokens=1536))
+    payload = {"instruction": "Rank current candidates", "mission": {"target": "requested"},
+               "candidates": [{"id": "current:1", "effect": "approach_target"}],
+               "recent_decisions": [{"reason": "history" * 1000}],
+               "graph": {"nodes": [{"id": str(index), "detail": "geometry" * 500} for index in range(5)]}}
+    context, output_tokens, metrics = client._bounded_http_context(payload)
+    assert output_tokens == 512
+    assert metrics["m2_input_utf8_bytes_after"] + output_tokens + 1024 <= 4096
+    assert context["candidates"] == payload["candidates"]
+    assert context["mission"] == payload["mission"]
+    assert len(payload["graph"]["nodes"]) == 5
+    assert metrics["m2_context_compacted"]
+
+
+def test_m2_budget_rejects_oversized_mandatory_context():
+    client = ModelPolicyClient(ModelPolicyConfig(context_window_tokens=2048))
+    with pytest.raises(ValueError, match="mandatory mission/candidates"):
+        client._bounded_http_context({"mission": {"instruction": "长" * 3000},
+                                      "candidates": [{"id": "current"}]})
+
+
 def make_candidate(candidate_id: str, target_relevance: float, distance_m: float) -> BehaviorCandidate:
     return BehaviorCandidate(
         candidate_id=candidate_id,
@@ -1254,6 +1276,12 @@ def test_request_leaves_room_target_reasoning_to_model() -> None:
     assert positions == sorted(positions)
     assert "return only the final JSON, not the reasoning" in request["instruction"]
     assert "extremely low priority" in request["instruction"]
+    assert "NEGATIVE PRIORITY" in request["instruction"]
+    assert "POSITIVE CONTAINER PRIORITY" in request["instruction"]
+    assert "CLOSED DOOR PRIORITY" in request["instruction"]
+    assert "FAILURE MEMORY" in request["instruction"]
+    assert "over generic frontiers" in request["instruction"]
+    assert "unknown room" in request["instruction"]
     assert "newly accessible, unentered room" in request["instruction"]
     assert "toilet" not in request["instruction"]
     assert "refrigerator" not in request["instruction"]

@@ -2,6 +2,71 @@
 
 最后更新：2026-09-23
 
+### 2026-09-23：M2 交互优先级与失败区域记忆
+
+- M2 公共提示增加：无关容器最后考虑、相关且未搜索容器优先于普通前沿、
+  通向未知/未进入空间的可执行关闭门优先；不引入隐藏目标容器名或场景白名单。
+- 失败前沿按同坐标系内 0.75m 空间邻域记忆，不依赖 frontier ID 或在线 room 标签。
+  首次失败冷却 120 observation steps，再失败后等待成功开门带来的拓扑变化或新 episode。
+  目标抢占的 CANCELED 不计失败；重复终态反馈不重复累计。
+- 低收益 repeat guard 移至模型成功返回、规则 fallback 和候选更新校验之后的共同路径。
+- 修复公开目标 `cellphone` 与感知 `CellPhone -> cell phone` 的同义词匹配；
+  修复扫描因公开目标可见提前停止时仍把打开状态上报成 closed。仍需 evaluator 核验成功。
+- 上一轮 2010 的宏动作证据位于 attempt_002/eval/smooth_interactions/000890.json：
+  target_discovery 距离 0.5674m、806 像素，stopped_on_public_target=true。
+  不应再将其归因为“扫描没看见”或直接按公共 closed 字段认定物理关上。
+- 2003 在开冰箱后仅9个GT目标像素，低于公共感知16像素门槛，M2仍是visible=false。
+  应区分交互位姿误差与目标物体距离；后者当时没有公开目标候选，不能用GT补给策略。
+
+最小检查：`test_frontier_failure_memory.py`、`test_rule_decision_navigation_recovery.py`、
+`test_behavior_candidates.py`、`test_model_policy.py`、`test_candidate_curator.py`；
+评测侧检查 `mlspaces_tests/data_generation/test_benchmark_smooth_interaction.py` 及
+`test_interactive_nav_v3_benchmark_evaluation.py`、`test_interactive_nav_v3_goal_status.py`。
+本轮未启动新30场仿真，既有M2-16K一轮已结束3/30，不能作为本次修改的验证结果。
+
+### 2026-09-23：离线目标外部画面
+
+`scripts/InteractiveNav/render_target_external.py` 读取冻结 benchmark 初态，从目标容器
+前上方绘图。方向来自离线 oracle 接近点，不输出到策略；橙框标识目标容器。
+默认隐藏显式屋顶/天花板；`--hide-walls` 额外隐藏墙体，适合目标被前景墙遮挡时查看。
+画面不是机器人第一视角，也不是评测终态。容器保持冻结初态，不会为展示而自动打开。
+
+```bash
+TMPDIR=/home/ldl/tmp/target-external \
+XDG_CACHE_HOME=/home/ldl/.cache/target-external \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=2 \
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/render_target_external.py \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-index 2007 --scenes-root /home/ldl/molmospaces/assets/scenes \
+  --distance 6 --elevation -50 --hide-walls \
+  --output /home/ldl/outputs/interactive-nav/scene-audit-20260923/2007_external_annotated.png
+```
+
+先创建命令中的 TMPDIR 与缓存目录。替换 episode-index/output 即可绘制其他场景；
+`--azimuth` 可覆盖前向方向。输出同名 JSON 记录相机、隐藏几何、对象状态恢复及可见像素。
+本次 2007/2016 实际渲染成功；8 项辅助函数测试通过。
+
+### 2026-09-23：M2 16K 与抽屉目标完成链路
+
+- 本机本轮使用的 Qwen 8102/8103 已重启为 16384 context、TP1、单卡各 16 并发；
+  保留 GPU 0/1 服务。自定义任务入口与批次托管 Qwen 默认也使用 16384/16。
+- M2 结构化输出最多 512 tokens，输入采用 UTF-8 字节数保守上界，并预留 1024
+  tokens 的模板余量；依次裁剪旧决策历史、额外房间推理、图上下文。
+  不裁剪 mission 或当前候选 ID；若必需内容仍超预算，发送前明确失败，由现有失败路径处理。
+  请求指标记录裁剪前后字节数、窗口大小与保留候选数。
+  `SEMANTIC_M2_CONTEXT_WINDOW_TOKENS` 必须与模型部署窗口匹配；自定义任务入口自动同步。
+- 当前可靠可见、公开距离满足条件的目标在 IDLE / EXPLORE / NAVIGATE / INTERACT
+  均可发起完成核验，不再仅在交互进行中触发。核验等待优先于全局无进展判断。
+  已在成功距离内的当前可见目标不因不一致房间标签被丢弃；远处目标仍遵守房间约束。
+  不利用私有可见性直接成功，保留 evaluator 对实例、距离与必要交互的最终核验。
+- 292 项定向测试与 213 项额外相邻测试通过；补充部署默认值断言后，启动器 23 项测试再次通过。
+  日志：`/home/ldl/tmp/m2-drawer-fix/tests.log`、`/home/ldl/tmp/m2-drawer-fix/adjacent-tests.log`、
+  `/home/ldl/tmp/m2-drawer-fix/launcher-tests.log`。
+- 新回归：`/home/ldl/outputs/interactive-nav/m2-16k-drawer-20260923-local2gpu-30mixed/evaluation`。
+  30 worker、2000–2029 共 30 场，GPU 2/3，ROS 18900–18929；保持原动态预算与
+  observation-turn multiplier=1，不录视频、无自动重试。启动前已通过模型接口确认 16K。
+  本次预算分析针对上一轮，不是尚在运行的新回归结果。
+
 ### 2026-09-23：五场针对性修复与本机双卡回归
 
 - 2005：M2 增加通用负面先验，尺寸/用途/存储语义明显不匹配的容器极低优先级，
@@ -3158,6 +3223,24 @@ python scripts/InteractiveNav/run_benchmark_eval.py \
 volc ml_task submit \
   -c scripts/InteractiveNav/configs/custom_task/m2_online_mixed0_29_8arm_remote.yaml
 ```
+
+### 标准评测启动：场景间隔 10 秒
+
+本地与远程统一入口 `run_benchmark_eval.py`、批处理入口 `run_interactive_nav_v3_ros_eval_batch.py`
+默认将所有 worker 的实际场景进程启动串行限流，相邻启动至少间隔 10 秒；第一场立即启动。
+30 worker 仍可并发执行，初始 30 场启动展开约 290 秒。后续场景及本轮补跑同样限流，
+resume 跳过已完成场景、dry-run 不等待。排队时间不占场景 timeout，成功启动后的场景耗时不含排队。
+配置键 `scene_start_interval_s`，批处理参数 `--scene-start-interval-s`；仅明确需要同步启动的对照实验才设为 0。
+远程双卡 30 场模板：`scripts/InteractiveNav/configs/evaluation/benchmark_remote2gpu_30mixed_stagger10.json`，
+保持 2000–2029、30 worker、dynamic/max 2000、M1 30s、M2 16K、不录制、不自动补跑。
+
+### 2026-09-23 近距离容器感知与目标匹配
+
+restricted-GT 对 refrigerator/cabinet/drawer/dresser/wardrobe 及中心位于这些容器动态 AABB 内的物体，
+在相机到物体 AABB 中心的三维距离 ≤2m 且分割中至少有 1 个真实可见像素时，放宽像素数、框尺寸与可见比例过滤。
+容器内判定是几何近似，不读取任务指定目标；门不适用。零像素对象仍不发布，远处对象保持原阈值，最大感知距离仍生效。
+公共目标可靠性接受已通过发布端过滤的 1 像素观测；正式成功仍由 evaluator 核验，不修改成功距离。
+目标类别统一大小写、CamelCase、分隔符和明确同义词后精确匹配，不再双向子串匹配或拆分复合类别。
 
 总体监控入口 `scripts/InteractiveNav/evaluation/m2_online_monitor.py --run-dir <RUN>`，
 每30秒写 `overall.log` 和原子更新的 `overall_status.json`；可用 `tail -f <RUN>/overall.log`。

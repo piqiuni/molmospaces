@@ -57,6 +57,7 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
                 "semantic_attribute_request_timeout_s", "scene_timeout_s", "conda_env", "python_bin"):
         command += ["--" + key.replace("_", "-"), str(config[key])]
     model_env = Path(config["semantic_model_env_file"])
+    command += ["--scene-start-interval-s", str(config.get("scene_start_interval_s", 10.0))]
     command += ["--semantic-model-env-file", str(model_env if model_env.is_absolute() else REPO / model_env)]
     for key in ("model_endpoints", "mujoco_egl_devices"):
         command += ["--" + key.replace("_", "-"), *map(str, config[key])]

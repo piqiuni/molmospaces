@@ -112,6 +112,8 @@ class QwenService:
         env["QWEN36_DP_SIZE"] = str(data_parallel)
         # One API process lets the vLLM internal DP scheduler see all ranks.
         env["QWEN36_API_SERVER_COUNT"] = "1"
+        env.setdefault("QWEN36_MAX_MODEL_LEN", "16384")
+        env.setdefault("QWEN36_MAX_NUM_SEQS", "16")
         self.devices = devices
         self.tensor_parallel_size = tensor_parallel
         self.data_parallel_size = data_parallel
@@ -126,6 +128,8 @@ class QwenService:
             "tensor_parallel_size": tensor_parallel,
             "data_parallel_size": data_parallel,
             "api_server_count": 1,
+            "max_model_len": int(env["QWEN36_MAX_MODEL_LEN"]),
+            "max_num_seqs": int(env["QWEN36_MAX_NUM_SEQS"]),
             "restart_policy": "never",
         }, indent=2))
 

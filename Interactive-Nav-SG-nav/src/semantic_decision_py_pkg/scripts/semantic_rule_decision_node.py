@@ -63,6 +63,7 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.room_context import room_context_for_xy
 from semantic_decision_py_pkg.frontier_context import eligible_room_frontier_counts
+from semantic_decision_py_pkg.frontier_failure_memory import FrontierFailureMemory
 from semantic_decision_py_pkg.rule_policy import (
     RulePolicy,
     RulePolicyConfig,
@@ -616,6 +617,7 @@ class SemanticRuleDecisionNode:
                 ),
                 temperature=float(model_config.get("temperature", 0.0)),
                 max_tokens=int(model_config.get("max_tokens", 96)),
+                context_window_tokens=int(os.environ.get("SEMANTIC_M2_CONTEXT_WINDOW_TOKENS", model_config.get("context_window_tokens", 16384))),
                 reasoning_effort=str(model_config.get("selection_reasoning_effort", model_config.get("reasoning_effort", "off"))),
                 image_detail=str(model_config.get("image_detail", "low")),
                 max_graph_nodes=int(model_config.get("max_graph_nodes", 80)),
@@ -776,6 +778,7 @@ class SemanticRuleDecisionNode:
         self.decision_history = deque(maxlen=32)
         self.group_history: dict[str, dict] = {}
         self.region_history: dict[str, dict] = {}
+        self.frontier_failure_memory = FrontierFailureMemory()
         # This is intentionally pose-derived rather than selection-derived:
         # an EXPLORE decision that fails at a doorway must not make the child
         # room look visited on the next ranking cycle.
@@ -932,6 +935,7 @@ class SemanticRuleDecisionNode:
                 self.decision_history.clear()
                 self.group_history.clear()
                 self.region_history.clear()
+                self.frontier_failure_memory.clear()
                 self.entered_room_ids.clear()
                 self.initial_robot_xy = None
                 self.initial_position_source = {}
@@ -966,7 +970,6 @@ class SemanticRuleDecisionNode:
                 )
             self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
-            self._observe_global_navigation_progress(payload)
             self._preempt_resolved_active_frontier(payload)
             priority_target = self.target_mission.priority_target_candidate(
                 payload.get("candidates") or []
@@ -997,18 +1000,18 @@ class SemanticRuleDecisionNode:
             if (
                 self.mission_mode == "semantic_interaction_object_goal"
                 and not self.goal_complete
-                and self.active_behavior_type == "INTERACT"
                 and self.target_context.get("enabled")
                 and not self.target_context.get("require_interaction", False)
                 and self.target_mission.claim_ready(priority_target)
             ):
                 self._request_goal_completion({
                     "reason": "target_goal_succeeded",
-                    "completion_source": "interaction_public_target_observation",
+                    "completion_source": "public_target_observation",
                     "node_id": priority_target.get("target_id"),
                     "candidate_sequence": payload.get("sequence"),
                     **dict(priority_target.get("metadata") or {}),
                 })
+            self._observe_global_navigation_progress(payload)
             if (
                 preemptible_priority_target is not None
                 and self.active_candidate_id
@@ -2393,17 +2396,6 @@ class SemanticRuleDecisionNode:
                         "curated_rule_fallback:"
                         f"{self.model_policy.last_result_source or 'model_unavailable'}"
                     )
-            selected, repeat_reason = self._apply_repeat_guard(
-                selected,
-                fallback_pool,
-                candidate_snapshot.get("graph_context") or {},
-            )
-            if repeat_reason:
-                selection_override_reason = (
-                    f"{selection_override_reason}:{repeat_reason}"
-                    if selection_override_reason
-                    else repeat_reason
-                )
         input_selected_fingerprint = (
             candidate_fingerprint(selected) if selected is not None else ""
         )
@@ -2419,6 +2411,10 @@ class SemanticRuleDecisionNode:
         stale_fallback_used = False
         candidate_validation_reason = "candidate_sequence_current"
         execution_snapshot = candidate_snapshot
+        execution_selection_pool = (
+            model_candidates or eligible
+            if self.policy_backend == "model" else eligible
+        )
         if selected is not None and latest_sequence != candidate_sequence:
             if str(latest_snapshot.get("episode_id") or "") != str(
                 candidate_snapshot.get("episode_id") or ""
@@ -2483,6 +2479,7 @@ class SemanticRuleDecisionNode:
                 )
                 candidate_validation_reason = validation.reason
                 execution_snapshot = latest_snapshot
+                execution_selection_pool = latest_selection_pool
                 if validation.valid:
                     selected = validation.candidate
                 else:
@@ -2505,14 +2502,15 @@ class SemanticRuleDecisionNode:
                         selection_override_reason = (
                             f"stale_response_rule_fallback:{validation.reason}"
                         )
-                    if selected is not None and not latest_priority_id:
-                        selected, repeat_reason = self._apply_repeat_guard(
-                            selected,
-                            latest_selection_pool,
-                            latest_snapshot.get("graph_context") or {},
-                        )
-                        if repeat_reason:
-                            selection_override_reason += f":{repeat_reason}"
+        selected, repeat_reason = self._apply_repeat_guard(
+            selected, execution_selection_pool,
+            execution_snapshot.get("graph_context") or {},
+        )
+        if repeat_reason:
+            selection_override_reason = (
+                f"{selection_override_reason}:{repeat_reason}"
+                if selection_override_reason else repeat_reason
+            )
         execution_exploration_context = (
             execution_snapshot.get("exploration_context") or {}
         )
@@ -2981,6 +2979,16 @@ class SemanticRuleDecisionNode:
             if candidate_fingerprint(candidate) in approach_exhausted_fingerprints:
                 rejected[candidate_id] = "interaction_approach_attempts_exhausted"
                 continue
+            if str(candidate.behavior_type).upper() == "EXPLORE":
+                with self.state_lock:
+                    failure_reason = self.frontier_failure_memory.rejection(
+                        list(metadata.get("frontier_point") or candidate.goal_xyyaw or []),
+                        str((candidate_snapshot.get("graph_context") or {}).get("frame_id") or ""),
+                        observation_step,
+                    )
+                if failure_reason:
+                    rejected[candidate_id] = failure_reason
+                    continue
             candidates.append(candidate)
         candidates, curator_rejections = self.candidate_curator.filter_candidates(
             candidates,
@@ -3172,6 +3180,9 @@ class SemanticRuleDecisionNode:
                 "target_id": selected.target_id,
                 "target_room_id": (selected.metadata or {}).get("target_room_id") or (selected.metadata or {}).get("room_id"),
                 "goal_xy": list(selected.goal_xyyaw or [])[:2],
+                "frontier_point": list((selected.metadata or {}).get("frontier_point") or selected.goal_xyyaw or [])[:2],
+                "frame_id": str(graph.get("frame_id") or ""),
+                "node_type": str((selected.metadata or {}).get("node_type") or ""),
                 "observation_step": observation_step,
                 "frontier_length_before_m": self._group_frontier_length(
                     group_id,
@@ -3210,6 +3221,19 @@ class SemanticRuleDecisionNode:
         if entry is None:
             return
         status = str(payload.get("status") or "UNKNOWN")
+        if entry.get("result_recorded"):
+            return
+        if status not in {"SUCCEEDED", "FAILED", "ABORTED", "CANCELED", "REJECTED"}:
+            return
+        entry["result_recorded"] = True
+        if entry.get("behavior_type") == "EXPLORE" and status in {"FAILED", "ABORTED", "REJECTED"}:
+            self.frontier_failure_memory.record_failure(
+                list(entry.get("frontier_point") or entry.get("goal_xy") or []),
+                str(entry.get("frame_id") or ""),
+                self._observation_step(self.latest_candidates_payload),
+            )
+        if status == "SUCCEEDED" and entry.get("behavior_type") == "INTERACT" and entry.get("node_type") == "portal":
+            self.frontier_failure_memory.clear()
         neutral_preempt = bool(
             status == "CANCELED"
             and str(((payload.get("detail") or {}).get("reason") or ""))
