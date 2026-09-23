@@ -125,6 +125,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
         mjr_resizeOffscreen(width, height, self._mjr_context)
         mjr_setBuffer(mjtFramebuffer.mjFB_OFFSCREEN.value, self._mjr_context)
         self._mjr_context.readDepthMap = mjtDepthMap.mjDEPTH_ZEROFAR
+        self._segmentation_context = None
 
         # TODO In MacOS, keeping the context locked seems to preclude others to progress,
         #  so it doesn't look like we can achieve true parallelism through multi threading?
@@ -218,6 +219,22 @@ class MjOpenGLRenderer(MjAbstractRenderer):
 
         self._gl_context.make_current()
 
+        render_context = self._mjr_context
+        if self._segmentation_rendering:
+            if self._segmentation_context is None:
+                original_samples = self.model.vis.quality.offsamples
+                try:
+                    self.model.vis.quality.offsamples = 0
+                    self._segmentation_context = MjrContext(
+                        self.model, mjtFontScale.mjFONTSCALE_150.value
+                    )
+                finally:
+                    self.model.vis.quality.offsamples = original_samples
+                mjr_resizeOffscreen(self.width, self.height, self._segmentation_context)
+                mjr_setBuffer(mjtFramebuffer.mjFB_OFFSCREEN.value, self._segmentation_context)
+            render_context = self._segmentation_context
+        mjr_setBuffer(mjtFramebuffer.mjFB_OFFSCREEN.value, render_context)
+
         # Upload textures to GPU before rendering if textures have been modified
         # This is necessary when textures are modified via model.tex_data
         # Only upload when needed to avoid performance overhead
@@ -245,7 +262,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
                 )
 
         # Render scene and read contents of RGB and depth buffers.
-        mjr_render(rect, self._scene, self._mjr_context)
+        mjr_render(rect, self._scene, render_context)
 
         if self._depth_rendering:
             mjr_readPixels(rgb=None, depth=out, viewport=rect, con=self._mjr_context)
@@ -284,7 +301,7 @@ class MjOpenGLRenderer(MjAbstractRenderer):
             # Reset scene flags.
             np.copyto(self._scene.flags, original_flags)
         elif self._segmentation_rendering:
-            mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
+            mjr_readPixels(rgb=out, depth=None, viewport=rect, con=render_context)
 
             # Convert 3-channel uint8 to 1-channel uint32.
             image3 = out.astype(np.uint32)
@@ -451,11 +468,16 @@ class MjOpenGLRenderer(MjAbstractRenderer):
         ```
         """
         if hasattr(self, "_gl_context") and self._gl_context:
-            self._gl_context.free()
-        self._gl_context = None
+            self._gl_context.make_current()
+        if getattr(self, "_segmentation_context", None) is not None:
+            self._segmentation_context.free()
+        self._segmentation_context = None
         if hasattr(self, "_mjr_context") and self._mjr_context:
             self._mjr_context.free()
         self._mjr_context = None
+        if hasattr(self, "_gl_context") and self._gl_context:
+            self._gl_context.free()
+        self._gl_context = None
 
     def __enter__(self):
         return self
