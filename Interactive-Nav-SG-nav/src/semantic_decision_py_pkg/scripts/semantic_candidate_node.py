@@ -125,6 +125,7 @@ class SemanticCandidateNode:
         )
         self.generator = CandidateGenerator(
             CandidateGeneratorConfig(
+                frontier_center_fallback_enabled=bool(config.get("frontier_center_fallback_enabled", True)),
                 max_frontier_candidates=int(config.get("max_frontier_candidates", 12)),
                 interaction_types=tuple(
                     config.get("interaction_types", ["portal", "container"])
@@ -513,7 +514,7 @@ class SemanticCandidateNode:
             return (translation[0]+math.cos(yaw)*xy[0]-math.sin(yaw)*xy[1],
                     translation[1]+math.sin(yaw)*xy[0]+math.cos(yaw)*xy[1])
 
-        def check(goal, tolerance, *, frame_id=None):
+        def check(goal, tolerance, *, frame_id=None, allow_unknown=False):
             source = str(frame_id or self.map_frame).lstrip("/")
             for name in ("local", "planning"):
                 snapshot = snapshots.get(name)
@@ -534,7 +535,7 @@ class SemanticCandidateNode:
                     except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                         return {"clear": False, "reason": "clearance_tf_unavailable"}
                 detail = grid.check(xy, tolerance, robot_radius_m=self.clearance_robot_radius_m,
-                                    safety_margin_m=self.clearance_safety_margin_m)
+                                    safety_margin_m=self.clearance_safety_margin_m, allow_unknown=allow_unknown)
                 if name == "local" and detail["reason"] == "outside_map_window":
                     continue
                 age = time.monotonic() - received_at
@@ -548,7 +549,7 @@ class SemanticCandidateNode:
                         try:
                             destination = global_grid.frame_id.lstrip("/")
                             path = global_grid.reachable(convert(robot_xy, robot_frame, destination),
-                                                         convert(goal[:2], source, destination))
+                                                         convert(goal[:2], source, destination), allow_unknown=allow_unknown)
                         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                             return {"clear": False, "reason": "clearance_tf_unavailable"}
                         detail["path_connectivity"] = path

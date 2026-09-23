@@ -217,6 +217,7 @@ class ExplorePyNode:
         self.rotation_replan_last_metrics = {}
 
         core_config = FrontierConfig(
+            frontier_center_fallback_enabled=bool(frontier_cfg.get("frontier_center_fallback_enabled", True)),
             free_max=int(frontier_cfg.get("free_max", 20)),
             occupied_min=int(frontier_cfg.get("occupied_min", 50)),
             hard_min_cluster_cells=int(frontier_cfg.get("hard_min_cluster_cells", 3)),
@@ -1186,6 +1187,7 @@ class ExplorePyNode:
         self.subgoal_pub.publish(point_msg)
         detail = {
             "cluster_id": cluster.cluster_id,
+            "frontier_center_fallback": bool(getattr(cluster, "frontier_center_fallback", False)),
             "goal_xyyaw": [
                 float(cluster.subgoal_world[0]),
                 float(cluster.subgoal_world[1]),

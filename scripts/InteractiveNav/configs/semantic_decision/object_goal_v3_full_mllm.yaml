@@ -13,6 +13,7 @@ target:
   completion_requires_visibility: true
 
 candidate:
+  frontier_center_fallback_enabled: true
   navigation_clearance_enabled: true
   # V3 object-goal constraints.
   # A target claim must be backed by the current perception frame.  Historical
@@ -136,6 +137,7 @@ model:
   verification_max_output_tokens: 256
 
 completion:
+  require_goal_verification: true
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
 

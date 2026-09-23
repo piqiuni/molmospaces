@@ -605,6 +605,7 @@ class RestrictedRosObjectGoalRuntime:
     smooth_bridge: Any = None
     goal_status_observer: Any = None
     pending_goal_terminal: Any = None
+    rejected_goal_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _body_root_id(model: Any, body_id: int) -> int | None:
@@ -3189,6 +3190,19 @@ def _poll_restricted_goal_status(
 ) -> tuple[str, GoalClaimVerification | None, dict[str, Any]] | None:
     """Consume fresh public status messages and return the first terminal one."""
 
+    def verified_terminal(payload, verification):
+        publish = getattr(observer, "publish_verification", None)
+        if callable(publish):
+            publish(payload, verification.accepted)
+        if verification.accepted:
+            return "target_found", verification, payload
+        rejected = getattr(runtime, "rejected_goal_claims", None)
+        if rejected is None:
+            rejected = runtime.rejected_goal_claims = []
+        rejected.append({"claim_id": (payload.get("detail") or {}).get("claim_id"),
+                         "reason": verification.reason, "timestamp": time.time()})
+        return None
+
     # Goal status and the restricted RGB-D frame travel on independent ROS
     # callbacks.  A container can expose its child on the next frame while the
     # decision node publishes the target claim immediately after the open
@@ -3205,14 +3219,14 @@ def _poll_restricted_goal_status(
         )
         if verification.accepted:
             runtime.pending_target_claim = None
-            return "target_found", verification, pending_payload
+            return verified_terminal(pending_payload, verification)
         if (
             verification.reason
             not in {"no_published_target_evidence", "nearest_target_not_published"}
             or time.monotonic() - float(pending_started_at) >= 2.0
         ):
             runtime.pending_target_claim = None
-            return "target_claim_unverified", verification, pending_payload
+            verified_terminal(pending_payload, verification)
 
     pending = getattr(runtime, "pending_goal_terminal", None)
     if pending is not None:
@@ -3232,8 +3246,11 @@ def _poll_restricted_goal_status(
             }:
                 runtime.pending_target_claim = (payload, time.monotonic())
                 continue
-            reason = "target_found" if verification.accepted else "target_claim_unverified"
-            return reason, verification, payload
+            terminal = verified_terminal(payload, verification)
+            if terminal is not None:
+                runtime.pending_target_claim = None
+                return terminal
+            continue
         if is_exploration_terminal(payload):
             status = str(payload.get("status") or "").strip().upper()
             reason_by_status = {
@@ -5238,6 +5255,8 @@ def evaluate_episode(
             "goal_definition_relaxed_success": relaxed_category_success,
             "goal_success_layers": goal_success_layers,
         }
+        if restricted_ros_runtime is not None:
+            terminal_trace["rejected_goal_claims"] = list(restricted_ros_runtime.rejected_goal_claims)
         if not restricted_public_mode:
             terminal_trace["interaction_score"] = terminal_score.to_dict()
         else:

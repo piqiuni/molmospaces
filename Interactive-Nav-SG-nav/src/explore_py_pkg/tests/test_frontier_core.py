@@ -59,6 +59,27 @@ def make_value_grid(width, height, hot_cell):
     return msg
 
 
+def test_frontier_center_fallback_uses_unknown_but_not_known_obstacles(monkeypatch):
+    grid = make_grid(12, 12, (2, 2, 7, 10))
+    core = FrontierExplorerCore(FrontierConfig(frontier_center_fallback_enabled=True))
+    monkeypatch.setattr(core, "_choose_subgoal_cell_with_visibility", lambda *args, **kwargs: (None, {}))
+    cells = [(6, row) for row in range(3, 9)]
+    cluster = core._build_cluster(grid, cells, (3.5, 5.5))
+    assert cluster.frontier_center_fallback
+    assert cluster.subgoal_world == cluster.centroid_world
+    grid.data[grid.spec.index(7, 6)] = 100
+    assert core._build_cluster(grid, cells, (3.5, 5.5)) is None
+
+
+def test_frontier_center_fallback_respects_blocked_state(monkeypatch):
+    from types import SimpleNamespace
+    grid = make_grid(12, 12, (2, 2, 7, 10))
+    core = FrontierExplorerCore(FrontierConfig(frontier_center_fallback_enabled=True))
+    monkeypatch.setattr(core, "_choose_subgoal_cell_with_visibility", lambda *args, **kwargs: (None, {}))
+    assert core._build_cluster(grid, [(6, row) for row in range(3, 9)], (3.5, 5.5),
+        state=SimpleNamespace(is_goal_point_blocked=lambda point: True)) is None
+
+
 def test_extracts_frontier_clusters_from_occ_only():
     grid = make_grid(10, 10, (2, 2, 8, 8))
     core = FrontierExplorerCore(FrontierConfig(min_cluster_cells=2))

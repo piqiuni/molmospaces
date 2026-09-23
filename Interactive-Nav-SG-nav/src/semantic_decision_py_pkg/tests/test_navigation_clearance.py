@@ -36,6 +36,20 @@ def test_local_inscribed_cost_is_not_inflated_twice():
     assert grid.check((0., 0.), 0.15)["reason"] == "center_blocked"
 
 
+def test_frontier_unknown_override_keeps_known_obstacles_and_map_bounds():
+    grid = make_grid()
+    grid.values[:, 50] = -1
+    assert not grid.check((0., 0.), 0.0)["clear"]
+    assert grid.check((0., 0.), 0.0, allow_unknown=True)["clear"]
+    assert not grid.reachable((-1., 0.), (1., 0.))["clear"]
+    assert grid.reachable((-1., 0.), (1., 0.), allow_unknown=True)["clear"]
+    blocked = make_grid()
+    blocked.values[:, 50] = 100
+    assert not blocked.check((0., 0.), 0.0, allow_unknown=True)["clear"]
+    assert not blocked.reachable((-1., 0.), (1., 0.), allow_unknown=True)["clear"]
+    assert not grid.check((5., 0.), 0.0, allow_unknown=True)["clear"]
+
+
 def test_cell_half_diagonal_and_rotated_origin():
     base = make_grid()
     base.values[50, 53] = 100

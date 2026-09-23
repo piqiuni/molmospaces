@@ -10540,7 +10540,8 @@ class SemanticBehaviorExecutor:
                     option_lookahead,
                     preflight_reason,
                 ) = self._preflight_navigation_plan(
-                    goal_frame, option_x, option_y, option_yaw
+                    goal_frame, option_x, option_y, option_yaw,
+                    **({"allow_unknown": True} if (candidate.get("metadata") or {}).get("frontier_center_fallback") else {}),
                 )
                 preflight_call_elapsed_s = max(
                     0.0, time.monotonic() - preflight_call_started_at
@@ -13409,6 +13410,8 @@ class SemanticBehaviorExecutor:
         goal_x: float,
         goal_y: float,
         goal_yaw: float,
+        *,
+        allow_unknown: bool = False,
     ) -> tuple[bool, tuple[float, float] | None, str]:
         if not self.make_plan_preflight_enabled:
             return True, None, "disabled"
@@ -13430,7 +13433,7 @@ class SemanticBehaviorExecutor:
                     ]
                 except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                     return False, None, "clearance_tf_unavailable"
-            path = grid.reachable(start_xy, goal_xy)
+            path = grid.reachable(start_xy, goal_xy, allow_unknown=allow_unknown)
             if not path["clear"]:
                 return False, None, path["reason"]
         stamp = rospy.Time.now()

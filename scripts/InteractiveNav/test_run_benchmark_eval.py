@@ -31,6 +31,19 @@ def test_qwen_respects_visible_gpu_selection(monkeypatch):
         launcher.visible_devices({"CUDA_VISIBLE_DEVICES": ""})
 
 
+def test_expected_episode_count_is_checked_before_launch(tmp_path, monkeypatch, capsys):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config.update(episode_indices=[2000, 2001], check_mujoco_gpu_inventory=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(sys, "argv", ["eval", "--config", str(config_path),
+                                     "--expected-episodes", "30", "--dry-run"])
+    with pytest.raises(SystemExit) as error:
+        launcher.main()
+    assert error.value.code == 2
+    assert "expected 30 episodes, selected 2" in capsys.readouterr().err
+
+
 def test_qwen_failure_does_not_restart(tmp_path):
     class DeadProcess:
         returncode = 1

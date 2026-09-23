@@ -38,6 +38,39 @@ from scripts.InteractiveNav.evaluation.benchmark_types import (
 from scripts.InteractiveNav.evaluation.goal_status import PublicGoalEvidenceLedger
 
 
+def test_unverified_goal_claim_does_not_end_rollout(monkeypatch):
+    from scripts.InteractiveNav.evaluation.goal_status import GoalClaimVerification
+    payload = {"status": "SUCCEEDED", "mission_mode": "object_goal",
+               "detail": {"reason": "target_goal_succeeded", "claim_id": "new"}}
+    feedback = []
+    observer = SimpleNamespace(drain=lambda: [payload], publish_verification=lambda *args: feedback.append(args))
+    runtime = SimpleNamespace()
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(False, "distance_failed"))
+    assert benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={}) is None
+    assert feedback == [(payload, False)]
+    assert runtime.rejected_goal_claims[0]["reason"] == "distance_failed"
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(True, "verified"))
+    terminal = benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={})
+    assert terminal[0] == "target_found"
+    assert feedback[-1] == (payload, True)
+
+
+def test_expired_pending_claim_rejects_without_terminal(monkeypatch):
+    from scripts.InteractiveNav.evaluation.goal_status import GoalClaimVerification
+    payload = {"detail": {"claim_id": "pending"}}
+    runtime = SimpleNamespace(pending_target_claim=(payload, 0.0))
+    feedback = []
+    observer = SimpleNamespace(drain=lambda: [], publish_verification=lambda *args: feedback.append(args))
+    monkeypatch.setattr(benchmark_runner.time, "monotonic", lambda: 3.0)
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(False, "no_published_target_evidence"))
+    assert benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={}) is None
+    assert runtime.pending_target_claim is None
+    assert feedback == [(payload, False)]
+
+
 def _public_episode() -> PublicEpisode:
     return PublicEpisode(
         house_index=7,

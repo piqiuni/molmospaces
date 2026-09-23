@@ -114,6 +114,20 @@ def test_frontier_recovery_keeps_identity_and_rechecks_original_tolerance(safe_r
     assert status["proposals"][0]["goal_xyyaw"] == [1., 0., 0.]
 
 
+def test_frontier_clearance_fallback_requests_optimistic_center_only():
+    generator = CandidateGenerator(CandidateGeneratorConfig(frontier_center_fallback_enabled=True))
+    status = {"proposals": [{"proposal_id": "wall", "goal_xyyaw": [1., 0., 0.],
+                              "frontier_point": [1., 1.], "frame_id": "map"}]}
+    def check(goal, tolerance, **kwargs):
+        return {"clear": kwargs.get("allow_unknown") and goal[:2] == [1., 1.]}
+    candidates = generator.generate(status, {}, (0., 0.), clearance_check=check)
+    assert len(candidates) == 1
+    assert candidates[0].goal_xyyaw[:2] == [1., 1.]
+    assert candidates[0].metadata["frontier_center_fallback"]
+    assert candidates[0].metadata["clearance_original_goal_xyyaw"] == [1., 0., 0.]
+    assert not generator.generate(status, {}, (0., 0.), clearance_check=lambda *args, **kwargs: {"clear": False})
+
+
 def test_clearance_filter_does_not_rotate_portal_normal_when_primary_is_blocked():
     node = {"id": "door", "type": "portal", "aabb_center": [0., 0., 1.],
             "aabb_size": [.2, 2., 2.], "state_age_sec": 0., "is_currently_visible": True,

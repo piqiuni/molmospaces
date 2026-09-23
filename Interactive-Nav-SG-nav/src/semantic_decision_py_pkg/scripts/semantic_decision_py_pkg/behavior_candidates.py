@@ -171,6 +171,7 @@ def execution_candidates_with_reobserve_fallback(
 
 @dataclass
 class CandidateGeneratorConfig:
+    frontier_center_fallback_enabled: bool = False
     max_frontier_candidates: int = 12
     interaction_types: tuple[str, ...] = ("portal", "container")
     container_require_same_room: bool = False
@@ -441,7 +442,8 @@ class CandidateGenerator:
                 if candidate.behavior_type in {BEHAVIOR_EXPLORE, BEHAVIOR_NAVIGATE} and candidate.goal_xyyaw:
                     tolerance = float(candidate.metadata.get("navigation_goal_position_tolerance_m", 0.25))
                     detail = clearance_check(candidate.goal_xyyaw, tolerance,
-                                             frame_id=candidate.metadata.get("frame_id"))
+                                             frame_id=candidate.metadata.get("frame_id"),
+                                             **({"allow_unknown": True} if candidate.metadata.get("frontier_center_fallback") else {}))
                     if not detail.get("clear"):
                         if candidate.metadata.get("target_goal"):
                             alternatives = candidate.metadata.get("goal_xyyaw_candidates", [])
@@ -462,6 +464,19 @@ class CandidateGenerator:
                                 "reason": detail.get("reason"), "alternative_count": len(alternatives)})
                             admitted.append(candidate)
                             continue
+                        frontier_center = candidate.metadata.get("frontier_point")
+                        if self.config.frontier_center_fallback_enabled and candidate.behavior_type == BEHAVIOR_EXPLORE and frontier_center and len(frontier_center) >= 2:
+                            center_goal = [float(frontier_center[0]), float(frontier_center[1]), candidate.goal_xyyaw[2]]
+                            center_detail = clearance_check(center_goal, tolerance,
+                                frame_id=candidate.metadata.get("frame_id"), allow_unknown=True)
+                            if center_detail.get("clear"):
+                                candidate.metadata["clearance_original_goal_xyyaw"] = list(candidate.goal_xyyaw)
+                                candidate.goal_xyyaw = center_goal
+                                candidate.metadata["frontier_center_fallback"] = True
+                                if robot_xy is not None:
+                                    candidate.features["distance_m"] = math.dist(robot_xy, center_goal[:2])
+                                admitted.append(candidate)
+                                continue
                         self.clearance_rejections.append({"candidate_id": candidate.candidate_id,
                             "behavior_type": candidate.behavior_type, "goal_xyyaw": candidate.goal_xyyaw,
                             "deferred": True, "recovery_attempted": navigation_goal_recovery is not None, **detail})
@@ -1246,6 +1261,7 @@ class CandidateGenerator:
                     },
                     metadata={
                         "cluster_id": cluster_id,
+                        "frontier_center_fallback": bool(proposal.get("frontier_center_fallback", False)),
                         "frontier_point": frontier_point,
                         "frame_id": str(proposal.get("frame_id") or status.get("frame_id") or ""),
                         "frontier_recovery_targets": list(proposal.get("frontier_cells_world") or [frontier_point])[::max(1, len(proposal.get("frontier_cells_world") or [])//12)],

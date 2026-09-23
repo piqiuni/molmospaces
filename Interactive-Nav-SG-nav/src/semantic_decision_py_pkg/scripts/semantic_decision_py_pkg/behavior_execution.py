@@ -1497,6 +1497,7 @@ class SemanticNavigationProgressSupervisor:
 
     subgoal_timeout_task_steps: int = 60
     mission_timeout_task_steps: int = 180
+    new_subgoal_grace_task_steps: int = 20
     min_displacement_m: float = 0.10
     min_goal_distance_reduction_m: float = 0.02
     min_yaw_error_reduction_rad: float = 0.02
@@ -1505,6 +1506,7 @@ class SemanticNavigationProgressSupervisor:
     subgoal_reference_goal_distance_m: float | None = None
     subgoal_reference_yaw_error_rad: float | None = None
     subgoal_reference_step_index: int | None = None
+    subgoal_started_step_index: int | None = None
     mission_reference_xy: tuple[float, float] | None = None
     mission_reference_step_index: int | None = None
 
@@ -1521,6 +1523,7 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_reference_goal_distance_m = None
         self.subgoal_reference_yaw_error_rad = None
         self.subgoal_reference_step_index = None
+        self.subgoal_started_step_index = None
         self.mission_reference_xy = None
         self.mission_reference_step_index = None
 
@@ -1537,6 +1540,7 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_reference_goal_distance_m = None
         self.subgoal_reference_yaw_error_rad = None
         self.subgoal_reference_step_index = None
+        self.subgoal_started_step_index = None
         self.mission_reference_xy = xy
         self.mission_reference_step_index = step
 
@@ -1581,6 +1585,7 @@ class SemanticNavigationProgressSupervisor:
 
         if str(subgoal_key) != self.subgoal_key:
             self.subgoal_key = str(subgoal_key)
+            self.subgoal_started_step_index = step
             self.subgoal_reference_xy = xy
             self.subgoal_reference_goal_distance_m = goal_distance
             self.subgoal_reference_yaw_error_rad = yaw_error
@@ -1635,7 +1640,9 @@ class SemanticNavigationProgressSupervisor:
             "subgoal_stalled": subgoal_elapsed
             >= max(1, int(self.subgoal_timeout_task_steps)),
             "mission_stalled": mission_elapsed
-            >= max(1, int(self.mission_timeout_task_steps)),
+            >= max(1, int(self.mission_timeout_task_steps))
+            and step - int(self.subgoal_started_step_index if self.subgoal_started_step_index is not None else step)
+            >= min(max(1, int(self.subgoal_timeout_task_steps)), max(1, int(self.new_subgoal_grace_task_steps))),
             "subgoal_key": self.subgoal_key,
             "subgoal_elapsed_task_steps": subgoal_elapsed,
             "mission_elapsed_task_steps": mission_elapsed,

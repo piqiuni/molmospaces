@@ -2,6 +2,34 @@
 
 最后更新：2026-09-23
 
+### 2026-09-23：mixed 2000–2029 场景针对性修复
+
+在 `ee2b3c895` 迁移基线上完成以下修改：
+
+- V3 目标声明必须由 evaluator 核验后通过 `goal_status_verification` 回执确认；
+  决策节点只接受当前 episode、当前 claim ID 的回执。拒绝后恢复 ACTIVE 并等待新候选，
+  回执缺失不视为成功。核验失败不再以 `target_claim_unverified` 结束 rollout。
+  回执只包含是否接受，不把 GT 距离、位置或实例映射传给 policy。
+- 有效前沿没有可用观察点时回退到前沿中心；未知栅格可通行，已知障碍、
+  地图边界、足迹约束及已有前沿黑名单仍有效。标记贯穿 proposal、候选、
+  clearance 与预规划；仿真 launch 启用 global planner 的 allow_unknown。
+- 全局无进展预算保留，但新语义子目标获得最多 20 个 task-step 的启动宽限
+  （不超过单目标无进展预算）；旧任务的累计时间不能在新目标刚选中时终止它。
+  同一子目标的私有 worker 替换不会重置计时，episode 总预算仍保留。
+- 自定义任务入口增加 `CUSTOM_TASK_DRY_RUN=true`，真正校验 `EXPECTED_EPISODES`；
+  入口尊重 `REPO_ROOT` 与 `QWEN_ROOT`，可使用独立固定代码工作树。
+
+定向及相邻回归：714 passed、1 deselected。被排除的旧测试
+`test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill`
+使用不含 `success_criteria` 的 fake episode，报 `KeyError`；已核对相关 runtime
+builder 与 `ee2b3c895` 的 AST 完全相同，没有修改生产逻辑来绕过该旧夹具问题。
+日志：`/home/ldl/tmp/scene-fixes-tests/final-regression.log`。
+
+本次计划运行与 22 日诊断相同的 mixed episode 2000–2029，2 卡、30 worker、
+动态预算上限 2000、M1/M2 30 秒、不录视频；保留当前分支同类过滤与指标 v3，
+因此不能把新旧分数差异全部归因于这三项算法修复。云端资源规格、模型服务参数、
+任务 ID 与部署 SHA 在提交回执中单独记录；测试通过不等于场景成功率已提高。
+
 ### 2026-09-23：22 日基线八项选择性迁移
 
 分支 `codex/migrate-22-selected` 基于 `d3f27870b`，迁移来源 `8fb9460ae`。

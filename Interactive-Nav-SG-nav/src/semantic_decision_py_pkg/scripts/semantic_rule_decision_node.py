@@ -768,6 +768,8 @@ class SemanticRuleDecisionNode:
             )
         )
         self.target_mission = TargetMissionTracker()
+        self.require_goal_verification = bool(completion_config.get("require_goal_verification", False))
+        self.pending_goal_claim = None
         self.state_lock = threading.RLock()
         self.latest_candidates_payload: dict = {}
         self.decision_in_flight = False
@@ -850,6 +852,10 @@ class SemanticRuleDecisionNode:
             String,
             queue_size=2,
             latch=True,
+        )
+        rospy.Subscriber(
+            topics.get("goal_status", "/semantic_decision/goal_status") + "_verification",
+            String, self._goal_verification_callback, queue_size=10,
         )
         rospy.Subscriber(
             topics.get("candidates", "/semantic_decision/candidates"),
@@ -948,6 +954,7 @@ class SemanticRuleDecisionNode:
             )
             if target_key != previous_target_key:
                 self.target_context = dict(target_context)
+                self.pending_goal_claim = None
                 self.no_eligible_candidate_tracker.reset()
                 self.goal_complete = False
                 self.target_goal_complete = False
@@ -995,9 +1002,7 @@ class SemanticRuleDecisionNode:
                 and not self.target_context.get("require_interaction", False)
                 and self.target_mission.claim_ready(priority_target)
             ):
-                self.target_goal_complete = True
-                self.goal_complete = True
-                self._publish_goal_status("SUCCEEDED", detail={
+                self._request_goal_completion({
                     "reason": "target_goal_succeeded",
                     "completion_source": "interaction_public_target_observation",
                     "node_id": priority_target.get("target_id"),
@@ -1557,14 +1562,11 @@ class SemanticRuleDecisionNode:
                     None,
                 )
                 if self.target_mission.claim_ready(fresh_candidate):
-                    self.target_goal_complete = True
                     detail.update(dict(fresh_candidate.get("metadata") or {}))
                     detail["reason"] = "target_goal_succeeded"
                     if target_interaction_succeeded and not self.active_target_goal:
                         detail["target_interaction_source"] = "autonomous_interaction"
-                    self._publish_goal_status("SUCCEEDED", detail=detail)
-                    if self.mission_mode == "semantic_interaction_object_goal":
-                        self.goal_complete = True
+                    self._request_goal_completion(detail)
         post_interaction_traversal = None
         if (
             status == "SUCCEEDED"
@@ -1656,7 +1658,7 @@ class SemanticRuleDecisionNode:
         # Drawer/container physical macros intentionally hold the base.  Their
         # own finite evaluator-step lease is authoritative, so pause rather
         # than reset the global navigation clock while INTERACT owns execution.
-        if self.active_behavior_type in {"INTERACT", BEHAVIOR_SCAN} or (
+        if getattr(self, "pending_goal_claim", None) or self.active_behavior_type in {"INTERACT", BEHAVIOR_SCAN} or (
             not self.active_candidate_id
             and self.no_eligible_candidate_tracker.since_step is not None
         ):
@@ -1862,6 +1864,11 @@ class SemanticRuleDecisionNode:
                 return
             if self.goal_complete:
                 return
+            pending_claim = getattr(self, "pending_goal_claim", None)
+            if pending_claim is not None:
+                if time.monotonic() - pending_claim["started_at"] < 10.0:
+                    return
+                self._reject_goal_completion()
             candidate_snapshot = copy.deepcopy(self.latest_candidates_payload)
             self.decision_in_flight = True
         if released_refresh_status is not None:
@@ -2658,6 +2665,8 @@ class SemanticRuleDecisionNode:
         if selected is None:
             return
         with self.state_lock:
+            if self.goal_complete or getattr(self, "pending_goal_claim", None):
+                return
             self.decision_index += 1
             decision_id = f"decision_{self.decision_index:06d}"
             selection = selected.to_dict()
@@ -3413,6 +3422,49 @@ class SemanticRuleDecisionNode:
         if len(parts) >= 2 and parts[0] == "interaction" and parts[1]:
             return f"interaction_target:{parts[1]}"
         return ""
+
+    def _request_goal_completion(self, detail: dict) -> None:
+        if getattr(self, "pending_goal_claim", None) is not None:
+            return
+        if getattr(self, "require_goal_verification", False):
+            claim_id = str(time.time_ns())
+            self.pending_goal_claim = {
+                "claim_id": claim_id,
+                "episode_id": str(self.target_context.get("episode_id") or ""),
+                "started_at": time.monotonic(),
+            }
+            detail = {**detail, "claim_id": claim_id}
+        else:
+            self.target_goal_complete = True
+            self.goal_complete = self.mission_mode == "semantic_interaction_object_goal"
+        self._publish_goal_status("SUCCEEDED", detail=detail)
+
+    def _reject_goal_completion(self) -> None:
+        self.pending_goal_claim = None
+        self.goal_complete = False
+        self.target_goal_complete = False
+        self.target_mission.reset()
+        self.minimum_candidate_sequence = int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1
+        self.next_decision_time = time.monotonic() + 1.0
+        self._publish_goal_status("ACTIVE", detail={"reason": "goal_claim_rejected"})
+
+    def _goal_verification_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.state_lock:
+            pending = getattr(self, "pending_goal_claim", None)
+            if pending is None or any(payload.get(key) != pending[key] for key in ("claim_id", "episode_id")):
+                return
+            if payload.get("accepted") is True:
+                self.pending_goal_claim = None
+                self.target_goal_complete = True
+                self.goal_complete = True
+            elif payload.get("accepted") is False:
+                self._reject_goal_completion()
 
     def _publish_goal_status(self, status: str, detail: dict | None = None) -> None:
         payload = {

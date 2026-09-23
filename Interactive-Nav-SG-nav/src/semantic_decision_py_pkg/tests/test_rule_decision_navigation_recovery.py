@@ -54,6 +54,41 @@ def node(monkeypatch):
     return decision.SemanticRuleDecisionNode()
 
 
+def test_goal_claim_waits_for_matching_evaluator_ack(node):
+    node.require_goal_verification = True
+    node.mission_mode = "semantic_interaction_object_goal"
+    node.target_context = {"episode_id": "episode_a"}
+    node._request_goal_completion({"reason": "target_goal_succeeded"})
+    assert not node.goal_complete and not node.target_goal_complete
+    pending = dict(node.pending_goal_claim)
+    for payload in (
+        {"claim_id": "old", "episode_id": "episode_a", "accepted": True},
+        {"claim_id": pending["claim_id"], "episode_id": "old", "accepted": True},
+    ):
+        node._goal_verification_callback(SimpleNamespace(data=json.dumps(payload)))
+        assert not node.goal_complete
+    node._goal_verification_callback(SimpleNamespace(data=json.dumps({
+        "claim_id": pending["claim_id"], "episode_id": "episode_a", "accepted": True,
+    })))
+    assert node.goal_complete and node.target_goal_complete
+    assert node.pending_goal_claim is None
+
+
+def test_rejected_goal_claim_resumes_with_fresh_candidates(node):
+    node.require_goal_verification = True
+    node.target_context = {"episode_id": "episode_a"}
+    node.latest_candidates_payload = {"sequence": 50}
+    node._request_goal_completion({"reason": "target_goal_succeeded"})
+    pending = dict(node.pending_goal_claim)
+    node._goal_verification_callback(SimpleNamespace(data=json.dumps({
+        "claim_id": pending["claim_id"], "episode_id": "episode_a", "accepted": False,
+    })))
+    assert not node.goal_complete and not node.target_goal_complete
+    assert node.pending_goal_claim is None
+    assert node.minimum_candidate_sequence == 51
+    assert node.goal_status_pub.messages[-1]["status"] == "ACTIVE"
+
+
 def candidate(**metadata):
     return BehaviorCandidate(
         candidate_id=CANDIDATE_ID,

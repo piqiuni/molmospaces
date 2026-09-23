@@ -107,6 +107,7 @@ exploration:
   initial_local_goal_count: 3
 
 frontier:
+  frontier_center_fallback_enabled: true
   free_max: 20
   occupied_min: 50
   hard_min_cluster_cells: 3

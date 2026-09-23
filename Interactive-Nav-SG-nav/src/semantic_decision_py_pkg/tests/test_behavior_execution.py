@@ -279,7 +279,11 @@ def test_semantic_progress_supervisor_survives_worker_and_anchor_changes() -> No
         task_step_index=28,
         goal_distance_m=3.0,
     )
-    assert mission_stall["mission_stalled"]
+    assert not mission_stall["mission_stalled"]
+    assert mission_stall["mission_elapsed_task_steps"] == 18
+    assert supervisor.observe(
+        subgoal_key="fridge|staging|3", pose=(0.02, 0.0, 0.0), task_step_index=34,
+    )["mission_stalled"]
 
 
 def test_semantic_progress_supervisor_accepts_shortest_yaw_and_translation_progress() -> None:
