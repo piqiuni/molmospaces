@@ -993,7 +993,7 @@ class SemanticRuleDecisionNode:
                 and self.active_behavior_type == "INTERACT"
                 and self.target_context.get("enabled")
                 and not self.target_context.get("require_interaction", False)
-                and self.target_mission.visible_arrived_target(priority_target)
+                and self.target_mission.claim_ready(priority_target)
             ):
                 self.target_goal_complete = True
                 self.goal_complete = True
@@ -1502,7 +1502,6 @@ class SemanticRuleDecisionNode:
                     detail=transition["detail"],
                 )
             elif transition["phase"] == "complete":
-                self.target_goal_complete = True
                 detail = dict(transition["detail"])
                 # The executor feedback intentionally carries only the
                 # public behavior result.  Preserve the narrow target
@@ -1526,6 +1525,19 @@ class SemanticRuleDecisionNode:
                 for key in (
                     "target_navigation_required",
                     "target_reliably_observed",
+                    "target_visible_now",
+                    "target_visible_pixels",
+                    "target_visible_fraction",
+                    "target_consecutive_observations",
+                    "target_min_visible_pixels",
+                    "target_min_visible_fraction",
+                    "target_min_consecutive_observations",
+                    "target_require_current_visibility",
+                    "verify_target_visibility",
+                    "target_goal_distance_m",
+                    "target_arrival_tolerance_m",
+                    "target_object_distance_m",
+                    "target_success_distance_threshold_m",
                     "containing_container_id",
                     "approach_strategy",
                     "direct_goal_tolerance_m",
@@ -1535,12 +1547,24 @@ class SemanticRuleDecisionNode:
                 ):
                     if key in selected_metadata and key not in detail:
                         detail[key] = selected_metadata[key]
-                detail["reason"] = "target_goal_succeeded"
-                if target_interaction_succeeded and not self.active_target_goal:
-                    detail["target_interaction_source"] = "autonomous_interaction"
-                self._publish_goal_status("SUCCEEDED", detail=detail)
-                if self.mission_mode == "semantic_interaction_object_goal":
-                    self.goal_complete = True
+                fresh_candidate = next(
+                    (
+                        candidate
+                        for candidate in self.latest_candidates_payload.get("candidates", [])
+                        if str(candidate.get("candidate_id") or "")
+                        == str(candidate_id or self.active_candidate_id or "")
+                    ),
+                    None,
+                )
+                if self.target_mission.claim_ready(fresh_candidate):
+                    self.target_goal_complete = True
+                    detail.update(dict(fresh_candidate.get("metadata") or {}))
+                    detail["reason"] = "target_goal_succeeded"
+                    if target_interaction_succeeded and not self.active_target_goal:
+                        detail["target_interaction_source"] = "autonomous_interaction"
+                    self._publish_goal_status("SUCCEEDED", detail=detail)
+                    if self.mission_mode == "semantic_interaction_object_goal":
+                        self.goal_complete = True
         post_interaction_traversal = None
         if (
             status == "SUCCEEDED"

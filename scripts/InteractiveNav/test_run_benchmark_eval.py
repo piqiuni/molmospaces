@@ -78,7 +78,7 @@ def test_single_endpoint_is_not_round_robin():
 
 def test_launcher_runs_deferred_retry_and_retains_full_selection(tmp_path, monkeypatch):
     config = json.loads(launcher.DEFAULT_CONFIG.read_text())
-    config.update(workers=1, base_master_port=0, episode_indices=[0, 5])
+    config.update(workers=1, base_master_port=0, episode_indices=[0, 5], check_mujoco_gpu_inventory=False)
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     output = tmp_path / "run"
@@ -312,3 +312,29 @@ def test_cleanup_finds_detached_child_and_preserves_unrelated_process(tmp_path):
         unrelated.wait(timeout=5)
         for pid in launcher.owned_processes(owner):
             os.kill(pid, 9)
+
+
+def test_shared_qwen_gpu_preflight_checks_inventory_and_records_assignment(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1", "2", "3"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["1", "2", "3", "0"],
+    }
+    assert launcher.check_mujoco_gpu_inventory(config, {}) == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["visible_devices"] == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["workers_per_gpu_if_even"] == 15.0
+
+
+
+def test_shared_qwen_gpu_preflight_fails_before_two_card_run(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["0", "1"],
+    }
+    with pytest.raises(RuntimeError, match="at least 4 visible GPUs"):
+        launcher.check_mujoco_gpu_inventory(config, {})

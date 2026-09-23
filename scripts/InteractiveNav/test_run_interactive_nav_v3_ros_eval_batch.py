@@ -557,3 +557,11 @@ def test_recovery_rejects_ambiguous_current_attempt_and_stale_fallback(tmp_path)
     _write_recovery_attempt(plan, args, attempt_name="attempt_001")
     (plan.task_dir / "attempt_002").mkdir()
     assert batch.recover_missing_task_summary(plan, args) is None
+
+
+def test_ros_action_wait_defaults_to_point_four_seconds(monkeypatch):
+    monkeypatch.delenv("ROS_ACTION_TIMEOUT_S", raising=False)
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.4"
+
+    monkeypatch.setenv("ROS_ACTION_TIMEOUT_S", "0.6")
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.6"

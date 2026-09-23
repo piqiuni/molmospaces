@@ -15,7 +15,10 @@ target:
 candidate:
   navigation_clearance_enabled: true
   # V3 object-goal constraints.
-  target_require_current_visibility: false
+  # A target claim must be backed by the current perception frame.  Historical
+  # graph evidence is still useful for planning, but cannot terminate an
+  # episode after the robot has moved away from the target.
+  target_require_current_visibility: true
   target_require_same_room: false
   target_allow_connected_room: true
   target_min_visible_pixels: 128

@@ -13,3 +13,5 @@ room_mllm:
   # so raise only its budget; successful results are then cached rather than
   # retried on every mapping refresh.
   max_output_tokens: 192
+  failure_refresh_interval_s: 30.0
+  fallback_enabled: true

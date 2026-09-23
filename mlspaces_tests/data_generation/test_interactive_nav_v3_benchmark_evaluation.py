@@ -162,12 +162,97 @@ def test_relaxed_category_verification_fails_closed_without_relation_decision(
         payload={
             "status": "SUCCEEDED",
             "mission_mode": "object_goal",
-            "detail": {"reason": "target_goal_succeeded"},
+            "detail": {
+                "reason": "target_goal_succeeded",
+                "target_visible_now": True,
+                "target_reliably_observed": True,
+                "target_object_distance_m": 0.1,
+                "target_success_distance_threshold_m": 0.5,
+            },
             "target_context": {"episode_id": "episode-1"},
         },
     )
     assert not verification.accepted
     assert verification.reason == "category_relation_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected_reason"),
+    [
+        ({"target_visible_now": False, "target_reliably_observed": True,
+          "target_object_distance_m": 0.5, "target_success_distance_threshold_m": 1.5},
+         "target_perception_not_current"),
+        ({"target_visible_now": True, "target_reliably_observed": True,
+          "target_object_distance_m": 5.0, "target_success_distance_threshold_m": 1.5},
+         "graph_distance_failed"),
+        ({"target_visible_now": True, "target_reliably_observed": True},
+         "graph_distance_unavailable"),
+    ],
+)
+def test_target_claim_requires_current_perception_and_graph_distance(
+    detail: dict[str, object], expected_reason: str
+) -> None:
+    assert benchmark_runner._verify_public_claim_context(detail).reason == expected_reason
+
+
+def test_target_claim_accepts_graph_distance_within_success_radius() -> None:
+    detail = {
+        "target_visible_now": True,
+        "target_reliably_observed": True,
+        "target_object_distance_m": 1.49,
+        "target_success_distance_threshold_m": 1.5,
+    }
+    assert benchmark_runner._verify_public_claim_context(detail) is None
+
+
+def test_open_container_claim_needs_perception_and_measured_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = PublicGoalEvidenceLedger(
+        episode_id="episode-1", target_instance_ids=["obj-target"]
+    )
+    evidence.record_frame(
+        {"target_context": {"episode_id": "episode-1"},
+         "observations": [{"instance_id": "obj-target"}]},
+        capture_step=10,
+    )
+    runtime = SimpleNamespace(
+        perception=SimpleNamespace(episode_id="episode-1"),
+        goal_evidence=evidence,
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_private_target_distances_m",
+        lambda *args, **kwargs: {"obj-target": 2.2},
+    )
+    payload = {
+        "status": "SUCCEEDED", "mission_mode": "object_goal",
+        "target_context": {"episode_id": "episode-1"},
+        "detail": {
+            "reason": "target_goal_succeeded",
+            "target_visible_now": True,
+            "target_reliably_observed": True,
+            "target_navigation_required": False,
+            "containing_container_id": "container-1",
+            "target_open_container_anchor_ready": True,
+            "target_open_container_anchor_distance_m": 0.2,
+            "direct_goal_tolerance_m": 0.45,
+        },
+    }
+    episode = {"interactive_nav": {
+        "success_criteria": {"distance": {"threshold_m": 1.5}}
+    }}
+    accepted = benchmark_runner._verify_restricted_goal_status(
+        task=SimpleNamespace(), runtime=runtime, episode=episode, payload=payload
+    )
+    assert accepted.accepted
+    assert accepted.reason == "verified_open_container_anchor"
+
+    del payload["detail"]["target_open_container_anchor_distance_m"]
+    rejected = benchmark_runner._verify_restricted_goal_status(
+        task=SimpleNamespace(), runtime=runtime, episode=episode, payload=payload
+    )
+    assert not rejected.accepted
+    assert rejected.reason == "graph_distance_unavailable"
 
 
 def _result_row(**overrides: object) -> dict[str, object]:
@@ -189,9 +274,9 @@ def _result_row(**overrides: object) -> dict[str, object]:
         # These are the evaluator-owned, per-episode fields used by the paper
         # metrics.  They deliberately are not inferred from the legacy
         # ``correct_interaction_action_count`` aggregate.
-        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v1",
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v3",
         "paper_metric_config": {
-            "schema_version": "interactive_nav_v3_paper_metrics_v1",
+            "schema_version": "interactive_nav_v3_paper_metrics_v3",
             "interaction_attempt_cost": 0.3,
             "error_interaction_surcharge": 1.0,
             "failure_penalty": 5.0,
@@ -221,6 +306,11 @@ def _result_row(**overrides: object) -> dict[str, object]:
         "terminal_reason": "interactive_nav_success",
     }
     row.update(overrides)
+    if "required_interaction_completion_fraction" not in overrides:
+        row["required_interaction_completion_fraction"] = (
+            float(bool(row["required_interaction_success"]))
+            if row["interaction_requirement"] == "required" else None
+        )
     return row
 
 
@@ -835,6 +925,21 @@ def test_paper_isr_excludes_unnecessary_episodes_from_its_denominator() -> None:
     assert groups["overall"]["required_interaction_success_rate"] == 1.0
     assert groups["requirement/required"]["required_interaction_success_rate"] == 1.0
     assert groups["requirement/unnecessary"]["required_interaction_success_rate"] is None
+
+
+def test_paper_isr_means_per_scene_completion_instead_of_all_or_nothing() -> None:
+    rows = [
+        _result_row(required_interaction_success=False,
+                    required_interaction_completion_fraction=0.5),
+        _result_row(required_interaction_success=True,
+                    required_interaction_completion_fraction=1.0),
+        _result_row(interaction_requirement="unnecessary",
+                    required_interaction_success=True),
+    ]
+    overall = summarise_results(rows)["groups"]["overall"]
+    assert overall["paper_isr"] == pytest.approx(0.75)
+    assert overall["required_interaction_success_rate"] == pytest.approx(0.75)
+    assert overall["full_required_interaction_success_rate"] == pytest.approx(0.5)
 
 
 def test_paper_ip_is_episode_macro_and_defines_both_zero_attempt_cases() -> None:

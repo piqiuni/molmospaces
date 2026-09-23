@@ -1,6 +1,42 @@
 # 交互导航开发测试手册
 
-最后更新：2026-09-17
+最后更新：2026-09-23
+
+### 2026-09-23：22 日基线八项选择性迁移
+
+分支 `codex/migrate-22-selected` 基于 `d3f27870b`，迁移来源 `8fb9460ae`。
+范围、保留的模型超时、未迁入项与性能验收边界见
+[迁移报告](docs/migration_22_selected_20260923.md)。
+本轮 706 项定向与相邻回归通过，没有运行 ROS 长时仿真。
+
+复现此次测试集合：
+
+```bash
+cd /home/ldl/molmospaces-exp-setting
+export TMPDIR=/home/ldl/tmp/migrate22-tests
+export XDG_CACHE_HOME=/home/ldl/.cache/migrate22-tests
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+export PYTHONPATH=/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_{attribute_inference_request_state,room_attribute_inference,interaction_graph_store}.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_{behavior_candidates,mission_completion,semantic_behavior_executor_static,behavior_execution,rule_decision_navigation_recovery,target_distance_verification}.py \
+  scripts/InteractiveNav/test_{run_benchmark_eval,run_interactive_nav_v3_ros_eval_batch,timeout_monitoring,scene_distractor_filter}.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_{metrics,benchmark_evaluation,goal_status,round_summary,benchmark_cli,public_evaluator_contract,evaluation}.py
+```
+
+监控脚本应从仓库根目录以模块方式启动，避免 evaluation 目录的 `types.py`
+遮蔽标准库。以下 `RUN` 和 `TASK_ID` 需要替换为实际运行目录与云任务 ID。
+collector 只读取已有产物，不启动模型/仿真；周期监控会查询云任务状态。
+
+```bash
+RUN=/home/ldl/outputs/interactive-nav/your-evaluation-run
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.collect_timeout_performance "$RUN"
+TASK_ID=your-cloud-task-id
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.monitor_mllm_timeouts \
+  --task-id "$TASK_ID" --evaluation-dir "$RUN" \
+  --qwen-dir "$RUN/qwen-service" --interval 30 --window 120
+```
 
 ### 2026-09-17: 独立模块消融入口
 

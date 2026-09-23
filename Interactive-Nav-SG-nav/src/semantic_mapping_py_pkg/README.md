@@ -2,6 +2,24 @@
 
 Python semantic mapping pipeline for MolmoSpaces navigation.
 
+## M1 admission and room recovery
+
+Each episode permits at most `attribute_inference.max_calls_per_object: 10`
+actual object-model submissions. Passive discovery can use eight slots;
+`targeted_call_reserve: 2` keeps the remaining capacity available for
+decision-triggered views. Targeted requests share the total cap, not a separate
+unlimited budget. Submitted failures consume a slot; local queue expiry does not.
+There is no consecutive-failure lockout. Counts reset on episode change, and
+exhausted targeted requests report an explicit failure rather than waiting for RGB.
+
+Room-model failures use weighted object-label inference when
+`room_mllm.fallback_enabled: true`. The fallback is marked in graph attributes;
+the same failed evidence signature can retry after
+`room_mllm.failure_refresh_interval_s: 30.0`. Successful results retain the
+120-second refresh interval. Room evidence remains room ID plus member labels,
+without geometry-based invalidation. The room timeout inherits the M1 request
+timeout; this migration does not shorten model timeouts.
+
 The package keeps the same downstream contract expected by `explore_pkg`:
 
 - `/semantic_mapping/obj_map`

@@ -2275,6 +2275,38 @@ def test_same_anchor_resume_checks_only_original_goal_and_reuses_attempt(executo
     assert "resume_same_anchor" not in attempts[0]
 
 
+def test_same_anchor_resume_seeds_missing_attempt_history(executor_module):
+    history = []
+    selected_attempt = {
+        "index": 2,
+        "goal_xyyaw": [1.0, 2.0, 0.3],
+        "reachable": True,
+        "preflight_reason": "reachable",
+    }
+    clearance = {"reason": "container_anchor_center_blocked", "confirmed": True}
+
+    executor_module.SemanticBehaviorExecutor._mark_same_anchor_resume(
+        history,
+        selected_attempt=selected_attempt,
+        selected_goal_option_index=2,
+        selected_goal=(1.0, 2.0, 0.3),
+        updates={
+            "clearance_recheck_resend": True,
+            "clearance_confirmation": clearance,
+        },
+    )
+
+    assert history == [
+        {
+            **selected_attempt,
+            "navigation_attempt": 1,
+            "resume_same_anchor": True,
+            "clearance_recheck_resend": True,
+            "clearance_confirmation": clearance,
+        }
+    ]
+
+
 def test_unchanged_costmap_is_inconclusive_not_a_blocked_anchor(executor_module, monkeypatch):
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.lock = threading.RLock()

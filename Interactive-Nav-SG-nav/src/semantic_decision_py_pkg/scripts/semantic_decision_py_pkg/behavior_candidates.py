@@ -2214,9 +2214,9 @@ class CandidateGenerator:
                     )
                     if is_refrigerator_container:
                         # Refrigerator force is authorized within a stable
-                        # 15-degree operational-front envelope.  Do not shrink
+                        # 25-degree operational-front envelope.  Do not shrink
                         # this envelope when the candidate fan is narrowed.
-                        interaction_face_angle_tolerance_rad = math.radians(15.0)
+                        interaction_face_angle_tolerance_rad = math.radians(25.0)
                     elif max_face_angle_deg > 1e-6:
                         interaction_face_angle_tolerance_rad = max(
                             0.05, min(0.55, math.radians(max_face_angle_deg))

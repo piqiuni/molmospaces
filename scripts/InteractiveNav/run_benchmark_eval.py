@@ -67,6 +67,62 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
     return command + ["--resource-telemetry", "--allow-failures"], indices
 
 
+def check_mujoco_gpu_inventory(config: dict, environment=None) -> list[str] | None:
+    """Validate the EGL assignment against the GPUs present at launch time.
+
+    Shared-Qwen experiments do not pass ``--start-qwen`` and therefore used to
+    skip the only GPU discovery performed by this launcher.  A stale static
+    device list could consequently start a full comparison with all simulators
+    on two cards while Qwen occupied all four.  GPU-bound configs are checked by
+    default; ``check_mujoco_gpu_inventory: false`` can be used only for a
+    deliberately device-less/externally managed run.  Configs can optionally
+    require a minimum card count.  The resolved inventory is persisted in
+    ``launch_config.json`` below.
+    """
+    check = config.get("check_mujoco_gpu_inventory")
+    if check is None:
+        check = bool(config.get("mujoco_egl_devices"))
+    if not check:
+        return None
+    devices = [str(device) for device in visible_devices(os.environ if environment is None else environment)]
+    required = int(config.get("required_mujoco_gpu_count", 0))
+    if config.get("auto_assign_mujoco_egl_devices", False):
+        requested = list(devices)
+        config["mujoco_egl_devices"] = requested
+    else:
+        requested = [str(device) for device in config.get("mujoco_egl_devices", [])]
+    if required < 0:
+        raise ValueError("required_mujoco_gpu_count must be non-negative")
+    if required and len(devices) < required:
+        raise RuntimeError(
+            f"Need at least {required} visible GPUs for MuJoCo EGL, found {devices}"
+        )
+    if not requested:
+        raise RuntimeError("GPU inventory check requires mujoco_egl_devices")
+    missing = [device for device in requested if device not in devices]
+    if missing:
+        raise RuntimeError(
+            f"Configured MuJoCo EGL GPU IDs {missing} are not available; "
+            f"visible GPUs are {devices}"
+        )
+    if required and len(set(requested)) < required:
+        raise RuntimeError(
+            f"Configured MuJoCo EGL assignment uses {sorted(set(requested))}, "
+            f"but {required} unique GPUs are required"
+        )
+    config["gpu_preflight"] = {
+        "visible_devices": devices,
+        "requested_mujoco_egl_devices": requested,
+        "required_mujoco_gpu_count": required,
+        "worker_count": int(config.get("workers", 0)),
+        "workers_per_gpu_if_even": (
+            int(config.get("workers", 0)) / len(set(requested))
+            if requested else None
+        ),
+    }
+    return devices
+
+
 def progress(output: Path, indices: list[int], started: float) -> str:
     rows = {}
     try:
@@ -293,11 +349,12 @@ def main() -> int:
         # DP/TP scheduler owns all visible GPUs; the eval client does no LB.
         config["model_endpoints"] = [endpoint_for_port(qwen_port)]
         if not args.dry_run:
-            config["mujoco_egl_devices"] = list(range(len(devices)))
+            config["mujoco_egl_devices"] = list(devices)
     for key in ("workers", "max_steps", "episode_indices", "recording"):
         value = getattr(args, key)
         if value is not None:
             config[key] = value
+    check_mujoco_gpu_inventory(config, os.environ)
     name = datetime.datetime.now().strftime("eval-%Y%m%d_%H%M%S_%f")
     output = (args.output_dir or Path(config["output_root"]) / name).resolve()
     command, indices = build_command(config, output)

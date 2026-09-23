@@ -160,6 +160,8 @@ room_mllm:
   max_queue_size: 4
   min_interval_s: 2.0
   success_refresh_interval_s: 120.0
+  failure_refresh_interval_s: 30.0
+  fallback_enabled: true
   max_output_tokens: 96
 
 # Module-1 visual evidence and decision-layer targeted refresh controls.
@@ -167,6 +169,8 @@ room_mllm:
 # waits for a later RGB + detection pair before submitting the high-priority
 # image-only request.
 attribute_inference:
+  max_calls_per_object: 10
+  targeted_call_reserve: 2
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
   # One M1 call may use earlier target views, but only when they are separated
