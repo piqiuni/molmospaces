@@ -21,11 +21,14 @@
   尝试该前沿上距中心最近的足迹安全点，允许未知，仍尊重已知障碍和黑名单。
 
 验证：582 项定向及相邻测试通过；日志 `/home/ldl/tmp/scene-targeted-tests/final-pytest.log`。
-本机测试目录：`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu/evaluation`。
+最初的五场测试已按用户要求停止，确认所属子进程已清理，旧产物保留在
+`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu/evaluation`。
+替代测试目录：`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu-mixed30/evaluation`。
 启动日志在同级 `launcher.log`，配置在同级 `config.json`。
-本轮只测上述 5 场，5 worker、GPU 2/3，复用端口 8102/8103 的现有模型服务，
+替代测试为 episode 2000–2029，共 30 场、30 worker、GPU 2/3，复用端口 8102/8103 的现有模型服务，
 不重启服务、不占用 GPU 0/1。动态预算 200–2000、M1/M2 30 秒、场景 7200 秒，
-不录视频、不开自动重试。提交时回归已启动，完整场景性能仍以最终结果为准。
+不录视频、不开自动重试，ROS master 使用 18800–18829。
+算法仍为 `8ebb6c33f`；替代测试已通过 30 场入口校验并启动，完整场景性能以最终结果为准。
 
 ### 2026-09-23：mixed 2000–2029 场景针对性修复
 
