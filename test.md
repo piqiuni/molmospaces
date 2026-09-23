@@ -30,6 +30,26 @@ builder 与 `ee2b3c895` 的 AST 完全相同，没有修改生产逻辑来绕过
 因此不能把新旧分数差异全部归因于这三项算法修复。云端资源规格、模型服务参数、
 任务 ID 与部署 SHA 在提交回执中单独记录；测试通过不等于场景成功率已提高。
 
+#### 云任务提交回执
+
+- 任务 ID：`t-20260923165300-kmn8w`；已由 `Queue` 转为 `Running`。
+  EGL preflight 通过，入口确认 30 场 / 30 worker；提交回执时模型服务仍在启动，
+  尚无完整 episode 结果。
+- 平台确认 `Preemptible=false`、`Priority=6`，单实例 `ml.pni2.7xlarge`（2 GPU）。
+- 部署代码固定为 `cdaa6b060734557f2fb62c087e935dc23769e9c8`；
+  独立工作树 `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/code`。
+  该工作树已完成 Release catkin 构建，两个 ROS 包均解析到本工作树。
+- episode 2000–2029、30 worker、动态 step 200–2000、场景超时 7200 秒、
+  M1/M2 请求超时 30 秒、不录视频；入口 dry-run 已校验恰好 30 个 episode。
+- Qwen 保留单 API 服务、TP=1/DP=2；每 rank `max_num_seqs=16`，
+  `max_model_len=10240`、显存比例 0.6。显式覆盖服务脚本默认的并发上限 1。
+  与 22 日本地两独立 endpoint 的部署不同，比较超时/吞吐时必须单独考虑此差异。
+- 任务配置、入口、提交回执保存在
+  `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/`；
+  运行日志为其下 `run/launcher.log`，评测产物为 `run/evaluation/`。
+- 此处回执对应后续文档提交，不改变已冻结的部署代码 SHA。
+  构建和单测通过不代表云端 30 场已完成，也不代表成功率或速度已经改善。
+
 ### 2026-09-23：22 日基线八项选择性迁移
 
 分支 `codex/migrate-22-selected` 基于 `d3f27870b`，迁移来源 `8fb9460ae`。
