@@ -327,12 +327,16 @@ class FrontierExplorerCore:
         if subgoal_cell is None:
             if not self.config.frontier_center_fallback_enabled:
                 return None
-            subgoal_cell = (round(cx), round(cy))
             radius_cells = int(ceil((self.config.robot_radius_m + self.config.footprint_safety_margin_m)
                                     / max(grid.spec.resolution, 1e-6)))
-            if not self._footprint_is_free(grid, subgoal_cell, radius_cells, allow_unknown=True):
-                return None
-            if state is not None and state.is_goal_point_blocked(centroid_world):
+            center_cells = [(round(cx), round(cy))] + sorted(
+                cells, key=lambda cell: (cell[0] - cx) ** 2 + (cell[1] - cy) ** 2
+            )
+            subgoal_cell = next((cell for cell in center_cells
+                if self._footprint_is_free(grid, cell, radius_cells, allow_unknown=True)
+                and (state is None or not state.is_goal_point_blocked(
+                    grid.spec.grid_to_world(cell[0], cell[1])))), None)
+            if subgoal_cell is None:
                 return None
             center_fallback = True
         subgoal_world = grid.spec.grid_to_world(subgoal_cell[0], subgoal_cell[1])

@@ -1219,6 +1219,10 @@ class CandidateGenerator:
                     0.0,
                     float(proposal.get("distance_to_robot", 0.0) or 0.0),
                 )
+            center_fallback = bool(proposal.get("frontier_center_fallback", False))
+            if len(subgoal) < 2 and len(frontier_point) >= 2 and self.config.frontier_center_fallback_enabled:
+                subgoal = list(frontier_point[:2])
+                center_fallback = True
             if not cluster_id or len(subgoal) < 2:
                 continue
             yaw = (
@@ -1261,7 +1265,7 @@ class CandidateGenerator:
                     },
                     metadata={
                         "cluster_id": cluster_id,
-                        "frontier_center_fallback": bool(proposal.get("frontier_center_fallback", False)),
+                        "frontier_center_fallback": center_fallback,
                         "frontier_point": frontier_point,
                         "frame_id": str(proposal.get("frame_id") or status.get("frame_id") or ""),
                         "frontier_recovery_targets": list(proposal.get("frontier_cells_world") or [frontier_point])[::max(1, len(proposal.get("frontier_cells_world") or [])//12)],

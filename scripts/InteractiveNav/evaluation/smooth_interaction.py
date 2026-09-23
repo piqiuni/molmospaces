@@ -45,9 +45,10 @@ def run_smooth_interaction(
             break
         terminal = measured("observation_and_task_step", index, lambda: step(controller, index))
         consumed += 1
-        if terminal is True:
+        if terminal is True or terminal == "public_target_visible":
             return {"result": {"success": True, "state": "open",
-                               "interrupted_by_goal_status": True},
+                               "interrupted_by_goal_status": terminal is True,
+                               "stopped_on_public_target": terminal == "public_target_visible"},
                     "task_steps_consumed": consumed, "events": controller._events,
                     "execution_mode": "ordinary_native_smooth"}
         result = measured("after_step", index, lambda: controller.after_step(task, index))

@@ -942,7 +942,7 @@ class SemanticBehaviorExecutor:
             config.get("make_plan_preflight_enabled", True)
         )
         self.make_plan_service = str(
-            config.get("make_plan_service", "/move_base/make_plan")
+            config.get("make_plan_service", "/move_base/GlobalPlanner/make_plan")
         )
         self.make_plan_service_wait_sec = float(
             config.get("make_plan_service_wait_sec", 2.0)
@@ -3564,6 +3564,9 @@ class SemanticBehaviorExecutor:
             received_at = time.monotonic()
             self._latest_step_sync_received_at = received_at
             action_source = str(payload.get("action_source") or "")
+            supervisor = getattr(self, "_semantic_navigation_progress", None)
+            if supervisor is not None and self.machine.state in {STATE_INTERACTING, STATE_VERIFYING}:
+                supervisor.pause(step_index)
             if self.startup_scan_enabled:
                 self._startup_scan_gate.record_step_sync(
                     step_index,
@@ -10541,7 +10544,8 @@ class SemanticBehaviorExecutor:
                     preflight_reason,
                 ) = self._preflight_navigation_plan(
                     goal_frame, option_x, option_y, option_yaw,
-                    **({"allow_unknown": True} if (candidate.get("metadata") or {}).get("frontier_center_fallback") else {}),
+                    **({"allow_unknown": True} if any((candidate.get("metadata") or {}).get(key)
+                        for key in ("frontier_center_fallback", "allow_unknown_planning")) else {}),
                 )
                 preflight_call_elapsed_s = max(
                     0.0, time.monotonic() - preflight_call_started_at

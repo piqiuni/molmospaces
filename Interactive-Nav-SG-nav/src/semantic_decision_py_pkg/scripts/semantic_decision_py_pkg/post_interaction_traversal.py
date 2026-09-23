@@ -1001,7 +1001,28 @@ def inject_pending_traversal(
     candidates = list(candidate_snapshot.get("candidates") or [])
     if any(str(candidate.get("candidate_id") or "") == candidate_id for candidate in candidates):
         return False
-    candidates.append(copy.deepcopy(pending_candidate))
+    traversal = copy.deepcopy(pending_candidate)
+    traversal_metadata = traversal.setdefault("metadata", {})
+    center = metadata.get("source_portal_center_xy") or []
+    approach = metadata.get("source_interaction_approach_xyyaw") or []
+    frontier_goals = []
+    if len(center) >= 2 and len(approach) >= 2:
+        axis = (center[0] - approach[0], center[1] - approach[1])
+        for candidate in candidates:
+            frontier = (candidate.get("metadata") or {}).get("frontier_point") or []
+            if candidate.get("behavior_type") != "EXPLORE" or len(frontier) < 2:
+                continue
+            offset = (frontier[0] - center[0], frontier[1] - center[1])
+            if math.hypot(*offset) > 2.5 or sum(left * right for left, right in zip(axis, offset)) <= 0:
+                continue
+            frontier_goals.append([float(frontier[0]), float(frontier[1]), math.atan2(axis[1], axis[0])])
+        frontier_goals.sort(key=lambda goal: math.hypot(goal[0] - center[0], goal[1] - center[1]))
+    if frontier_goals:
+        traversal_metadata["goal_xyyaw_candidates"] = frontier_goals + list(metadata.get("goal_xyyaw_candidates") or [traversal["goal_xyyaw"]])
+        traversal_metadata["post_open_frontier_centers"] = frontier_goals
+        traversal["goal_xyyaw"] = frontier_goals[0]
+    traversal_metadata["allow_unknown_planning"] = True
+    candidates.append(traversal)
     candidate_snapshot["candidates"] = candidates
     candidate_snapshot["candidate_count"] = len(candidates)
     return True

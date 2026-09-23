@@ -1253,7 +1253,10 @@ def test_request_leaves_room_target_reasoning_to_model() -> None:
     positions = [request["instruction"].index(stage) for stage in stages]
     assert positions == sorted(positions)
     assert "return only the final JSON, not the reasoning" in request["instruction"]
-    assert "A toilet cannot be inside a refrigerator" in request["instruction"]
+    assert "extremely low priority" in request["instruction"]
+    assert "newly accessible, unentered room" in request["instruction"]
+    assert "toilet" not in request["instruction"]
+    assert "refrigerator" not in request["instruction"]
 
 
 def test_room_object_reasoning_context_caps_observed_graph_evidence() -> None:

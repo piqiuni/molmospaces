@@ -24,6 +24,23 @@ for path in (PACKAGE_SCRIPTS, MLLM_SCRIPTS):
         sys.path.insert(0, str(path))
 
 
+def test_interaction_step_sync_pauses_navigation_clock(executor_module):
+    from semantic_decision_py_pkg.behavior_execution import SemanticNavigationProgressSupervisor
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = SimpleNamespace(state=executor_module.STATE_INTERACTING)
+    executor.startup_scan_enabled = False
+    executor.rear_goal_prerotate_step_sync_enabled = False
+    executor.interaction_final_align_enabled = False
+    supervisor = SemanticNavigationProgressSupervisor(mission_timeout_task_steps=18)
+    executor._semantic_navigation_progress = supervisor
+    supervisor.observe(subgoal_key="old", pose=(0.0, 0.0), task_step_index=1)
+    executor._step_sync_callback(SimpleNamespace(data=json.dumps({"step_index": 100, "action_source": "navigation_hold"})))
+    detail = supervisor.observe(subgoal_key="new", pose=(0.0, 0.0), task_step_index=101)
+    assert detail["mission_elapsed_task_steps"] == 1
+    assert not detail["mission_stalled"]
+
+
 def _stub_module(monkeypatch, name: str, **attributes):
     module = types.ModuleType(name)
     for key, value in attributes.items():

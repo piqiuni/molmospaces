@@ -68,6 +68,11 @@ def test_frontier_center_fallback_uses_unknown_but_not_known_obstacles(monkeypat
     assert cluster.frontier_center_fallback
     assert cluster.subgoal_world == cluster.centroid_world
     grid.data[grid.spec.index(7, 6)] = 100
+    recovered = core._build_cluster(grid, cells, (3.5, 5.5))
+    assert recovered is not None
+    assert recovered.subgoal_world != recovered.centroid_world
+    for row in range(3, 9):
+        grid.data[grid.spec.index(6, row)] = 100
     assert core._build_cluster(grid, cells, (3.5, 5.5)) is None
 
 

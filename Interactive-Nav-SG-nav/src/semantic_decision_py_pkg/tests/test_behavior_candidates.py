@@ -128,6 +128,17 @@ def test_frontier_clearance_fallback_requests_optimistic_center_only():
     assert not generator.generate(status, {}, (0., 0.), clearance_check=lambda *args, **kwargs: {"clear": False})
 
 
+def test_frontier_without_observation_subgoal_uses_center():
+    generator = CandidateGenerator(CandidateGeneratorConfig(frontier_center_fallback_enabled=True))
+    status = {"proposals": [{"proposal_id": "edge", "goal_xyyaw": [],
+                              "frontier_point": [1.0, 1.0], "frame_id": "map"}]}
+    candidates = generator.generate(status, {}, (0.0, 0.0),
+        clearance_check=lambda *args, **kwargs: {"clear": bool(kwargs.get("allow_unknown"))})
+    assert len(candidates) == 1
+    assert candidates[0].goal_xyyaw[:2] == [1.0, 1.0]
+    assert candidates[0].metadata["frontier_center_fallback"]
+
+
 def test_clearance_filter_does_not_rotate_portal_normal_when_primary_is_blocked():
     node = {"id": "door", "type": "portal", "aabb_center": [0., 0., 1.],
             "aabb_size": [.2, 2., 2.], "state_age_sec": 0., "is_currently_visible": True,

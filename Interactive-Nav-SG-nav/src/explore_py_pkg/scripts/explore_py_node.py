@@ -155,7 +155,7 @@ class ExplorePyNode:
             exploration_cfg.get("make_plan_preflight_enabled", True)
         )
         self.make_plan_service = str(
-            exploration_cfg.get("make_plan_service", "/move_base/make_plan")
+            exploration_cfg.get("make_plan_service", "/move_base/GlobalPlanner/make_plan")
         )
         self.make_plan_service_wait_sec = float(
             exploration_cfg.get("make_plan_service_wait_sec", 2.0)

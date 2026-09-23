@@ -2186,9 +2186,10 @@ def _execute_native_smooth(task, runtime, request, source_name, joints, episode,
     opened = {}
     samples = []
     observation_counts = {}
+    public_target_observed = False
 
     def step(controller, index):
-        nonlocal observed
+        nonlocal observed, public_target_observed
         bridge.force_interaction_controller = controller
         _report_interaction_progress(runtime)
         observation = task.get_observations()
@@ -2222,6 +2223,15 @@ def _execute_native_smooth(task, runtime, request, source_name, joints, episode,
         # open drawer does not yet satisfy its physical open postcondition.
         may_finish = phase == "observe" and observation_counts.get(
             int((controller._pending or {}).get("group_index", 0)), 0) >= 10
+        evidence_ledger = getattr(runtime, "goal_evidence", None)
+        public_target_observed = public_target_observed or bool(
+            phase == "observe"
+            and evidence_ledger is not None
+            and any(frame.capture_step == decision_index + index
+                    for frame in evidence_ledger.frames)
+        )
+        if request.sequence_type == "drawer_scan" and may_finish and public_target_observed:
+            return "public_target_visible"
         if observer is not None and (request.sequence_type != "drawer_scan" or may_finish):
             terminal = _poll_restricted_goal_status(
                 observer=observer, task=task, runtime=runtime, episode=episode)

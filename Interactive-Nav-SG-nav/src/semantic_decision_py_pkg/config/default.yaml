@@ -395,7 +395,7 @@ executor:
   interaction_final_align_delivery_retry_steps: 2
   final_align_cancel_wait_s: 1.0
   make_plan_preflight_enabled: true
-  make_plan_service: "/move_base/make_plan"
+  make_plan_service: "/move_base/GlobalPlanner/make_plan"
   make_plan_service_wait_sec: 2.0
   make_plan_tolerance_m: 0.20
   make_plan_endpoint_tolerance_m: 0.60
