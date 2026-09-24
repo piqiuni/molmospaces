@@ -849,10 +849,13 @@ class ExplorePyNode:
         global_fresh = now - self.latest_global_plan_time <= self.plan_freshness_sec
         local_fresh = now - self.latest_local_plan_time <= self.plan_freshness_sec
         global_available = global_fresh and self.latest_global_plan_pose_count >= self.global_plan_min_poses
+        min_local_plan_length_m = self.local_plan_min_length_m
+        if rospy.get_param_cached("/move_base/base_local_planner", "") == "nav_pkg/PathFollower":
+            min_local_plan_length_m = min(min_local_plan_length_m, 0.08)
         local_available = (
             local_fresh
             and self.latest_local_plan_pose_count >= self.local_plan_min_poses
-            and self.latest_local_plan_length_m >= self.local_plan_min_length_m
+            and self.latest_local_plan_length_m >= min_local_plan_length_m
         )
         if not global_available or local_available:
             self.local_plan_bad_since = 0.0

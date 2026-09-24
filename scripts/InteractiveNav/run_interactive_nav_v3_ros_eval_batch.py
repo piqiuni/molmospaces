@@ -56,6 +56,7 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "BASE_LOCAL_PLANNER": "dwa_local_planner/DWAPlannerROS",
     "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
     "RECORDER_SAVE_EVENTS": "false",
     "RECORDER_COMPACT_STEPS": "true",
@@ -143,6 +144,10 @@ _V3_EVALUATOR_PROTOCOL_FILES = (
 # resume is invalidated by a relevant ROS change without making every batch
 # startup scan unrelated assets/tests.
 _ROS_RUNTIME_PROTOCOL_FILES = (
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "src" / "path_follower.cpp",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "include" / "nav_pkg" / "path_follower.h",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "path_follower_plugin.xml",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "cfg" / "PathFollower.cfg",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "molmospaces_nav_system.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "nav.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "scripts" / "run_nav_ros_sim.py",
@@ -158,6 +163,7 @@ _ROS_RUNTIME_PROTOCOL_FILES = (
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_result_contract.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_graph_store.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "launch" / "explore_py.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_node.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_pkg" / "frontier_core.py",
 )
 
