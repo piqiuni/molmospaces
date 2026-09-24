@@ -1193,6 +1193,64 @@ def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_pos
     assert selected is traversal
 
 
+@pytest.mark.parametrize(
+    ("confidence", "expected_new_room"),
+    [("high", False), ("medium", True)],
+)
+def test_new_room_guard_preserves_high_confidence_target_container_choice(
+    monkeypatch, confidence, expected_new_room
+) -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="mock", pre_score_guard_margin=0.75))
+    fridge = BehaviorCandidate(
+        candidate_id="interaction:container_obj_000037:open",
+        behavior_type="INTERACT",
+        source="test",
+        target_id="container_obj_000037",
+        target_name="refrigerator",
+        goal_xyyaw=[1.0, 0.0, 0.0],
+        interaction_command={"action": "open"},
+        features={"distance_m": 1.0},
+        metadata={"node_type": "container"},
+    )
+    new_room = BehaviorCandidate(
+        candidate_id="frontier:19:3",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="frontier_19_3",
+        target_name="frontier",
+        goal_xyyaw=[3.0, 0.0, 0.0],
+        features={"distance_m": 3.0},
+        metadata={"room_status": "unentered_new_room"},
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload, metrics_context=None: {
+            "ranked_ids": [fridge.candidate_id, new_room.candidate_id],
+            "reason": "REVEAL_TARGET_CONTAINER",
+            "confidence": confidence,
+        },
+    )
+
+    selected = client.select(
+        [fridge, new_room],
+        robot_context={
+            "candidate_pre_scores": {
+                fridge.candidate_id: 0.97,
+                new_room.candidate_id: 2.013,
+            },
+            "candidate_decision_hints": {new_room.candidate_id: "NEW_ROOM_FRONTIER"},
+        },
+    )
+
+    assert selected is (new_room if expected_new_room else fridge)
+    assert client.last_pre_score_guard == (
+        "NEW_ROOM_FRONTIER:interaction:container_obj_000037:open->frontier:19:3:margin=1.043"
+        if expected_new_room
+        else ""
+    )
+
+
 def test_request_leaves_room_target_reasoning_to_model() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     fridge = BehaviorCandidate(

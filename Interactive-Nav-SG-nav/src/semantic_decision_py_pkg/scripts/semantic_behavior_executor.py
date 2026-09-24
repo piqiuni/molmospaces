@@ -1748,8 +1748,13 @@ class SemanticBehaviorExecutor:
                     detail=payload.get("detail") or {}
                 )
             elif status in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
+                detail = dict(payload.get("detail") or {})
+                detail.setdefault("explore_feedback_status", status)
+                detail.setdefault("command_id", str(payload.get("command_id") or ""))
+                if status != "SUCCEEDED":
+                    detail.setdefault("reason", str(payload.get("reason") or status.lower()))
                 commands = self.machine.on_explore_result(
-                    status == "SUCCEEDED", detail=payload
+                    status == "SUCCEEDED", detail=detail
                 )
             else:
                 return
@@ -14245,6 +14250,10 @@ class SemanticBehaviorExecutor:
             }
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
+            if status == "FAILED" and str(selection.get("behavior_type") or "").upper() == "EXPLORE":
+                feedback_status = str(detail.get("explore_feedback_status") or "")
+                if feedback_status in {"CANCELED", "REJECTED"}:
+                    status = feedback_status
             if decision_id:
                 self._navigation_failure_recovery_attempts.pop(decision_id, None)
             drawer_scan_wait = self._drawer_scan_wait_records.pop(decision_id, None)
@@ -14305,9 +14314,21 @@ class SemanticBehaviorExecutor:
             return False
         command_id = str(payload.get("command_id") or "")
         candidate_id = str(payload.get("candidate_id") or "")
-        return command_id == self._command_id(self.selection) or (
-            candidate_id and candidate_id == str(self.selection.get("candidate_id") or "")
-        )
+        if command_id:
+            expected = self._command_id(self.selection)
+            if command_id == expected:
+                return True
+            return bool(
+                command_id.startswith(expected + ":interaction:")
+                and command_id == getattr(self, "_interaction_command_sent_id", "")
+                and candidate_id == str(self.selection.get("candidate_id") or "")
+                and str(payload.get("decision_id") or "")
+                == str(self.selection.get("decision_id") or "")
+            )
+        decision_id = str(payload.get("decision_id") or "")
+        if decision_id and decision_id != str(self.selection.get("decision_id") or ""):
+            return False
+        return bool(candidate_id and candidate_id == str(self.selection.get("candidate_id") or ""))
 
     @staticmethod
     def _command_id(candidate: dict) -> str:

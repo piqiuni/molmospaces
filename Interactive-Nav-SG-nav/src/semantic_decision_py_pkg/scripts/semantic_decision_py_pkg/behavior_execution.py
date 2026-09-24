@@ -1594,6 +1594,20 @@ class SemanticNavigationProgressSupervisor:
             self.subgoal_reference_goal_distance_m = goal_distance
             self.subgoal_reference_yaw_error_rad = yaw_error
             self.subgoal_reference_step_index = step
+            if (
+                self.mission_grace_deadline_step_index is not None
+                and self.mission_reference_step_index is not None
+            ):
+                subgoal_timeout = max(1, int(self.subgoal_timeout_task_steps))
+                grace_cap = (
+                    self.mission_reference_step_index
+                    + max(1, int(self.mission_timeout_task_steps))
+                    + 2 * subgoal_timeout
+                )
+                self.mission_grace_deadline_step_index = max(
+                    self.mission_grace_deadline_step_index,
+                    min(step + subgoal_timeout, grace_cap),
+                )
         else:
             displacement = math.hypot(
                 xy[0] - float(self.subgoal_reference_xy[0]),

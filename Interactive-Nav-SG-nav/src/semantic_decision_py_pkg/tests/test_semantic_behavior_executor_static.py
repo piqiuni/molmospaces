@@ -65,6 +65,81 @@ def test_frontier_preempt_releases_navigation_and_reports_cancel(executor_module
     assert events == ["decision_old", "reset", "cancel_goal", reason, "CANCELED"]
 
 
+def test_explore_terminal_feedback_preserves_reason_without_nesting(executor_module):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "current", "candidate_id": "frontier:shared"}
+    executor._explore_feedback_received_count = 0
+    executor._explore_feedback_matched_count = 0
+    executor._explore_feedback_ignored_count = 0
+    executor._last_explore_feedback = {}
+    recorded = []
+    executor.machine = SimpleNamespace(on_explore_result=lambda success, detail: recorded.append((success, detail)) or [])
+    executor._dispatch = lambda commands: None
+    command_id = executor._command_id(executor.selection)
+    executor._explore_feedback_callback(SimpleNamespace(data=json.dumps({
+        "command_id": command_id, "candidate_id": "frontier:shared", "status": "FAILED",
+        "detail": {"reason": "make_plan_unreachable", "retryable": True},
+    })))
+    assert recorded == [(False, {
+        "reason": "make_plan_unreachable", "retryable": True,
+        "explore_feedback_status": "FAILED", "command_id": command_id,
+    })]
+    executor._explore_feedback_callback(SimpleNamespace(data=json.dumps({
+        "command_id": "old:frontier:shared", "candidate_id": "frontier:shared",
+        "status": "FAILED", "detail": {"reason": "old_failure"},
+    })))
+    assert len(recorded) == 1
+    assert executor._explore_feedback_ignored_count == 1
+
+
+def test_active_interaction_child_result_matches_without_allowing_stale_commands(executor_module):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = {"decision_id": "current", "candidate_id": "interaction:container:open"}
+    active_command = executor._command_id(executor.selection) + ":interaction:001"
+    executor._interaction_command_sent_id = active_command
+    assert executor._matches_active({
+        "command_id": active_command, "decision_id": "current",
+        "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": "previous:interaction:container:open:interaction:001",
+        "decision_id": "previous", "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": active_command, "decision_id": "previous",
+        "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": executor._command_id(executor.selection) + ":interaction:000",
+        "decision_id": "current", "candidate_id": "interaction:container:open",
+    })
+
+
+@pytest.mark.parametrize("feedback_status", ["FAILED", "REJECTED", "CANCELED"])
+def test_explore_terminal_keeps_original_feedback_status(executor_module, feedback_status):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "current", "candidate_id": "frontier:1", "behavior_type": "EXPLORE"}
+    executor.machine = SimpleNamespace(state=executor_module.STATE_PREPARING_EXPLORE, reset=lambda: None)
+    executor._navigation_failure_recovery_attempts = {}
+    executor._drawer_scan_wait_records = {}
+    executor._drawer_scan_wait_contexts = {}
+    executor.model_events = []
+    executor.move_base = SimpleNamespace(cancel_goal=lambda: None)
+    executor._observation_only_interaction_result_locked = lambda *args, **kwargs: None
+    executor._clear_drawer_scan_execution_wait_locked = lambda: None
+    received = []
+    executor._publish_feedback = lambda selection, status, success, detail: received.append((status, success, detail))
+    executor._finish_terminal({
+        "success": False,
+        "detail": {"reason": "executor_busy", "explore_feedback_status": feedback_status},
+    })
+    assert received == [(feedback_status, False, {
+        "reason": "executor_busy", "explore_feedback_status": feedback_status,
+    })]
+
+
 def _stub_module(monkeypatch, name: str, **attributes):
     module = types.ModuleType(name)
     for key, value in attributes.items():
@@ -569,8 +644,9 @@ def test_remembered_portal_navigation_completion_enters_m1_barrier(
     assert dispatched[0]["object_id"] == "door_0003"
 
 
+@pytest.mark.parametrize("child_command", [False, True])
 def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
-    executor_module,
+    executor_module, child_command,
 ) -> None:
     selection = _portal_selection()
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
@@ -605,7 +681,10 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
     )
 
     payload = {
-        "command_id": "decision_static:interaction:portal_static:open",
+        "command_id": (
+            "decision_static:interaction:portal_static:open:interaction:001"
+            if child_command else "decision_static:interaction:portal_static:open"
+        ),
         "decision_id": "decision_static",
         "candidate_id": "interaction:portal_static:open",
         "event_id": "decision_static_interaction_001",
@@ -620,6 +699,7 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
         "post_state": "static_open",
         "source": "executor_static_portal",
     }
+    executor._interaction_command_sent_id = payload["command_id"]
     executor._interaction_result_callback(
         SimpleNamespace(data=json.dumps(payload, separators=(",", ":")))
     )

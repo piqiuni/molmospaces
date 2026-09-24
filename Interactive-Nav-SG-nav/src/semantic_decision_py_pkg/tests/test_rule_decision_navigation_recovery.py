@@ -502,7 +502,8 @@ def test_idle_recovery_handles_unresolved_interaction_without_frontiers(monkeypa
     assert tracker.recovery_candidate(payload) is not None
     clock[0] += 20
     detail = tracker.update(payload, eligible_candidate_count=0, has_active_behavior=False)
-    assert detail["blocked"]
+    assert not detail["blocked"]
+    assert detail["no_eligible_confirmations"] == 1
     assert detail["no_eligible_elapsed_wall_seconds"] < 60
 
 
@@ -535,6 +536,31 @@ def test_idle_timeout_excludes_recovery_execution(monkeypatch):
     assert detail["no_eligible_elapsed_wall_seconds"] == 11.0
 
 
+def test_no_eligible_timeout_excludes_recovery_observation_steps(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker()
+    initial = snapshot(30)
+    initial["exploration_context"]["unresolved_interaction_target_count"] = 1
+    tracker.update(initial, eligible_candidate_count=0, has_active_behavior=False)
+    clock[0] = 111.0
+    recovery = tracker.recovery_candidate(initial)
+    assert recovery is not None
+    active = snapshot(170)
+    active["exploration_context"]["unresolved_interaction_target_count"] = 1
+    detail = tracker.update(active, eligible_candidate_count=0, has_active_behavior=True)
+    assert not detail["blocked"]
+    clock[0] = 151.0
+    tracker.finish_recovery(recovery.candidate_id)
+    detail = tracker.update(active, eligible_candidate_count=0, has_active_behavior=False)
+    assert detail["no_eligible_elapsed_steps"] == 0
+    assert not detail["blocked"]
+    later = snapshot(289)
+    assert not tracker.update(later, eligible_candidate_count=0, has_active_behavior=False)["blocked"]
+    final = snapshot(290)
+    assert tracker.update(final, eligible_candidate_count=0, has_active_behavior=False)["blocked"]
+
+
 def test_nonempty_pool_does_not_hide_failure_to_select_an_action(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
@@ -546,11 +572,69 @@ def test_nonempty_pool_does_not_hide_failure_to_select_an_action(monkeypatch):
     clock[0] += 31
     detail = tracker.update(payload, eligible_candidate_count=3,
         has_active_behavior=False, has_executable_candidate=False)
-    assert detail["blocked"]
+    assert not detail["blocked"]
     assert detail["eligible_candidate_count"] == 3
     assert detail["executable_candidate_count"] == 0
+    assert tracker.recovery_candidate(payload) is not None
     assert tracker.update(payload, eligible_candidate_count=3,
         has_active_behavior=False, has_executable_candidate=True) == {}
+
+
+def test_wall_clock_load_cannot_exhaust_semantic_recovery(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+    tracker = decision.NoEligibleCandidateTracker(max_idle_seconds=30)
+    for step, wall in ((10, 100.0), (11, 151.0), (12, 211.0)):
+        clock[0] = wall
+        assert not observe(tracker, step)["blocked"]
+        recovery = tracker.recovery_candidate(snapshot(step))
+        if recovery is not None:
+            tracker.finish_recovery(recovery.candidate_id)
+    assert observe(tracker, 130)["blocked"]
+
+
+@pytest.mark.parametrize("status,detail", [
+    ("FAILED", {"reason": "navigation_costmap_not_fresh", "retryable": True}),
+    ("REJECTED", {"reason": "executor_busy"}),
+])
+def test_unexecuted_explore_feedback_is_neutral(node, status, detail):
+    frontier = BehaviorCandidate(candidate_id="frontier:shared", behavior_type="EXPLORE",
+                                 source="frontier", target_id="shared", target_name="frontier",
+                                 goal_xyyaw=[1, 2, 0])
+    payload = snapshot(10, [frontier.to_dict()])
+    node.latest_candidates_payload = payload
+    node._record_decision_selection("unexecuted", frontier, "explore:room_1", payload, "", "")
+    node._record_decision_result({"decision_id": "unexecuted", "status": status,
+                                  "detail": detail})
+    entry = node.decision_history[-1]
+    assert entry["failure_reason"] == detail["reason"]
+    assert entry["neutral_preempt"]
+    assert not node.frontier_failure_memory.entries
+    assert not any(stats.get("failure_count") for stats in node.region_history.values())
+    assert node.group_history["explore:room_1"].get("selection_count") is None
+    assert not any(stats.get("selection_count") for stats in node.region_history.values())
+    recent, groups = node._history_context(snapshot(11, [frontier.to_dict()]))
+    assert not recent
+    assert not any(group["selection_count"] for group in groups)
+    assert entry["frontier_metrics_evaluated"]
+    assert not any(stats.get("last_frontier_shrink_m") for stats in node.region_history.values())
+
+
+def test_busy_result_restores_previous_successful_group_history(node):
+    frontier = BehaviorCandidate(candidate_id="frontier:shared", behavior_type="EXPLORE",
+                                 source="frontier", target_id="shared", target_name="frontier",
+                                 goal_xyyaw=[1, 2, 0])
+    payload = snapshot(10, [frontier.to_dict()])
+    node.latest_candidates_payload = payload
+    node._record_decision_selection("completed", frontier, "explore:room_1", payload, "", "")
+    node._record_decision_result({"decision_id": "completed", "status": "SUCCEEDED"})
+    node._record_decision_selection("busy", frontier, "explore:room_1", payload, "", "")
+    node._record_decision_result({"decision_id": "busy", "status": "REJECTED",
+                                  "detail": {"reason": "executor_busy"}})
+    assert node.group_history["explore:room_1"]["selection_count"] == 1
+    assert node.group_history["explore:room_1"]["last_result"] == "SUCCEEDED"
+    assert any(stats.get("selection_count") == 1 and stats.get("last_result") == "SUCCEEDED"
+               for stats in node.region_history.values())
 
 
 def test_active_recovery_scan_keeps_idle_tracker_state(monkeypatch):
@@ -646,17 +730,29 @@ def test_node_reports_blocked_for_material_frontiers_without_safe_viewpoints(nod
     assert node.trace_pub.messages[-1]["execution_eligible_candidate_count"] == 0
 
 
-def test_recovery_scan_has_two_attempts_inside_one_step_budget():
+def test_recovery_scan_has_two_attempts_without_spending_wait_step_budget():
     tracker = decision.NoEligibleCandidateTracker()
     observe(tracker, 0)
     assert tracker.recovery_candidate(snapshot(0)) is None
     observe(tracker, 20)
-    assert tracker.recovery_candidate(snapshot(20)).metadata["frontier_recovery_scan"]
+    first = tracker.recovery_candidate(snapshot(20))
+    assert first.metadata["frontier_recovery_scan"]
     assert tracker.recovery_candidate(snapshot(20)) is None
-    observe(tracker, 60)
-    assert tracker.recovery_candidate(snapshot(60)).behavior_type == "SCAN"
-    assert tracker.recovery_candidate(snapshot(60)) is None
-    assert observe(tracker, 120)["blocked"]
+    assert not tracker.update(
+        snapshot(40), eligible_candidate_count=0, has_active_behavior=True
+    )["blocked"]
+    tracker.finish_recovery(first.candidate_id)
+    assert not observe(tracker, 40)["blocked"]
+    observe(tracker, 80)
+    second = tracker.recovery_candidate(snapshot(80))
+    assert second.behavior_type == "SCAN"
+    assert tracker.recovery_candidate(snapshot(80)) is None
+    assert not tracker.update(
+        snapshot(100), eligible_candidate_count=0, has_active_behavior=True
+    )["blocked"]
+    tracker.finish_recovery(second.candidate_id)
+    assert not observe(tracker, 159)["blocked"]
+    assert observe(tracker, 160)["blocked"]
 
 
 def test_stale_costmap_feedback_does_not_consume_interaction_failure_budget(node):
