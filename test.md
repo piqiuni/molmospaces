@@ -3251,6 +3251,97 @@ resume 跳过已完成场景、dry-run 不等待。排队时间不占场景 time
 远程双卡 30 场模板：`scripts/InteractiveNav/configs/evaluation/benchmark_remote2gpu_30mixed_stagger10.json`，
 保持 2000–2029、30 worker、dynamic/max 2000、M1 30s、M2 16K、不录制、不自动补跑。
 
+### 2026-09-23 路径跟随局部规划器 A/B 回归
+
+`nav_pkg/PathFollower` 通过 `BASE_LOCAL_PLANNER=nav_pkg/PathFollower` 启用；
+同时将 `NAV_CONFIG_OVERRIDE` 指向
+`scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml`。
+不设置时仍使用 DWA 与 `semantic_interaction_nav.yaml`。
+插件沿实时全局路径前瞻 0.2 m，按 V3 桥接器实际 0.2 秒控制步长预测运动，检查 footprint
+和横向偏离；`/move_base/PathFollower/set_parameters` 提供每次交互到达容差租约。
+
+先用 `2015 2016 2017 2020 2026 2029` 六场运行固定 300 step，再用
+`2004 2007 2008 2009 2010 2015 2016 2017 2020 2024 2025 2026 2029`
+十三场运行固定 1000 step。新旧两组必须设置独立输出目录、ROS 端口段和相同
+`--workers`、`--max-steps`、模型服务、种子及录制模式；每组 `--workers`
+等于该组场景数，EGL 设备由 `--mujoco-egl-devices 0 1 2 3` 轮转分配。
+例如首次 300-step 新版：
+
+```bash
+BASE_LOCAL_PLANNER=nav_pkg/PathFollower \
+NAV_CONFIG_OVERRIDE="$PWD/scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml" \
+TMPDIR=/home/ldl/tmp/path-follower-eval XDG_CACHE_HOME=/home/ldl/.cache/path-follower-eval \
+python scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --output-dir /home/ldl/outputs/interactive-nav/path-follower-ab/new-300 \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-indices 2015 2016 2017 2020 2026 2029 \
+  --workers 6 --max-steps 300 --step-budget-mode fixed \
+  --base-master-port 23400 --mujoco-egl-devices 0 1 2 3 \
+  --model-endpoints http://127.0.0.1:8100/v1 http://127.0.0.1:8101/v1 \
+    http://127.0.0.1:8102/v1 http://127.0.0.1:8103/v1 \
+  --semantic-model-env-file "$PWD/.env" --allow-failures
+```
+
+将 `BASE_LOCAL_PLANNER` 改为 `dwa_local_planner/DWAPlannerROS`、配置改回
+`semantic_interaction_nav.yaml`、ROS 端口和输出目录改为不冲突的值以运行基线。
+完成后可用 `scripts/InteractiveNav/analyze_path_follower_ab.py --new <目录>
+--dwa <目录> --episodes <索引...>` 查看每场成功、实际 step、移动距离和退出原因。
+检查六宫格中的局部轨迹及 `debug/move_base_plans.csv`，区分没有下发 subgoal 的
+上游停滞与已激活导航后的路径跟随失败；只用目标成功率无法证明局部规划改进。
+新插件会同时发布 `/move_base/DWAPlannerROS/local_plan` 以兼容现有消费者；该话题名
+不表示实际使用 DWA，应以 `config/effective_config.env` 的 `BASE_LOCAL_PLANNER` 为准。
+录制模式还可用 `scripts/InteractiveNav/path_following_diagnostics.py --run-dir <目录>
+--episodes <索引...>` 对齐活动导航期间的机器人位姿与最近一次公开全局路径；
+统计只包括正式 `applied_action_step_count` 内的帧，不把录像收尾时仍带 ACTIVE 状态的
+额外帧算成路径偏离。空的全局路径消息不写入 CSV，因此从录制的
+`debug/raw/step_boundaries.jsonl.gz` 还原空消息并清除旧路径；没有公开有效路径的时段
+不参与统计。此值仅是公开路径的诊断代理，外部 `make_plan` 可能覆盖最新路径。
+对照结果必须同时核对正式成功率/SPL、有效交互、无候选早停、实际动作步数和墙钟耗时；
+移动距离增加或路径误差下降不能单独视为整体任务性能提升。
+
+该测试集实测结果（同为 13 worker、固定 1000 step、4 张 GPU、同一批 13 个 episode，
+使用独立 ROS master；墙钟受同时运行的模型服务负载影响，不能直接当作算法提速）：
+
+| 局部规划 | 成功数 | 平均 SPL | 正确交互数 | 无候选早停数 | 平均移动距离 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DWA 原配置 | 2/13 | 0.0705 | 12 | 4 | 15.25 m |
+| PathFollower，0.20 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0476 | 16 | 7 | 27.41 m |
+| PathFollower，0.26 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0393 | 15 | 7 | 27.76 m |
+| PathFollower，0.20 m 前瞻、最高 0.23 m/s | 1/13 | 0.0141 | 14 | 6 | 22.39 m |
+| PathFollower，0.20 m 前瞻、受约束转向/倒退恢复 | 2/13 | 0.0386 | 15 | 9 | 24.06 m |
+
+六场录制版的 300-step 局部轨迹诊断：最新版在导航 ACTIVE 的记录样本中
+六场均没有超过 0.2 m 的公开全局路径偏离；DWA 在 2015、2020、2029 的超限
+比例分别为 8.9%、5.1%、11.8%。此诊断依赖公开路径话题，可能受到外部
+`make_plan` 发布的路径影响，不是内部真实跟踪误差的严格证明。
+前两个 PathFollower 配置提高了该批次的成功数，但 SPL、早停及移动距离明显退化；
+0.23 m/s 限速配置也失去了原有成功场景，**均未通过整体性能
+提升门槛**。加入仅在正常指令全部失败后启用、限制横向偏离与累计倒退距离的
+转向/倒退恢复后，七场 300-step 录制中 2029 成功、SPL 0.951；但该次没有实际发出
+倒退命令，13 场 1000-step 复跑中 2029 未成功、早停反而升至九场，不能将单场成功
+归因于恢复动作或视为稳定提升。另以失败的 0.23 m/s 配置单独录制 2029 1000-step，
+恢复版本实际发出三次 `-0.08 m/s` 短倒退、没有出现“no collision-free command”警告，
+公开有效路径样本 P95 偏离 0.034 m，超过 0.2 m 的样本占 0.1%；但它仍在 749 step
+因无可执行候选退出，正式成功率和 SPL 均为零。对比实验中的倒退恢复可用，不等于
+已解决上游候选耗尽。不要把 PathFollower 替换为默认规划器。实际候选配置为
+`path_follower_precise_nav.yaml` 和 `path_follower_smooth_nav.yaml`，其中前者
+整体指标较好；`path_follower_cautious_nav.yaml` 仅保留为限速失败对照，
+首轮 `path_follower_nav.yaml` 只用于 300-step 控制验证。
+新版提前结束的七场都报 `no_eligible_candidates_after_bounded_recovery`；例如 2004
+仍有未知连通区域及两个未解决的交互目标，但可执行候选数为零。这类故障发生在
+局部规划器收到 subgoal 之前，需要单独排查上游前沿视点、候选生成和恢复逻辑。
+2009 单场录制复跑还原了路径效率退化：DWA 290 step、8.42 m、SPL 0.505，
+0.35 m/s 配置的 PathFollower 903 step、44.89 m、SPL 0.095。两组最初都依次选择
+前沿 11:3、同一扇门及穿门导航；之后 DWA 直接交互冰箱，PathFollower 先选择四个
+新房间前沿，绕远后才返回冰箱。两者 M2 都收到冰箱候选：DWA 给出距离 0.36 m
+并优先交互，PathFollower 给出距离 0.68 m 却优先探索新房间。PathFollower 对公开
+全局路径的 P95 偏离为 0.118 m，DWA 为 0.134 m；所以不能把额外 36 m 误判为
+局部跟踪脱轨。虽然穿门候选 ID 相同，执行前上游给出的穿门 subgoal 已经不同：
+DWA 为 `(1.45, 4.95)`，PathFollower 为 `(2.45, 4.35)`；局部规划器不能在
+保持跟随下发全局路径的同时自行把后者改成前者。减少局部运动速度会改变进门
+后的视点及候选优先级，必须重新跑
+完整场景验证，而不是凭这一次录制宣称成功率或 SPL 提升。
+
 ### 2026-09-23 近距离容器感知与目标匹配
 
 restricted-GT 对 refrigerator/cabinet/drawer/dresser/wardrobe 及中心位于这些容器动态 AABB 内的物体，

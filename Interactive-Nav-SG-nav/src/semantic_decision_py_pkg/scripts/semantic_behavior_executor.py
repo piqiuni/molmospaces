@@ -8796,6 +8796,8 @@ class SemanticBehaviorExecutor:
             )
             or "/move_base/DWAPlannerROS"
         ).strip()
+        if rospy.get_param("/move_base/base_local_planner", "") == "nav_pkg/PathFollower":
+            server = "/move_base/PathFollower"
         if not server:
             return None, {"reason": "container_m1_capture_dwa_reconfigure_server_missing"}
         try:
