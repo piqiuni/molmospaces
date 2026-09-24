@@ -1053,7 +1053,7 @@ class SemanticRuleDecisionNode:
     def _handle_feedback(self, payload: dict) -> None:
         candidate_id = str(payload.get("candidate_id") or "")
         decision_id = str(payload.get("decision_id") or "")
-        if decision_id and self.active_decision_id and decision_id != self.active_decision_id:
+        if decision_id and decision_id != self.active_decision_id:
             return
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
@@ -1146,13 +1146,18 @@ class SemanticRuleDecisionNode:
         # receipt can place every real subgoal on cooldown.
         executor_transport_defer = bool(
             status != "SUCCEEDED"
-            and detail.get("retryable", False)
             and (
-                "successor_not_quiescent" in failure_reason
-                or "successor_quiescence" in failure_reason
-                or "service_unavailable" in failure_reason
-                or "transport" in failure_reason
-                or failure_reason == "navigation_costmap_not_fresh"
+                (status == "REJECTED" and failure_reason == "executor_busy")
+                or (
+                    detail.get("retryable", False)
+                    and (
+                        "successor_not_quiescent" in failure_reason
+                        or "successor_quiescence" in failure_reason
+                        or "service_unavailable" in failure_reason
+                        or "transport" in failure_reason
+                        or failure_reason == "navigation_costmap_not_fresh"
+                    )
+                )
             )
         )
         # The executor has a finite set of preserved approach poses. Once that
@@ -1180,7 +1185,9 @@ class SemanticRuleDecisionNode:
         )
         preempted_by_target = bool(
             status == "CANCELED"
-            and str(detail.get("reason") or "") == "preempted_by_target"
+            and str(detail.get("reason") or "") in {
+                "preempted_by_target", "frontier_resolved_by_observation"
+            }
         )
         terminal_interaction_failure: dict = {}
         successful_drawer_scan = bool(
@@ -1387,6 +1394,7 @@ class SemanticRuleDecisionNode:
         ).strip().casefold()
         container_transport_defer = bool(
             executor_transport_defer
+            and failure_reason != "executor_busy"
             and self.active_behavior_type == "INTERACT"
             and active_container_kind
             in {"drawer", "fridge", "refrigerator", "container"}
@@ -1420,7 +1428,10 @@ class SemanticRuleDecisionNode:
                     step_cooldowns,
                 )
         if executor_transport_defer:
-            self.next_decision_time = 0.0
+            self.next_decision_time = (
+                time.monotonic() + 0.5
+                if failure_reason == "executor_busy" else 0.0
+            )
         elif container_navigation_failure or all_container_anchors_unreachable:
             # Skip immediately to another candidate while this target cools
             # down.  The cooldown is retryable map-generation memory, not a
@@ -1443,7 +1454,7 @@ class SemanticRuleDecisionNode:
         pending_traversal_id = str(
             self.pending_post_interaction_traversal.get("candidate_id") or ""
         )
-        if is_terminal_post_interaction_traversal_failure(
+        if not executor_transport_defer and is_terminal_post_interaction_traversal_failure(
             candidate_id,
             active_behavior_type,
             status,
@@ -3226,7 +3237,12 @@ class SemanticRuleDecisionNode:
         if status not in {"SUCCEEDED", "FAILED", "ABORTED", "CANCELED", "REJECTED"}:
             return
         entry["result_recorded"] = True
-        if entry.get("behavior_type") == "EXPLORE" and status in {"FAILED", "ABORTED", "REJECTED"}:
+        executor_busy = bool(
+            status == "REJECTED"
+            and str(((payload.get("detail") or {}).get("reason") or ""))
+            == "executor_busy"
+        )
+        if entry.get("behavior_type") == "EXPLORE" and status in {"FAILED", "ABORTED", "REJECTED"} and not executor_busy:
             self.frontier_failure_memory.record_failure(
                 list(entry.get("frontier_point") or entry.get("goal_xy") or []),
                 str(entry.get("frame_id") or ""),
@@ -3235,9 +3251,11 @@ class SemanticRuleDecisionNode:
         if status == "SUCCEEDED" and entry.get("behavior_type") == "INTERACT" and entry.get("node_type") == "portal":
             self.frontier_failure_memory.clear()
         neutral_preempt = bool(
-            status == "CANCELED"
-            and str(((payload.get("detail") or {}).get("reason") or ""))
-            == "preempted_by_target"
+            executor_busy or (
+                status == "CANCELED"
+                and str(((payload.get("detail") or {}).get("reason") or ""))
+                in {"preempted_by_target", "frontier_resolved_by_observation"}
+            )
         )
         entry["result"] = status
         entry["failure_reason"] = str((payload.get("detail") or {}).get("reason") or "")

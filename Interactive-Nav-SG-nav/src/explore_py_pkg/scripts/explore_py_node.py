@@ -1285,7 +1285,9 @@ class ExplorePyNode:
         cluster = self.external_reserved_cluster
         success = bool(command.get("success"))
         detail = dict(command.get("detail") or {})
-        canceled = str(detail.get("reason") or "") == "preempted_by_target"
+        canceled = str(detail.get("reason") or "") in {
+            "preempted_by_target", "frontier_resolved_by_observation"
+        }
         if cluster is not None and self.robot_xy is not None:
             if self.state.active_goal is None:
                 self.state.start_goal(
@@ -1297,7 +1299,7 @@ class ExplorePyNode:
             if canceled:
                 self.state.clear_active_goal(
                     "subgoal_canceled",
-                    event="preempted_by_target",
+                    event=str(detail.get("reason") or ""),
                 )
             elif success:
                 has_frontier = self.core.has_frontier_near(

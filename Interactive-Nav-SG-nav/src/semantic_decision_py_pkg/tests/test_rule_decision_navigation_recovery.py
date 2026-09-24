@@ -173,7 +173,8 @@ def test_successful_portal_unlocks_failed_frontier_regions(node):
     assert not node.frontier_failure_memory.entries
 
 
-def test_target_preemption_does_not_poison_frontier_memory(node):
+@pytest.mark.parametrize("reason", ["preempted_by_target", "frontier_resolved_by_observation"])
+def test_target_preemption_does_not_poison_frontier_memory(node, reason):
     frontier = BehaviorCandidate(candidate_id="frontier:cancel", behavior_type="EXPLORE",
                                  source="frontier", target_id="cancel", target_name="frontier",
                                  goal_xyyaw=[1, 2, 0])
@@ -181,8 +182,106 @@ def test_target_preemption_does_not_poison_frontier_memory(node):
     node.latest_candidates_payload = payload
     node._record_decision_selection("preempted", frontier, "explore:room_1", payload, "", "")
     node._record_decision_result({"decision_id": "preempted", "status": "CANCELED",
-                                 "detail": {"reason": "preempted_by_target"}})
+                                 "detail": {"reason": reason}})
     assert not node.frontier_failure_memory.entries
+
+
+@pytest.mark.parametrize("active_decision_id", ["", "decision_new"])
+def test_late_feedback_after_selection_cleared_does_not_touch_new_decision(node, active_decision_id):
+    node.active_decision_id = active_decision_id
+    node.active_candidate_id = "frontier:new" if active_decision_id else ""
+    node.latest_candidates_payload = snapshot(200)
+    node._handle_feedback({
+        "status": "FAILED", "decision_id": "decision_old", "candidate_id": CANDIDATE_ID,
+        "detail": NAVIGATION_DETAIL,
+    })
+    assert not node.interaction_failure_tracker.failure_counts
+    assert not node.container_anchor_unreachable_until_step
+    assert node.active_decision_id == active_decision_id
+
+
+def test_global_mission_timer_grants_new_goal_its_navigation_window(node, monkeypatch):
+    published_statuses = []
+    monkeypatch.setattr(node, "_publish_goal_status", lambda status, detail: published_statuses.append(status))
+    node.active_candidate_id = "frontier:old"
+    node.active_decision_id = "decision_old"
+    node.active_behavior_type = "EXPLORE"
+    node._observe_global_navigation_progress(snapshot(0))
+    node.active_candidate_id = "frontier:new"
+    node.active_decision_id = "decision_new"
+    node._observe_global_navigation_progress(snapshot(179))
+    node._observe_global_navigation_progress(snapshot(200))
+    assert not node.goal_complete
+    assert not published_statuses
+    node._observe_global_navigation_progress(snapshot(239))
+    assert node.goal_complete
+    assert published_statuses == ["EXPLORATION_STALLED"]
+
+
+def test_resolved_frontier_preempts_only_after_consecutive_observations(node):
+    node.active_candidate_id = "frontier:old"
+    node.active_decision_id = "decision_old"
+    node.active_behavior_type = "EXPLORE"
+    node.active_frontier_missing_confirmations = 2
+    disappeared = snapshot(21, [], source_frontier_candidate_ids=["frontier:other"])
+    node._preempt_resolved_active_frontier(disappeared)
+    assert not node.preempt_pub.messages
+    node._preempt_resolved_active_frontier(disappeared)
+    assert node.preempt_pub.messages[-1]["reason"] == "frontier_resolved_by_observation"
+    assert node.preempt_pub.messages[-1]["decision_id"] == "decision_old"
+
+
+def test_executor_busy_rejection_does_not_consume_interaction_candidate(node):
+    node.latest_candidates_payload = snapshot(70)
+    node.active_decision_id = "decision_new"
+    node.active_candidate_id = CANDIDATE_ID
+    node.active_behavior_type = "INTERACT"
+    node.active_interaction_candidate = candidate()
+    node._handle_feedback({
+        "status": "REJECTED", "decision_id": "decision_new",
+        "candidate_id": CANDIDATE_ID, "detail": {"reason": "executor_busy"},
+    })
+    assert not node.interaction_failure_tracker.failure_counts
+    assert not node.cooldown_until
+    assert not node.failure_counts
+    assert not node.container_anchor_unreachable_until_step
+    assert node.next_decision_time > 0.0
+
+
+def test_executor_busy_does_not_terminally_exclude_post_open_traversal(node):
+    traversal = "traverse:door_1"
+    node.latest_candidates_payload = snapshot(70, [])
+    node.active_decision_id = "decision_cross"
+    node.active_candidate_id = traversal
+    node.active_behavior_type = "NAVIGATE"
+    node.pending_post_interaction_traversal = {"candidate_id": traversal}
+    node._handle_feedback({
+        "status": "REJECTED", "decision_id": "decision_cross",
+        "candidate_id": traversal, "detail": {"reason": "executor_busy"},
+    })
+    assert traversal not in node.terminal_post_interaction_traversal_ids
+    assert node.pending_post_interaction_traversal["candidate_id"] == traversal
+
+
+def test_executor_busy_does_not_poison_frontier_failure_memory(node):
+    frontier = BehaviorCandidate(
+        candidate_id="frontier:new", behavior_type="EXPLORE", source="frontier",
+        target_id="new", target_name="frontier", goal_xyyaw=[1, 2, 0],
+    )
+    payload = snapshot(70, [frontier.to_dict()])
+    node.latest_candidates_payload = payload
+    node.active_decision_id = "decision_new"
+    node.active_candidate_id = frontier.candidate_id
+    node.active_behavior_type = "EXPLORE"
+    node._record_decision_selection("decision_new", frontier, "explore:room_1", payload, "", "")
+    node._handle_feedback({
+        "status": "REJECTED", "decision_id": "decision_new",
+        "candidate_id": frontier.candidate_id, "detail": {"reason": "executor_busy"},
+    })
+    assert not node.frontier_failure_memory.entries
+    assert not node.failure_counts
+    assert not node.cooldown_until
+    assert not any(entry.get("failure_count") for entry in node.region_history.values())
 
 
 def test_successful_model_selection_still_runs_repeat_guard(node, monkeypatch):

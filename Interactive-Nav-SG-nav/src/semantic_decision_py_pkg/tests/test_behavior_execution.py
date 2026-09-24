@@ -286,6 +286,39 @@ def test_semantic_progress_supervisor_survives_worker_and_anchor_changes() -> No
     )["mission_stalled"]
 
 
+def test_new_subgoal_gets_full_window_after_mission_timeout_without_infinite_refresh() -> None:
+    supervisor = SemanticNavigationProgressSupervisor(
+        subgoal_timeout_task_steps=60,
+        mission_timeout_task_steps=180,
+    )
+    supervisor.observe(subgoal_key="old", pose=(0.0, 0.0), task_step_index=0)
+    first = supervisor.observe(subgoal_key="new", pose=(0.0, 0.0), task_step_index=179)
+    assert not first["mission_stalled"]
+    assert not supervisor.observe(
+        subgoal_key="new", pose=(0.0, 0.0), task_step_index=200,
+    )["mission_stalled"]
+    assert not supervisor.observe(
+        subgoal_key="another", pose=(0.0, 0.0), task_step_index=238,
+    )["mission_stalled"]
+    assert supervisor.observe(
+        subgoal_key="another", pose=(0.0, 0.0), task_step_index=239,
+    )["mission_stalled"]
+
+
+def test_paused_interaction_does_not_expire_mission_grace() -> None:
+    supervisor = SemanticNavigationProgressSupervisor(
+        subgoal_timeout_task_steps=60,
+        mission_timeout_task_steps=180,
+    )
+    supervisor.observe(subgoal_key="old", pose=(0.0, 0.0), task_step_index=0)
+    supervisor.observe(subgoal_key="new", pose=(0.0, 0.0), task_step_index=179)
+    supervisor.observe(subgoal_key="new", pose=(0.0, 0.0), task_step_index=180)
+    supervisor.pause(260)
+    resumed = supervisor.observe(subgoal_key="next", pose=(0.0, 0.0), task_step_index=261)
+    assert not resumed["mission_stalled"]
+    assert resumed["mission_elapsed_task_steps"] == 1
+
+
 def test_semantic_progress_supervisor_accepts_shortest_yaw_and_translation_progress() -> None:
     supervisor = SemanticNavigationProgressSupervisor(
         subgoal_timeout_task_steps=6,
