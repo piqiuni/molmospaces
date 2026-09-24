@@ -1,6 +1,10 @@
 import math
+import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -60,3 +64,29 @@ def test_current_frontier_reservation_still_uses_live_cluster() -> None:
 
     assert not retained
     assert cluster is current
+
+
+def test_resolved_frontier_cancel_does_not_register_navigation_failure():
+    pytest.importorskip("rospy")
+    module_path = ROOT / "scripts" / "explore_py_node.py"
+    spec = importlib.util.spec_from_file_location("explore_py_node_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    node = module.ExplorePyNode.__new__(module.ExplorePyNode)
+    node.external_reserved_cluster = make_cluster()
+    node.external_reserved_command = {"candidate_id": "frontier:current"}
+    node.robot_xy = (1.0, 2.0)
+    node.robot_yaw = 0.0
+    actions = []
+    node.state = SimpleNamespace(
+        active_goal=None,
+        start_goal=lambda *args, **kwargs: actions.append("start"),
+        clear_active_goal=lambda *args, **kwargs: actions.append("clear"),
+        mark_active_failed=lambda *args, **kwargs: actions.append("failed"),
+    )
+    node._publish_behavior_feedback = lambda command, status, success, detail: actions.append(status)
+    node._finalize_external_frontier({
+        "candidate_id": "frontier:current",
+        "detail": {"reason": "frontier_resolved_by_observation"},
+    })
+    assert actions == ["start", "clear", "CANCELED"]

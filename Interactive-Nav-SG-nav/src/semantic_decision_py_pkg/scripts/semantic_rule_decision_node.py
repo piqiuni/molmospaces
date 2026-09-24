@@ -155,6 +155,7 @@ class NoEligibleCandidateTracker:
         self.recovery_count = 0
         self.since_wall: float | None = None
         self.recovery_started_wall: float | None = None
+        self.recovery_started_step: int | None = None
         self.recovery_candidate_id = ""
 
     def finish_recovery(self, candidate_id: str) -> None:
@@ -162,7 +163,10 @@ class NoEligibleCandidateTracker:
             return
         if self.since_wall is not None:
             self.since_wall += max(0.0, time.monotonic() - self.recovery_started_wall)
+        if self.since_step is not None and self.recovery_started_step is not None:
+            self.since_step += max(0, (self.last_step or 0) - self.recovery_started_step)
         self.recovery_started_wall = None
+        self.recovery_started_step = None
         self.recovery_candidate_id = ""
 
     @staticmethod
@@ -181,10 +185,11 @@ class NoEligibleCandidateTracker:
         wall_elapsed = time.monotonic() - self.since_wall if self.since_wall is not None else 0.0
         due = max(1, self.min_steps // (6 if self.recovery_count == 0 else 2))
         wall_due = self.max_idle_seconds * (1 / 3 if self.recovery_count == 0 else 2 / 3)
-        if (elapsed < due and wall_elapsed < wall_due) or elapsed >= self.min_steps or wall_elapsed >= self.max_idle_seconds:
+        if (elapsed < due and wall_elapsed < wall_due) or elapsed >= self.min_steps:
             return None
         self.recovery_count += 1
         self.recovery_started_wall = time.monotonic()
+        self.recovery_started_step = self.last_step
         self.recovery_candidate_id = f"frontier_recovery_scan:{self.since_step}:{self.recovery_count}"
         return BehaviorCandidate(
             candidate_id=self.recovery_candidate_id,
@@ -233,8 +238,9 @@ class NoEligibleCandidateTracker:
         elapsed = step - self.since_step
         wall_elapsed = time.monotonic() - self.since_wall if self.since_wall is not None else 0.0
         blocked = (
-            (elapsed >= self.min_steps and self.confirmations >= self.required_confirmations)
-            or wall_elapsed >= self.max_idle_seconds
+            not recovery_active
+            and elapsed >= self.min_steps
+            and self.confirmations >= self.required_confirmations
         )
         return {
             "reason": (
@@ -1053,7 +1059,7 @@ class SemanticRuleDecisionNode:
     def _handle_feedback(self, payload: dict) -> None:
         candidate_id = str(payload.get("candidate_id") or "")
         decision_id = str(payload.get("decision_id") or "")
-        if decision_id and self.active_decision_id and decision_id != self.active_decision_id:
+        if decision_id and decision_id != self.active_decision_id:
             return
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
@@ -1146,13 +1152,18 @@ class SemanticRuleDecisionNode:
         # receipt can place every real subgoal on cooldown.
         executor_transport_defer = bool(
             status != "SUCCEEDED"
-            and detail.get("retryable", False)
             and (
-                "successor_not_quiescent" in failure_reason
-                or "successor_quiescence" in failure_reason
-                or "service_unavailable" in failure_reason
-                or "transport" in failure_reason
-                or failure_reason == "navigation_costmap_not_fresh"
+                (status == "REJECTED" and failure_reason == "executor_busy")
+                or (
+                    detail.get("retryable", False)
+                    and (
+                        "successor_not_quiescent" in failure_reason
+                        or "successor_quiescence" in failure_reason
+                        or "service_unavailable" in failure_reason
+                        or "transport" in failure_reason
+                        or failure_reason == "navigation_costmap_not_fresh"
+                    )
+                )
             )
         )
         # The executor has a finite set of preserved approach poses. Once that
@@ -1180,7 +1191,9 @@ class SemanticRuleDecisionNode:
         )
         preempted_by_target = bool(
             status == "CANCELED"
-            and str(detail.get("reason") or "") == "preempted_by_target"
+            and str(detail.get("reason") or "") in {
+                "preempted_by_target", "frontier_resolved_by_observation"
+            }
         )
         terminal_interaction_failure: dict = {}
         successful_drawer_scan = bool(
@@ -1387,6 +1400,7 @@ class SemanticRuleDecisionNode:
         ).strip().casefold()
         container_transport_defer = bool(
             executor_transport_defer
+            and failure_reason != "executor_busy"
             and self.active_behavior_type == "INTERACT"
             and active_container_kind
             in {"drawer", "fridge", "refrigerator", "container"}
@@ -1420,7 +1434,10 @@ class SemanticRuleDecisionNode:
                     step_cooldowns,
                 )
         if executor_transport_defer:
-            self.next_decision_time = 0.0
+            self.next_decision_time = (
+                time.monotonic() + 0.5
+                if failure_reason == "executor_busy" else 0.0
+            )
         elif container_navigation_failure or all_container_anchors_unreachable:
             # Skip immediately to another candidate while this target cools
             # down.  The cooldown is retryable map-generation memory, not a
@@ -1443,7 +1460,7 @@ class SemanticRuleDecisionNode:
         pending_traversal_id = str(
             self.pending_post_interaction_traversal.get("candidate_id") or ""
         )
-        if is_terminal_post_interaction_traversal_failure(
+        if not executor_transport_defer and is_terminal_post_interaction_traversal_failure(
             candidate_id,
             active_behavior_type,
             status,
@@ -3038,7 +3055,7 @@ class SemanticRuleDecisionNode:
                     } if entry.get("frontier_metrics_evaluated") else {}),
                 }
                 for entry in list(self.decision_history)[-history_limit:]
-                if history_limit
+                if history_limit and not entry.get("neutral_preempt")
             ]
             groups = []
             for group_id, stats in sorted(self.group_history.items()):
@@ -3146,6 +3163,11 @@ class SemanticRuleDecisionNode:
             self.candidate_curator.config.region_size_m,
         )
         stats = self.group_history.setdefault(group_id, {})
+        prior_group_history = {
+            key: stats.get(key)
+            for key in ("selection_count", "consecutive_selection_count", "last_selected_step", "last_result")
+        }
+        prior_group_id = self.last_selected_group_id
         stats["selection_count"] = int(stats.get("selection_count", 0) or 0) + 1
         stats["consecutive_selection_count"] = (
             int(stats.get("consecutive_selection_count", 0) or 0) + 1
@@ -3156,6 +3178,11 @@ class SemanticRuleDecisionNode:
         stats["last_result"] = "PENDING"
         self.last_selected_group_id = group_id
         region_stats = self.region_history.setdefault(history_key, {})
+        prior_region_history = {
+            key: region_stats.get(key)
+            for key in ("selection_count", "consecutive_selection_count", "last_selected_step", "last_result", "last_candidate_id", "goal_xy")
+        }
+        prior_history_key = self.last_selected_history_key
         region_stats["selection_count"] = int(
             region_stats.get("selection_count", 0) or 0
         ) + 1
@@ -3172,6 +3199,10 @@ class SemanticRuleDecisionNode:
         self.decision_history.append(
             {
                 "decision_id": decision_id,
+                "prior_group_history": prior_group_history,
+                "prior_region_history": prior_region_history,
+                "prior_group_id": prior_group_id,
+                "prior_history_key": prior_history_key,
                 "group_id": group_id,
                 "history_key": history_key,
                 "candidate_id": selected.candidate_id,
@@ -3221,12 +3252,31 @@ class SemanticRuleDecisionNode:
         if entry is None:
             return
         status = str(payload.get("status") or "UNKNOWN")
+        detail = payload.get("detail") or {}
+        if isinstance(detail.get("detail"), dict) and not detail.get("reason"):
+            detail = detail["detail"]
+        reason = str(detail.get("reason") or "")
         if entry.get("result_recorded"):
             return
         if status not in {"SUCCEEDED", "FAILED", "ABORTED", "CANCELED", "REJECTED"}:
             return
         entry["result_recorded"] = True
-        if entry.get("behavior_type") == "EXPLORE" and status in {"FAILED", "ABORTED", "REJECTED"}:
+        executor_busy = bool(
+            status == "REJECTED"
+            and reason == "executor_busy"
+        )
+        retryable_infrastructure = bool(
+            status != "SUCCEEDED" and detail.get("retryable")
+            and (
+                "successor_not_quiescent" in reason
+                or "successor_quiescence" in reason
+                or "service_unavailable" in reason
+                or "transport" in reason
+                or reason == "navigation_costmap_not_fresh"
+            )
+        )
+        neutral_failure = executor_busy or retryable_infrastructure
+        if entry.get("behavior_type") == "EXPLORE" and status in {"FAILED", "ABORTED", "REJECTED"} and not neutral_failure:
             self.frontier_failure_memory.record_failure(
                 list(entry.get("frontier_point") or entry.get("goal_xy") or []),
                 str(entry.get("frame_id") or ""),
@@ -3235,12 +3285,13 @@ class SemanticRuleDecisionNode:
         if status == "SUCCEEDED" and entry.get("behavior_type") == "INTERACT" and entry.get("node_type") == "portal":
             self.frontier_failure_memory.clear()
         neutral_preempt = bool(
-            status == "CANCELED"
-            and str(((payload.get("detail") or {}).get("reason") or ""))
-            == "preempted_by_target"
+            neutral_failure or (
+                status == "CANCELED"
+                and reason in {"preempted_by_target", "frontier_resolved_by_observation"}
+            )
         )
         entry["result"] = status
-        entry["failure_reason"] = str((payload.get("detail") or {}).get("reason") or "")
+        entry["failure_reason"] = reason
         entry["neutral_preempt"] = neutral_preempt
         group_id = str(entry.get("group_id") or "")
         history_key = str(entry.get("history_key") or "")
@@ -3248,10 +3299,28 @@ class SemanticRuleDecisionNode:
             int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1
         )
         stats = self.group_history.setdefault(group_id, {})
-        stats["last_result"] = status
+        if neutral_preempt:
+            for key, value in entry.get("prior_group_history", {}).items():
+                if value is None:
+                    stats.pop(key, None)
+                else:
+                    stats[key] = value
+            if self.last_selected_group_id == group_id:
+                self.last_selected_group_id = entry.get("prior_group_id", "")
+        else:
+            stats["last_result"] = status
         if history_key:
             region_stats = self.region_history.setdefault(history_key, {})
-            region_stats["last_result"] = status
+            if neutral_preempt:
+                for key, value in entry.get("prior_region_history", {}).items():
+                    if value is None:
+                        region_stats.pop(key, None)
+                    else:
+                        region_stats[key] = value
+                if self.last_selected_history_key == history_key:
+                    self.last_selected_history_key = entry.get("prior_history_key", "")
+            else:
+                region_stats["last_result"] = status
             if status == "SUCCEEDED":
                 region_stats["success_count"] = int(
                     region_stats.get("success_count", 0) or 0
@@ -3271,6 +3340,9 @@ class SemanticRuleDecisionNode:
         with self.state_lock:
             for entry in self.decision_history:
                 if bool(entry.get("frontier_metrics_evaluated")):
+                    continue
+                if bool(entry.get("neutral_preempt")):
+                    entry["frontier_metrics_evaluated"] = True
                     continue
                 if str(entry.get("result") or "PENDING") == "PENDING":
                     continue

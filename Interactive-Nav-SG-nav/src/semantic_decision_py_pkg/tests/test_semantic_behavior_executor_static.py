@@ -41,6 +41,105 @@ def test_interaction_step_sync_pauses_navigation_clock(executor_module):
     assert not detail["mission_stalled"]
 
 
+@pytest.mark.parametrize("reason", ["preempted_by_target", "frontier_resolved_by_observation"])
+def test_frontier_preempt_releases_navigation_and_reports_cancel(executor_module, reason):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {
+        "decision_id": "decision_old", "candidate_id": "frontier:old",
+        "behavior_type": "EXPLORE",
+    }
+    events = []
+    executor.machine = SimpleNamespace(
+        state=executor_module.STATE_NAVIGATING,
+        reset=lambda: events.append("reset"),
+    )
+    executor.move_base = SimpleNamespace(cancel_goal=lambda: events.append("cancel_goal"))
+    executor._clear_navigation_tracking_locked = lambda decision_id: events.append(decision_id)
+    executor._publish_explore_command = lambda *args, **kwargs: events.append(kwargs["detail"]["reason"])
+    executor._publish_feedback = lambda selection, status, success, detail: events.append(status)
+    executor._preempt_callback(SimpleNamespace(data=json.dumps({
+        "decision_id": "decision_old", "reason": reason,
+    })))
+    assert executor.selection is None
+    assert events == ["decision_old", "reset", "cancel_goal", reason, "CANCELED"]
+
+
+def test_explore_terminal_feedback_preserves_reason_without_nesting(executor_module):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "current", "candidate_id": "frontier:shared"}
+    executor._explore_feedback_received_count = 0
+    executor._explore_feedback_matched_count = 0
+    executor._explore_feedback_ignored_count = 0
+    executor._last_explore_feedback = {}
+    recorded = []
+    executor.machine = SimpleNamespace(on_explore_result=lambda success, detail: recorded.append((success, detail)) or [])
+    executor._dispatch = lambda commands: None
+    command_id = executor._command_id(executor.selection)
+    executor._explore_feedback_callback(SimpleNamespace(data=json.dumps({
+        "command_id": command_id, "candidate_id": "frontier:shared", "status": "FAILED",
+        "detail": {"reason": "make_plan_unreachable", "retryable": True},
+    })))
+    assert recorded == [(False, {
+        "reason": "make_plan_unreachable", "retryable": True,
+        "explore_feedback_status": "FAILED", "command_id": command_id,
+    })]
+    executor._explore_feedback_callback(SimpleNamespace(data=json.dumps({
+        "command_id": "old:frontier:shared", "candidate_id": "frontier:shared",
+        "status": "FAILED", "detail": {"reason": "old_failure"},
+    })))
+    assert len(recorded) == 1
+    assert executor._explore_feedback_ignored_count == 1
+
+
+def test_active_interaction_child_result_matches_without_allowing_stale_commands(executor_module):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = {"decision_id": "current", "candidate_id": "interaction:container:open"}
+    active_command = executor._command_id(executor.selection) + ":interaction:001"
+    executor._interaction_command_sent_id = active_command
+    assert executor._matches_active({
+        "command_id": active_command, "decision_id": "current",
+        "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": "previous:interaction:container:open:interaction:001",
+        "decision_id": "previous", "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": active_command, "decision_id": "previous",
+        "candidate_id": "interaction:container:open",
+    })
+    assert not executor._matches_active({
+        "command_id": executor._command_id(executor.selection) + ":interaction:000",
+        "decision_id": "current", "candidate_id": "interaction:container:open",
+    })
+
+
+@pytest.mark.parametrize("feedback_status", ["FAILED", "REJECTED", "CANCELED"])
+def test_explore_terminal_keeps_original_feedback_status(executor_module, feedback_status):
+    executor = executor_module.SemanticBehaviorExecutor.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "current", "candidate_id": "frontier:1", "behavior_type": "EXPLORE"}
+    executor.machine = SimpleNamespace(state=executor_module.STATE_PREPARING_EXPLORE, reset=lambda: None)
+    executor._navigation_failure_recovery_attempts = {}
+    executor._drawer_scan_wait_records = {}
+    executor._drawer_scan_wait_contexts = {}
+    executor.model_events = []
+    executor.move_base = SimpleNamespace(cancel_goal=lambda: None)
+    executor._observation_only_interaction_result_locked = lambda *args, **kwargs: None
+    executor._clear_drawer_scan_execution_wait_locked = lambda: None
+    received = []
+    executor._publish_feedback = lambda selection, status, success, detail: received.append((status, success, detail))
+    executor._finish_terminal({
+        "success": False,
+        "detail": {"reason": "executor_busy", "explore_feedback_status": feedback_status},
+    })
+    assert received == [(feedback_status, False, {
+        "reason": "executor_busy", "explore_feedback_status": feedback_status,
+    })]
+
+
 def _stub_module(monkeypatch, name: str, **attributes):
     module = types.ModuleType(name)
     for key, value in attributes.items():
@@ -545,8 +644,9 @@ def test_remembered_portal_navigation_completion_enters_m1_barrier(
     assert dispatched[0]["object_id"] == "door_0003"
 
 
+@pytest.mark.parametrize("child_command", [False, True])
 def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
-    executor_module,
+    executor_module, child_command,
 ) -> None:
     selection = _portal_selection()
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
@@ -581,7 +681,10 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
     )
 
     payload = {
-        "command_id": "decision_static:interaction:portal_static:open",
+        "command_id": (
+            "decision_static:interaction:portal_static:open:interaction:001"
+            if child_command else "decision_static:interaction:portal_static:open"
+        ),
         "decision_id": "decision_static",
         "candidate_id": "interaction:portal_static:open",
         "event_id": "decision_static_interaction_001",
@@ -596,6 +699,7 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
         "post_state": "static_open",
         "source": "executor_static_portal",
     }
+    executor._interaction_command_sent_id = payload["command_id"]
     executor._interaction_result_callback(
         SimpleNamespace(data=json.dumps(payload, separators=(",", ":")))
     )
@@ -4598,7 +4702,8 @@ def test_interaction_missing_path_heading_retries_next_safe_staging_pose(
 
 
 def _run_container_staging_rear_failure(
-    executor_module, monkeypatch, *, phase: str, retry_result: bool
+    executor_module, monkeypatch, *, phase: str, retry_result: bool,
+    portal: bool = False, rear_reason: str = "rear_goal_turn_failed",
 ) -> tuple[list[tuple], list[tuple]]:
     """Exercise the rear-turn exit before a move_base goal is sent."""
 
@@ -4644,6 +4749,13 @@ def _run_container_staging_rear_failure(
             "interaction_ready_yaw_tolerance_rad": 0.30,
         },
     }
+    if portal:
+        candidate["candidate_id"] = "interaction:portal:open"
+        candidate["metadata"] = {
+            "frame_id": "map",
+            "portal_clearance_aware_approach": True,
+            "goal_xyyaw_candidates": [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        }
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.lock = threading.RLock()
     executor.map_frame = "map"
@@ -4663,6 +4775,9 @@ def _run_container_staging_rear_failure(
         (1.0, 0.0),
         "reachable",
     )
+    if portal:
+        executor._container_anchor_eligible = lambda *_args: (True, {})
+        executor._container_anchor_local_clearance = lambda *_args: (True, {})
     # This test isolates the outer/physical rear-turn branch itself; a private
     # inner corridor has separate ownership and result-routing coverage.
     executor._start_container_inner_corridor = lambda *_args, **_kwargs: False
@@ -4670,7 +4785,7 @@ def _run_container_staging_rear_failure(
     executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: False
     executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
     executor._last_rear_goal_recovery_detail = {
-        "reason": "rear_goal_turn_failed",
+        "reason": rear_reason,
         "turn_failure_detail": {
             "reason": "rear_goal_step_budget_exhausted",
             "delivered_step_count": 14,
@@ -4710,6 +4825,65 @@ def test_two_stage_outer_staging_turn_failure_retries_next_safe_staging_pose(
     assert detail["turn_failure_detail"]["reason"] == "rear_goal_step_budget_exhausted"
     assert detail["rear_goal_turn_retry_to_next_outer_staging"] is True
     assert terminal_results == []
+
+
+def test_portal_rear_turn_failure_retries_next_clearance_checked_pose(
+    executor_module, monkeypatch
+) -> None:
+    retry_calls, terminal_results = _run_container_staging_rear_failure(
+        executor_module, monkeypatch, phase="staging", retry_result=True,
+        portal=True,
+    )
+
+    assert len(retry_calls) == 1
+    selected_index, attempts, option_count, detail = retry_calls[0]
+    assert selected_index == 0
+    assert attempts[-1]["index"] == 0
+    assert option_count == 2
+    assert detail["reason"] == "navigation_terminal_failure"
+    assert detail["failure_reason"] == "rear_goal_turn_failed"
+    assert detail["rear_goal_turn_retry_to_next_portal_pose"] is True
+    assert detail["rear_goal_turn_retry_to_next_outer_staging"] is False
+    assert terminal_results == []
+
+
+def test_portal_rear_turn_retry_uses_bounded_successor(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.interaction_approach_fallback_max_attempts = 3
+    executor.interaction_approach_fallback_cancel_wait_s = 0.0
+    executor._navigation_is_current = lambda _decision_id: True
+    scheduled = []
+    executor._schedule_navigation_successor = lambda *args: scheduled.append(args)
+    candidate = {
+        "behavior_type": "INTERACT",
+        "metadata": {"portal_clearance_aware_approach": True},
+    }
+    detail = {"reason": "navigation_terminal_failure", "failure_reason": "rear_goal_turn_failed"}
+
+    assert executor._retry_interaction_approach(
+        "portal", candidate, 0, [{"index": 0}], 4, detail,
+    ) is True
+    assert scheduled[0][2] == 1
+    assert scheduled[0][3][0]["outcome"] == "navigation_terminal_failure"
+    assert executor._retry_interaction_approach(
+        "portal", candidate, 2, [{"index": 0}, {"index": 1}, {"index": 2}], 4, detail,
+    ) is False
+    assert len(scheduled) == 1
+
+
+def test_portal_missing_heading_does_not_retry_blind(
+    executor_module, monkeypatch
+) -> None:
+    retry_calls, terminal_results = _run_container_staging_rear_failure(
+        executor_module, monkeypatch, phase="staging", retry_result=True,
+        portal=True, rear_reason="rear_goal_heading_unavailable",
+    )
+
+    assert retry_calls == []
+    assert len(terminal_results) == 1
+    assert terminal_results[0][0][2]["reason"] == "rear_goal_heading_unavailable"
 
 
 def test_two_stage_physical_rear_turn_failure_does_not_retry_outer_staging(

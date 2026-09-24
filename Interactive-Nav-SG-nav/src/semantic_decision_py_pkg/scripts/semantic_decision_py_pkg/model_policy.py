@@ -1652,6 +1652,14 @@ class ModelPolicyClient:
         selected_hint = str(hints.get(protected_selected) or "").upper()
         if selected_hint in protected_hints:
             return protected_selected
+        selected_candidate = candidate_groups[protected_selected][0]
+        if (
+            selected_candidate.behavior_type == "INTERACT"
+            and (selected_candidate.metadata or {}).get("node_type") == "container"
+            and self.last_reason == "REVEAL_TARGET_CONTAINER"
+            and self.last_confidence.casefold() == "high"
+        ):
+            return protected_selected
         new_room_ids = [
             candidate_id
             for candidate_id, members in candidate_groups.items()

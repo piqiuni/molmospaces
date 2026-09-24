@@ -1497,7 +1497,6 @@ class SemanticNavigationProgressSupervisor:
 
     subgoal_timeout_task_steps: int = 60
     mission_timeout_task_steps: int = 180
-    new_subgoal_grace_task_steps: int = 20
     min_displacement_m: float = 0.10
     min_goal_distance_reduction_m: float = 0.02
     min_yaw_error_reduction_rad: float = 0.02
@@ -1509,6 +1508,7 @@ class SemanticNavigationProgressSupervisor:
     subgoal_started_step_index: int | None = None
     mission_reference_xy: tuple[float, float] | None = None
     mission_reference_step_index: int | None = None
+    mission_grace_deadline_step_index: int | None = None
 
     @staticmethod
     def _finite(value: float | None) -> float | None:
@@ -1526,6 +1526,7 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_started_step_index = None
         self.mission_reference_xy = None
         self.mission_reference_step_index = None
+        self.mission_grace_deadline_step_index = None
 
     def note_success(
         self, pose: tuple[float, ...] | None, task_step_index: int | None
@@ -1543,6 +1544,7 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_started_step_index = None
         self.mission_reference_xy = xy
         self.mission_reference_step_index = step
+        self.mission_grace_deadline_step_index = None
 
     def pause(self, task_step_index: int | None) -> None:
         """Exclude a legitimate stationary macro from no-progress time."""
@@ -1554,6 +1556,7 @@ class SemanticNavigationProgressSupervisor:
             self.subgoal_reference_step_index = step
         if self.mission_reference_step_index is not None:
             self.mission_reference_step_index = step
+            self.mission_grace_deadline_step_index = None
 
     def observe(
         self,
@@ -1582,6 +1585,7 @@ class SemanticNavigationProgressSupervisor:
         if mission_displacement >= max(0.0, float(self.min_displacement_m)):
             self.mission_reference_xy = xy
             self.mission_reference_step_index = step
+            self.mission_grace_deadline_step_index = None
 
         if str(subgoal_key) != self.subgoal_key:
             self.subgoal_key = str(subgoal_key)
@@ -1590,6 +1594,20 @@ class SemanticNavigationProgressSupervisor:
             self.subgoal_reference_goal_distance_m = goal_distance
             self.subgoal_reference_yaw_error_rad = yaw_error
             self.subgoal_reference_step_index = step
+            if (
+                self.mission_grace_deadline_step_index is not None
+                and self.mission_reference_step_index is not None
+            ):
+                subgoal_timeout = max(1, int(self.subgoal_timeout_task_steps))
+                grace_cap = (
+                    self.mission_reference_step_index
+                    + max(1, int(self.mission_timeout_task_steps))
+                    + 2 * subgoal_timeout
+                )
+                self.mission_grace_deadline_step_index = max(
+                    self.mission_grace_deadline_step_index,
+                    min(step + subgoal_timeout, grace_cap),
+                )
         else:
             displacement = math.hypot(
                 xy[0] - float(self.subgoal_reference_xy[0]),
@@ -1636,16 +1654,29 @@ class SemanticNavigationProgressSupervisor:
                 else step
             ),
         )
+        mission_timeout = max(1, int(self.mission_timeout_task_steps))
+        subgoal_timeout = max(1, int(self.subgoal_timeout_task_steps))
+        subgoal_age = step - int(
+            self.subgoal_started_step_index
+            if self.subgoal_started_step_index is not None else step
+        )
+        if mission_elapsed >= mission_timeout and self.mission_grace_deadline_step_index is None:
+            self.mission_grace_deadline_step_index = step + max(
+                0, subgoal_timeout - subgoal_age
+            )
+        mission_stalled = bool(
+            mission_elapsed >= mission_timeout
+            and self.mission_grace_deadline_step_index is not None
+            and step >= self.mission_grace_deadline_step_index
+        )
         return {
             "subgoal_stalled": subgoal_elapsed
-            >= max(1, int(self.subgoal_timeout_task_steps)),
-            "mission_stalled": mission_elapsed
-            >= max(1, int(self.mission_timeout_task_steps))
-            and step - int(self.subgoal_started_step_index if self.subgoal_started_step_index is not None else step)
-            >= min(max(1, int(self.subgoal_timeout_task_steps)), max(1, int(self.new_subgoal_grace_task_steps))),
+            >= subgoal_timeout,
+            "mission_stalled": mission_stalled,
             "subgoal_key": self.subgoal_key,
             "subgoal_elapsed_task_steps": subgoal_elapsed,
             "mission_elapsed_task_steps": mission_elapsed,
+            "mission_grace_deadline_step_index": self.mission_grace_deadline_step_index,
             "subgoal_timeout_task_steps": max(
                 1, int(self.subgoal_timeout_task_steps)
             ),
