@@ -309,7 +309,10 @@ class SemanticOccupancyOverlay:
         width = int(grid_info.width)
         height = int(grid_info.height)
         cell_count = width * height
-        result = [int(value) for value in raw_data]
+        if isinstance(raw_data, np.ndarray) and raw_data.ndim == 1 and raw_data.dtype.kind in "iu":
+            result = raw_data.tolist()
+        else:
+            result = list(map(int, raw_data))
         mask = [0] * cell_count
         if len(result) != cell_count:
             return result, mask, {
@@ -480,6 +483,10 @@ class SemanticOccupancyOverlay:
         if source_extent <= 0.0:
             return 0.0
         inset_extent = source_extent + 2.0 * self.clear_padding_m
+        # Apply the configured inset to every portal length, including narrow
+        # doors.  Restoring the full measured width for ~1 m doors erased cells
+        # occupied by an opened leaf near the jamb, allowing the global plan to
+        # cut through geometry the local planner still observed.
         # A negative padding must never erase the portal just because the
         # closed leaf is thinner than twice the requested 5 cm inset.  One map
         # cell is the smallest meaningful clearance in the planning grid.
@@ -498,10 +505,12 @@ class SemanticOccupancyOverlay:
         source_extent = max(0.0, float(source_extent))
         if source_extent <= 0.0:
             return 0.0
-        return min(
-            max(source_extent, 2.0 * float(resolution)),
-            self._thickness_limit(resolution),
-        )
+        # Clear the full bounded normal-axis allowance, not merely the source
+        # leaf thickness.  A thin, off-grid leaf can occupy two adjacent rows;
+        # using only ``max(source, 2*resolution)`` may select the wrong pair and
+        # leave the actual second row sealed.  The configured cap keeps this
+        # expansion local to the wall-normal direction.
+        return self._thickness_limit(resolution)
 
     @staticmethod
     def _quaternion_yaw(quaternion: Any) -> float:

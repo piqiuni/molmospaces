@@ -38,7 +38,9 @@ TERMINAL_GOAL_STATUS_REASONS: dict[str, str] = {
 class RosPolicyTerminationConfig:
     """Public policy-terminal and command-starvation settings."""
 
-    command_starvation_timeout_s: float = 60.0
+    # One default M2 request may time out after 30 s, back off for 1 s, and make
+    # one bounded retry.  The liveness guard must leave margin above that 61 s.
+    command_starvation_timeout_s: float = 90.0
     observation_turn_multiplier: float = 4.0
 
     def validate(self) -> None:

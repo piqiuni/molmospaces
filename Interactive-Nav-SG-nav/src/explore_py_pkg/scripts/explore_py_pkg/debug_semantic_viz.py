@@ -29,6 +29,14 @@ def candidate_color(behavior_type: str) -> tuple[int, int, int]:
     return CANDIDATE_COLORS.get(str(behavior_type).upper(), (100, 100, 100))
 
 
+def semantic_node_display_label(node: dict[str, Any]) -> str:
+    if node.get("type") != "room":
+        return str(node.get("label") or node.get("type") or "object")
+    value = str((node.get("attributes") or {}).get("room_attribute") or "unknown").strip()
+    value = value.replace("_", " ") or "unknown"
+    return "living room" if value == "livingroom" else value
+
+
 def candidate_overlays(
     candidates_payload: dict[str, Any] | None,
     proposals_payload: dict[str, Any] | None,

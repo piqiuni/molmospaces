@@ -2,6 +2,24 @@
 
 Python semantic mapping pipeline for MolmoSpaces navigation.
 
+## M1 admission and room recovery
+
+Each episode permits at most `attribute_inference.max_calls_per_object: 10`
+actual object-model submissions. Passive discovery can use eight slots;
+`targeted_call_reserve: 2` keeps the remaining capacity available for
+decision-triggered views. Targeted requests share the total cap, not a separate
+unlimited budget. Submitted failures consume a slot; local queue expiry does not.
+There is no consecutive-failure lockout. Counts reset on episode change, and
+exhausted targeted requests report an explicit failure rather than waiting for RGB.
+
+Room-model failures use weighted object-label inference when
+`room_mllm.fallback_enabled: true`. The fallback is marked in graph attributes;
+the same failed evidence signature can retry after
+`room_mllm.failure_refresh_interval_s: 30.0`. Successful results retain the
+120-second refresh interval. Room evidence remains room ID plus member labels,
+without geometry-based invalidation. The room timeout inherits the M1 request
+timeout; this migration does not shorten model timeouts.
+
 The package keeps the same downstream contract expected by `explore_pkg`:
 
 - `/semantic_mapping/obj_map`
@@ -15,6 +33,16 @@ Internally the pipeline is split into replaceable nodes:
 3. `semantic_mapping_node.py`: accumulated object map and scene-id grid publication.
 
 The default object detector backend is `mock_empty`, and `no_detection` is available when a test should explicitly publish no detections.
+
+Module-1 visual inference has per-object, per-episode limits in `config/default.yaml`:
+`attribute_inference.max_calls_per_object` defaults to 10 real model submissions,
+with 2 slots reserved for decision-triggered targeted views. The first failed
+or queue-expired request can be retried at most twice
+(`max_failure_retries_per_object: 2`); a successful response resets that failure
+streak, but not the total call count. Superseded queued requests do not consume
+model-call slots. Once the limit is reached, targeted requests return a failure
+status instead of submitting another model call; these limits do not apply to
+the separate room inference lane.
 
 ## Two-level object detection design
 

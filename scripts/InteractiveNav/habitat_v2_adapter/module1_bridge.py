@@ -28,6 +28,11 @@ class FullRosStackResult:
     candidate_payload: dict[str, Any]
     detections: dict[str, Any]
     candidate_sequence: int
+    cmd_vel: dict[str, float] | None = None
+    cmd_vel_age_s: float | None = None
+    move_base_status: int = 0
+    global_plan_xyyaw: tuple[tuple[float, float, float], ...] = ()
+    local_plan_xyyaw: tuple[tuple[float, float, float], ...] = ()
     error: str = ""
     latency_s: float = 0.0
 
@@ -71,6 +76,24 @@ class FullRosStackClient:
                 response = json.loads(handle.read().decode("utf-8"))
             if not isinstance(response, dict) or response.get("error"):
                 raise RuntimeError(str(response.get("error") or "invalid selection response"))
+            return ""
+        except (OSError, URLError, ValueError, RuntimeError) as exc:
+            return str(exc)
+
+    def reset_navigation(self, episode: dict[str, Any] | None = None) -> str:
+        """Reset only ROS mapping/navigation state between Habitat episodes."""
+
+        try:
+            request = Request(
+                self._endpoint + "/reset",
+                data=json.dumps(dict(episode or {}), separators=(",", ":")).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=min(self._timeout_s, 3.0)) as handle:
+                response = json.loads(handle.read().decode("utf-8"))
+            if not isinstance(response, dict) or response.get("error"):
+                raise RuntimeError(str(response.get("error") or "invalid reset response"))
             return ""
         except (OSError, URLError, ValueError, RuntimeError) as exc:
             return str(exc)
@@ -195,6 +218,23 @@ class FullRosStackClient:
             candidate_payload=dict(response.get("candidate_payload") or {}),
             detections=dict(response.get("detections") or {}),
             candidate_sequence=int(response.get("candidate_sequence", -1) or -1),
+            cmd_vel=(dict(response["cmd_vel"]) if isinstance(response.get("cmd_vel"), dict) else None),
+            cmd_vel_age_s=(
+                float(response["cmd_vel_age_s"])
+                if response.get("cmd_vel_age_s") is not None
+                else None
+            ),
+            move_base_status=int(response.get("move_base_status", 0) or 0),
+            global_plan_xyyaw=tuple(
+                tuple(float(value) for value in row[:3])
+                for row in (response.get("global_plan_xyyaw") or [])
+                if isinstance(row, list) and len(row) >= 3
+            ),
+            local_plan_xyyaw=tuple(
+                tuple(float(value) for value in row[:3])
+                for row in (response.get("local_plan_xyyaw") or [])
+                if isinstance(row, list) and len(row) >= 3
+            ),
             error=error,
             latency_s=time.monotonic() - started,
         )

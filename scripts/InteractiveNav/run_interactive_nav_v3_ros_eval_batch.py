@@ -33,10 +33,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -54,19 +56,34 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "BASE_LOCAL_PLANNER": "dwa_local_planner/DWAPlannerROS",
+    "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
+    "RECORDER_SAVE_EVENTS": "false",
+    "RECORDER_COMPACT_STEPS": "true",
+    "RECORDER_COMPRESS_STEPS": "true",
+    "OFFLINE_SAVE_COMPOSITE_FRAMES": "false",
+    "ROS_LOG_LEVEL": "WARN",
+    "ROS_LOG_MAX_BYTES": "5242880",
+    "ROS_LOG_BACKUP_COUNT": "2",
     "METHOD": "full_mllm_object_goal",
     "POLICY": "ros_object_goal_rule",
-    "MIN_STEPS": "300",
+    "MIN_STEPS": "200",
     "DYNAMIC_PATH_FREE_M": "3.0",
-    "DYNAMIC_STEPS_PER_PATH_M": "25.0",
-    "DYNAMIC_CHANNEL_INTERACTION_STEPS": "150",
-    "DYNAMIC_CONTAINER_INTERACTION_STEPS": "200",
-    "DYNAMIC_CONTAINER_JOINT_STEPS": "40",
+    "DYNAMIC_STEPS_PER_PATH_M": "40.0",
+    "DYNAMIC_CHANNEL_INTERACTION_STEPS": "200",
+    "DYNAMIC_CONTAINER_INTERACTION_STEPS": "250",
+    "DYNAMIC_CONTAINER_JOINT_STEPS": "50",
     "DYNAMIC_STEP_QUANTUM": "50",
-    "VIDEO_FPS": "5",
+    "VIDEO_FPS": "15",
     "RECORD_HEAD_CAMERA": "false",
     "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS": "384",
-    "ROS_ACTION_TIMEOUT_S": "0.2",
+    # M2 candidate selection is text-only and has an independent bounded
+    # timeout/retry contract.  A caller can override these with exported
+    # SEMANTIC_M2_* values or in the selected dotenv file.
+    "SEMANTIC_M2_TIMEOUT_S": "12.0",
+    "SEMANTIC_M2_TIMEOUT_RETRY_COUNT": "1",
+    "SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S": "1.0",
+    "ROS_ACTION_TIMEOUT_S": "0.4",
     "ROS_STEP_READY_BARRIER_ENABLED": "true",
     "ROS_STEP_READY_TOPIC": "/semantic_decision/step_ready",
     "ROS_STEP_READY_WARMUP_SKIP_FRAMES": "0",
@@ -87,6 +104,7 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
     "ROS_SETUP": str(REPO_ROOT / "Interactive-Nav-SG-nav" / "devel" / "setup.bash"),
 }
 _RUNNER_FILE_ENV_KEYS = (
+    "EVAL_CONFIG",
     "SEMANTIC_DECISION_OVERRIDE",
     "SEMANTIC_MAPPING_OVERRIDE",
     "EXPLORE_PY_CONFIG_OVERRIDE",
@@ -113,6 +131,7 @@ _V3_EVALUATOR_PROTOCOL_FILES = (
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "goal_status.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "ros_policy_termination.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "trusted_interaction_skill.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "scene_distractor_filter.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_runtime.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_bridge.py",
     REPO_ROOT / "scripts" / "InteractiveNav" / "container_scene_probe.py",
@@ -125,6 +144,10 @@ _V3_EVALUATOR_PROTOCOL_FILES = (
 # resume is invalidated by a relevant ROS change without making every batch
 # startup scan unrelated assets/tests.
 _ROS_RUNTIME_PROTOCOL_FILES = (
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "src" / "path_follower.cpp",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "include" / "nav_pkg" / "path_follower.h",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "path_follower_plugin.xml",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "cfg" / "PathFollower.cfg",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "molmospaces_nav_system.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "nav.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "scripts" / "run_nav_ros_sim.py",
@@ -140,6 +163,7 @@ _ROS_RUNTIME_PROTOCOL_FILES = (
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_result_contract.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_graph_store.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "launch" / "explore_py.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_node.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_pkg" / "frontier_core.py",
 )
 
@@ -175,6 +199,15 @@ EPISODE_RESULT_SUMMARY_FIELDS = (
     "target_visibility_fraction",
     "scoring_eligible",
     "early_stop",
+    "goal_definition_relaxed_success",
+    "goal_definition_relaxed_instance_id",
+    "goal_definition_relaxed_reason",
+    "exact_instance_success",
+    "category_goal_success",
+    "interaction_contract_goal_success",
+    "interactive_episode_success",
+    "category_goal_instance_id",
+    "goal_success_layers",
     "timing_summary",
 )
 
@@ -207,8 +240,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episode-indices", nargs="+", type=int, required=True)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--scene-start-interval-s", type=float, default=10.0,
+                        help="Minimum interval between scene process launches (default: 10 seconds; 0 disables).")
     parser.add_argument("--base-master-port", type=int, default=12600)
-    parser.add_argument("--max-steps", type=int, default=1500)
+    parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument(
         "--step-budget-mode",
         choices=("dynamic", "fixed"),
@@ -221,14 +256,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semantic-attribute-request-timeout-s",
         type=float,
-        default=30.0,
+        default=15.0,
         help="M1 request timeout forwarded to each V3 runner; independent of M2/M3.",
     )
     parser.add_argument(
         "--ros-command-starvation-timeout-s",
         type=float,
-        default=60.0,
-        help="Continuous no-fresh-command wall time before the V3 evaluator stops.",
+        default=90.0,
+        help=(
+            "Continuous no-fresh-command wall time before the V3 evaluator stops. "
+            "The default leaves headroom for one 12 s M2 timeout, 1 s backoff, "
+            "and one bounded retry."
+        ),
     )
     parser.add_argument(
         "--ros-observation-turn-multiplier",
@@ -453,6 +492,11 @@ def planned_invocation_payload(
         if record is None:
             return None
         file_settings[key] = record
+    for name in ("benchmark_eval.conf", "python_logging.conf"):
+        record = _file_digest_record(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation" / name)
+        if record is None:
+            return None
+        file_settings[name] = record
     semantic_model_env: dict[str, str] | None = None
     semantic_model_env_file = getattr(args, "semantic_model_env_file", None)
     if semantic_model_env_file is None:
@@ -585,9 +629,11 @@ def derive_episode_model_env_file(
 ) -> Path:
     """Copy the local model config and append an episode-specific endpoint.
 
-    ``python-dotenv`` loads this file with ``override=True`` in the semantic
-    stack, so the final setting wins without replacing the model name, timeout,
-    or any local-only configuration in the source file.
+    The semantic stack loads this file with ``override=True``, so the final
+    endpoint wins without replacing the model name, shared timeout, M2-only
+    timeout/retry settings, or any local-only configuration in the source file.
+    The launcher supplies 12 s / one retry / 1 s backoff defaults when the
+    source file leaves the M2 keys unset.
     """
 
     source_text = source_env_file.read_text(encoding="utf-8")
@@ -894,6 +940,75 @@ def artifact_paths(attempt_dir: Path, episode_index: int) -> dict[str, Path | No
         "six_panel_video": attempt_dir / "videos" / "overview_6panel.mp4",
         "topdown": None if episode_dir is None else episode_dir / "episode_topdown.png",
     }
+
+
+def publish_file(source: Path, destination: Path) -> None:
+    """Expose a final artifact directly below the episode directory.
+
+    The attempt tree remains the authoritative evidence location.  The shallow
+    path is a hard-link alias when possible, so publishing a large MP4 does not
+    double disk usage; ``copy2`` is the portable fallback.
+    """
+
+    source = Path(source)
+    destination = Path(destination)
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise FileNotFoundError(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def publish_episode_artifacts(
+    task_dir: Path,
+    paths: Mapping[str, Path | None],
+    *,
+    recording_required: bool,
+) -> dict[str, str | None]:
+    """Publish image/video aliases at ``output_dir/episode_xxxx/``."""
+
+    published: dict[str, str | None] = {
+        "six_panel_video": None,
+        "topdown": None,
+        "topdown_metadata": None,
+        "errors": None,
+    }
+    errors: list[str] = []
+    specs = (
+        ("six_panel_video", paths.get("six_panel_video"), task_dir / "overview_6panel.mp4"),
+        ("topdown", paths.get("topdown"), task_dir / "episode_topdown.png"),
+        (
+            "topdown_metadata",
+            None if paths.get("topdown") is None else paths["topdown"].with_suffix(".json"),
+            task_dir / "episode_topdown.json",
+        ),
+    )
+    for key, source, destination in specs:
+        if source is None or not Path(source).is_file():
+            continue
+        try:
+            publish_file(Path(source), destination)
+        except OSError as exc:
+            errors.append(f"{source} -> {destination}: {type(exc).__name__}: {exc}")
+            continue
+        published[key] = str(destination)
+    if errors:
+        published["errors"] = json.dumps(errors, ensure_ascii=False)
+    if recording_required and published["six_panel_video"] is None:
+        errors.append("recording artifact was not published")
+    return published
 
 
 def load_episode_result(path: Path | None) -> tuple[dict[str, Any], str | None]:
@@ -1222,6 +1337,11 @@ def recover_missing_task_summary(plan: EpisodePlan, args: argparse.Namespace) ->
     paths = artifact_paths(attempt_dir, plan.episode_index)
     six_panel = paths["six_panel_video"]
     topdown = paths["topdown"]
+    published = publish_episode_artifacts(
+        plan.task_dir,
+        paths,
+        recording_required=not args.fast_eval,
+    )
     recovered_at = utc_now()
     result = base_summary(
         plan,
@@ -1251,11 +1371,19 @@ def recover_missing_task_summary(plan: EpisodePlan, args: argparse.Namespace) ->
             "artifact_validation_mode": (
                 "episode_result_only_fast_eval" if args.fast_eval else "episode_result_and_six_panel_video"
             ),
-            "six_panel_video": None if args.fast_eval else str(six_panel),
+            "six_panel_video": (
+                None
+                if args.fast_eval
+                else published.get("six_panel_video") or str(six_panel)
+            ),
             "six_panel_video_bytes": (
                 0 if args.fast_eval or not video_is_valid(six_panel) else six_panel.stat().st_size
             ),
-            "topdown": None if args.fast_eval or topdown is None else str(topdown),
+            "topdown": (
+                None
+                if args.fast_eval or topdown is None
+                else published.get("topdown") or str(topdown)
+            ),
             "topdown_exists": (
                 False
                 if args.fast_eval
@@ -1298,6 +1426,23 @@ def recover_unreported_task_summaries(
         if recovered is not None:
             results.append(recovered)
             reported_indices.add(plan.episode_index)
+
+
+class SceneLaunchGate:
+    def __init__(self, interval_s: float) -> None:
+        self.interval_s = interval_s
+        self._lock = threading.Lock()
+        self._last_start = None
+
+    def launch(self, *args, **kwargs):
+        with self._lock:
+            if self._last_start is not None:
+                delay = self.interval_s - (time.monotonic() - self._last_start)
+                if delay > 0:
+                    time.sleep(delay)
+            process = subprocess.Popen(*args, **kwargs)
+            self._last_start = time.monotonic()
+            return process
 
 
 def run_episode(
@@ -1365,11 +1510,11 @@ def run_episode(
 
     timed_out = False
     exception_text: str | None = None
-    if telemetry is not None:
-        telemetry.mark_started(plan)
     try:
         with runner_log.open("wb") as log_handle:
-            process = subprocess.Popen(
+            launch_gate = getattr(args, "_scene_launch_gate", None)
+            launcher = launch_gate.launch if launch_gate is not None else subprocess.Popen
+            process = launcher(
                 command,
                 cwd=str(REPO_ROOT),
                 env=environment,
@@ -1377,6 +1522,10 @@ def run_episode(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            started = time.monotonic()
+            append_task_log(task_log, f"[{utc_now()}] process_started pid={process.pid}")
+            if telemetry is not None:
+                telemetry.mark_started(plan)
             try:
                 runner_exit_code = process.wait(timeout=args.scene_timeout_s)
             except subprocess.TimeoutExpired:
@@ -1396,6 +1545,11 @@ def run_episode(
     episode_result, document_status = load_episode_result(paths["episode_result"])
     six_panel = paths["six_panel_video"]
     topdown = paths["topdown"]
+    published = publish_episode_artifacts(
+        plan.task_dir,
+        paths,
+        recording_required=not args.fast_eval,
+    )
     episode_result_complete = (
         document_status == "complete" and episode_result.get("status") == "complete"
     )
@@ -1426,16 +1580,28 @@ def run_episode(
             "artifact_validation_mode": (
                 "episode_result_only_fast_eval" if args.fast_eval else "episode_result_and_six_panel_video"
             ),
-            "six_panel_video": None if args.fast_eval else str(six_panel),
+            "six_panel_video": (
+                None
+                if args.fast_eval
+                else published.get("six_panel_video") or str(six_panel)
+            ),
             "six_panel_video_bytes": (
                 0 if args.fast_eval or not video_is_valid(six_panel) else six_panel.stat().st_size
             ),
-            "topdown": None if args.fast_eval or topdown is None else str(topdown),
+            "topdown": (
+                None
+                if args.fast_eval or topdown is None
+                else published.get("topdown") or str(topdown)
+            ),
             "topdown_exists": (
                 False
                 if args.fast_eval
-                else topdown is not None and topdown.is_file() and topdown.stat().st_size > 0
+                else bool(
+                    published.get("topdown")
+                    or (topdown is not None and topdown.is_file() and topdown.stat().st_size > 0)
+                )
             ),
+            "artifact_publish_errors": published.get("errors"),
             "semantic_model_env_file": environment.get("SEMANTIC_MODEL_ENV_FILE"),
             "error": exception_text or episode_result.get("error"),
         }
@@ -1454,6 +1620,33 @@ def run_episode(
 def numeric_mean(rows: list[dict[str, Any]], key: str) -> float | None:
     values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
     return sum(values) / len(values) if values else None
+
+
+def _summary_layer_success(
+    row: Mapping[str, Any],
+    key: str,
+    *fallback_keys: str,
+    fallback_requires_nav: bool = False,
+) -> bool:
+    """Read a layered outcome while tolerating pre-layer/partial summaries.
+
+    Result writers before the goal-equivalence protocol did not emit the four
+    layer fields, and a few interrupted writers emitted them as ``null``.  A
+    null is therefore treated like an absent field, while an explicit Boolean
+    remains authoritative.  Legacy ``success`` can be stale after a failed
+    navigation claim, so the Interactive fallback is additionally gated by
+    ``nav_success`` when that field is explicitly false.
+    """
+
+    value = row.get(key)
+    if value is None:
+        for fallback_key in fallback_keys:
+            value = row.get(fallback_key)
+            if value is not None:
+                break
+        if fallback_requires_nav and row.get("nav_success") is False:
+            value = False
+    return bool(value) if value is not None else False
 
 
 def missing_plan_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any]:
@@ -1537,6 +1730,33 @@ def write_summary(
         "formal_success_count": sum(bool(row.get("success")) for row in completed),
         "task_success_count": sum(bool(row.get("task_success")) for row in completed),
         "nav_success_count": sum(bool(row.get("nav_success")) for row in completed),
+        "goal_definition_relaxed_success_count": sum(
+            bool(row.get("goal_definition_relaxed_success")) for row in completed
+        ),
+        "exact_instance_success_count": sum(
+            _summary_layer_success(row, "exact_instance_success", "nav_success")
+            for row in completed
+        ),
+        "category_goal_success_count": sum(
+            _summary_layer_success(row, "category_goal_success", "nav_success")
+            for row in completed
+        ),
+        "interaction_contract_goal_success_count": sum(
+            _summary_layer_success(
+                row, "interaction_contract_goal_success", "nav_success"
+            )
+            for row in completed
+        ),
+        "interactive_episode_success_count": sum(
+            _summary_layer_success(
+                row,
+                "interactive_episode_success",
+                "interaction_conditioned_success",
+                "success",
+                fallback_requires_nav=True,
+            )
+            for row in completed
+        ),
         "mean_runner_elapsed_sec": numeric_mean(completed, "elapsed_sec"),
         "mean_evaluator_elapsed_sec": numeric_mean(completed, "elapsed_seconds"),
         "mean_step_count": numeric_mean(completed, "step_count"),
@@ -1553,6 +1773,7 @@ def write_summary(
             "runner": str(args.runner),
             "runner_shell": args.runner_shell,
             "workers": args.workers,
+            "scene_start_interval_s": getattr(args, "scene_start_interval_s", 10.0),
             "base_master_port": args.base_master_port,
             "max_steps": args.max_steps,
             "step_budget_mode": str(args.step_budget_mode),
@@ -1609,6 +1830,11 @@ def write_summary(
         "task_success",
         "nav_success",
         "required_interaction_success",
+        "goal_definition_relaxed_success",
+        "exact_instance_success",
+        "category_goal_success",
+        "interaction_contract_goal_success",
+        "interactive_episode_success",
         "terminal_reason",
         "step_count",
         "interaction_action_count",
@@ -1629,6 +1855,264 @@ def write_summary(
     return aggregate
 
 
+def _gallery_slug(value: Any, *, fallback: str) -> str:
+    text = str(value or "").strip()
+    safe = "".join(
+        char if (char.isalnum() or char in {"-", "_"}) else "-"
+        for char in text
+    ).strip("-_")
+    return (safe or fallback)[:120]
+
+
+def _relative_symlink_atomic(source: Path, destination: Path) -> None:
+    """Create/replace a relative symlink without touching the source artifact."""
+
+    source = Path(source).resolve()
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(os.path.relpath(source, destination.parent))
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _render_batch_contact_sheet(
+    output_path: Path,
+    images: list[tuple[str, Path]],
+    *,
+    tile_width: int = 420,
+    tile_height: int = 330,
+    columns: int = 4,
+) -> tuple[Path | None, list[str]]:
+    """Render a bounded contact sheet for the shallow episode top-down images."""
+
+    errors: list[str] = []
+    if not images:
+        return None, errors
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageOps
+    except Exception as exc:  # pragma: no cover - optional plotting dependency
+        return None, [f"Pillow unavailable: {type(exc).__name__}: {exc}"]
+
+    loaded: list[tuple[str, Any]] = []
+    for label, path in images:
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as exc:
+            errors.append(f"{path}: {type(exc).__name__}: {exc}")
+            continue
+        loaded.append((label, image))
+    if not loaded:
+        return None, errors
+
+    label_height = 34
+    rows = (len(loaded) + max(1, columns) - 1) // max(1, columns)
+    sheet = Image.new(
+        "RGB",
+        (tile_width * max(1, columns), tile_height * rows),
+        (242, 242, 242),
+    )
+    draw = ImageDraw.Draw(sheet)
+    try:
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", 16)
+        except OSError:
+            font = ImageFont.load_default()
+        for index, (label, image) in enumerate(loaded):
+            thumbnail = ImageOps.contain(
+                image,
+                (tile_width - 12, tile_height - label_height - 12),
+                method=Image.Resampling.LANCZOS,
+            )
+            column = index % max(1, columns)
+            row = index // max(1, columns)
+            x0 = column * tile_width
+            y0 = row * tile_height
+            image_x = x0 + (tile_width - thumbnail.width) // 2
+            image_y = y0 + label_height + (tile_height - label_height - thumbnail.height) // 2
+            sheet.paste(thumbnail, (image_x, image_y))
+            draw.rectangle(
+                (x0, y0, x0 + tile_width - 1, y0 + label_height - 1),
+                fill=(255, 255, 255),
+            )
+            draw.text((x0 + 8, y0 + 8), label[:58], fill=(20, 20, 20), font=font)
+            thumbnail.close()
+    finally:
+        for _label, image in loaded:
+            image.close()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        sheet.save(temporary, format="PNG", optimize=True)
+        temporary.replace(output_path)
+    finally:
+        sheet.close()
+        temporary.unlink(missing_ok=True)
+    return output_path, errors
+
+
+def publish_batch_galleries(
+    args: argparse.Namespace,
+    plans: list[EpisodePlan],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish stable batch-level image/video aliases after all workers join.
+
+    The attempt tree and the per-episode shallow aliases remain authoritative.
+    Gallery entries are additional links/copies for browsing and are never used
+    as resume inputs, so a missing optional artifact cannot invalidate a score.
+    """
+
+    output_dir = Path(args.output_dir)
+    recording_enabled = not bool(args.fast_eval)
+    result_by_index = {
+        int(row["episode_index"]): row
+        for row in rows
+        if isinstance(row.get("episode_index"), int)
+    }
+    topdown_dir = output_dir / "topdown_gallery"
+    video_dir = output_dir / "video_gallery"
+    errors: list[str] = []
+    topdown_rows: list[dict[str, Any]] = []
+    video_rows: list[dict[str, Any]] = []
+    contact_images: list[tuple[str, Path]] = []
+
+    for plan in sorted(plans, key=lambda item: item.ordinal):
+        row = result_by_index.get(plan.episode_index, {})
+        case_id = str(row.get("case_id") or f"episode_{plan.episode_index:04d}")
+        stem = f"{plan.episode_index:04d}_{_gallery_slug(case_id, fallback='episode')}"
+
+        if not recording_enabled:
+            continue
+
+        source_png = Path(str(row["topdown"])) if row.get("topdown") else None
+        source_json = (
+            None if source_png is None else source_png.with_suffix(".json")
+        )
+        source_video = (
+            Path(str(row["six_panel_video"]))
+            if row.get("six_panel_video")
+            else None
+        )
+
+        if source_png is not None and source_png.is_file():
+            gallery_png = topdown_dir / f"{stem}_topdown.png"
+            try:
+                publish_file(source_png, gallery_png)
+                gallery_json = None
+                if source_json is not None and source_json.is_file():
+                    gallery_json = topdown_dir / f"{stem}_topdown.json"
+                    publish_file(source_json, gallery_json)
+                metadata = read_json(source_json) if source_json and source_json.is_file() else {}
+                coverage = metadata.get("coverage", {}) if isinstance(metadata, dict) else {}
+                topdown_rows.append(
+                    {
+                        "episode_index": plan.episode_index,
+                        "case_id": case_id,
+                        "source_png": str(source_png),
+                        "gallery_png": str(gallery_png),
+                        "source_json": None if source_json is None else str(source_json),
+                        "gallery_json": None if gallery_json is None else str(gallery_json),
+                        "coverage": coverage.get("exploration_coverage_ratio"),
+                        "mapped_free": coverage.get("mapped_free_coverage_ratio"),
+                        "false_occupied": coverage.get("mapped_occupied_on_gt_free_ratio"),
+                    }
+                )
+                coverage_value = coverage.get("exploration_coverage_ratio")
+                coverage_text = (
+                    f"cov {100.0 * float(coverage_value):.1f}%"
+                    if isinstance(coverage_value, (int, float))
+                    else "cov n/a"
+                )
+                contact_images.append(
+                    (f"{plan.episode_index:04d} {coverage_text}", gallery_png)
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                errors.append(
+                    f"topdown episode {plan.episode_index}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        elif bool(row.get("completed")):
+            errors.append(f"topdown episode {plan.episode_index}: missing PNG")
+
+        if source_video is not None and source_video.is_file():
+            link_path = video_dir / f"{stem}_overview_6panel.mp4"
+            try:
+                _relative_symlink_atomic(source_video, link_path)
+                video_rows.append(
+                    {
+                        "episode_index": plan.episode_index,
+                        "case_id": case_id,
+                        "source_video": str(source_video),
+                        "link": str(link_path),
+                        "relative_target": os.path.relpath(source_video.resolve(), link_path.parent),
+                        "bytes": source_video.stat().st_size,
+                    }
+                )
+            except OSError as exc:
+                errors.append(
+                    f"video episode {plan.episode_index}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        elif bool(row.get("completed")):
+            errors.append(
+                f"video episode {plan.episode_index}: missing overview_6panel.mp4"
+            )
+
+    contact_sheet = None
+    if recording_enabled:
+        topdown_dir.mkdir(parents=True, exist_ok=True)
+        contact_sheet, contact_errors = _render_batch_contact_sheet(
+            output_dir / "contact_sheet_all.png",
+            contact_images,
+        )
+        errors.extend(f"contact sheet: {error}" for error in contact_errors)
+        video_dir.mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            topdown_dir / "index.json",
+            {
+                "schema_version": "interactive_nav_topdown_gallery_v2",
+                "source_batch": str(output_dir),
+                "count": len(topdown_rows),
+                "contact_sheet": None if contact_sheet is None else "../contact_sheet_all.png",
+                "rows": topdown_rows,
+                "errors": errors,
+            },
+        )
+        atomic_json(
+            video_dir / "index.json",
+            {
+                "schema_version": "interactive_nav_video_gallery_v2",
+                "source_batch": str(output_dir),
+                "count": len(video_rows),
+                "symlink_count": len(video_rows),
+                "total_source_bytes": sum(int(row["bytes"]) for row in video_rows),
+                "rows": video_rows,
+                "errors": errors,
+            },
+        )
+
+    summary = {
+        "topdown_gallery": str(topdown_dir) if recording_enabled else None,
+        "topdown_count": len(topdown_rows),
+        "video_gallery": str(video_dir) if recording_enabled else None,
+        "video_count": len(video_rows),
+        "contact_sheet": None if contact_sheet is None else str(contact_sheet),
+        "error_count": len(errors),
+        "errors": errors,
+    }
+    atomic_json(output_dir / "artifact_gallery_summary.json", summary)
+    return summary
+
+
 def validate_args(args: argparse.Namespace) -> None:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.benchmark = args.benchmark.expanduser().resolve()
@@ -1639,6 +2123,8 @@ def validate_args(args: argparse.Namespace) -> None:
         args.semantic_model_env_file = args.semantic_model_env_file.expanduser().resolve()
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if not math.isfinite(args.scene_start_interval_s) or args.scene_start_interval_s < 0:
+        raise ValueError("--scene-start-interval-s must be finite and non-negative")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be positive")
     if args.scene_timeout_s <= 0:
@@ -1723,6 +2209,7 @@ def run_worker(
 def main() -> int:
     args = parse_args()
     validate_args(args)
+    args._scene_launch_gate = SceneLaunchGate(args.scene_start_interval_s)
     plans = [
         EpisodePlan(
             ordinal=ordinal,
@@ -1752,6 +2239,7 @@ def main() -> int:
                 "runner_shell": args.runner_shell,
                 "benchmark": str(args.benchmark),
                 "workers": args.workers,
+                "scene_start_interval_s": args.scene_start_interval_s,
                 "base_master_port": args.base_master_port,
                 "max_steps": args.max_steps,
                 "step_budget_mode": str(args.step_budget_mode),
@@ -1812,6 +2300,13 @@ def main() -> int:
         resource_summary,
         recover_missing_task_summaries=True,
     )
+    gallery_summary = publish_batch_galleries(args, plans, results)
+    aggregate["artifact_gallery"] = gallery_summary
+    final_summary = read_json(args.output_dir / "summary.json")
+    if isinstance(final_summary, dict):
+        final_summary["aggregate"] = aggregate
+        atomic_json(args.output_dir / "summary.json", final_summary)
+    atomic_json(args.output_dir / "aggregate_metrics.json", aggregate)
     failure_count = int(aggregate["failed_or_incomplete_episode_count"])
     print(
         json.dumps(
@@ -1823,6 +2318,7 @@ def main() -> int:
                 "resource_telemetry": (
                     None if resource_summary is None else resource_summary.get("resource_telemetry_path")
                 ),
+                "artifact_gallery": gallery_summary,
             },
             ensure_ascii=False,
             indent=2,

@@ -24,6 +24,7 @@ from scripts.InteractiveNav.evaluation.ros_object_goal_adapter import (
 )
 from semantic_decision_py_pkg.behavior_candidates import CandidateGenerator
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
 
 
 def test_v3_restricted_frame_generates_an_opaque_semantic_open_command() -> None:
@@ -60,20 +61,38 @@ def test_v3_restricted_frame_generates_an_opaque_semantic_open_command() -> None
     portal = next(node for node in graph["nodes"] if node["type"] == "portal")
     assert portal["confidence"] == 1.0
     assert portal["interaction"]["is_interactable"] is True
+    assert portal["attributes"]["instance_id"] == observation["id"]
+    consensus = PortalStateConsensus()
+    assert consensus.can_request(
+        observation["id"], capture_step=7, observation_pose_xyyaw=[0., 0., 0.],
+    ) == (True, "initial_evidence")
+    assert store.apply_attribute_patch({
+        "object_id": observation["id"], "attribute_status": "ready",
+        "interaction_class": "portal", "coarse_state": "closed",
+        "confidence": 1.0,
+    }, stamp=2.0)
 
+    candidates = CandidateGenerator().generate(
+        {"initial_scan_complete": True}, graph, robot_xy=(0.0, 0.0)
+    )
+    assert not any(candidate.behavior_type == "INTERACT" for candidate in candidates)
+    # A public detection alone does not establish that a portal is closed.
+    portal["interaction"].update(state="closed", state_confidence=1.0, requires_interaction=True)
+    portal.setdefault("attributes", {}).update(attribute_status="ready", visible_pixels=1024, visible_fraction=1.0)
     candidates = CandidateGenerator().generate(
         {"initial_scan_complete": True}, graph, robot_xy=(0.0, 0.0)
     )
     interaction = next(
         candidate for candidate in candidates if candidate.behavior_type == "INTERACT"
     )
-    assert interaction.interaction_command == {
+    expected = {
         "node_id": "portal_obj_000001",
         "object_id": "obj_000001",
         "action": "open",
         "interaction_mode": "open_close",
         "expected_state": "open",
     }
+    assert {key: interaction.interaction_command[key] for key in expected} == expected
 
 
 def test_strict_detector_payload_uses_the_same_compact_semantic_wire_schema() -> None:

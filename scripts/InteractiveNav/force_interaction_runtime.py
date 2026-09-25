@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import math
+import os
 from typing import Any, Callable, Mapping
 
 import mujoco
@@ -24,6 +25,13 @@ class ForceDriveConfig:
     slide_max_effort: float = 160.0
     open_fraction_threshold: float = 0.67
     assume_success: bool = True
+    # Opt in while comparing against the same code with legacy callback timing.
+    coalesce_robot_lock: bool = os.environ.get("INTERACTIVE_NAV_COALESCE_ROBOT_LOCK") == "1"
+    intermediate_position_only: bool = os.environ.get("INTERACTIVE_NAV_INTERMEDIATE_POSITION_ONLY") == "1"
+    position_only_settle: bool = False
+    # Diagnostic replay: preserve a recorded drive duration despite a new dt.
+    replay_duration_seconds: float | None = None
+    replay_stable_seconds: float | None = None
 
 
 class ForceInteractionError(RuntimeError):
@@ -597,6 +605,40 @@ def articulation_joint_infos(env, object_name: str) -> list[dict[str, Any]]:
     return _joint_infos_for_group(env.current_model, env.current_data, list(group["joints"]))
 
 
+def _body_subtree_geometry_centroid(model, data, root_body_id: int) -> np.ndarray | None:
+    """Return a size-weighted live geom centroid for one articulated leaf."""
+
+    root_body_id = int(root_body_id)
+    geom_positions: list[np.ndarray] = []
+    geom_weights: list[float] = []
+    for geom_id in range(int(getattr(model, "ngeom", 0) or 0)):
+        body_id = int(model.geom_bodyid[geom_id])
+        cursor = body_id
+        belongs = cursor == root_body_id
+        while not belongs and cursor > 0:
+            cursor = int(model.body_parentid[cursor])
+            belongs = cursor == root_body_id
+        if not belongs:
+            continue
+        position = np.asarray(data.geom_xpos[geom_id], dtype=float)
+        if position.shape[0] < 3 or not np.all(np.isfinite(position[:3])):
+            continue
+        try:
+            size = np.asarray(model.geom_size[geom_id], dtype=float)
+            weight = float(np.prod(np.maximum(np.abs(size[:3]), 1e-3)))
+        except (AttributeError, IndexError, TypeError, ValueError):
+            weight = 1.0
+        geom_positions.append(position[:3])
+        geom_weights.append(max(1e-9, weight))
+    if not geom_positions:
+        return None
+    return np.average(
+        np.asarray(geom_positions, dtype=float),
+        axis=0,
+        weights=np.asarray(geom_weights, dtype=float),
+    )
+
+
 def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     """Infer a private physical front normal from live articulation geometry.
 
@@ -615,6 +657,15 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     data = env.current_data
     axes: list[np.ndarray] = []
     sources: list[str] = []
+    # A refrigerator can expose both a hinge for the door leaf and slide joints
+    # for internal trays/rails.  Averaging those motion vectors can produce a
+    # diagonal (or even cancelling) normal that is not an operable front.  The
+    # articulated door/leaf hinge is the stronger operational-front signal;
+    # use slide travel only when no hinge geometry is available.
+    hinge_axes: list[np.ndarray] = []
+    hinge_sources: list[str] = []
+    slide_axes: list[np.ndarray] = []
+    slide_sources: list[str] = []
     for joint in list(group.get("joints") or []):
         joint_id = int(joint.get("joint_id", -1))
         if joint_id < 0:
@@ -631,19 +682,40 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
             source = "slide_open_travel"
         elif joint_type == "hinge":
             anchor = np.asarray(data.xanchor[joint_id], dtype=float)
-            radial = np.asarray(data.xpos[body_id], dtype=float) - anchor
+            panel_centroid = _body_subtree_geometry_centroid(model, data, body_id)
+            radial_source = "body_origin"
+            if panel_centroid is not None:
+                radial = np.asarray(panel_centroid, dtype=float) - anchor
+                radial_source = "panel_geometry"
+            else:
+                radial = np.asarray(data.xpos[body_id], dtype=float) - anchor
             axis_xy = direction_sign * np.cross(world_axis, radial)[:2]
-            source = "hinge_initial_open_motion"
+            source = f"hinge_{radial_source}_initial_open_motion"
         else:
             continue
         norm = float(np.linalg.norm(axis_xy))
         if math.isfinite(norm) and norm > 1e-6:
-            axes.append(np.asarray(axis_xy, dtype=float) / norm)
+            normalized_axis = np.asarray(axis_xy, dtype=float) / norm
+            axes.append(normalized_axis)
             sources.append(source)
+            if joint_type == "hinge":
+                hinge_axes.append(normalized_axis)
+                hinge_sources.append(source)
+            elif joint_type == "slide":
+                slide_axes.append(normalized_axis)
+                slide_sources.append(source)
     if not axes:
         return {"checked": False, "reason": "front_axis_geometry_unavailable"}
-    reference = axes[0]
-    aligned = [axis if float(np.dot(axis, reference)) >= 0.0 else -axis for axis in axes]
+    # Prefer hinge-derived panel motion when mixed hinge/slide articulations
+    # exist.  Slide-only appliances (or drawer-like containers) still use their
+    # direct travel axis.
+    selected_axes = hinge_axes or slide_axes or axes
+    selected_sources = hinge_sources or slide_sources or sources
+    reference = selected_axes[0]
+    aligned = [
+        axis if float(np.dot(axis, reference)) >= 0.0 else -axis
+        for axis in selected_axes
+    ]
     mean_axis = np.mean(aligned, axis=0)
     norm = float(np.linalg.norm(mean_axis))
     if not math.isfinite(norm) or norm <= 1e-6:
@@ -652,8 +724,9 @@ def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
     return {
         "checked": True,
         "axis_xy": [float(value) for value in mean_axis / norm],
-        "source": "+".join(sorted(set(sources))),
-        "joint_count": len(axes),
+        "source": "+".join(sorted(set(selected_sources))),
+        "joint_count": len(selected_axes),
+        "candidate_joint_count": len(axes),
     }
 
 
@@ -713,41 +786,65 @@ def apply_articulation_force_once(
     plan["force_specs"] = specs
 
 
+@dataclass(frozen=True)
+class _RobotContactLookup:
+    root_ids: np.ndarray
+    robot_geoms: np.ndarray
+    geom_names: tuple[str, ...]
+
+
+def _build_robot_contact_lookup(model: mujoco.MjModel) -> _RobotContactLookup:
+    names = tuple(str(model.body(body_id).name or "") for body_id in range(model.nbody))
+    body_ids = np.asarray(model.geom_bodyid)
+    root_ids = np.array(model.body_rootid[body_ids], copy=True)
+    robot_geoms = np.array([name.startswith("robot") for name in names], dtype=bool)[body_ids]
+    root_ids.flags.writeable = robot_geoms.flags.writeable = False
+    return _RobotContactLookup(
+        root_ids, robot_geoms,
+        tuple(names[body_id] or str(body_id) for body_id in body_ids),
+    )
+
+
 def _robot_articulation_contact_stats(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     root_body_id: int,
+    *,
+    lookup: _RobotContactLookup | None = None,
 ) -> dict[str, Any]:
+    root_body_id = int(root_body_id)
     count = 0
     minimum_distance = None
     pairs = set()
-    for contact_index in range(int(data.ncon)):
+    indexes = range(int(data.ncon))
+    if lookup is not None:
+        # Cache model topology only. Contact membership/distances are read again
+        # after every physics step, in their original order.
+        geoms = np.asarray(data.contact.geom)[:int(data.ncon)]
+        roots = lookup.root_ids[geoms]
+        robot = lookup.robot_geoms[geoms]
+        indexes = np.flatnonzero(
+            ((roots[:, 0] == root_body_id) | (roots[:, 1] == root_body_id))
+            & (robot[:, 0] | robot[:, 1])
+        )
+    for contact_index in indexes:
         contact = data.contact[contact_index]
-        body_ids = [
-            int(model.geom_bodyid[int(contact.geom1)]),
-            int(model.geom_bodyid[int(contact.geom2)]),
-        ]
-        root_matches = [
-            body_id
-            for body_id in body_ids
-            if int(model.body_rootid[body_id]) == int(root_body_id)
-        ]
-        robot_matches = [
-            body_id
-            for body_id in body_ids
-            if str(model.body(body_id).name or "").startswith("robot")
-        ]
-        if not root_matches or not robot_matches:
-            continue
+        if lookup is None:
+            body_ids = [
+                int(model.geom_bodyid[int(contact.geom1)]),
+                int(model.geom_bodyid[int(contact.geom2)]),
+            ]
+            if not any(int(model.body_rootid[body_id]) == int(root_body_id) for body_id in body_ids):
+                continue
+            if not any(str(model.body(body_id).name or "").startswith("robot") for body_id in body_ids):
+                continue
+            names = tuple(str(model.body(body_id).name or body_id) for body_id in body_ids)
+        else:
+            names = (lookup.geom_names[int(contact.geom1)], lookup.geom_names[int(contact.geom2)])
         count += 1
         distance = float(contact.dist)
         minimum_distance = distance if minimum_distance is None else min(minimum_distance, distance)
-        pairs.add(
-            tuple(sorted(
-                str(model.body(body_id).name or body_id)
-                for body_id in body_ids
-            ))
-        )
+        pairs.add(tuple(sorted(names)))
     return {
         "count": int(count),
         "minimum_distance": minimum_distance,
@@ -959,6 +1056,16 @@ def advance_articulation_force(
         ),
         assume_success=False,
     )
+    position_only = bool(
+        config.intermediate_position_only and 0.0 < alpha < 1.0
+        and all(env.current_model.joint(name).type[0] == mujoco.mjtJoint.mjJNT_SLIDE
+                for name in targets)
+    )
+    if position_only:
+        # These waypoints are traversed, not observed endpoints. Keep the same
+        # position tolerance and budget; do not wait for velocity to settle.
+        # The driver already zeros commanded joint velocities on return.
+        step_config = replace(step_config, position_only_settle=True)
     drive = drive_joint_group_to_targets(
         env.current_model,
         env.current_data,
@@ -981,6 +1088,8 @@ def advance_articulation_force(
         "targets": targets,
         "physics_substeps": int(drive.get("physics_substeps", 0)),
         "fallback": fallback,
+        "position_only_settle": position_only,
+        "position_only_contact_guarded": bool(drive.get("position_only_contact_guarded", False)),
         "joint_infos": _joint_infos_for_group(
             env.current_model, env.current_data, list(plan["group"]["joints"])
         ),
@@ -1341,15 +1450,33 @@ def drive_joint_group_to_targets(
     completed_substeps = 0
     reached = False
     root_body_id = int(model.body_rootid[specs[0]["body_id"]])
-    initial_contacts = _robot_articulation_contact_stats(model, data, root_body_id)
+    contact_lookup = _build_robot_contact_lookup(model)
+    initial_contacts = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
     max_contact_count = int(initial_contacts["count"])
     minimum_contact_distance = initial_contacts["minimum_distance"]
+    original_timestep = float(model.opt.timestep)
+    replay_duration = config.replay_duration_seconds
+    if replay_duration is not None and (not math.isfinite(replay_duration) or replay_duration <= 0):
+        raise ValueError("Replay duration must be finite and positive")
+    if config.replay_stable_seconds is not None and (
+        not math.isfinite(config.replay_stable_seconds) or config.replay_stable_seconds <= 0
+    ):
+        raise ValueError("Replay stability duration must be finite and positive")
+    drive_steps = (max(1, int(config.max_physics_substeps)) if replay_duration is None
+                   else max(1, int(math.ceil(replay_duration / original_timestep - 1e-10))))
+    start_sim_time = float(data.time)
+    stable_seconds = 0.0
     try:
-        for substep in range(max(1, int(config.max_physics_substeps))):
-            if robot_lock_callback is not None:
+        for substep in range(drive_steps):
+            if replay_duration is not None:
+                model.opt.timestep = min(original_timestep, replay_duration - substep * original_timestep)
+            # The previous iteration already restored the robot and refreshed
+            # derived state after mj_step. Only read-only checks intervene.
+            if robot_lock_callback is not None and (substep == 0 or not config.coalesce_robot_lock):
                 robot_lock_callback()
             data.xfrc_applied[:, :] = 0.0
-            all_stable = True
+            positions_stable = True
+            velocities_stable = True
             for spec in specs:
                 current = float(data.qpos[spec["qpos_addr"]])
                 velocity = float(data.qvel[spec["dof_addr"]])
@@ -1364,15 +1491,13 @@ def drive_joint_group_to_targets(
                     data.xfrc_applied[spec["body_id"], :3] += world_axis * effort
                 else:
                     data.xfrc_applied[spec["body_id"], 3:] += world_axis * effort
-                all_stable = all_stable and (
-                    abs(error) <= config.position_tolerance
-                    and abs(velocity) <= config.velocity_tolerance
-                )
+                positions_stable = positions_stable and abs(error) <= config.position_tolerance
+                velocities_stable = velocities_stable and abs(velocity) <= config.velocity_tolerance
             mujoco.mj_step(model, data)
             if robot_lock_callback is not None:
                 robot_lock_callback()
             completed_substeps = substep + 1
-            contact_stats = _robot_articulation_contact_stats(model, data, root_body_id)
+            contact_stats = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
             max_contact_count = max(max_contact_count, int(contact_stats["count"]))
             contact_distance = contact_stats["minimum_distance"]
             if contact_distance is not None:
@@ -1381,14 +1506,26 @@ def drive_joint_group_to_targets(
                     if minimum_contact_distance is None
                     else min(minimum_contact_distance, contact_distance)
                 )
+            # Any robot/target contact latches the conservative settle rule for
+            # this entire drive, including contacts first created by this step.
+            position_only = config.position_only_settle and max_contact_count == 0
+            all_stable = positions_stable and (position_only or velocities_stable)
             if all_stable:
                 stable_substeps += 1
-                if stable_substeps >= max(1, int(config.stable_substeps)):
+                stable_seconds += float(model.opt.timestep)
+                required_stable = 1 if position_only else max(1, int(config.stable_substeps))
+                enough_stability = (stable_substeps >= required_stable if config.replay_stable_seconds is None
+                                    else stable_seconds + 1e-12 >= config.replay_stable_seconds)
+                if enough_stability:
                     reached = True
-                    break
+                    if replay_duration is None:
+                        break
             else:
                 stable_substeps = 0
+                stable_seconds = 0.0
+                reached = False
     finally:
+        model.opt.timestep = original_timestep
         data.xfrc_applied[:, :] = 0.0
         for spec in specs:
             data.qvel[spec["dof_addr"]] = 0.0
@@ -1413,15 +1550,17 @@ def drive_joint_group_to_targets(
             }
         )
     reached = reached or all(joint["reached_target"] for joint in joints)
-    final_contacts = _robot_articulation_contact_stats(model, data, root_body_id)
+    final_contacts = _robot_articulation_contact_stats(model, data, root_body_id, lookup=contact_lookup)
     return {
         "method": "xfrc_applied_group_pd",
         "success": bool(reached),
         "physics_substeps": int(completed_substeps),
+        "simulated_seconds": float(data.time) - start_sim_time,
         "stable_substeps": int(stable_substeps),
         "robot_target_contacts_before": initial_contacts,
         "robot_target_contacts_after": final_contacts,
         "robot_target_max_contact_count": int(max_contact_count),
+        "position_only_contact_guarded": bool(config.position_only_settle and max_contact_count > 0),
         "robot_target_min_contact_distance": minimum_contact_distance,
         "joints": joints,
         "config": asdict(config),

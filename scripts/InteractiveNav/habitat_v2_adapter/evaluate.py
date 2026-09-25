@@ -16,6 +16,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import numpy as np
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -53,6 +55,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mllm-endpoint", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--mllm-model", default="qwen3.6-35b-a3b-fp8")
     parser.add_argument("--mllm-timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--full-ros-stack-endpoint",
+        default="",
+        help="override the profile's per-experiment Habitat/ROS bridge endpoint",
+    )
     parser.add_argument(
         "--adapter-config",
         type=Path,
@@ -150,13 +157,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--record-six-panel-video",
-        action="store_true",
-        help="record an evaluator-only 3x2 MP4 with RGB, depth, M1 detections, occupancy/route, semantic graph, and GT posthoc map",
-    )
-    parser.add_argument("--video-fps", type=float, default=10.0)
-    parser.add_argument("--video-frame-stride", type=int, default=1)
-    parser.add_argument(
         "--allow-no-mllm-success",
         action="store_true",
         help="permit a diagnostic run even when no successful Module-2 selection is recorded",
@@ -170,8 +170,6 @@ def _parse_args() -> argparse.Namespace:
         or args.clear_space_fallback_candidates < 0
         or args.frontier_arrival_scan_steps < 0
         or args.local_escape_relaxation_m < 0.0
-        or args.video_fps <= 0.0
-        or args.video_frame_stride < 1
     ):
         parser.error("scene/episode/step counts must be positive and timing/candidate counts cannot be negative")
     return args
@@ -283,7 +281,7 @@ def _mllm_request_stats(path: Path) -> dict[str, Any]:
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 records.append(json.loads(line))
-    by_role: dict[str, dict[str, int]] = {}
+    by_role: dict[str, dict[str, Any]] = {}
     for record in records:
         role = str(record.get("role", "unknown"))
         stats = by_role.setdefault(role, {"requests": 0, "successful": 0, "failed": 0})
@@ -292,6 +290,16 @@ def _mllm_request_stats(path: Path) -> dict[str, Any]:
             stats["failed"] += 1
         else:
             stats["successful"] += 1
+        latency = record.get("latency_s")
+        if latency is not None:
+            stats.setdefault("_latencies_s", []).append(float(latency))
+    for stats in by_role.values():
+        latencies = np.asarray(stats.pop("_latencies_s", []), dtype=np.float64)
+        if len(latencies):
+            stats["latency_mean_s"] = float(np.mean(latencies))
+            stats["latency_p50_s"] = float(np.percentile(latencies, 50))
+            stats["latency_p95_s"] = float(np.percentile(latencies, 95))
+            stats["latency_max_s"] = float(np.max(latencies))
     return {
         "requests": len(records),
         "successful": sum(stats["successful"] for stats in by_role.values()),
@@ -438,9 +446,12 @@ def main() -> int:
     }
     sidecar_health: dict[str, Any] | None = None
     recorder_diagnostic_client = None
+    recorder_diagnostic_interval = 1
     if profile is not None:
         profile_values = profile.policy_overrides()
         policy_values.update(profile_values)
+        if args.full_ros_stack_endpoint:
+            policy_values["full_ros_stack_endpoint"] = str(args.full_ros_stack_endpoint)
         # The profile is the source of truth for Module-1/2/3 policy settings.
         # Keep CLI switches as evaluator/data controls rather than silently
         # overriding the audited navigation-only bridge configuration.
@@ -457,10 +468,17 @@ def main() -> int:
 
             if profile.module1["mode"] == "full_ros_navigation_stack":
                 probe = FullRosStackClient(
-                    endpoint=str(profile.module1["sidecar"]["endpoint"]),
+                    endpoint=str(
+                        args.full_ros_stack_endpoint
+                        or profile.module1["sidecar"]["endpoint"]
+                    ),
                     timeout_s=float(profile.module1["sidecar"]["timeout_s"]),
                 )
                 recorder_diagnostic_client = probe
+                recorder_diagnostic_interval = max(
+                    1,
+                    int(profile.module1["sidecar"]["interval_steps"]),
+                )
             else:
                 probe = Module1DetectorSidecarClient(
                     endpoint=str(profile.module1["sidecar"]["endpoint"]),
@@ -537,54 +555,32 @@ def main() -> int:
                 _mllm_goal_name(category_by_id[goal_id]),
             )
             policy.reset(public_episode)
+            recorder_topdown = None
+            if recorder_diagnostic_client is not None:
+                from habitat_v2_adapter.posthoc_topdown import RecorderTopdownPanel
+
+                recorder_topdown = RecorderTopdownPanel(env, current_episode)
             steps = 0
             posthoc_first_distance: float | None = None
             posthoc_min_distance: float | None = None
             posthoc_min_step: int | None = None
             posthoc_episode_rows: list[dict[str, Any]] = []
-            video_recorder = None
-            if args.record_six_panel_video:
-                from habitat_v2_adapter.six_panel_video import SixPanelVideoRecorder
-
-                scene_name = Path(str(current_episode.scene_id)).parent.name
-                video_recorder = SixPanelVideoRecorder(
-                    path=args.output_dir / f"six_panel_{scene_name}_ep{current_episode.episode_id}.mp4",
-                    env=env,
-                    episode=current_episode,
-                    fps=args.video_fps,
-                    frame_stride=args.video_frame_stride,
-                )
             try:
                 for steps in range(1, args.max_steps + 1):
                     action = policy.act(observations)
                     policy.assert_navigation_only(action)
-                    if video_recorder is not None:
-                        # Record the exact public RGB-D frame consumed by the
-                        # policy. Recording after env.step() would overlay the
-                        # previous detector result on the next camera frame.
-                        video_metrics = dict(env.get_metrics())
-                        video_state = env.sim.get_agent_state()
-                        if recorder_diagnostic_client is not None:
-                            diagnostic_panel = video_recorder.render_recorder_topdown(
-                                policy=policy,
-                                metrics=video_metrics,
-                                agent_world_position=[float(value) for value in video_state.position],
-                            )
-                            diagnostic_error = recorder_diagnostic_client.publish_recorder_diagnostic(
-                                diagnostic_panel[..., ::-1],
-                                step=steps,
-                            )
-                            if diagnostic_error:
-                                raise RuntimeError(
-                                    f"could not publish evaluator-only recorder panel 6: {diagnostic_error}"
-                                )
-                        video_recorder.append(
-                            observations=observations,
-                            action=action,
-                            policy=policy,
-                            metrics=video_metrics,
-                            agent_world_position=[float(value) for value in video_state.position],
+                    if (
+                        recorder_topdown is not None
+                        and (steps - 1) % recorder_diagnostic_interval == 0
+                    ):
+                        diagnostic_error = recorder_diagnostic_client.publish_recorder_diagnostic(
+                            recorder_topdown.render(policy.diagnostic_snapshot()),
+                            step=steps,
                         )
+                        if diagnostic_error:
+                            raise RuntimeError(
+                                f"could not publish exact-step recorder diagnostic: {diagnostic_error}"
+                            )
                     observations = env.step(action)
                     if posthoc_metrics_path is not None:
                         # This is intentionally post-action evaluator instrumentation.
@@ -623,8 +619,7 @@ def main() -> int:
                     if env.episode_over:
                         break
             finally:
-                if video_recorder is not None:
-                    video_recorder.close()
+                pass
             metrics = dict(env.get_metrics())
             episode_decisions = policy.decision_stats()
             episode_vision = policy.vision_stats()
@@ -723,9 +718,6 @@ def main() -> int:
         "public_trace": bool(policy.config.diagnostic_trace_path),
         "posthoc_step_metrics": bool(posthoc_metrics_path is not None),
         "posthoc_topdown_map": bool(args.posthoc_topdown_map),
-        "six_panel_video": bool(args.record_six_panel_video),
-        "video_fps": float(args.video_fps) if args.record_six_panel_video else None,
-        "video_frame_stride": int(args.video_frame_stride) if args.record_six_panel_video else None,
         "mllm_requests": mllm_stats,
         "mllm_policy_decisions": decision_stats,
         "vision_policy_stats": vision_stats,

@@ -22,16 +22,21 @@ rospy = pytest.importorskip("rospy")
 import semantic_mapping_node as semantic_mapping_module
 from semantic_mapping_node import OccupancyGrid, SemanticMappingNode
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
-from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
+from semantic_mapping_py_pkg.room_inference_backends import room_evidence_signature
+from semantic_mapping_py_pkg.semantic_occ_overlay import (
+    OverlayUpdateRegionTracker,
+    SemanticOccupancyOverlay,
+)
 
 
-class _Overlay:
+class _Overlay(SemanticOccupancyOverlay):
     def __init__(self) -> None:
+        super().__init__()
         self.pending = []
 
-    def set_interaction_pending(self, node_id, pending):
+    def set_interaction_pending(self, node_id, pending, *, node_type=None):
         self.pending.append((node_id, pending))
-        return True
+        return super().set_interaction_pending(node_id, pending, node_type=node_type)
 
 
 @pytest.mark.parametrize("time_fields", [
@@ -171,15 +176,21 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     node.lock = threading.RLock()
     node.pending_interaction_commands = {}
     node.semantic_occ_overlay = _Overlay()
+    node.semantic_occ_update_tracker = OverlayUpdateRegionTracker()
+    node.door_clear_mask_pub = _Publisher()
+    node.planning_occupancy_grid_updates_pub = _Publisher()
     node.graph_store = _GraphStore()
     node.room_segmenter = _RoomSegmenter()
     node.room_post_open_force_refresh = True
     node.scene_store = _SceneStore()
     node.world_frame = "world"
     events = []
-    node.planning_occupancy_grid_pub = SimpleNamespace(
-        publish=lambda msg: events.append(("publish", msg))
-    )
+
+    def publish_planning(msg):
+        assert node.room_segmenter.calls == []
+        events.append(("publish", msg))
+
+    node.planning_occupancy_grid_pub = SimpleNamespace(publish=publish_planning)
     node._refresh_room_grid_locked = lambda *, force_stable=False: events.append(
         ("room_refresh", force_stable)
     )
@@ -211,8 +222,16 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     fresh_raw = _raw_occupancy(12.1)
     SemanticMappingNode.occupancy_callback(node, fresh_raw)
 
-    # The planner receives the exact raw message before portal hints/room work.
-    assert events == [("publish", fresh_raw), ("room_refresh", True)]
+    # This portal is outside the tiny map, so its effective planning data stays
+    # unchanged. Publication must still precede portal hints and room work.
+    assert len(events) == 2 and events[0][0] == "publish"
+    assert events[1] == ("room_refresh", True)
+    published = events[0][1]
+    assert published.header == fresh_raw.header
+    assert published.info == fresh_raw.info
+    assert list(published.data) == list(fresh_raw.data)
+    assert len(node.door_clear_mask_pub.messages) == 1
+    assert list(node.door_clear_mask_pub.messages[0].data) == [0, 0, 0, 0]
     assert node._post_open_room_refresh_result is None
     observations, source_mode, refresh_active = node.room_segmenter.calls[0]
     assert source_mode == "realtime_gt_observation"
@@ -278,6 +297,10 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch, r
                 {
                     "secs": 1,
                     "nsecs": 0,
+                    "stamp_sec": 1,
+                    "stamp_nsec": 123,
+                    "image_size": [1280, 720],
+                    "observation_pose_xyyaw": [1.0, 2.0, 0.5],
                     "detections": [
                         {
                             "semantic_class": "bottle",
@@ -301,6 +324,10 @@ def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch, r
     )
 
     assert len(published) == 1
+    envelope = json.loads(published[0].data)
+    assert envelope["stamp_nsec"] == 123
+    assert envelope["image_size"] == [1280, 720]
+    assert envelope["observation_pose_xyyaw"] == [1.0, 2.0, 0.5]
     assert json.loads(published[0].data)["episode_id"] == "before-reset"
     assert json.loads(published[0].data)["detections"] == []
     assert len(node.graph_store.observations) == 1
@@ -797,6 +824,8 @@ def test_room_mllm_request_contains_only_room_and_member_object_metadata():
                 "id": "room_2",
                 "type": "room",
                 "room_id": 2,
+                "aabb_center": [1.0, 2.0, 0.1],
+                "aabb_size": [4.0, 5.0, 0.2],
                 "attributes": {"active": True, "cell_count": 42},
             },
             {
@@ -834,6 +863,12 @@ def test_room_mllm_request_contains_only_room_and_member_object_metadata():
             {
                 "room_id": 2,
                 "room_node_id": "room_2",
+                "room_box": {"center_xy": [1.0, 2.0], "size_xy": [4.0, 5.0]},
+                "observation_signature": room_evidence_signature(
+                    2,
+                    {"center_xy": [1.0, 2.0], "size_xy": [4.0, 5.0]},
+                    [{"object_id": "stove_1", "name": "Stove", "category": "appliance", "type": "object"}],
+                ),
                 "objects": [
                     {
                         "object_id": "stove_1",
@@ -851,6 +886,141 @@ def test_room_mllm_request_contains_only_room_and_member_object_metadata():
     serialized = json.dumps(request)
     for forbidden in ("image", "crop", "aabb", "geometry", "pose"):
         assert forbidden not in serialized
+
+
+def test_room_requests_stay_near_robot_and_refresh_after_box_or_member_change():
+    node = object.__new__(SemanticMappingNode)
+    node.room_mllm_enabled = True
+    node.room_mllm_min_evidence_objects = 1
+    node.room_mllm_success_refresh_interval_s = 120.0
+    node.ablation = SimpleNamespace(module1="dynamic_mllm")
+    node._room_mllm_committed_signatures = {}
+    node._room_mllm_committed_at = {}
+    node._room_mllm_episode_id = ""
+    node._room_mllm_selection_cursor = 0
+    node._room_robot_xy = lambda: (0.0, 0.0)
+
+    graph = {
+        "episode_id": "episode_1",
+        "timestamp": 10.0,
+        "nodes": [
+            {
+                "id": f"room_{room_id}", "type": "room", "room_id": room_id,
+                "aabb_center": [float(room_id * 10), 0.0, 0.1],
+                "aabb_size": [4.0, 4.0, 0.2], "attributes": {"active": True},
+            }
+            for room_id in range(3)
+        ] + [
+            {
+                "id": f"object_{room_id}", "type": "object", "room_id": room_id,
+                "name": f"label_{room_id}",
+                "is_currently_visible": room_id == 0,
+                "attributes": {"instance_id": f"object_{room_id}"},
+            }
+            for room_id in range(3)
+        ] + [{
+            "id": "portal_0", "type": "portal",
+            "attributes": {"connected_room_ids": [0, 1]},
+        }],
+        "edges": [
+            {"src_id": "portal_0", "relation": "connects", "dst_id": "room_0"},
+            {"src_id": "portal_0", "relation": "connects", "dst_id": "room_1"},
+        ],
+    }
+
+    def request():
+        payload = node._build_room_attribute_request_locked(graph)
+        return payload["rooms"][0] if payload is not None else None
+
+    def complete(room):
+        node._room_mllm_committed_signatures[room["room_node_id"]] = room["observation_signature"]
+        node._room_mllm_committed_at[room["room_node_id"]] = time.monotonic()
+
+    first = request()
+    assert first["room_id"] == 0
+    complete(first)
+    second = request()
+    assert second["room_id"] == 1
+    complete(second)
+    assert request() is None
+
+    graph["nodes"][5]["is_currently_visible"] = True
+    graph["nodes"][5]["name"] = "new_remote_object"
+    assert request() is None
+
+    graph["nodes"][1]["aabb_size"][0] = 4.3
+    changed_box = request()
+    assert changed_box["room_id"] == 1
+    complete(changed_box)
+    graph["nodes"][4]["name"] = "new_nearby_object"
+    changed_member = request()
+    assert changed_member["room_id"] == 1
+    complete(changed_member)
+    assert request() is None
+
+    node._room_mllm_committed_at["room_1"] -= 121.0
+    assert request()["room_id"] == 1
+
+    graph["episode_id"] = "episode_2"
+    assert request() is not None
+
+
+def test_empty_robot_room_still_requests_changed_neighbor():
+    node = object.__new__(SemanticMappingNode)
+    node.room_mllm_enabled = True
+    node.room_mllm_min_evidence_objects = 1
+    node.ablation = SimpleNamespace(module1="dynamic_mllm")
+    node._room_robot_xy = lambda: (0.0, 0.0)
+    graph = {
+        "episode_id": "episode_1", "timestamp": 10.0,
+        "nodes": [
+            {"id": "room_0", "type": "room", "room_id": 0,
+             "aabb_center": [0.0, 0.0, 0.1], "aabb_size": [4.0, 4.0, 0.2]},
+            {"id": "room_1", "type": "room", "room_id": 1,
+             "aabb_center": [5.0, 0.0, 0.1], "aabb_size": [4.0, 4.0, 0.2]},
+            {"id": "object_1", "type": "object", "room_id": 1,
+             "name": "bed", "attributes": {"instance_id": "bed_1"}},
+            {"id": "portal_0", "type": "portal",
+             "attributes": {"connected_room_ids": [0, 1]}},
+        ],
+        "edges": [
+            {"src_id": "portal_0", "relation": "connects", "dst_id": "room_0"},
+            {"src_id": "portal_0", "relation": "connects", "dst_id": "room_1"},
+        ],
+    }
+    request = node._build_room_attribute_request_locked(graph)
+    assert request["rooms"][0]["room_id"] == 1
+
+
+def test_room_fallback_remains_refreshable_until_mllm_result():
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.ablation = SimpleNamespace(module1="dynamic_mllm")
+    node.graph_store = SimpleNamespace(
+        episode_id="episode_1",
+        apply_room_attribute_patch=lambda _patch, stamp: True,
+    )
+    node._room_mllm_committed_signatures = {}
+    node._room_mllm_committed_at = {}
+    node._collect_publish_bundle = lambda: {}
+    node._safe_publish_bundle = lambda _bundle: None
+
+    patch = {
+        "room_id": 1,
+        "room_node_id": "room_1",
+        "room_attribute_status": "ready",
+        "observation_signature": "box-and-members",
+    }
+    node.room_attribute_updates_callback(SimpleNamespace(data=json.dumps({
+        "episode_id": "episode_1", "stamp_sec": 10.0,
+        "updates": [{**patch, "fallback": True}],
+    })))
+    assert node._room_mllm_committed_signatures == {}
+    node.room_attribute_updates_callback(SimpleNamespace(data=json.dumps({
+        "episode_id": "episode_1", "stamp_sec": 11.0, "updates": [patch],
+    })))
+    assert node._room_mllm_committed_signatures == {"room_1": "box-and-members"}
+    assert "room_1" in node._room_mllm_committed_at
 
 
 def test_strict_step_ready_requires_same_occ_room_and_graph_source():

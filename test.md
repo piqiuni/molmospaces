@@ -26,6 +26,421 @@ YOLO 启动默认执行两帧合成图预热，成功标志为 `warmup OK`，不
 PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
   /home/user/miniconda3/envs/mlspaces/bin/python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_yolo_startup_warmup.py
 ```
+最后更新：2026-09-23
+
+### 2026-09-23：分割伪像素导致初始资格误判
+
+`MjOpenGLRenderer` 的物体 ID 分割改用按需创建、复用的无 MSAA 渲染上下文，
+RGB 和深度继续使用原上下文。切换时显式绑定对应缓冲，关闭时释放两个上下文。
+保持 benchmark 可见性阈值与评分规则不变，不对个别场次做豁免。
+
+最小回归：`python -m pytest -q mlspaces_tests/test_opengl_segmentation.py`。
+需要可用的 OpenGL/EGL 环境；缓存、临时目录按本文件约定设置到大容量存储。
+测试只渲染静态合成场景，检查遮挡目标为零像素、移除遮挡后可见、上下文复用、
+RGB/深度切换结果不变和重复关闭安全，不执行策略或物理 rollout。
+
+2027 初始验证使用同一项目渲染器、同一冻结状态对照：原 4x MSAA 缓冲得到
+目标 1 像素并触发 `initial_target_visibility_mismatch`；无 MSAA 分割得到 0 像素，
+全部适用的一致性检查通过，重复检查仍通过。未执行导航或交互动作。
+该场景 RGB 前后有少量通道值相差 1 灰度级（最终验证为 56 个），未达到逐像素完全相等；
+静态合成回归中的 RGB/深度逐值比较通过。未重跑完整场景或批量评测。
+
+### 2026-09-23：M2 交互优先级与失败区域记忆
+
+- M2 公共提示增加：无关容器最后考虑、相关且未搜索容器优先于普通前沿、
+  通向未知/未进入空间的可执行关闭门优先；不引入隐藏目标容器名或场景白名单。
+- 失败前沿按同坐标系内 0.75m 空间邻域记忆，不依赖 frontier ID 或在线 room 标签。
+  首次失败冷却 120 observation steps，再失败后等待成功开门带来的拓扑变化或新 episode。
+  目标抢占的 CANCELED 不计失败；重复终态反馈不重复累计。
+- 低收益 repeat guard 移至模型成功返回、规则 fallback 和候选更新校验之后的共同路径。
+- 修复公开目标 `cellphone` 与感知 `CellPhone -> cell phone` 的同义词匹配；
+  修复扫描因公开目标可见提前停止时仍把打开状态上报成 closed。仍需 evaluator 核验成功。
+- 上一轮 2010 的宏动作证据位于 attempt_002/eval/smooth_interactions/000890.json：
+  target_discovery 距离 0.5674m、806 像素，stopped_on_public_target=true。
+  不应再将其归因为“扫描没看见”或直接按公共 closed 字段认定物理关上。
+- 2003 在开冰箱后仅9个GT目标像素，低于公共感知16像素门槛，M2仍是visible=false。
+  应区分交互位姿误差与目标物体距离；后者当时没有公开目标候选，不能用GT补给策略。
+
+最小检查：`test_frontier_failure_memory.py`、`test_rule_decision_navigation_recovery.py`、
+`test_behavior_candidates.py`、`test_model_policy.py`、`test_candidate_curator.py`；
+评测侧检查 `mlspaces_tests/data_generation/test_benchmark_smooth_interaction.py` 及
+`test_interactive_nav_v3_benchmark_evaluation.py`、`test_interactive_nav_v3_goal_status.py`。
+本轮未启动新30场仿真，既有M2-16K一轮已结束3/30，不能作为本次修改的验证结果。
+
+### 2026-09-23：离线目标外部画面
+
+`scripts/InteractiveNav/render_target_external.py` 读取冻结 benchmark 初态，从目标容器
+前上方绘图。方向来自离线 oracle 接近点，不输出到策略；橙框标识目标容器。
+默认隐藏显式屋顶/天花板；`--hide-walls` 额外隐藏墙体，适合目标被前景墙遮挡时查看。
+画面不是机器人第一视角，也不是评测终态。容器保持冻结初态，不会为展示而自动打开。
+
+```bash
+TMPDIR=/home/ldl/tmp/target-external \
+XDG_CACHE_HOME=/home/ldl/.cache/target-external \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=2 \
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/render_target_external.py \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-index 2007 --scenes-root /home/ldl/molmospaces/assets/scenes \
+  --distance 6 --elevation -50 --hide-walls \
+  --output /home/ldl/outputs/interactive-nav/scene-audit-20260923/2007_external_annotated.png
+```
+
+先创建命令中的 TMPDIR 与缓存目录。替换 episode-index/output 即可绘制其他场景；
+`--azimuth` 可覆盖前向方向。输出同名 JSON 记录相机、隐藏几何、对象状态恢复及可见像素。
+本次 2007/2016 实际渲染成功；8 项辅助函数测试通过。
+
+### 2026-09-23：M2 16K 与抽屉目标完成链路
+
+- 本机本轮使用的 Qwen 8102/8103 已重启为 16384 context、TP1、单卡各 16 并发；
+  保留 GPU 0/1 服务。自定义任务入口与批次托管 Qwen 默认也使用 16384/16。
+- M2 结构化输出最多 512 tokens，输入采用 UTF-8 字节数保守上界，并预留 1024
+  tokens 的模板余量；依次裁剪旧决策历史、额外房间推理、图上下文。
+  不裁剪 mission 或当前候选 ID；若必需内容仍超预算，发送前明确失败，由现有失败路径处理。
+  请求指标记录裁剪前后字节数、窗口大小与保留候选数。
+  `SEMANTIC_M2_CONTEXT_WINDOW_TOKENS` 必须与模型部署窗口匹配；自定义任务入口自动同步。
+- 当前可靠可见、公开距离满足条件的目标在 IDLE / EXPLORE / NAVIGATE / INTERACT
+  均可发起完成核验，不再仅在交互进行中触发。核验等待优先于全局无进展判断。
+  已在成功距离内的当前可见目标不因不一致房间标签被丢弃；远处目标仍遵守房间约束。
+  不利用私有可见性直接成功，保留 evaluator 对实例、距离与必要交互的最终核验。
+- 292 项定向测试与 213 项额外相邻测试通过；补充部署默认值断言后，启动器 23 项测试再次通过。
+  日志：`/home/ldl/tmp/m2-drawer-fix/tests.log`、`/home/ldl/tmp/m2-drawer-fix/adjacent-tests.log`、
+  `/home/ldl/tmp/m2-drawer-fix/launcher-tests.log`。
+- 新回归：`/home/ldl/outputs/interactive-nav/m2-16k-drawer-20260923-local2gpu-30mixed/evaluation`。
+  30 worker、2000–2029 共 30 场，GPU 2/3，ROS 18900–18929；保持原动态预算与
+  observation-turn multiplier=1，不录视频、无自动重试。启动前已通过模型接口确认 16K。
+  本次预算分析针对上一轮，不是尚在运行的新回归结果。
+
+### 2026-09-23：五场针对性修复与本机双卡回归
+
+- 2005：M2 增加通用负面先验，尺寸/用途/存储语义明显不匹配的容器极低优先级，
+  不硬禁未知但合理的容器；移除提示词中的具体物体示例，不注入 episode 名称或私有答案。
+  executor 在 INTERACTING / VERIFYING 的公开 step-sync 到达时暂停自身导航无进展计数，
+  补齐只在决策层暂停、执行层累计跨宏动作 step 的缺口；交互自己的超时限制仍有效。
+- 2004：预规划改用 `/move_base/GlobalPlanner/make_plan`，避免 move_base 顶层服务
+  对 ACTIVE/PREEMPTING 的拒绝；既有导航目标取消/静默确认流程不变。
+  开门后把门另一侧、距门中心 2.5 米内的当前前沿中心加入穿门候选，近点优先，
+  保留原穿门点作备选；这些规划允许未知栅格，但已知障碍仍受 clearance 和 planner 约束。
+- 2013：提示词明确开门后优先探索新可达、未进入的房间，远穿门点失败不代表房间耗尽。
+- 2015：此前仅在收到成功声明并核验后才能提前结束抽屉宏动作。
+  现在将 observe 阶段实际公开发布的目标证据锁存，完成当前抽屉的 10 帧观察后，
+  保持抽屉打开并停止继续扫描/关闭；不等待异步成功声明，也不直接宣告 episode 成功。
+  最终成功仍必须经过声明与 evaluator 核验；私有瞬时可见性不会触发此停止。
+- 2029：无观察 subgoal 的有效前沿 proposal 可直接生成中心候选；中心贴已知墙时，
+  尝试该前沿上距中心最近的足迹安全点，允许未知，仍尊重已知障碍和黑名单。
+
+验证：582 项定向及相邻测试通过；日志 `/home/ldl/tmp/scene-targeted-tests/final-pytest.log`。
+最初的五场测试已按用户要求停止，确认所属子进程已清理，旧产物保留在
+`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu/evaluation`。
+替代测试目录：`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu-mixed30/evaluation`。
+启动日志在同级 `launcher.log`，配置在同级 `config.json`。
+替代测试为 episode 2000–2029，共 30 场、30 worker、GPU 2/3，复用端口 8102/8103 的现有模型服务，
+不重启服务、不占用 GPU 0/1。动态预算 200–2000、M1/M2 30 秒、场景 7200 秒，
+不录视频、不开自动重试，ROS master 使用 18800–18829。
+算法仍为 `8ebb6c33f`；替代测试已通过 30 场入口校验并启动，完整场景性能以最终结果为准。
+
+### 2026-09-23：mixed 2000–2029 场景针对性修复
+
+在 `ee2b3c895` 迁移基线上完成以下修改：
+
+- V3 目标声明必须由 evaluator 核验后通过 `goal_status_verification` 回执确认；
+  决策节点只接受当前 episode、当前 claim ID 的回执。拒绝后恢复 ACTIVE 并等待新候选，
+  回执缺失不视为成功。核验失败不再以 `target_claim_unverified` 结束 rollout。
+  回执只包含是否接受，不把 GT 距离、位置或实例映射传给 policy。
+- 有效前沿没有可用观察点时回退到前沿中心；未知栅格可通行，已知障碍、
+  地图边界、足迹约束及已有前沿黑名单仍有效。标记贯穿 proposal、候选、
+  clearance 与预规划；仿真 launch 启用 global planner 的 allow_unknown。
+- 全局无进展预算保留，但新语义子目标获得最多 20 个 task-step 的启动宽限
+  （不超过单目标无进展预算）；旧任务的累计时间不能在新目标刚选中时终止它。
+  同一子目标的私有 worker 替换不会重置计时，episode 总预算仍保留。
+- 自定义任务入口增加 `CUSTOM_TASK_DRY_RUN=true`，真正校验 `EXPECTED_EPISODES`；
+  入口尊重 `REPO_ROOT` 与 `QWEN_ROOT`，可使用独立固定代码工作树。
+
+定向及相邻回归：714 passed、1 deselected。被排除的旧测试
+`test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill`
+使用不含 `success_criteria` 的 fake episode，报 `KeyError`；已核对相关 runtime
+builder 与 `ee2b3c895` 的 AST 完全相同，没有修改生产逻辑来绕过该旧夹具问题。
+日志：`/home/ldl/tmp/scene-fixes-tests/final-regression.log`。
+
+本次计划运行与 22 日诊断相同的 mixed episode 2000–2029，2 卡、30 worker、
+动态预算上限 2000、M1/M2 30 秒、不录视频；保留当前分支同类过滤与指标 v3，
+因此不能把新旧分数差异全部归因于这三项算法修复。云端资源规格、模型服务参数、
+任务 ID 与部署 SHA 在提交回执中单独记录；测试通过不等于场景成功率已提高。
+
+#### 云任务提交回执
+
+- 任务 ID：`t-20260923165300-kmn8w`；已由 `Queue` 转为 `Running`。
+  EGL preflight 通过，入口确认 30 场 / 30 worker；提交回执时模型服务仍在启动，
+  尚无完整 episode 结果。
+- 平台确认 `Preemptible=false`、`Priority=6`，单实例 `ml.pni2.7xlarge`（2 GPU）。
+- 部署代码固定为 `cdaa6b060734557f2fb62c087e935dc23769e9c8`；
+  独立工作树 `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/code`。
+  该工作树已完成 Release catkin 构建，两个 ROS 包均解析到本工作树。
+- episode 2000–2029、30 worker、动态 step 200–2000、场景超时 7200 秒、
+  M1/M2 请求超时 30 秒、不录视频；入口 dry-run 已校验恰好 30 个 episode。
+- Qwen 保留单 API 服务、TP=1/DP=2；每 rank `max_num_seqs=16`，
+  `max_model_len=10240`、显存比例 0.6。显式覆盖服务脚本默认的并发上限 1。
+  与 22 日本地两独立 endpoint 的部署不同，比较超时/吞吐时必须单独考虑此差异。
+- 任务配置、入口、提交回执保存在
+  `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/`；
+  运行日志为其下 `run/launcher.log`，评测产物为 `run/evaluation/`。
+- 此处回执对应后续文档提交，不改变已冻结的部署代码 SHA。
+  构建和单测通过不代表云端 30 场已完成，也不代表成功率或速度已经改善。
+
+### 2026-09-23：22 日基线八项选择性迁移
+
+分支 `codex/migrate-22-selected` 基于 `d3f27870b`，迁移来源 `8fb9460ae`。
+范围、保留的模型超时、未迁入项与性能验收边界见
+[迁移报告](docs/migration_22_selected_20260923.md)。
+本轮 706 项定向与相邻回归通过，没有运行 ROS 长时仿真。
+
+复现此次测试集合：
+
+```bash
+cd /home/ldl/molmospaces-exp-setting
+export TMPDIR=/home/ldl/tmp/migrate22-tests
+export XDG_CACHE_HOME=/home/ldl/.cache/migrate22-tests
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+export PYTHONPATH=/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_{attribute_inference_request_state,room_attribute_inference,interaction_graph_store}.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_{behavior_candidates,mission_completion,semantic_behavior_executor_static,behavior_execution,rule_decision_navigation_recovery,target_distance_verification}.py \
+  scripts/InteractiveNav/test_{run_benchmark_eval,run_interactive_nav_v3_ros_eval_batch,timeout_monitoring,scene_distractor_filter}.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_{metrics,benchmark_evaluation,goal_status,round_summary,benchmark_cli,public_evaluator_contract,evaluation}.py
+```
+
+监控脚本应从仓库根目录以模块方式启动，避免 evaluation 目录的 `types.py`
+遮蔽标准库。以下 `RUN` 和 `TASK_ID` 需要替换为实际运行目录与云任务 ID。
+collector 只读取已有产物，不启动模型/仿真；周期监控会查询云任务状态。
+
+```bash
+RUN=/home/ldl/outputs/interactive-nav/your-evaluation-run
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.collect_timeout_performance "$RUN"
+TASK_ID=your-cloud-task-id
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.monitor_mllm_timeouts \
+  --task-id "$TASK_ID" --evaluation-dir "$RUN" \
+  --qwen-dir "$RUN/qwen-service" --interval 30 --window 120
+```
+
+### 2026-09-17: 独立模块消融入口
+
+新增 `scripts/InteractiveNav/run_benchmark_ablation.py`，提供 `full`、
+`no_interaction_graph`、`no_task_decision`、`no_outcome_update` 四组。
+原算法、原 launch、原评测器及默认配置保持不变；适配通过运行目录中的 launch-prefix 生效。
+实验定义、边界和命令见 [消融说明](scripts/InteractiveNav/ablations/README.md)。
+其中图消融是高层关系图推理消融，底层候选可行性仍共用原图。
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python \
+  /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_benchmark_ablation.py \
+  --variant no_task_decision --workers 1 --episode-indices 10 --max-steps 20 --dry-run
+```
+
+`--dry-run` 不创建产物，不启动 ROS/模型/仿真。
+本轮 28 项新增消融测试及 100 项原有相关回归通过，共 128 项。
+检查日志位于 `/home/ldl/outputs/interactive-nav/ablation-check-20260917/`；
+已验证三组生成 launch 均可由实际 ROS loader 解析，并且只替换指定的节点。
+这里只验证接口和模块行为，未运行长时仿真或 benchmark。
+
+### 2026-09-17: 完整方法实验基线
+
+Git 标签 `codex/experiment-baseline-20260917` 固定本轮完整方法与评测器代码，
+作为后续模块级消融的共同起点。提交前 HEAD 为 `301f0aff8`。
+这是代码与配置基线，本次未重新运行仿真或完整 benchmark，不代表新增性能验收结果。
+
+- 方法：`full_mllm_object_goal`；M1/M2/M3 分别为
+  `dynamic_mllm / mllm_score / mllm_skill_verified`。
+- 评测器：`interactive_nav_v3_benchmark_eval_v17`；动态预算公式 v2，基础 200，
+  路径超过 3 m 后每米 40，必要通道交互 200，必要容器交互 250，
+  容器每个记录关节 50，向上取整到 50，launcher 硬上限 2000。
+- 默认 launcher：10 worker，episode 10–12、1010–1012、2010–2013，
+  完整录制，本机模型入口 8010。观察轮次倍率保持当前值 1；因此可能先达到观察轮次
+  上限，不能把每场运行解释为一定执行满动态动作预算。后续变更须对所有比较组一致生效。
+- restricted-GT 最大距离 8 m；抽屉 action/M1 最小站距 0.70 m；
+  保留当前容器交互锚点完成判定、drawer scan 完成记忆、静态开门通行与目标冷却修复。
+  容器锚点判定与旧版单纯目标中心距离判定不同，消融组必须共用本基线评测器。
+- Manifest：`interactive_nav_v3_procthor10k_val_release_v1_2` 的 `benchmark/benchmark.json`，
+  3000 episode、639 house，SHA-256：
+  `4021ca2bebd9c875ccc4df70c746d9ed7f2376d13247fa1b7e98f2e9690b219f`。
+- 默认 `benchmark_batch.json` SHA-256：
+  `d535b883a8f0c8758eb9d555a687ae6a366e969c5e9082d7e5b00366775b27b0`。
+- 模型权重、认证、数据集、运行产物及包含个人云端队列/挂载的资源 YAML 不进入本提交。
+  Git 标签不固定外部模型服务；每轮仍需记录模型版本、推理参数和实际生效配置。
+
+提交前验证共 408 项通过：候选生成、执行状态机、决策恢复、交互图、launcher、
+批量调度器、benchmark 预算/指标、restricted-GT 与目标完成契约。
+其中 33 项决策恢复测试需要先加载 `/home/ldl/conda_envs/ros-noetic/setup.bash`；
+其余测试使用 `mlspaces` Python，并将 `semantic_decision_py_pkg/scripts`、
+`semantic_mapping_py_pkg/scripts`、`semantic_mllm_py_pkg/scripts` 加入 `PYTHONPATH`。
+另通过修改文件的 Python AST、Shell 语法、JSON 解析和 `git diff --check`。
+本机检查日志在 `/home/ldl/outputs/interactive-nav/baseline-check-20260917/`，不纳入 Git。
+
+### 2026-09-16: 双卡自定义任务评测 smoke
+
+入口为 `scripts/InteractiveNav/run_v3_custom_task_smoke.sh`，内部使用当前本机统一入口
+`python scripts/InteractiveNav/run_benchmark_eval.py`。提交配置为
+`scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml`
+（本机云端资源配置，含队列及挂载信息，不纳入 Git）。
+配置使用一个 `ml.pni2.7xlarge` 双卡实例：GPU 0/1 分别启动一个 Qwen 35B FP8
+后端（端口 8000/8001），本机 8010 负载均衡器供 10 个隔离的 ROS/MuJoCo
+worker 使用。Qwen 与仿真共享同一实例，启动方式与本机双服务一致。
+测试选择 10 个 episode，覆盖 channel、container、mixed，固定 100 applied steps；
+使用 `--no-recording`，用于验证云端调度、模型服务、ROS 与仿真链路，不作为性能回归。
+
+```bash
+cd /home/ldl
+volc ml_task submit \
+  -c molmospaces-exp-setting/scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml \
+  -n interactive_nav_v3_qwen_10w10s100_$(date +%Y%m%d_%H%M%S)
+```
+
+提交后用返回的 task ID 监控；不要用 CLI `--set TaskRoleSpecs[0]...` 修改副本数，
+当前 CLI 会把数组覆盖解析成无效规格。
+
+```bash
+volc ml_task get -i TASK_ID --output json
+volc ml_task instance list -i TASK_ID --output json
+volc ml_task logs -i TASK_ID
+```
+
+Python 3.10 编译头从 Ubuntu 开发包解压到
+`/home/ldl/.cache/python3.10-dev`，不修改系统 Python 或 Qwen 虚拟环境。
+容器镜像未预装 GLVND 的 EGL loader，因此 `libegl1`/`libglvnd0` 运行库解压到
+`/home/ldl/.cache/egl-runtime`，入口在启动 Qwen 前执行一次 MuJoCo EGL context
+预检；NVIDIA 驱动库仍由双卡实例注入，不复制本机驱动。
+云端容器还必须显式设置 `MLSPACES_CACHE_DIR=/home/ldl/molmo-spaces-resources` 和
+`MLSPACES_ASSETS_DIR=/home/ldl/molmospaces/assets`。否则资源管理器会在容器默认
+home 下重新初始化资源；首个 worker 持锁联网，其余 worker 会长期阻塞在 `.lock`。
+同时设置 `NLTK_DATA=/home/ldl/nltk_data`，复用已有 WordNet，禁止 worker 向
+`/root/nltk_data` 下载语料。
+共享输出目录为
+`/home/ldl/outputs/interactive-nav/custom-task-TASK_ID/evaluation`。重点检查
+`resource_telemetry.csv`、`summary.csv`、各 episode 的 `eval.log`，以及
+`task-state/evaluation.exit_code`。任一 episode、Qwen、环境预检或 batch runner
+失败都会令自定义任务失败，避免平台显示 Success 时掩盖评测未实际运行。
+
+### 2026-09-15: 到达判定与无动作恢复回归
+
+- 目标导航候选与最终图验证都检查对象距离；导航锚点到达不能替代目标成功距离。目标视点在成功半径内生成，受阻时检查其他方向，保留当前可见且已到达目标的无移动验证路径。
+- `require_current_visibility=false` 时，可靠历史观测与当前对象距离共同决定到达，允许抽屉关闭后接近已观测目标；这与 evaluator 的公共观测证据账本一致。显式开启实时可见性要求时仍检查当前帧；历史可见不能绕过距离阈值。
+- 无有效 frontier 但仍有未解决交互对象时，允许有界恢复扫描。无候选等待保留 120 观察步上限，并增加 30 秒空闲上限；扫描执行时间不计入空闲墙钟时间，避免与 bridge 的 60 秒无新动作保护竞态。
+- 门 M1 在完整入镜前提下，按同一对象的相邻源帧累计稳定观测；不再以旋转扫描中包围框 IoU 作为连续观测的必要条件。重复帧不累加、间断帧重置，精确 RGB 配对与后续状态确认仍保留。
+- 三轮端到端复测使用 `run_interactive_nav_v3_ros_eval_batch.py`、动态预算与完整录制。正式评估以 `applied_action_step_count` 为预算单位，不能用录像帧数比较预算；任务失败与执行进程失败分开统计。复测与并发结论须以最终批次报告为准，不能仅凭以下单测宣称全部场景成功。
+
+最小回归（从仓库根目录运行，复用已有 Conda 环境）：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python - <<'PY'
+import sys
+from pathlib import Path
+root = Path.cwd() / "Interactive-Nav-SG-nav"
+sys.path.extend(str(p) for p in (root / "src").glob("*/scripts"))
+sys.path.extend([
+    "/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages",
+    str(root / "devel/lib/python3.11/site-packages"),
+])
+import pytest
+decision = root / "src/semantic_decision_py_pkg/tests"
+tests = [decision / name for name in (
+    "test_behavior_candidates.py", "test_behavior_execution.py", "test_mission_completion.py",
+    "test_rule_decision_navigation_recovery.py", "test_target_distance_verification.py",
+)]
+tests.append(root / "src/semantic_mapping_py_pkg/tests/test_attribute_inference_request_state.py")
+raise SystemExit(pytest.main([*(str(p) for p in tests), "-q", "-p", "no:cacheprovider"]))
+PY
+```
+
+### 2026-09-15: 轻量录制配置与动态预算
+
+- 配置入口：`scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf`，详细说明见同目录 `README.md`。单场命令只需输出目录与 episode index；可用第三个参数传入 Bash 覆盖配置。
+- 默认动态预算、上限 2000；关闭 `events.jsonl` 与离线六宫格 PNG，保存精简且 gzip 压缩的 `step_boundaries.jsonl.gz`。保留完整图 6 数据与终止摘要，旧 JSONL 仍可重绘。
+- 每场保存 `config/effective_config.env`、四份算法 YAML、ROS 日志配置；不复制凭据内容。Python ROS 日志默认 WARN、每文件 5 MiB 加 2 份轮转，控制台日志不是严格总量配额。
+- M2 使用五步逻辑提示词与独立 `selection_reasoning_effort=low`，1536 token 总上限、30 秒超时；超时仅重试 1 次，退避 1 秒（最大等待约 61 秒）。`SEMANTIC_M2_ENDPOINT` / `SEMANTIC_M2_MODEL_NAME` 可把 M2 切到更强的 OpenAI-compatible 文本模型，不改变视觉 M1/M3；未设置时沿用共享模型。仅消费最终 JSON；需区分请求推理模式与后端实际返回 reasoning token。
+- 历史对照（实际 applied action）：Container 动态 650、成功 202；Mixed 动态 1000、首次失败 1000、复跑成功 685；旧 Channel 动态 650、历史失败 1000。这不是动态预算下的新仿真结果。
+
+```bash
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  /home/ldl/outputs/interactive-nav/my_eval 0
+```
+
+### 2026-09-15: Benchmark v16 感知与门 M1 接口修复
+
+- 默认评测数据改为 `interactive_nav_v3_procthor10k_val_release_v1_2`，三类各 1000 条。旧 v1.1 的 2968 条结果和质量门控签名不沿用。
+- Benchmark 感知移除额外的 512 像素平方 bbox 面积门槛；保留像素、短边、距离和投影可见范围检查。图像里可见不等于已通过这些过滤，不应把没有发布解释为物理不可见。
+- `doorway` / `doorframe` / `door_leaf` 统一公开类别为 `door`，保留 `obj_…` 身份；帧头携带同一采集时刻的相机 `observation_pose_xyyaw`，使门的多视点 M1 门控能够正常请求。
+- 最小回归：`python -m pytest mlspaces_tests/data_generation/test_v3_semantic_minimal_bridge.py mlspaces_tests/data_generation/test_ros_object_goal_evaluator_adapter.py mlspaces_tests/data_generation/test_restricted_gt_perception.py mlspaces_tests/data_generation/test_benchmark_current_contract.py`。
+- 本次未重新运行仿真；此前 v15 视频不能作为 v16 端到端验收。整体 AABB 包含也不能作为真实容器内腔关系的证据。
+
+### 2026-09-15: 跳过等待后的十场并行 500-step 回归
+
+- 当前可提交的完整性能记录：[2026-09-15 性能检查点](docs/interactive_nav_performance_20260915.md)。提交前扩大回归 1218 + 13 = 1231 项通过；没有重新启动另一轮仿真。
+- H1-H10、seed=house、10 worker、500-step 上限，原生线程各 1、录制开启；8 场达到上限，H2/H3 在 371/286 步因 `no_eligible_candidates_after_bounded_recovery` 提前结束，共 4657 步。整批墙钟 725.060 秒；平均 0.751 秒/step，P95 1.047 秒。
+- 相比最近十场 R5：平均 step 耗时下降 2.1%，覆盖率 72.15% -> 72.20%；门调用/物理成功 10/4 -> 11/6，另有 1 次静态通道确认，门失败 6 -> 4；容器调用/成功均为 8/8，无待返回。两轮还相差横移修复与机器人锁定缓存，不是跳过等待的单变量 A/B。
+- `navigation_hold` 207 步，ready 后平均等待 0.619 ms、最大 0.924 ms；无未 ready 放行、无误计动作超时。M1 237/237 无请求错误或超时。GT 分母、批处理参数与 R5 十场均一致，源码运行期间无变化。
+- 十个视频 exact-step 对齐，全部 4657 帧完整解码通过。日志审计未发现运行期崩溃；H2/H3/H4/H6/H8/H9/H10 仍有关闭期内存释放告警。本轮专用端口 16201-16210 已释放。
+- 不能宣称逐场无退化：H3 覆盖率 45.73% -> 27.82%、无交互且提前结束，该场未触发 navigation_hold；H10 的 17.84 个百分点提升几乎抵消了 H3 的下降。H8 容器成功 1 -> 0。结果、逐场耗时、差异说明及全部视频见 [本轮报告](/home/ldl/molmospaces-exp-setting/outputs/navigation_hold_500/report.md)；原始批次为 `/home/ldl/outputs/interactive-nav/batch_timeopt_navigation_hold_500_20260915_020704`。
+
+### 2026-09-15: 交互期间跳过导航指令等待
+
+- 仿真主循环仅在交互控制器 `should_pause_navigation()` 为真时，调用 `RosBridgePolicy.get_action(..., hold_navigation=True)`。原传感器发布和本帧地图 ready 等待完成后返回保持动作，记录 `action_source=navigation_hold`，不计入连续动作超时；未 ready 时保留原导航等待路径，其他调用者默认行为不变。
+- 保留原 fresh-command gate、step sync、录制 ACK、`task.step`、交互 before/after 回调和躯干视角目标；未修改物理子步、交互步数、距离、容差、地图发布频率或其他优化项。
+- 验证 142 项通过：`mlspaces_tests/test_ros_bridge_navigation_hold.py`、`test_nav_ros_scene_timeout.py`、`test_ros_bridge_policy_twist.py`、`test_force_interaction_bridge.py`、`test_force_robot_lock_cache.py`、`test_force_contact_lookup.py`。新测试覆盖延迟 ready、ready 失败、bootstrap、ROS shutdown、普通导航超时，以及保持 20 步后第 21 步恢复导航，逐步检查传感器/录制与躯干指令保留。
+- 测试使用下述组件验证相同的 `/home/ldl` 临时/缓存目录、Conda Python 与 ROS `PYTHONPATH`，通过 `python -m pytest -q -p no:cacheprovider` 运行这六个文件。本次没有启动 500-step ROS 仿真，不据此宣称整场性能提升。
+
+### 2026-09-15: 后续耗时优化的组件验证
+
+- 本次只修改交互期间的机器人锁定回调，缓存同一次交互的 base/group views、零速度模板和控制数组形状；模型、data 或 robot view 更换时退回原查询路径。保留全部物理子步、锁定回调、`mj_forward`、相机更新以及 base ctrl setter，不调整交互距离或容差。
+- 定向测试 99 项通过。新增真实小型 MuJoCo 力驱动轨迹逐元素对比、yaw 跨界与缓存失效测试；交互状态机同时覆盖 3/20 步，第 20 步之前不返回完成，物理子步计数不变。该次组件验证时尚未实现“交互时跳过导航动作等待”，不能把该测试当作这一优化的端到端验收。
+- H1 静态组件微基准：锁定回调 9.301 -> 9.271 ms/次，约 0.3%，收益很小；其中 `mj_forward` 约 9.048 ms。渲染场景更新复用约节省 0.1 ms/三通道渲染，去重 RGB readback 约节省 0.8-1.0 ms；三个视角中的一个连原始基线 RGB 重复渲染都不完全一致，因此未修改生产渲染路径。
+- H1 静态 GT 的位打包压缩样本约 17.1 KB，解压逐位一致；新地图算法与旧评测相差 6648 个可导航像素，旧算法重放精确复现旧分母 1789027。正式缓存必须固定算法、资产和机器人半径版本，不可直接改变历史覆盖率口径。
+- 本次未跑 500-step ROS 回归、未做全量 GT 扫描。完整命令、实测数据、并行扫描/报错方案及六项建议见 [后续优化分析](/home/ldl/molmospaces-exp-setting/outputs/speed_followup_20260915/report.md)。
+
+### 2026-09-14: 横移修复后 H1 单 worker 500-step 实测
+
+- H1、seed=1、1 worker、原生数值线程 1、500 step 已完成；运行期间源码哈希未变。总墙钟 757.865 秒，step 总计 506.351 秒，平均 1.013 秒/step，P50 0.805 秒，P95 2.691 秒；视频 500 帧 exact-step 对齐且抽样可解码。
+- 覆盖率 43.99%。门指令 2 次，成功 1 次，另一次在 step 497 发出、500 步结束时未返回；容器 1 次成功，为抽屉扫描。M1 28 次全部有效返回。关闭阶段仍有一次内存释放告警。
+- 1579 条 stamped 速度指令全部 vy=0，无横移拒绝保护触发；实际位姿估计侧向速度峰值仍有 0.133 m/s，不能宣称物理侧向位移完全消失。
+- 对照上轮 10-worker 的 H1：平均 0.915 秒/step，覆盖率 49.67%，无成功物理交互。本轮普通步均值约快 8.9%，但更多交互前置控制增加约 83.1 秒，使完整均值慢 10.6%。两轮横移修复、路线及交互不同，不是并发数单变量 A/B，不代表无质量退化。
+- [视频、逐阶段耗时、残留问题与复现命令](/home/ldl/molmospaces-exp-setting/outputs/h1_lateral_fix_500/report.md)；[原始输出](/home/ldl/outputs/interactive-nav/batch_h1_lateral_fix_1worker_500_20260914_213404)。
+
+### 2026-09-14: 非全向导航横移修复
+
+- DWA 保持 `min_vel_y=max_vel_y=0`，将 `acc_lim_y` 从 0 改为 2.5，`vy_samples` 从 0 改为 1。横向制动窗口现在覆盖 `max_vel_trans=0.5` / `controller_frequency=5` 的一个控制周期，避免把非零 odom 横向速度重新采样为导航指令。
+- 当前十场仿真入口 `scripts/InteractiveNav/run_nav_ros_sim.py` 默认 `--allow_lateral_cmd_vel false`；残留非法横移指令整步保持当前位姿，记录 `action_source=lateral_cmd_vel_rejected` 和累计拒绝告警，不仅截断横向分量后继续执行原前进/转向分量。明确使用全向规划器时可以设为 true；通用 `RosBridgePolicy` 默认仍兼容全向调用者。
+- 保留真实 odom 横向速度、前向/旋转速度参数、3.0 线速度增益、0.2 秒控制周期、交互与到位条件。没有修改底盘物理或强制清零实际速度。
+- 验证：相关 Python 回归 204 项通过；本机 ROS DWA 动态窗口七组输入均只产生 vy=0，旧 acc_lim_y=0 负对照能复现失败；H1 的 2057 条原始消息转换回放中，937 条横移指令被拒绝、1120 条正常指令保持原样。这不是场景重跑，尚未验证修复后十场运动与覆盖率。
+- 扩展回归需将 `/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages` 加入 `PYTHONPATH`，与五轮评测原有测试环境一致；否则既有 executor 测试的 ROS stub 缺少 `rospy.numpy_msg`。命令与结果见 [修复验证](/home/ldl/molmospaces-exp-setting/outputs/nav_lateral_fix/report.md)。
+- 前后视频均为 15 fps，每仿真步 0.2 秒，没有改变播放倍率。R0->R5 的 H1 `timeout_noop` 从 139 减至 32，轨迹长度从 11.98 增至 21.93 m；视频运动更连贯还包含轨迹变化和原有异常横移，不能仅用计算加速解释，也不是提高了速度上限。
+
+### 2026-09-14: 五轮时间优化评测
+
+- 检查点为 `c0386aa4e`（时间优化前）。已完成额外同代码 R0 对照及五轮 H1-H10、10 worker、500-step 上限评测；优化改动尚未提交 git。
+- 最近完整评测 R5（横移修复前）：实际 4840 step，9 场满 500，H2 在 340 step 提前结束；加权平均 0.768 秒/step、P95 1.083 秒、整批墙钟 844.173 秒。R0 为 1.551 秒/step，因此平均降低 50.5%。覆盖率 72.15%，门调用/成功 10/4，容器 8/8，无待返回命令。
+- 不代表全面无退化：H1 本轮门成功和容器调用均为零；六次门失败全部为 `non_articulated` 拒绝。关闭期的内存释放告警仍存在。R4 首次数组真假判断异常已修复并完整重跑，失败现场保留。
+- 五项实现分别是原生线程限制、深度射线/掩码复用、ROS NumPy 地图传输、地图预处理按掩码复用、交互接触拓扑查询缓存。未改变分辨率、物理步数、交互距离、安全距离和到达条件。
+- 批处理新增 `--native-threads-per-worker`，默认 `1`，`0` 保留库默认；显式设置的 `OPENBLAS_NUM_THREADS` / `OMP_NUM_THREADS` / `MKL_NUM_THREADS` 优先，并记录在场景结果的 `native_thread_environment` 中。
+- 最终相关测试 1180+13=1193 项通过；两处同名 `test_force_interaction_bridge.py` 分开运行。六个有效批次的 60 个视频均 exact-step 对齐，运行期间源码未变；测试不等于全仓库验收。
+- [完整报告、历史对照与复现命令](/home/ldl/molmospaces-exp-setting/outputs/time_optimization_5rounds/report.md)；[逐场数据及最新十个视频](/home/ldl/molmospaces-exp-setting/outputs/time_optimization_5rounds/report_tables.md)。最新输出：`/home/ldl/outputs/interactive-nav/batch_timeopt_r5_contacts_500_20260914_192049`。
+
+### 2026-09-14: 到位净空、M1 请求归属与深度投影回归
+
+- `candidate.navigation_clearance_enabled`：full MLLM 配置启用候选发布前净空检查；过滤发生在生成索引对齐的 capture/action 列表之前，不修改已执行中的锚点编号。
+- 当前候选筛选、替代探索点搜索及门/容器执行净空只检查机器人半径 + 安全余量 + 栅格半对角线，不再叠加到位容差；进入位置容差后不再检查 XY 容差，只检查实际位置的碰撞净空。探索模块原有的 0.40 m 足迹筛选、各类站位档位与到达容差保持不变。
+- 去掉到位容差后的定向回归 434 项通过，覆盖净空、候选生成、导航执行、到位锁定、门前姿态和探索恢复；该修改已作为上方时间优化的 R0 对照重跑。下方保留修改前的历史批次。
+- `executor.drawer_fallback_bbox_wait_task_steps: 8`：M1 失败后的抽屉 bbox 延迟可原地等待新帧，30 秒为失活保护；超出预算可重试，不永久排除对象。
+- 当前物体表面距离：抽屉按后续要求改为 `0.50/0.85/1.00 m`，冰箱 `1.15/1.35/1.55 m`，其他容器 `0.50 m`，门交互 `0.95/1.20/1.45 m`，门复观测 `0.85/1.10/1.35 m`。
+- 重点测试：`test_navigation_clearance.py`、`test_behavior_candidates.py`、`test_semantic_behavior_executor_static.py`、`test_attribute_inference_request_state.py`、`mlspaces_tests/test_depth_continuity_equivalence.py`。
+- 原始 H10 地图回放和投影微基准：`outputs/analysis_runtime500_20260914/verify_clearance_runtime_fixes.py`。结果与命令约束见同目录 `clearance_runtime_fixes.md`；不启动仿真，不改原始 batch。
+- 深度投影优化保留图像尺寸、深度阈值、物理步数和录制精度。微基准的阶段加速不等于 10 worker 的整场加速。
+
+优化前实测：`/home/ldl/outputs/interactive-nav/batch_minimalfix_h1_h10_500_20260914_155635`，最小导航修复后 H1-H10、10 worker、500-step 上限，总墙钟 1286.160 秒（含启动、仿真、清理、离线视频和分析）。实际 4529 step，实测加权平均 1.576 秒/step，P95 2.544 秒（不含启动和后处理）；H2/H3/H5 分别在 421/151/457 step 因有界恢复后仍无可执行候选而提前结束，其他 7 场达到 500 step。门交互调用/成功为 5/3，容器为 6/6；平均覆盖率 66.54%。10 个视频 exact-step 对齐且可解码，无悬而未决的交互命令，运行期间源文件未变化。启动前相关测试 623 项通过。
+
+本轮不代表性能验收通过：相对上一轮，平均覆盖率从 68.60% 降至 66.54%，H7/H8 分别从 99.60%/36.22% 降至 83.40%/20.52%，门成功数从 6 降至 3，H3 仍有导航停滞。日志审计未发现关闭前崩溃；各场关闭阶段存在内存释放错误，H7/H9 另有向已关闭 ROS topic 发布的异常。明细、视频入口和原始审计见最新目录的 `results_500.md`、`results_500.json`、`interaction_audit_500.json`、`step_timing_summary.csv` 和 `step_phase_timing.csv`。复现入口：`outputs/analysis_minimalfix_500_20260914/run_timed_batch.py`；汇总入口：同目录 `report_batch.py RUN_DIR`。
+
+上一轮实测：`/home/ldl/outputs/interactive-nav/batch_clearance100_h1_h10_500_20260914_112848`，H1-H10、10 worker、500-step 上限，总墙钟 1172.989 秒。实际 4018 step，加权平均 1.428 秒/step，P95 2.194 秒；H2/H3/H4/H5/H10 分别提前结束于 319/106/217/430/446 step，因此不算完整的 5000-step 回归。10 个视频 exact-step 对齐，运行中源文件未变化。明细为该目录的 `step_timing_summary.csv`、`step_phase_timing.csv`、`step_timing_report.md` 和 `results_500.json`。原始计时保留在各场 `sim/step_timing.jsonl`。
+
+上一轮距离/净空定向测试 94 项通过；额外的 `test_nav_goal_orientation_config.py` 有 3 项既有配置契约不匹配（orientation 0 对旧断言 3、DWA path bias 30 对旧断言 18、V3 的冰箱角度/净空开关与探索配置不同），未为此次运行改动这些无关参数。复现入口：`outputs/analysis_clearance100_500_20260914/run_timed_batch.py`；耗时汇总入口：同目录 `report_step_timing.py RUN_DIR`。
 
 ## 1. 文档定位
 
@@ -390,6 +805,54 @@ conda run -n mlspaces python -m pytest -q \
 ---
 
 ## 3. 环境与路径
+
+### 2026-09-14 执行与感知回归
+
+- 原始仿真入口启用 `publish_odom_twist=True, odom_twist_source="step_delta"`，按仿真控制 dt 计算实际位姿差分，同一步重复发布保持同一速度。离散位置控制动作结束时 qvel 接近零，不能把该瞬时停车速度当作上一控制步的运动，也不能使用墙钟 step 耗时估计速度。其他入口的瞬时速度模式保持兼容。
+- 已发出的物理命令持有执行所有权直到匹配的 backend result。后台每秒在 `interaction_action_feedback` 发布带 command ID 的 RUNNING 进度，不携带私有资产名。
+- `interaction_execution_stall_timeout_s=60`、`interaction_execution_wall_cap_s=600` 为失联/硬上限保护；drawer scan 仍受任务步预算约束。超限发布 EXPLORATION_STALLED 并保留所有权，结束本场，不在后台仍忙时派发新目标。
+- M1 targeted refresh 区分 waiting_for_view / pending / in_flight；无有效视图最多等 `interaction_observation_view_wait_task_steps=6`，已入队请求仍使用原观测预算。过期未入队请求被撤销，晚到状态不能把 in_flight 降为 waiting_for_view。
+- 门共识的补充视角不再受普通物体成功缓存抑制；仍保留不同视角、完整画面和三次状态确认。门框检测以可见范围而非实心面积衡量投影覆盖，保留连通分量、像素数量和短边阈值。
+- 交互导航偏离同一 global path 超过 0.35 m 时，每隔至少 20 个任务步重规划一次，最多 3 次；进入位置容差后不触发这类重规划。local inflation 保持 0.45 m。
+- 导航无步进兜底从 5 s 调整为 30 s，任务步超时预算不变；房间颜色在线/离线共享稳定 ID 配色，不再每 8 个 ID 重复。
+
+按下节 PYTHONPATH 配置运行两个 ROS Python 包的完整 tests，并加上
+`mlspaces_tests/test_force_interaction_bridge.py`、
+`mlspaces_tests/test_semantic_video_offline.py`、
+`mlspaces_tests/test_interactive_nav_runtime_regressions.py`、
+`mlspaces_tests/test_organized_depth_scan.py`。
+
+本次端到端为 H1-H10、seed=house、10 worker、horizon=500、录制开启，
+每场独立 master 端口 16001-16010；输出使用新的 runtimefix 批次目录，
+不能用 500 步结果直接与上一轮 1000 步的最终覆盖率作等价比较。
+
+### 2026-09-13 批次故障回归
+
+轻量测试覆盖真实 rospy 序列化、M1 配帧与入队、房间分裂/合并确认、
+交互失败兜底、视角去重、导航客户端恢复、局部净空及视频因果时序。
+无需启动仿真或 ROS master；使用已有 mlspaces 的 pytest 加载 Conda ROS 库，
+避免因 rospy 缺失而跳过关键测试。
+
+```bash
+cd /home/ldl/molmospaces-exp-setting
+export TMPDIR=/home/ldl/.cache/interactive-nav-regression/tmp
+export XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-regression
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$PWD:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages"
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_semantic_video_offline.py
+```
+
+执行真实仿真前，应先检查 M1 `image_pairing.stage=paired` 以及对象请求
+`enqueued/started` 计数。`interaction_observation_timeout` 不等于 HTTP 请求超时；
+`header.seq` 不等于 task step。动作兜底不会伪造 M1 ready 或 open 状态，
+仍须通过物理位姿检查；抽屉扫描仍要求同帧有效的公开检测框。
+
+长时间仿真需另行确认。单元测试和保存候选回放通过不代表物理交互成功率已恢复，
+也不能证明 move_base 原生崩溃的内部原因已消除。
 
 ## 3.1 常用环境
 
@@ -1375,12 +1838,54 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.y
 
 ### 5.3.3 冻结 V3 单 episode 可视化评测
 
+当前 ROS benchmark 使用 `interactive_nav_v3_benchmark_eval_v15`。复用原始
+`AtomicForceInteractionController` 的 smooth 状态机：转换 5 步、每抽屉打开观察
+3 步、关闭并恢复视角；这些步骤真实调用 task.step、发布受限观察并进入录制，
+计入动作预算和观察步号。`drawer_scan` 扫描选定容器全部抽屉，不要求 M1 region；
+`drawer_open` 仍按 region 选择。单场和 batch 均默认 15 fps。门候选采用原始
+unknown-state 逻辑，M1 distinct-view 到达容差为 0.15 m / 0.20 rad。
+锚点阻挡确认最少连续 3 次不同地图更新，中途恢复 clear 则恢复同一锚点导航。
+每次 smooth 交互的私有阶段、实际打开比例和录制步号保存在
+`eval/smooth_interactions/*.json`；必须结合视频的 open/observe/close 验收，不能
+只看后端 success。v15 与历史 fast 运行的步数、视频和性能结果不可混算。
+
+上一版 evaluator 协议为 `interactive_nav_v3_benchmark_eval_v14`：受限 GT 和同状态 RGB
+使用相同源时间戳（包括宏内开/关观测），交互前置条件复用原始执行器的容差与选面检查，
+公开结果保留姿态失败恢复类型，V3 候选开启导航净空检查。不要把 v13/v14 结果合并计分。
+执行器通过 fresh-command window 的源时间戳将 RGB 绑定到明确的任务步号，
+不再把 ROS 自动改写的 `Image.header.seq` 当作任务步号；额外宏观测不会推进旋转预算。
+同步 force 宏在真实执行进度点发送 command-scoped `RUNNING` 反馈，避免长抽屉扫描
+被新版执行器误判为后端未确认；完成后停止反馈，仍保留进度停滞和总时长保护。
+交互仍是历史 benchmark 的同步 fast 宏，不是原始 smooth 逐 task-step 交互；宏内 RGB
+不额外增加 evaluator 动作步或六联图 step marker。
+
+三类录制 smoke 使用各 domain 文件的 episode 0、固定 200 applied-step 上限，
+分别选择空闲 ROS 端口和全新输出目录。例如 channel：
+
+```bash
+TMPDIR=/home/ldl/tmp/v3-smoke \
+XDG_CACHE_HOME=/home/ldl/.cache/v3-smoke \
+HF_HOME=/home/ldl/.cache/v3-smoke/hf \
+TORCH_HOME=/home/ldl/.cache/v3-smoke/torch \
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+BENCHMARK=/home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/channel.json \
+ROS_MASTER_URI=http://127.0.0.1:16451 \
+MAX_STEPS=200 MIN_STEPS=200 STEP_BUDGET_MODE=fixed FAST_EVAL=false \
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  /home/ldl/outputs/interactive-nav/v3_smoke_channel_new 0
+```
+
+container/mixed 分别替换 domain 文件、端口和输出目录。验收同时检查 M1 status 的
+`image_pairing.stage=paired`、`reason=matched`，episode result、真实交互结果及
+`offline_video_summary.json` 的帧数/对齐状态；不能把 wrapper 退出 0 等同于任务成功。
+GT 先于对应 RGB 到达时可出现短暂等待计数，需区分随后配对成功与持续配帧失败。
+
 冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master 和 ROS 算法栈；默认还会启动 recorder，并强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
 
 ```bash
 ROS_MASTER_URI=http://127.0.0.1:11311 \
 MAX_STEPS=1000 \
-VIDEO_FPS=5 \
+VIDEO_FPS=15 \
 bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/v3_container_episode_1000 1000
 ```
@@ -2374,6 +2879,289 @@ python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
 输出包含整体及各角色的准确率、有效响应率、逐题耗时、token、reasoning token、可见输出 TPS，并同时生成 CSV。
 视觉属性和交互反馈只输入目标 `2D bbox` 裁切；交互反馈只使用交互后的单张目标图。
 
+### 模块 2：历史决策离线 replay
+
+无需启动 ROS 或仿真，可将已保存的 `mllm_metrics.jsonl` 与
+`debug/raw/step_boundaries.jsonl.gz` 连接成只含公开感知信息的 M2 测试集：
+
+```bash
+DATASET=/home/ldl/outputs/interactive-nav/m2-replay/<RUN_NAME>
+TMPDIR=/home/ldl/tmp/m2-replay-extract \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-replay-extract \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py extract \
+  --input-root /home/ldl/outputs/interactive-nav/<EVAL_RUN>/evaluation \
+  --output-dir "$DATASET"
+```
+
+输出包括 `cases.jsonl`、带 SHA256 的 `manifest.json` 和
+`annotations.template.jsonl`。旧录像未保存 policy 内部的精确
+`recent_decisions`，这类 case 会标记为 `reconstructed_public_context` 及缺失字段；
+不得将其描述为逐字节请求复现。模型输入经过递归隐私审计，不包含
+`target_instance_id`、oracle plan、required interaction 或 recorder 的
+`gt_observations`。
+
+仅测试 M2 并与原模型输出或人工标注对比：
+
+```bash
+OUT=/home/ldl/outputs/interactive-nav/m2-replay-results/<MODEL_NAME>
+TMPDIR=/home/ldl/tmp/m2-replay-run \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-replay-run \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py replay \
+  --dataset "$DATASET" \
+  --output-dir "$OUT" \
+  --endpoint http://127.0.0.1:8000/v1 \
+  --model <MODEL_NAME> \
+  --timeout-s 30 \
+  --max-retries 1 \
+  --annotations "$DATASET/annotations.template.jsonl"
+```
+
+`recorded_top1_agreement` 只表示相对历史 policy 的行为一致性，不是准确率。
+填写 `acceptable_top1_ids`、`preferred_ranking` 或 `forbidden_ids` 后，才会生成
+`acceptable_top1_accuracy`、`preferred_mrr` 和 `forbidden_top1_rate` 等正确性指标。
+可通过 `--prompt-file` 比较提示词，通过 `--case-id`、`--limit` 运行小切片。
+
+若要只替换 M2 文本模型，先确认目标服务的 `/v1/models` 中确实暴露该模型，
+再在本地未提交的 dotenv 中设置（不会改变 M1/M3）：
+
+```bash
+SEMANTIC_M2_ENDPOINT=https://<strong-model-host>/v1
+SEMANTIC_M2_MODEL_NAME=<served-model-id>
+SEMANTIC_M2_API_KEY_ENV=SEMANTIC_M2_API_KEY
+SEMANTIC_M2_TIMEOUT_S=30
+SEMANTIC_M2_TIMEOUT_RETRY_COUNT=1
+SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S=1
+```
+
+当前开发机可用的本地服务/权重仍是 `qwen3.6-35b-a3b-fp8`；没有第二个更强的本地
+文本模型可供切换，因此已有 high-reasoning replay 只证明同一权重的协议/行为稳定性，
+不能写成“更强模型提升”。接入远端或新权重后，用同一 `cases.jsonl` 和人工标注再比较。
+
+#### M2 并发镜像与同提示词模型对比（2026-09-22）
+
+本轮使用 166 条公开历史快照。以 episode 分组冻结 dev/holdout 后，由独立
+subagent 盲审规则生成标签；标签不读取历史回答或本轮预测。主指标只计能够
+区分优劣的多候选请求：dev 30、holdout 72；46 条单候选另报，18 条歧义/证据
+冲突不计主分数。该分数是公开策略规则接受率，不是人工真值准确率或导航 SR。
+规则与数据集见 `/home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/`。
+
+冻结的候选提示词为
+`scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt`。
+它仅用于显式指定的 replay。开发集选择后，原/优化提示词分别在完整 166 条上
+运行；独立 holdout 为 51/72 → 53/72，尚不足以确认闭环收益。同一优化提示词下，
+Qwen / GPT / Gemini 的 holdout 分别为 53/72、58/72、60/72；Gemini 的 4 条
+开门后穿越阶段样本仅通过 2 条，需与整体探索排序分数一起看。GPT 有 1 条
+服务过载失败，保留在评分分母；Gemini 恢复后正式请求 166/166 有效。
+完整结果、逐条输出和复算脚本位于
+`/home/ldl/outputs/interactive-nav/m2-mirror-20260922/report.md`。
+
+本地高并发测试（需先有健康的 Qwen 服务）：
+
+```bash
+TMPDIR=/home/ldl/tmp/m2-mirror-20260922 \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-mirror-20260922 \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_replay_eval.py replay \
+  --dataset /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv \
+  --annotations /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/annotations.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --endpoint http://127.0.0.1:8000/v1 --model qwen3.6-35b-a3b-fp8 \
+  --concurrency 32 --timeout-s 90 --max-retries 1 --max-tokens 1536 --reasoning-effort off \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-mirror-local-new-run
+```
+
+远端配置文件使用 `url`、`key`、`model1`、`model2` 字段，凭据只在进程内读取。
+以下命令对两个模型合计限流：8 并发、任意滚动 60 秒最多 28 次请求，重试也
+占用配额。若服务配额按模型独立计算，可分别使用 `--model-key model1` 和
+`--model-key model2` 启动独立进程，各自设为 8 并发、26 RPM；本轮用户后续
+确认按模型独立配额执行。先用 `--limit 1` 和独立输出目录做协议预检。
+
+```bash
+TMPDIR=/home/ldl/tmp/m2-mirror-20260922 \
+XDG_CACHE_HOME=/home/ldl/.cache/m2-mirror-20260922 \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/m2_mirror_compare.py \
+  --env-file /home/ldl/.env \
+  --dataset /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv \
+  --annotations /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/annotations.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --concurrency 8 --requests-per-minute 28 --timeout-s 90 --max-retries 1 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-mirror-remote-new-run
+```
+
+若本机继承了 SOCKS 代理但环境无 `socksio`，且该服务可直连，可仅在本次命令前
+加 `env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy`。
+本轮 Gemini 早期两次返回 `User location is not supported for the API use`，
+用户恢复服务后预检通过，再执行正式 166-case 测试。预检错误只记录为服务故障，
+不混入恢复后的正式模型成绩。
+
+#### M2 公共事实上下文与 Qwen 消融（2026-09-22）
+
+在线 M2 保持提示词不变，新增初始/当前位置、实际房间访问序列、最近30次决策、
+房间/门/容器几何和房间前沿统计；房间关键物体只保留名称，不发送可见性标记、
+规则房间评分或房间—目标匹配结论。默认候选池为最多12个去重前沿加全部有效交互/
+导航候选；`model_policy.candidate_pool_mode=legacy` 保留旧裁剪策略作消融。
+`include_pre_scores` 默认false；后置执行守卫并未关闭，离线主指标只评原始模型选择。
+在线机器人坐标按位姿时间戳通过TF转换到图坐标系，转换失败标为未知，不假设坐标系
+一致；不改变导航执行位姿。房间前沿统计按实际提取时间检查新鲜度，旧状态重发不会
+刷新有效期，缺失/过期统计不伪装成零。
+
+历史重建禁止使用请求之后的图、反馈或完整场景GT。旧日志中请求开始时间仍是估计值，
+图版本精确对齐不等于原HTTP请求完整恢复；图版本较旧、历史不完整、前沿长度下界均
+须标记。最近30条是上限，不能将实际只有数条的记录凑满。新在线请求直接保存
+`public_request` 和 `request_started_ts`，后续不必再依赖异步快照拼接。
+
+以下命令从仓库根目录运行；新运行请选择新的输出目录，冻结输入/标签禁止覆盖。
+
+```bash
+export TMPDIR=/home/ldl/tmp/m2-context-20260922
+export XDG_CACHE_HOME=/home/ldl/.cache/m2-context-20260922
+export HF_HOME=/home/ldl/.cache/m2-context-20260922/hf
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_dataset.py \
+  --cases /home/ldl/outputs/interactive-nav/m2-replay/custom-task-t-20260917012600-dw5wv/cases.jsonl \
+  --log-root /home/ldl/outputs/interactive-nav/custom-task-t-20260917012600-dw5wv/evaluation \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/dataset
+
+/home/ldl/qwen36-fp8/venv/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py prepare \
+  --records /home/ldl/outputs/interactive-nav/m2-context-new/dataset/enriched_records.jsonl \
+  --prompt-file scripts/InteractiveNav/configs/semantic_decision/prompts/m2_rank_public_evidence_v2.txt \
+  --tokenizer /home/ldl/qwen36-fp8/model/Qwen3.6-35B-A3B-FP8 \
+  --max-model-len 16384 --max-tokens 1536 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/inputs
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_labels.py \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs/label_inputs.jsonl \
+  --split /home/ldl/outputs/interactive-nav/m2-mirror-20260922/labels/split.json \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/labels
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py run \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --concurrency 32 --timeout-s 120 --max-tokens 1536 --max-retries 1 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/run
+
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_report.py \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --run /home/ldl/outputs/interactive-nav/m2-context-new/run \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --guard-shadow \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/report
+```
+
+运行前确认Qwen服务的实际上下文窗口与 `--max-model-len` 一致；prepare会对所有消融
+共同检查token预算，不静默截断。`compact_control` 是同一新候选池的简化事实对照，
+不是旧HTTP请求；`legacy_candidate_pool` 是旧池策略的重算，不等同历史已发送候选。
+去近期决策/轨迹消融仍保留候选历史摘要/房间到访状态，分别测事件明细与轨迹顺序的
+额外贡献。标签为预测盲的公开策略proxy，禁止将其接受率称为导航成功率。
+主报告使用固定的非单候选、可评分样本分母，另列单候选、歧义样本、严格/滞后图版本、
+阶段合同和schema错误；不要把runner包含单候选的汇总接受率作为主指标。各条件只采样
+一次，微小差异不构成稳定收益证据，阶段合同与历史成功记录冲突需在线闭环验证。
+
+远端模型使用相同冻结输入时，先导出完整上下文这一组；导出只给标签ID加与请求一致的
+命名空间，不重建候选、不改评分规则。以下命令只读取既有数据，导出目录必须不存在：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/evaluation/m2_context_ablation.py export-arm \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/inputs \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/labels/annotations.jsonl \
+  --arm full_context \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs
+```
+
+启动前在选用的Python中检查 `httpx` 和代理所需的 `socksio` 导入。当前基础环境
+`/home/ldl/miniconda3/bin/python` 已有这两个依赖；此处只读取冻结请求，不用它重新
+计算候选预评分。凭据在runner进程内读取，不要打印 `.env` 或把URL/key放进命令行。
+例如GPT保守运行如下，Gemini另用 `--model-key model2 --concurrency 2` 和独立新输出目录：
+
+```bash
+/home/ldl/miniconda3/bin/python -m scripts.InteractiveNav.evaluation.m2_mirror_compare \
+  --env-file /home/ldl/.env \
+  --dataset /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/cases.jsonl \
+  --annotations /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/annotations.jsonl \
+  --prompt-file /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs/prompt.txt \
+  --model-key model1 --concurrency 2 --requests-per-minute 20 \
+  --timeout-s 120 --max-retries 1 --max-tokens 1536 --reasoning-effort off \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/gpt
+```
+
+每个模型只启动一个pool，Gemini不要叠加多个2并发进程；timeout重试也计入滑动60秒
+请求额度。保留客户端启动失败诊断，与真实网络请求分开审计；不得用事后重跑替换
+正式模型的错误回答。新旧Qwen耗时比较须同时报告服务并发负载、窗口和限流等待。
+各模型分别未超限并不保证共享网关配额未超限；也可能受token吞吐或服务端并发限制。
+若要同进程共享额度，可以省略 `--model-key`，使用 `--concurrency 4` 给两个模型各2个
+worker，并共用 `--requests-per-minute 20`。遇到429应保留失败并降低压力，不能仅凭
+客户端未超过28RPM就认定服务错误；本runner只自动重试timeout，不自动重试429。
+
+所有模型完整结束后，用同一份冻结标签比较原始回答；下列入口拒绝不完整结果，自动
+从Qwen九组输出中只取full_context，保留模型/服务失败在固定主分母中：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_context_model_report \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-new/remote_inputs \
+  --run qwen=/home/ldl/outputs/interactive-nav/m2-context-new/run/predictions.jsonl \
+  --run gpt=/home/ldl/outputs/interactive-nav/m2-context-new/gpt/model1/predictions.jsonl \
+  --run gemini=/home/ldl/outputs/interactive-nav/m2-context-new/gemini/model2/predictions.jsonl \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-context-new/model_report
+```
+
+#### M2 语义提示词与建议摘要的成对测试（2026-09-22）
+
+入口 `scripts/InteractiveNav/evaluation/m2_semantic_experiment.py` 只做离线镜像，
+不修改在线默认提示词或候选。11 组为 B、新语义链 P1、起点近房 P2、探索历史 P3、
+相关容器优先 P4、承载物 P5、融合 P6，以及相对 P6 的阶段摘要、区域摘要、备用动作
+多样性与三者组合。每组重复两次、随机交错，共用一个 32 并发池，不给各组分别开池。
+
+先冻结预测盲的新检查和独立人工探针，再冻结全部请求。下列新输出路径不得已存在：
+
+```bash
+export TMPDIR=/home/ldl/tmp/m2-semantic-new
+export XDG_CACHE_HOME=/home/ldl/.cache/m2-semantic-new
+export HF_HOME=/home/ldl/.cache/m2-semantic-new/hf
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_checks \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-remote-20260922/inputs \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/checks
+
+/home/ldl/qwen36-fp8/venv/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_experiment prepare \
+  --inputs /home/ldl/outputs/interactive-nav/m2-context-remote-20260922/inputs \
+  --records /home/ldl/outputs/interactive-nav/m2-context-20260922/dataset/enriched_records.jsonl \
+  --checks /home/ldl/outputs/interactive-nav/m2-semantic-new/checks \
+  --prompt-dir scripts/InteractiveNav/configs/semantic_decision/prompts/m2_semantic_20260922 \
+  --tokenizer /home/ldl/qwen36-fp8/model/Qwen3.6-35B-A3B-FP8 \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --repeats 2 --seed 20260922 --max-model-len 16384 --max-tokens 1536
+
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY=127.0.0.1,localhost \
+  /home/ldl/conda_envs/mlspaces/bin/python -u -m scripts.InteractiveNav.evaluation.m2_semantic_experiment run \
+  --inputs /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/run \
+  --concurrency 32 --timeout-s 120 --max-retries 1 --max-tokens 1536
+
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.m2_semantic_report \
+  --inputs /home/ldl/outputs/interactive-nav/m2-semantic-new/inputs \
+  --run /home/ldl/outputs/interactive-nav/m2-semantic-new/run \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-semantic-new/report
+```
+
+本次冻结集为历史 166 条和人工探针 18 条，共 4,048 次请求；历史主评分仍是原来的
+130 条（dev 38、历史 holdout 92），两次合并分母为 260，但不是 260 个独立场景。
+人工探针、新策略相对排序检查、旧 Top1 接受率分别报告，均不等同闭环导航 SR。
+旧 holdout 已被查看，不能再称新盲测集。阶段冲突只作诊断，不把历史执行成功当成
+当前物理穿越完成。历史区域摘要缺少同坐标系候选关联，不能证明空间去重收益；
+承载物和受控起点距离在历史集没有适用检查，只能用人工探针检查偏好遵循。
+
+准备过程会核验提示词、标签及检查文件哈希，并对实际 wire 文本检查完整 token
+预算；任何超限均在调用模型前失败，不截断或剔除样本。建议摘要 v2 通过引用原始
+历史去重，不删原始上下文。运行保留所有服务/格式错误，只按预定策略重试 timeout。
+阶段/区域组同时改变摘要和指令，不能解释成纯提示词单因素实验。
+
 ### 模块 3：历史图像视觉操作规划
 
 使用运行时同一提示词与输出 schema，测试门操作方式和多抽屉中心点：
@@ -2425,3 +3213,538 @@ env EGL_PLATFORM=surfaceless \
 模型实际选中、1,104/1,104 次 MLLM 请求成功，但 SR=0、SPL=0。该数值证明
 外部接口和官方 v2 评测链路可运行，不可表述为导航性能提升；后续模型改动应
 先在相同 manifest 上重新报告官方 `success` / `spl`。
+
+### 2026-09-14 位置锁定与交互恢复回归
+
+本轮到位契约：当前接近位首次进入XY容差后锁定位置完成，后续只判断yaw；
+同位姿停车重发保留锁定，新目标或新阶段重新建立锁定。碰撞与物理交互面检查仍保留。
+Noetic实际读取 `/move_base/latch_xy_goal_tolerance`，不能仅配置DWA插件子命名空间。
+逐步执行状态的 `navigation_arrival` 记录锁定步数、位置和 `rotation_only` 模式。
+
+- 动态占据先停车，最多复核3个任务步；短暂恢复后同点重试有次数上限，持续阻塞才换位。
+- 同面yaw偏差允许一次公开TF/M1正面信息驱动的原位修正，不能排除整面。
+- 物理交互预算为120步，step停止180秒后触发停流兜底；缺少step时才使用墙钟超时。
+- 导航不可达与M1失败分开反馈；导航冷却20步，持续60步无可执行候选则明确报告受阻。
+
+完整决策/执行/交互桥回归使用Conda ROS模块：554 passed；感知、房间分割和离线视频补充回归186 passed。
+端到端结果独立验收，不能由静态测试推断性能提升。
+
+`nav.launch` 在加载override后显式设置委托 `GlobalPlanner/orientation_mode=0`，
+由 `OrientedGlobalPlanner` 负责路径切线与末端yaw。Noetic模式3在两点短路径上存在负索引，
+仅改YAML不足以保证实际启动值；启动前用 `roslaunch --dump-params` 验证，启动后查询参数服务器。
+同面原位yaw恢复使用独占step控制，不调用 `make_plan`、移动走廊或平移目标。
+
+```bash
+env TMPDIR=/home/ldl/.cache/interactive-nav-latch-500 \
+  XDG_CACHE_HOME=/home/ldl/.cache HF_HOME=/home/ldl/.cache/huggingface \
+  TORCH_HOME=/home/ldl/.cache/torch \
+  MPLCONFIGDIR=/home/ldl/.cache/interactive-nav-latch-500/matplotlib \
+  CONDA_SH=/home/ldl/miniconda3/etc/profile.d/conda.sh \
+  CONDA_ENV=/home/ldl/conda_envs/mlspaces \
+  PYTHON_BIN=/home/ldl/conda_envs/mlspaces/bin/python \
+  ROS_SETUP=/home/ldl/molmospaces-exp-setting/Interactive-Nav-SG-nav/devel/setup.bash \
+  MAPPING_SCAN_SOURCE=organized_depth POINTCLOUD_STRIDE=1 CLEAN_INTERMEDIATE=false \
+  /home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
+  --output-dir /home/ldl/outputs/interactive-nav/batch_latched_v4_h1_h10_500_20260914_014500 \
+  --house-inds 1 2 3 4 5 6 7 8 9 10 --workers 10 --base-master-port 15801 \
+  --task-horizon 500 --method full_mllm_exploration --scene-timeout-s 3600 \
+  --semantic-model-env-file /home/ldl/molmospaces-exp-setting/.env
+```
+
+重跑必须使用新输出目录及未占用端口，不覆盖既有数据。完成后核对 `summary.json`、
+`force_interaction_events.json`、`debug/raw/step_boundaries.jsonl` 和 `offline_video_summary.json`。
+
+### 2026-09-14 门净空与切向候选回归
+
+- 范围：portal完整到位区域净空、同面小切向候选及正面角预算、按净空选择可达候选。
+- candidate.portal_tangent_offsets_m默认[0.10,-0.10,0.15,-0.15]；空列表关闭切向选点。
+- 验证：完整决策执行与交互桥574 passed。H2原始costmap离线筛选13个候选、5个通过，
+  原点净空不足被拒绝；优选点净空0.591m、中心cost0。未执行新500step仿真。
+- 第3项semantic_subgoal_no_progress重试缺口本次保持未改，不能将离线选点通过解释为整场问题已解决。
+
+```bash
+env TMPDIR=/home/ldl/.cache XDG_CACHE_HOME=/home/ldl/.cache \
+  PYTHONPATH="$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:$PWD:/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages" \
+  /home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_force_interaction_bridge.py -q
+```
+
+离线加载真实ROS执行器和OpenCV时使用`/home/ldl/conda_envs/ros-noetic/bin/python`，
+不要在MolmoSpaces解释器中优先导入ROS环境的OpenCV二进制，两套OpenSSL版本并不兼容。
+
+### 2026-09-14 最小导航修复回归
+
+- 探索/穿门位置容差保持 0.25 m，不增加 0.10/0.05 m 降级档位；抽屉净空仍为 0.50/0.85/1.00 m。
+- 净空不合格的探索点在原点 0.8 m 内寻找替代位置，仍需满足完整到位区域净空、同一 frontier 可见性和全局膨胀地图连通性；穿门替代点必须留在门的目标侧。找不到时保留 deferred 诊断，不标记为已探索。
+- 全局 costmap 的完整图和增量更新共同维护四连通可达域；candidate 和 executor 都可拒绝新鲜地图中不连通的目标。过期地图不作为确定的不可达证据，执行器仍保留 make_plan 验证。
+- 临时障碍需在不同地图回执和不同 step 上连续确认 3 次；恢复后只重发原锚点，保持原导航尝试计数，不重排全部锚点。20 step 内无法确认时返回可重试的 costmap 未更新，不记为 M1 失败。
+- AABB 选面后的独立物理正面复核放宽到 25 度；公开选面 15 度、导航到位距离/朝向、错误面拒绝均不变，不向规划器输出 GT 法向或纠偏角。
+- 仍有 frontier 但无可执行候选时，第 20/60 step 最多各尝试一次已有扫描动作。旋转需通过当前局部地图安全检查；无候选总预算为 120 step，最终报告 stalled 而非探索完成。
+
+无仿真回归：623 passed；`git diff --check` 通过。测试入口：
+
+```bash
+env TMPDIR=/home/ldl/.cache XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+  /home/ldl/conda_envs/mlspaces/bin/python -c '
+import sys, cv2
+from pathlib import Path
+root = Path("/home/ldl/molmospaces-exp-setting")
+sys.path[:0] = [str(root), *[str(root/"Interactive-Nav-SG-nav/src"/p/"scripts") for p in ("semantic_decision_py_pkg", "semantic_mapping_py_pkg", "semantic_mllm_py_pkg", "explore_py_pkg")]]
+sys.path.append("/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages")
+import pytest
+raise SystemExit(pytest.main(sys.argv[1:]))
+' -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  mlspaces_tests/test_force_interaction_bridge.py
+```
+
+该入口先加载 MolmoSpaces 的 OpenCV，再将 ROS 库追加到搜索路径，避免 OpenCV 二进制混用。
+原始批次 `batch_clearance100_h1_h10_500_20260914_112848` 的离线地图回放结果在
+`outputs/analysis_clearance100_500_20260914/minimal_fix_replay.json`：H4 step 100/216 各恢复 2 个安全点；
+H10 step 307 恢复 1 个、step 445 恢复 2 个；H3 step 33/57 的 7 个交互锚点均不连通，
+0.8 m 搜索范围内仍无安全探索替代点。H9 step 250 的原位姿通过新角度复核单测。
+这些结果仅验证控制逻辑和已记录几何，不代表新一轮仿真或覆盖率验收通过。
+# Room 分割离线诊断回放
+
+已有录制目录包含 `debug/raw/map_manifest.jsonl` 与
+`debug/raw/step_boundaries.jsonl` 时，可不启动 ROS、仿真或模型服务：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+MPLCONFIGDIR=/home/ldl/.cache/matplotlib \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/replay_room_segmentation.py \
+  /home/ldl/outputs/interactive-nav/benchmark-v16-1000-20260915_055700 \
+  --output-dir /home/ldl/outputs/interactive-nav/room-replay
+```
+
+输出三场 OCC / 历史 room 标签 / 离线回放拼图、逐帧 room ID 和最终栅格。
+回放使用当前 `semantic_map` 配置、历史公开门观测和已确认的 graph overlay，
+按记录的 step 顺序处理；不复现 ROS 的完整异步回调顺序，也不能替代闭环导航验收。
+
+## 目标等价离线重评分（分层协议 v2）
+
+对已完成的批量评估使用独立的分层口径，不覆盖原始严格结果。每个 episode 同时报告
+`exact_instance_success`、`category_goal_success`、
+`interaction_contract_goal_success` 和 `interactive_episode_success`：
+
+- 同容器内、同类别且位于冻结容器体积内的实例可以计 Category；只有数据集声明的
+  `identity_contract`，或经过审核的 candidate-specific interaction plan，才可以再计
+  Contract/Interactive。
+- 同房间、同类别且支持关系兼容的 0.30 m 内近邻（例如约 0.275 m 的 CD）只计
+  Category，不把距离当作交互契约证据。
+- 同房间同类目标（包括原目标在容器、候选在台面的情况）可计 Category；共享同一扇门
+  仍需门拓扑审计，且共享通道不能证明完整 container/full interaction contract。
+- 旧 benchmark 没有 identity contract 时安全降级为 Category-only；不要把事后类别
+  成功写回原始 `success`。
+不同房间或已知不同容器的目标不自动放宽；若要把门/容器交互也视为等价，仍需候选级
+交互计划证据。
+
+```bash
+EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --scene-dir /home/ldl/molmospaces/assets/scenes/procthor-10k-val \
+  --near-radius-m 0.30 \
+  --output-dir "$EVAL_RUN/goal_equivalence_v2"
+```
+
+输出 `report.md`、`report.json`（逐场改分理由与证据 SHA256）、`rescored_results.json`。
+输出目录必须不存在；原始 summary/result、benchmark、交互完成事实不变，不启动仿真。
+报告同时展示四层 SR；严格的 `nav_success`、`success`、SPL 和 Total Cost 完全保留，
+不会因为类别放宽而去除失败惩罚。`category_spl` 保持为空，因为没有 candidate-specific
+参考路径，`spl_original_reference` 也不能当作等价目标最短路后的标准 SPL。
+
+对旧 benchmark 进行 Contract/Interactive 晋级必须提供经过人工审核的审计文件（包含
+benchmark SHA256、candidate 名、plan ID 和完整 `required_interaction_ids`），例如：
+
+```bash
+python scripts/InteractiveNav/rescore_benchmark_goals.py "$EVAL_RUN/evaluation" \
+  --benchmark <BENCHMARK_JSON> --scene-dir <SCENE_DIR> \
+  --identity-contract-audit <REVIEWED_AUDIT_JSON> \
+  --output-dir "$EVAL_RUN/goal_equivalence_v2_reviewed"
+```
+
+最小回归：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  scripts/InteractiveNav/test_rescore_benchmark_goals.py -q -p no:cacheprovider
+```
+
+## 2026-09-17 Perception-only 交互后视觉刷新修正
+
+修正仅在 `scripts/InteractiveNav/ablations/` 的第三组适配器生效：纯观察结束不清空
+M1 共识；实际动作后禁止旧状态立即重复执行，必须先完成 observation-only 刷新。
+Full、原生 mapper/executor 和评分逻辑未改。51 项相关测试通过：
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -c '
+import sys, cv2
+sys.path.append("/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages")
+import pytest
+raise SystemExit(pytest.main(sys.argv[1:]))
+' -q -p no:cacheprovider \
+  scripts/InteractiveNav/ablations/tests \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_portal_state_consensus.py
+```
+
+第三组重跑目录：
+`/home/ldl/outputs/interactive-nav/ablation-v3-perception-selected10-20260917-202540`。
+`comparison.md` 为完整状态/结果，`diagnostic_notes.md` 与 `repair_case_evidence.json`
+记录 mixed 15/29 的视觉票与交互对照。启动命令冻结在同名 `.launch.json` 中。
+入口 `run_ablation_pool.py --variants no_outcome_update` 只运行第三组；场景选择输入使用
+上次保存的 `selected_scene_source.json`。本次动态 max2000、无录制，worker 上限25，
+实际10场同时运行。原始 Full 与另外两组不重跑，历史结果保留不覆盖。
+
+### Mixed 场景质量审计与条件子集重评分
+
+在上述目标等价报告基础上，审计所有 mixed 场景（包括成功场景），分别输出
+原始全量、原始 eligible、场景定义有效、再排除执行器异常四种分母。
+已核实的规则包括初始状态不一致、严格原目标无需容器交互即可完成的必要性反例，
+以及抽屉扫描/关闭成功后姿态恢复超时。关闭 ROS 时的异常不计为运行期失败；
+私有 GT 看见目标、导航警告或算法耗尽预算，均不能单独作为剔除理由。
+
+```bash
+EVAL_RUN=/home/ldl/outputs/interactive-nav/custom-task-t-20260917034403-twst6
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+python scripts/InteractiveNav/audit_mixed_benchmark_run.py "$EVAL_RUN/evaluation" \
+  --goal-rescore-dir "$EVAL_RUN/goal_equivalence_v2" \
+  --output-dir "$EVAL_RUN/mixed_quality_audit_v2_verified"
+```
+
+输出目录必须不存在。`exclusions.json` 列出本次运行的隔离清单，`report.json`
+保留逐场证据与日志行号，`filtered_results.json` 是全量场景中保留下来的计分集合。
+不改成功标签，不删除 benchmark，不修复算法，也不重跑仿真。此为事后质量条件子集，
+不可当作算法提升或替代全量 benchmark；执行超时场景应修复/重跑后再恢复计分。
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache PYTHONDONTWRITEBYTECODE=1 \
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest \
+  scripts/InteractiveNav/test_audit_mixed_benchmark_run.py \
+  scripts/InteractiveNav/test_rescore_benchmark_goals.py -q -p no:cacheprovider
+```
+# 2026-09-21：评测失败重试与模型服务归属
+
+## 初始化姿态回归（2026-09-21）
+
+V3 benchmark 回放在环境的初始 500 次稳定化之前恢复 episode 的机器人关节、
+底盘姿态及静止控制目标；常规任务的初始化钩子为空。碰撞和稳定化步数保持原值，
+稳定化之后仍由原有回放逻辑恢复完整场景状态。
+
+仅初始化测试入口：`scripts/InteractiveNav/profile_scene_initialization.py --episode INDEX --output DIR`。
+使用 mlspaces Python、`MUJOCO_GL=egl`，并将 TMPDIR、缓存与输出放在 `/home/ldl`。
+正式回归不要传诊断用的 `--settle-steps` 或 `--isolate-robot-during-settle`。
+脚本只调用 sample_task/task.reset，不运行导航策略；输出 timings.json、physics.jsonl
+和 state_audit.json。状态检查范围为机器人底盘／关节和 episode 指定物体的位置／朝向，
+不是完整导航性能回归。
+
+本机实测：house 13 的 episode 3、2006 初始化分别为 9.47、9.43 秒，house 2
+episode 0 为 8.68 秒；三场均执行 500 个稳定化物理步且状态审计通过。
+结果目录：`/home/ldl/outputs/interactive-nav/init-fixed-h13-e3-r2`、
+`init-fixed-h13-e2006-r1`、`init-fixed-h2-e0-r1`（后两者同一父目录）。
+
+统一入口为 `python scripts/InteractiveNav/run_benchmark_eval.py --config <config.json>`。
+使用已有模型服务时直接运行；自定义任务需要在同一实例启动模型时增加
+`--start-qwen`。它按 `CUDA_VISIBLE_DEVICES`（未设置时按 GPU 枚举）启动每卡一个
+Qwen 副本，统一入口 `http://127.0.0.1:8010/v1`。副本只在批次开始时启动，
+场景不能重启服务；服务进程退出会中断批次并保留结果，结束时只清理本轮服务。
+自定义任务 wrapper 保留平台 EGL、缓存及资产环境准备，并调用同一入口。
+
+默认首轮结束后重试运行不完整场景一次；`--retry-rounds N` 可指定重试轮数。
+导航失败但正常完成的场景不重试。每轮 `retry_queue_N.json` 保存剩余场景，
+通过批处理的 `--resume` 复用已完成结果并为异常场景新建 attempt，最终汇总保留完整采样集。
+重试耗尽仍有缺失／异常结果时入口返回非零。每轮复用首次启动生成的
+`runner_snapshot.sh`，启动前执行 `bash -n`，避免共享 shell 在执行中被编辑。
+运行期间仍应避免修改 Python 算法和依赖配置；此快照不是整个仓库快照。
+
+历史 episode 2150 的 10800 秒超时：只推进到约 655 步，后段部分相邻观测
+间隔约 150 秒，另有约 22 秒的区间。297 条模型请求中 288 条无错误、9 条超时。
+超时中断栈位于抽屉物理交互、关节驱动、机器人锁定的 `mujoco.mj_forward`。
+因此不能用恒定 1.5 秒/步估算该场景；物理计算与同步延迟各自占比仍需定向测量。
+当前不修改物理交互语义或扩大 3 小时超时限制。
+
+### 交互过程计时与锁定回调对照
+
+在统一 eval 入口前设置 `INTERACTIVE_NAV_PROFILE_INTERACTION=1`，即可在每个
+attempt 的 `eval/interaction_profiles/<decision_index>/` 保存 `steps.jsonl`
+（before_step、观测/task.step、after_step 的起止计时）、`calls.json`
+（函数调用数、自身耗时、累计耗时）和 `calls.pstats`。函数累计时间存在嵌套，不能
+直接相加。cProfile 只覆盖当前同步交互线程，且引入额外计时开销。
+
+`INTERACTIVE_NAV_COALESCE_ROBOT_LOCK=1` 可选择合并物理子步边界的重复机器人
+锁定回调；默认关闭，设置 `0` 恢复原逻辑。保留第一次子步前和每次物理子步后的
+锁定及 forward，不修改物理步长、控制增益或抽屉扫描策略。环境变量须在启动 Python
+前设置；基线与候选均开启相同计时，用独立输出目录和同一配置比较。
+
+单场测量使用 `--workers 1 --episode-indices 1445 --no-recording --retry-rounds 0`；
+三场对照使用 `--workers 3 --episode-indices 1445 1095 1280`，其余配置保持不变。
+需要同时启动本机模型时增加 `--start-qwen`，已有服务则不增加。比较时同时核对
+交互对象、内部步骤、关节轨迹、接触统计和任务结果；导航路径与机器并发负载变化时，
+不得将总运行时间差全部归因于交互优化。
+
+### 固定位置的交互专项测试
+
+`scripts/InteractiveNav/run_fixed_interaction_test.py` 是独立诊断入口，不代替正式
+导航评测：直接在指定交互位姿初始化机器人，关闭所选柜子的抽屉，固定完整
+drawer_scan，不运行导航、ROS 或 Qwen，也不因找到目标提前结束。保留原生平滑
+交互控制器、robot control/physics 和前后两次传感器观测；不计算导航奖励/终止。
+
+输入 manifest 是 JSON 列表，每项包含 `episode`、历史 `smooth_interactions/*.json`
+的 `macro_path`，可选 `pose_xyyaw`。未指定 pose 时读取历史结果的
+`approach_goal_xyyaw`；优先用历史 trace 的 `actual_pose_xyyaw` 显式指定实际到达位姿，
+而非把导航期望位置当作实际位置。源文件只提供关节身份、交互位姿和公开扫描参数，不能声称
+恢复了未保存的历史完整物理状态。场景仍从同一 benchmark 初始化，两版使用相同
+固定初态。初始化后同步控制器保持目标到当前关节/底盘位置，不重置机器人的固定位置。
+一个 worker 对应一场；每轮等待全部场景就绪后同步开始计时。
+
+```bash
+TMPDIR=/home/ldl/tmp XDG_CACHE_HOME=/home/ldl/.cache \
+PYTHONDONTWRITEBYTECODE=1 python scripts/InteractiveNav/run_fixed_interaction_test.py \
+  --benchmark /home/ldl/path/to/benchmark.json \
+  --manifest /home/ldl/path/to/fixed_cases.json \
+  --output /home/ldl/outputs/interactive-nav/fixed-new-run --workers 3
+```
+
+`--prepare-only` 仅检查两版初态与模型一致性，不执行交互。输出目录必须不存在。
+`--view-only` 先做低视角/回位短测试，不开抽屉，不能作为 drawer scan 加速结果。
+`--adaptive` 对照实验性的中间滑动关节位置收敛策略，两轮都开启重复锁定合并。
+该模式使用独立的 `effect_comparison.json` 验收，不再声称物理轨迹逐位相等：检查
+观察帧/顺序、目标可见性、逐抽屉/阶段兜底、采样接触、观测及最终状态偏差、回位、
+物理步与耗时。任一条件不通过即返回非零。它不能代替完整导航 SR/SPL 回归；
+正式入口的 `INTERACTIVE_NAV_INTERMEDIATE_POSITION_ONLY` 默认关闭。
+`--position-forward` 是另一项独立实验：保留所有物理步，只将锁姿时的完整 forward
+替换为位置更新；仍使用严格轨迹比较，不能与 `--adaptive` 混用。
+`--baseline-from <既有运行目录>` 可只读复用成功基线，要求 `run_config.json`、manifest
+和基线模式匹配，并重新校验候选初态；输出明确记录引用来源，耗时不是同轮重跑的基线。
+入口与正式评测一样在 reset 后恢复 benchmark 的物体/关节状态，再关闭所选抽屉。
+每版保存 `ready.json`、`initial_state.npy`、`model_hashes.json`、完整轨迹
+`trajectory.npz`、`execution.json`、`summary.json` 和 `profile/`。两版模型或完整
+MuJoCo integration state 的哈希、控制器类型或保持目标不同时，优化轮不会开始。
+结束后复查这些初态条件，并检查阶段/内部步数、
+物理子步数、成功状态、所有关节位置/速度、接触数及最终状态；轨迹容差为 1e-8，
+不一致时返回非零，不接受等价加速结论。计时不包括场景加载、初态准备和首次渲染。
+配置开关由子进程显式设置，不依赖用户 shell 是否设置优化变量。
+
+`--force-frequency-factor 2` / `4` 必须搭配 `--baseline-from`，只降低额外交互力控
+循环的物理频率，不能与 adaptive/position-forward 混用。普通机器人控制周期、
+policy 周期和物理步长不变；力控 PD 每物理步更新一次，其频率同步降低。
+每段重放基线实际推进的仿真时长，末尾不足整步的余量用较短 timestep 补足，
+不因提前收敛而缩短该段；稳定窗口按秒换算，原成功/兜底判据保持。
+`frequency_drives.jsonl` 检查逐段时钟、物理步数和 MuJoCo 警告，
+`frequency_config.json` 记录范围和步长。使用保守效果比较，不能要求不同积分步长
+下轨迹逐位相同，也不能把通过专项测试表述为完整导航性能不变。
+同机可同时启动两组各 3 worker 的命令，分别指定 factor 2/4 和独立输出目录。
+若基线是历史 3 并发而候选合计 6 并发，耗时比仅供诊断，不能视为严格吞吐加速比。
+
+`--lock-experiment camera_batch|geometry_only|combined` 测试不改物理时序的额外计算优化。
+该模式的基线已经开启 coalesced lock 和 position-forward；候选分别暂缓力控段内
+相机刷新至段末、只刷新锁姿后必需的几何/碰撞数据，或组合两者。具有 flex 的模型
+不走精简几何路径。该模式不可与频率或 adaptive 等实验混用。
+只读复用上一轮通过的优化波次时，增加 `--baseline-wave optimized`；不支持把尚未
+验证的 lock/frequency 实验候选当作普通基线。默认仍可省略 baseline-from 跑新基线。
+新生成的 lock 实验保存 `observation_hashes.json`，两版均存在时必须逐数组一致，
+涵盖相机图像/深度以及其他数组型观测。严格比较还包括完整 frames.jsonl，
+避免仅状态相同而可见性不同的情况漏检。历史基线缺少图像哈希时不声称像素级等价。
+`--lock-experiment reference` 不启用任何新增优化，只保留 position-forward 基线，
+用于同状态渲染/观测哈希的重复性对照。
+
+### 2026-09-22：M2 在线 Mixed 0–29 配对实验
+
+配置模板：`scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json`。
+使用 v1.2 总表索引 2000–2029，共 8 × 30 = 240 次评测；动态预算 min200/cap2000，
+不录制视频，保留决策、交互与请求追踪。G0 是历史上下文兼容基线，仍保留当前
+TF、房间包围归属和执行修正，不等同于逐字复原历史 HTTP 请求。
+
+| 组 | 上下文 | 候选池 | 提示词 |
+| --- | --- | --- | --- |
+| G0 | 历史兼容，recent8 | legacy | B |
+| G1 | 新公共事实，recent30 | legacy | B |
+| G2 | 新公共事实，recent30 | 全动作＋最多12前沿 | B |
+| G3 | 同 G2 | 同 G2 | P1 目标语义链 |
+| G4 | 同 G2 | 同 G2 | P2 初始位置邻近 |
+| G5 | 同 G2 | 同 G2 | P3 新房间与历史 |
+| G6 | 同 G2 | 同 G2 | P4 相关容器优先 |
+| G7 | 同 G2 | 同 G2 | P6 综合偏好 |
+
+G0→G1 比较上下文，G1→G2 比较整个候选池策略（不只是数量），G3–G7 与 G2 比较提示词。
+Mixed 局部编号 `% 3` 分配到三个 lane，同一场景全部组合留在同一 lane，固定种子交错。
+每 lane 15 workers / 80 jobs。本机 lane0/1 共用已有 `8000` TP=2 Qwen，**不得加
+`--start-qwen` 或重启共享模型服务**；仿真分别用 EGL 0/1、ROS 19000/19100 起始端口。
+远端 lane2 是一张卡，任务内启动 TP=1 Qwen＋仿真，模型上下文统一16384、无 MTP。
+M2 timeout120、超时重试1、reasoning off、max_tokens1536；ROS starvation300。
+正常算法失败不重试择优；基础设施/不完整结果另入 failure_queue，保留原 attempt。
+
+冻结 manifest 后，通过统一入口分别启动（输出与缓存均须放在 `/home/ldl`）：
+
+```bash
+python scripts/InteractiveNav/run_m2_experiment_lane.py \
+  --prepare-experiment scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json \
+  --output-dir /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922
+python scripts/InteractiveNav/run_benchmark_eval.py \
+  --experiment-manifest /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922/manifest.json \
+  --experiment-lane 0
+python scripts/InteractiveNav/run_benchmark_eval.py \
+  --experiment-manifest /home/ldl/outputs/interactive-nav/m2-online-mixed0-29-20260922/manifest.json \
+  --experiment-lane 1
+volc ml_task submit \
+  -c scripts/InteractiveNav/configs/custom_task/m2_online_mixed0_29_8arm_remote.yaml
+```
+
+### 标准评测启动：场景间隔 10 秒
+
+本地与远程统一入口 `run_benchmark_eval.py`、批处理入口 `run_interactive_nav_v3_ros_eval_batch.py`
+默认将所有 worker 的实际场景进程启动串行限流，相邻启动至少间隔 10 秒；第一场立即启动。
+30 worker 仍可并发执行，初始 30 场启动展开约 290 秒。后续场景及本轮补跑同样限流，
+resume 跳过已完成场景、dry-run 不等待。排队时间不占场景 timeout，成功启动后的场景耗时不含排队。
+配置键 `scene_start_interval_s`，批处理参数 `--scene-start-interval-s`；仅明确需要同步启动的对照实验才设为 0。
+远程双卡 30 场模板：`scripts/InteractiveNav/configs/evaluation/benchmark_remote2gpu_30mixed_stagger10.json`，
+保持 2000–2029、30 worker、dynamic/max 2000、M1 30s、M2 16K、不录制、不自动补跑。
+
+### 2026-09-23 路径跟随局部规划器 A/B 回归
+
+`nav_pkg/PathFollower` 通过 `BASE_LOCAL_PLANNER=nav_pkg/PathFollower` 启用；
+同时将 `NAV_CONFIG_OVERRIDE` 指向
+`scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml`。
+不设置时仍使用 DWA 与 `semantic_interaction_nav.yaml`。
+插件沿实时全局路径前瞻 0.2 m，按 V3 桥接器实际 0.2 秒控制步长预测运动，检查 footprint
+和横向偏离；`/move_base/PathFollower/set_parameters` 提供每次交互到达容差租约。
+
+先用 `2015 2016 2017 2020 2026 2029` 六场运行固定 300 step，再用
+`2004 2007 2008 2009 2010 2015 2016 2017 2020 2024 2025 2026 2029`
+十三场运行固定 1000 step。新旧两组必须设置独立输出目录、ROS 端口段和相同
+`--workers`、`--max-steps`、模型服务、种子及录制模式；每组 `--workers`
+等于该组场景数，EGL 设备由 `--mujoco-egl-devices 0 1 2 3` 轮转分配。
+例如首次 300-step 新版：
+
+```bash
+BASE_LOCAL_PLANNER=nav_pkg/PathFollower \
+NAV_CONFIG_OVERRIDE="$PWD/scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml" \
+TMPDIR=/home/ldl/tmp/path-follower-eval XDG_CACHE_HOME=/home/ldl/.cache/path-follower-eval \
+python scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --output-dir /home/ldl/outputs/interactive-nav/path-follower-ab/new-300 \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-indices 2015 2016 2017 2020 2026 2029 \
+  --workers 6 --max-steps 300 --step-budget-mode fixed \
+  --base-master-port 23400 --mujoco-egl-devices 0 1 2 3 \
+  --model-endpoints http://127.0.0.1:8100/v1 http://127.0.0.1:8101/v1 \
+    http://127.0.0.1:8102/v1 http://127.0.0.1:8103/v1 \
+  --semantic-model-env-file "$PWD/.env" --allow-failures
+```
+
+将 `BASE_LOCAL_PLANNER` 改为 `dwa_local_planner/DWAPlannerROS`、配置改回
+`semantic_interaction_nav.yaml`、ROS 端口和输出目录改为不冲突的值以运行基线。
+完成后可用 `scripts/InteractiveNav/analyze_path_follower_ab.py --new <目录>
+--dwa <目录> --episodes <索引...>` 查看每场成功、实际 step、移动距离和退出原因。
+检查六宫格中的局部轨迹及 `debug/move_base_plans.csv`，区分没有下发 subgoal 的
+上游停滞与已激活导航后的路径跟随失败；只用目标成功率无法证明局部规划改进。
+新插件会同时发布 `/move_base/DWAPlannerROS/local_plan` 以兼容现有消费者；该话题名
+不表示实际使用 DWA，应以 `config/effective_config.env` 的 `BASE_LOCAL_PLANNER` 为准。
+录制模式还可用 `scripts/InteractiveNav/path_following_diagnostics.py --run-dir <目录>
+--episodes <索引...>` 对齐活动导航期间的机器人位姿与最近一次公开全局路径；
+统计只包括正式 `applied_action_step_count` 内的帧，不把录像收尾时仍带 ACTIVE 状态的
+额外帧算成路径偏离。空的全局路径消息不写入 CSV，因此从录制的
+`debug/raw/step_boundaries.jsonl.gz` 还原空消息并清除旧路径；没有公开有效路径的时段
+不参与统计。此值仅是公开路径的诊断代理，外部 `make_plan` 可能覆盖最新路径。
+对照结果必须同时核对正式成功率/SPL、有效交互、无候选早停、实际动作步数和墙钟耗时；
+移动距离增加或路径误差下降不能单独视为整体任务性能提升。
+
+该测试集实测结果（同为 13 worker、固定 1000 step、4 张 GPU、同一批 13 个 episode，
+使用独立 ROS master；墙钟受同时运行的模型服务负载影响，不能直接当作算法提速）：
+
+| 局部规划 | 成功数 | 平均 SPL | 正确交互数 | 无候选早停数 | 平均移动距离 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DWA 原配置 | 2/13 | 0.0705 | 12 | 4 | 15.25 m |
+| PathFollower，0.20 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0476 | 16 | 7 | 27.41 m |
+| PathFollower，0.26 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0393 | 15 | 7 | 27.76 m |
+| PathFollower，0.20 m 前瞻、最高 0.23 m/s | 1/13 | 0.0141 | 14 | 6 | 22.39 m |
+| PathFollower，0.20 m 前瞻、受约束转向/倒退恢复 | 2/13 | 0.0386 | 15 | 9 | 24.06 m |
+
+六场录制版的 300-step 局部轨迹诊断：最新版在导航 ACTIVE 的记录样本中
+六场均没有超过 0.2 m 的公开全局路径偏离；DWA 在 2015、2020、2029 的超限
+比例分别为 8.9%、5.1%、11.8%。此诊断依赖公开路径话题，可能受到外部
+`make_plan` 发布的路径影响，不是内部真实跟踪误差的严格证明。
+前两个 PathFollower 配置提高了该批次的成功数，但 SPL、早停及移动距离明显退化；
+0.23 m/s 限速配置也失去了原有成功场景，**均未通过整体性能
+提升门槛**。加入仅在正常指令全部失败后启用、限制横向偏离与累计倒退距离的
+转向/倒退恢复后，七场 300-step 录制中 2029 成功、SPL 0.951；但该次没有实际发出
+倒退命令，13 场 1000-step 复跑中 2029 未成功、早停反而升至九场，不能将单场成功
+归因于恢复动作或视为稳定提升。另以失败的 0.23 m/s 配置单独录制 2029 1000-step，
+恢复版本实际发出三次 `-0.08 m/s` 短倒退、没有出现“no collision-free command”警告，
+公开有效路径样本 P95 偏离 0.034 m，超过 0.2 m 的样本占 0.1%；但它仍在 749 step
+因无可执行候选退出，正式成功率和 SPL 均为零。对比实验中的倒退恢复可用，不等于
+已解决上游候选耗尽。不要把 PathFollower 替换为默认规划器。实际候选配置为
+`path_follower_precise_nav.yaml` 和 `path_follower_smooth_nav.yaml`，其中前者
+整体指标较好；`path_follower_cautious_nav.yaml` 仅保留为限速失败对照，
+首轮 `path_follower_nav.yaml` 只用于 300-step 控制验证。
+新版提前结束的七场都报 `no_eligible_candidates_after_bounded_recovery`；例如 2004
+仍有未知连通区域及两个未解决的交互目标，但可执行候选数为零。这类故障发生在
+局部规划器收到 subgoal 之前，需要单独排查上游前沿视点、候选生成和恢复逻辑。
+2009 单场录制复跑还原了路径效率退化：DWA 290 step、8.42 m、SPL 0.505，
+0.35 m/s 配置的 PathFollower 903 step、44.89 m、SPL 0.095。两组最初都依次选择
+前沿 11:3、同一扇门及穿门导航；之后 DWA 直接交互冰箱，PathFollower 先选择四个
+新房间前沿，绕远后才返回冰箱。两者 M2 都收到冰箱候选：DWA 给出距离 0.36 m
+并优先交互，PathFollower 给出距离 0.68 m 却优先探索新房间。PathFollower 对公开
+全局路径的 P95 偏离为 0.118 m，DWA 为 0.134 m；所以不能把额外 36 m 误判为
+局部跟踪脱轨。虽然穿门候选 ID 相同，执行前上游给出的穿门 subgoal 已经不同：
+DWA 为 `(1.45, 4.95)`，PathFollower 为 `(2.45, 4.35)`；局部规划器不能在
+保持跟随下发全局路径的同时自行把后者改成前者。减少局部运动速度会改变进门
+后的视点及候选优先级，必须重新跑
+完整场景验证，而不是凭这一次录制宣称成功率或 SPL 提升。
+
+### 2026-09-23 近距离容器感知与目标匹配
+
+restricted-GT 对 refrigerator/cabinet/drawer/dresser/wardrobe 及中心位于这些容器动态 AABB 内的物体，
+在相机到物体 AABB 中心的三维距离 ≤2m 且分割中至少有 1 个真实可见像素时，放宽像素数、框尺寸与可见比例过滤。
+容器内判定是几何近似，不读取任务指定目标；门不适用。零像素对象仍不发布，远处对象保持原阈值，最大感知距离仍生效。
+公共目标可靠性接受已通过发布端过滤的 1 像素观测；正式成功仍由 evaluator 核验，不修改成功距离。
+目标类别统一大小写、CamelCase、分隔符和明确同义词后精确匹配，不再双向子串匹配或拆分复合类别。
+
+总体监控入口 `scripts/InteractiveNav/evaluation/m2_online_monitor.py --run-dir <RUN>`，
+每30秒写 `overall.log` 和原子更新的 `overall_status.json`；可用 `tail -f <RUN>/overall.log`。
+展示每组已完成 n 个的平均指标，同时保留计划分母30。ICS 取 episode `success`，
+NavSR 单列，不使用 aggregate `success_rate` 冒充正式成功。未完成分母下的成功率只是
+临时下界；infra、排队、heartbeat过期与正常算法失败分开显示。新增输出不纳入 Git。
+
+### 2026-09-25 exp-setting 合入 Go2 的离线验收
+
+合并范围、实物参数适配和运行边界见
+[`docs/physical_exp_setting_merge.md`](docs/physical_exp_setting_merge.md)。
+下面的回归无需 ROS master、GPU 推理或连接 Go2：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:." \
+conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests \
+  Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/tests \
+  Interactive-Nav-SG-nav/src/explore_py_pkg/tests \
+  scripts/InteractiveNav/physical_nav/tests \
+  scripts/InteractiveNav/uni_control/test_motion_switch.py \
+  scripts/InteractiveNav/uni_control/test_motion_enable_retry.py \
+  scripts/InteractiveNav/uni_control/test_speech_control.py
+```
+
+新增 `test_exp_setting_merge_contract.py` 验证物理参数无重复键、时钟不依赖相机帧率、
+门状态冷却和采集位姿/精确图像身份传递。原有实物身份隔离、安全停止、外参和
+latest-only 数据链回归继续运行。
+
+已有 ROS/Catkin 环境中编译（不启动节点）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source Interactive-Nav-SG-nav/devel/setup.bash
+cmake -S Interactive-Nav-SG-nav/src -B Interactive-Nav-SG-nav/build \
+  -DCATKIN_WHITELIST_PACKAGES="struct_mapping_pkg;nav_pkg"
+cmake --build Interactive-Nav-SG-nav/build \
+  --target slam_gmapping oriented_global_planner path_follower -j4
+```
+
+此编译命令适用于当前仅编译实物依赖的工作空间；其他工作树已有包白名单时，
+应在其原有白名单中添加上述包，而不是覆盖。默认局部规划器仍是 DWA。

@@ -30,7 +30,9 @@ class MLLMClientConfig:
     model: str = "qwen3.6-35b-a3b"
     protocol: str = "openai_chat"
     command: str = ""
-    timeout_s: float = 20.0
+    # Shared visual MLLM fallback (M1).  M2 and M3 pass their own budgets
+    # explicitly (12 s and 10 s respectively).
+    timeout_s: float = 15.0
     temperature: float = 0.0
     max_tokens: int = 384
     reasoning_effort: str = "off"
@@ -222,6 +224,9 @@ class MLLMClient:
                 body_payload["reasoning_effort"] = reasoning_effort
             if self._thinking_disabled(config):
                 body_payload["enable_thinking"] = False
+            else:
+                body_payload["enable_thinking"] = True
+                body_payload["chat_template_kwargs"] = {"enable_thinking": True}
         is_openai_chat = protocol in {"openai_chat", "chat_completions", "openai"}
         if is_openai_chat:
             body_payload["stream"] = True

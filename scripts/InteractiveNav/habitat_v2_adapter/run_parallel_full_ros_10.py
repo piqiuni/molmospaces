@@ -39,14 +39,11 @@ def _args() -> argparse.Namespace:
         default=[],
         help="repeatable focused scene selection; defaults to the canonical ten-scene slice",
     )
-    parser.add_argument("--record-six-panel-video", action="store_true")
     parser.add_argument(
         "--record-original-ros-video",
         action="store_true",
         help="bind one original ROS six-panel recorder to each isolated worker",
     )
-    parser.add_argument("--video-fps", type=float, default=10.0)
-    parser.add_argument("--video-frame-stride", type=int, default=1)
     return parser.parse_args()
 
 
@@ -91,7 +88,11 @@ def main() -> int:
     ports = [
         port
         for index in range(len(scenes))
-        for port in (args.ros_master_port_base + index, args.bridge_port_base + index)
+        for port in (
+            args.ros_master_port_base + index,
+            args.bridge_port_base + index,
+            args.bridge_port_base + index + 10,
+        )
     ]
     occupied = [port for port in ports if not _port_is_free(port)]
     if occupied:
@@ -114,15 +115,12 @@ def main() -> int:
         "max_episode_seconds": args.max_episode_seconds,
         "gpu_id": args.gpu_id,
         "shared_m2_endpoint": base_profile["modules"]["module2"]["endpoint"],
-        "shared_yoloe_gateway": "http://127.0.0.1:12219/detect",
-        "yoloe_replicas": 5,
-        "yoloe_gateway_ingress_concurrency_limit": None,
+        "shared_yoloe_gateway": None,
+        "dedicated_yolo_per_worker": True,
+        "yoloe_replicas_per_worker": 1,
         "isolated_ros_state_per_worker": True,
         "module3_enabled": False,
-        "six_panel_video": bool(args.record_six_panel_video),
         "original_ros_six_panel_video": bool(args.record_original_ros_video),
-        "video_fps": float(args.video_fps) if args.record_six_panel_video else None,
-        "video_frame_stride": int(args.video_frame_stride) if args.record_six_panel_video else None,
     }
     (run_root / "parallel_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -157,6 +155,7 @@ def main() -> int:
                 {
                     "ROS_MASTER_PORT": str(master_port),
                     "FULL_STACK_BRIDGE_PORT": str(bridge_port),
+                    "FULL_STACK_YOLO_PORT": str(bridge_port + 10),
                     "HABITAT_FULL_STACK_RUNTIME_ROOT": str(worker_runtime / "ros"),
                 }
             )
@@ -212,14 +211,6 @@ def main() -> int:
                 "--posthoc-topdown-map",
                 "--allow-no-mllm-success",
             ]
-            if args.record_six_panel_video:
-                command.extend(
-                    [
-                        "--record-six-panel-video",
-                        "--video-fps", str(args.video_fps),
-                        "--video-frame-stride", str(args.video_frame_stride),
-                    ]
-                )
             eval_log = (worker_dir / "worker.log").open("w", encoding="utf-8")
             process = subprocess.Popen(
                 command,

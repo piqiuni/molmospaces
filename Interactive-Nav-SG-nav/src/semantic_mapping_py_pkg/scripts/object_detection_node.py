@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import os
+import json
 import sys
 import threading
+from collections import deque
 
 import numpy as np
 import rospy
@@ -11,6 +14,7 @@ from visualization_msgs.msg import MarkerArray
 
 from semantic_mapping_py_pkg.detector_backends import make_detector_backend
 from semantic_mapping_py_pkg.messages import dumps_compact, stamp_to_json
+from semantic_mapping_py_pkg.image_frame_pairing import select_image_record, stamp_key_from_ros
 from semantic_mapping_py_pkg import object_debug_viz
 from semantic_mapping_py_pkg.object_debug_viz import (
     make_box_markers,
@@ -118,6 +122,9 @@ class ObjectDetectionNode:
         self.projection_frame_id = str(config.get("projection_frame_id", self.default_frame_id) or self.default_frame_id)
         self.world_frame = frames.get("world_frame", "tf_frame_map")
         self.backend = make_detector_backend(config.get("backend", "mock_empty"), config, frames=frames)
+        self.debug_dump_rgb_dir = os.environ.get("HABITAT_OBJECT_DETECTOR_DUMP_RGB_DIR", "")
+        if self.debug_dump_rgb_dir:
+            os.makedirs(self.debug_dump_rgb_dir, exist_ok=True)
         self.publish_debug_markers = bool(config.get("publish_debug_markers", False))
         self.publish_debug_segmented_cloud = bool(config.get("publish_debug_segmented_cloud", False))
         self.publish_debug_detection_image = bool(config.get("publish_debug_detection_image", False))
@@ -149,6 +156,8 @@ class ObjectDetectionNode:
         self.latest_camera_info_stamp = None
         self.latest_frame_id = self.default_frame_id
         self.latest_camera_frame_id = ""
+        self.latest_rgb_sequence = 0
+        self.step_identity_history = deque(maxlen=64)
         self.processing = False
         self.last_processed_stamp = None
 
@@ -174,6 +183,10 @@ class ObjectDetectionNode:
         self.rgb_sub = rospy.Subscriber(self.rgb_topic, Image, self.rgb_callback, queue_size=1)
         self.depth_sub = rospy.Subscriber(self.depth_topic, Image, self.depth_callback, queue_size=1)
         self.info_sub = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback, queue_size=1)
+        self.step_sub = rospy.Subscriber(
+            topics.get("step_sync", "/molmo_spaces/step_sync"), String,
+            self.step_sync_callback, queue_size=64,
+        )
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate, 1e-3)), self.timer_callback)
 
         cv2_version = object_debug_viz.cv2.__version__ if object_debug_viz.cv2 is not None else "missing"
@@ -193,6 +206,26 @@ class ObjectDetectionNode:
                 sys.executable,
             )
 
+    def step_sync_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            step = int(payload["step_index"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if step >= 0:
+            with self.lock:
+                self.step_identity_history.append({**payload, "capture_step": step})
+
+    def _capture_step_for_stamp(self, stamp):
+        record = {"stamp_key": stamp_key_from_ros(stamp)}
+        with self.lock:
+            history = list(self.step_identity_history)
+        matches = {
+            packet["capture_step"] for packet in history
+            if select_image_record(packet, [record])[0] is not None
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
     def rgb_callback(self, msg):
         try:
             rgb = _image_msg_to_numpy(msg, desired_encoding="rgb8")
@@ -202,6 +235,7 @@ class ObjectDetectionNode:
         with self.lock:
             self.latest_rgb = rgb
             self.latest_stamp = msg.header.stamp
+            self.latest_rgb_sequence = max(0, int(getattr(msg.header, "seq", 0) or 0))
             if msg.header.frame_id:
                 self.latest_frame_id = msg.header.frame_id
 
@@ -234,6 +268,7 @@ class ObjectDetectionNode:
                 return
             depth_stamp = self.latest_depth_stamp
             camera_info_stamp = self.latest_camera_info_stamp
+            rgb_sequence = int(self.latest_rgb_sequence)
             sensor_frame_id = self.latest_camera_frame_id or self.latest_frame_id or self.default_frame_id
             frame_id = self.projection_frame_id or sensor_frame_id
             self.processing = True
@@ -275,6 +310,16 @@ class ObjectDetectionNode:
                 except Exception as exc:
                     rospy.logwarn_throttle(2.0, "[object_detection_node] TF snapshot unavailable: %s", exc)
 
+            if self.debug_dump_rgb_dir:
+                try:
+                    import cv2
+
+                    cv2.imwrite(
+                        os.path.join(self.debug_dump_rgb_dir, f"rgb_step_{int(getattr(stamp, 'nsecs', 0)):09d}.png"),
+                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                    )
+                except Exception as exc:
+                    rospy.logwarn_throttle(5.0, "[object_detection_node] debug RGB dump failed: %s", exc)
             detections = self.backend.detect(rgb, depth, camera_info, stamp, frame_id, tf_snapshot=tf_snapshot)
             detections = [
                 det for det in detections
@@ -282,6 +327,12 @@ class ObjectDetectionNode:
             ]
             payload = {
                 **stamp_to_json(stamp),
+                # Preserve the RGB frame identity through the asynchronous
+                # detector topic.  M1 must pair boxes with this exact frame,
+                # never with whichever image callback happened to run last.
+                "image_sequence": rgb_sequence if rgb_sequence > 0 else None,
+                "capture_step": self._capture_step_for_stamp(stamp),
+                "image_size": [int(rgb.shape[1]), int(rgb.shape[0])],
                 "detections": detections,
             }
             self.pub.publish(String(data=dumps_compact(payload)))

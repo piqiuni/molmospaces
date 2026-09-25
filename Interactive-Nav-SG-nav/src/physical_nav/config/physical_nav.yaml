@@ -18,6 +18,9 @@ topics:
   unified_graph_markers: /physical_nav/unified_graph_markers
   unified_graph_markers_lifted: /physical_nav/unified_graph_markers_lifted
   navigation_hints: /physical_nav/navigation_hints
+attribute_inference:
+  portal_state_confirmation_count: 1
+  portal_state_cooldown_s: 120.0
 object_detection:
   backend: yoloe_pf_box3d
   provider: yoloe_local

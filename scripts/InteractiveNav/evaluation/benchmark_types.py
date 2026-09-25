@@ -170,14 +170,36 @@ class EpisodeResult:
     # restricted-policy result traces.
     paper_metric_schema_version: str = ""
     paper_metric_config: dict[str, Any] = field(default_factory=dict)
+    required_interaction_completion_fraction: float | None = None
+    completed_required_interaction_count: int = 0
+    required_interaction_count: int = 0
     valid_interaction_attempt_count: int = 0
     error_interaction_attempt_count: int = 0
     task_irrelevant_interaction_attempt_count: int = 0
+    non_target_class_interaction_attempt_count: int = 0
     failed_interaction_attempt_count: int = 0
     repeated_interaction_attempt_count: int = 0
     interaction_precision_episode: float | None = None
     episode_total_cost: float | None = None
     episode_total_cost_breakdown: dict[str, Any] = field(default_factory=dict)
+    # Diagnostic-only endpoint for releases whose natural-language target
+    # description does not uniquely identify one same-category instance.
+    # ``success`` and ``nav_success`` remain strict selected-instance scores.
+    goal_definition_relaxed_success: bool = False
+    goal_definition_relaxed_instance_id: str | None = None
+    goal_definition_relaxed_reason: str | None = None
+    # Layered goal semantics.  Exact/category/contract/interactive answers are
+    # deliberately independent so a nearby same-category observation cannot
+    # erase a missing fridge/drawer interaction.  Legacy episodes without a
+    # frozen candidate contract can still report category success; contract
+    # promotion then remains false until a private post-hoc audit proves it.
+    goal_metric_protocol: str = "interactive_nav_goal_equivalence_v2"
+    exact_instance_success: bool = False
+    category_goal_success: bool = False
+    interaction_contract_goal_success: bool = False
+    interactive_episode_success: bool = False
+    category_goal_instance_id: str | None = None
+    goal_success_layers: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

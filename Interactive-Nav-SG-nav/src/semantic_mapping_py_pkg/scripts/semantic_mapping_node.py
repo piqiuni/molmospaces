@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 
 import numpy as np
 import rospy
@@ -31,10 +32,12 @@ from semantic_mapping_py_pkg.interaction_result_contract import (
     merge_interaction_result_with_command,
     take_pending_interaction_command,
 )
-from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
+from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text, observation_stamp_seconds
+from semantic_mapping_py_pkg.occupancy_transport import NumpyOccupancyGrid, occupancy_data_snapshot
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
+from semantic_mapping_py_pkg.room_inference_backends import normalized_room_box, room_evidence_signature
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore, SceneGridStore
 from semantic_mapping_py_pkg.semantic_occ_overlay import OverlayUpdateRegionTracker, SemanticOccupancyOverlay
 from semantic_mllm_py_pkg.ablation import AblationConfig
@@ -65,6 +68,7 @@ class SemanticMappingNode:
         room_mllm_config = get_nested_param(rospy, "room_mllm", {}) or {}
 
         self.world_frame = frames.get("world_frame", "tf_frame_map")
+        self.base_frame = frames.get("base_frame", "tf_frame_base_link")
         self.object_detection_topic = topics.get("object_detections", "/semantic_mapping/object_detections")
         self.scene_attribute_topic = topics.get("scene_attribute", "/semantic_mapping/scene_attribute")
         self.pointcloud_topic = topics.get("pointcloud", "/registered_scan")
@@ -222,6 +226,17 @@ class SemanticMappingNode:
             0.0,
             min(1.0, float(room_mllm_config.get("min_confidence", 0.55))),
         )
+        self.room_mllm_success_refresh_interval_s = max(
+            0.0, float(room_mllm_config.get("success_refresh_interval_s", 120.0))
+        )
+        # Room MLLM evidence is intentionally incremental.  A room remains
+        # dirty until a non-fallback result for the same evidence signature is
+        # applied, so a failed request can be refreshed without re-submitting
+        # every room in the graph.
+        self._room_mllm_committed_signatures = {}
+        self._room_mllm_committed_at = {}
+        self._room_mllm_episode_id = ""
+        self._room_mllm_selection_cursor = 0
         # When enabled, the mapper readiness stream is a causal watermark,
         # rather than a heartbeat: the source OCC frame must have completed
         # room segmentation and the corresponding unified graph publication
@@ -322,7 +337,7 @@ class SemanticMappingNode:
             clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
             max_aperture_thickness_m=overlay_config.get(
-                "max_aperture_thickness_m", 0.25
+                "max_aperture_thickness_m", 0.35
             ),
             raw_free_confirmations=overlay_config.get(
                 "raw_free_confirmations", 3
@@ -337,7 +352,7 @@ class SemanticMappingNode:
             clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
             max_aperture_thickness_m=overlay_config.get(
-                "max_aperture_thickness_m", 0.25
+                "max_aperture_thickness_m", 0.35
             ),
             raw_free_confirmations=overlay_config.get(
                 "raw_free_confirmations", 3
@@ -524,7 +539,7 @@ class SemanticMappingNode:
                 "[semantic_mapping_node.py] PointCloud2 subscription disabled; "
                 "legacy scene_attribute messages will be ignored"
             )
-        self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1)
+        self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, NumpyOccupancyGrid, self.occupancy_callback, queue_size=1)
         self.room_context_sub = rospy.Subscriber(self.room_context_topic, String, self.room_context_callback, queue_size=1)
         self.gt_observation_sub = rospy.Subscriber(
             self.gt_observations_topic,
@@ -1400,9 +1415,10 @@ class SemanticMappingNode:
         room_commit = None
         with self.lock:
             commit_lock_wait_ms = (time.perf_counter() - commit_lock_t0) * 1000.0
-            # New raw OCC alone does not invalidate a same-geometry topology
-            # result.  Portal-hint changes and episode resets do, so a room
-            # result can make forward progress under a 5 Hz mapping stream.
+            # Do not publish a room grid against a newer raw OCC source.  The
+            # worker remains latest-only, but an older result must be discarded
+            # before it can overwrite the graph/readiness watermark and strand
+            # a newly opened room behind a stale decomposition.
             if (
                 epoch == int(self._room_epoch)
                 and topology_revision == int(
@@ -1490,6 +1506,10 @@ class SemanticMappingNode:
                     int(room_commit["epoch"]) == int(self._room_epoch)
                     and int(room_commit["topology_revision"])
                     == int(getattr(self, "_room_topology_revision", 0))
+                    and self._room_snapshot_is_current_locked(
+                        raw=raw,
+                        input_revision=input_revision,
+                    )
                 ):
                     self._room_last_commit = dict(room_commit)
             # In strict mode the worker is the event that makes the causal
@@ -1553,6 +1573,25 @@ class SemanticMappingNode:
         except (TypeError, ValueError):
             return False
         return left_step >= 0 and right_step >= 0 and left_step == right_step
+
+    def _room_snapshot_is_current_locked(self, *, raw, input_revision):
+        """Return whether a room result still describes the latest OCC source.
+
+        The room worker is deliberately latest-only.  A high-rate mapper can
+        publish another callback while segmentation is running, so revision
+        equality is the normal fast path.  Some publishers resend the same
+        source frame, however; accepting that exact source avoids starving the
+        worker without ever committing a result for a newer map.
+        """
+
+        current_revision = int(getattr(self, "_room_input_revision", 0))
+        if int(input_revision) == current_revision:
+            return True
+        current_raw = getattr(self, "latest_occupancy_grid", None)
+        return self._same_occupancy_source(
+            self._occupancy_source_identity(raw),
+            self._occupancy_source_identity(current_raw),
+        )
 
     def _semantic_mapping_ready_payload_for_bundle(self, bundle):
         """Build the mapper readiness watermark for one published bundle.
@@ -2035,6 +2074,12 @@ class SemanticMappingNode:
             "capture_step": parsed.get("capture_step", parsed.get("seq")),
             "detections": tracked_detections,
         }
+        # Preserve source-image identity and capture-time pose for M1.
+        # ROS Header.seq is rewritten independently on each topic.
+        for key in ("stamp_sec", "stamp_nsec", "capture_stamp_sec", "capture_stamp_nsec",
+                    "image_sequence", "source_image_sequence", "image_size", "observation_pose_xyyaw"):
+            if key in parsed:
+                tracked_payload[key] = parsed[key]
         self.tracked_detections_pub.publish(
             String(data=dumps_compact(tracked_payload))
         )
@@ -2109,12 +2154,9 @@ class SemanticMappingNode:
             if isinstance(observation, dict)
         ]
         episode_id = str(parsed.get("episode_id") or "")
-        stamp_value = parsed.get("stamp_sec")
-        stamp = (
-            float(stamp_value)
-            if stamp_value is not None
-            else rospy.Time.now().to_sec()
-        )
+        stamp = observation_stamp_seconds(parsed, math.nan)
+        if not math.isfinite(stamp):
+            stamp = rospy.Time.now().to_sec()
         episode_reset_requested = False
         portal_structure_changed = False
         with self.lock:
@@ -2123,6 +2165,10 @@ class SemanticMappingNode:
             if episode_reset_requested:
                 self._save_episode_graph_locked(final=True)
                 self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
+                self._room_mllm_committed_signatures = {}
+                self._room_mllm_committed_at = {}
+                self._room_mllm_episode_id = episode_id
+                self._room_mllm_selection_cursor = 0
                 self._post_open_planning_refresh_after_stamp_sec = None
                 self._post_open_room_refresh_result = None
                 self.pending_interaction_commands.clear()
@@ -2184,6 +2230,7 @@ class SemanticMappingNode:
     def interaction_result_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
         deferred_room_refresh_result = None
+        refresh_room_immediately = False
         pending_node_id = ""
         with self.lock:
             if not self._interaction_episode_matches_locked(parsed):
@@ -2231,6 +2278,16 @@ class SemanticMappingNode:
                 # traversability to the planner.
                 self._post_open_planning_refresh_after_stamp_sec = stamp
                 self._post_open_room_refresh_result = dict(parsed)
+                # A room split is a graph/topology product, not a costmap
+                # readiness gate. Refresh it immediately from the latest raw
+                # grid as soon as a confirmed portal result arrives; the next
+                # OCC frame still drives the causal planning-map bridge.
+                refresh_room_immediately = (
+                    getattr(self, "latest_occupancy_grid", None) is not None
+                )
+                if refresh_room_immediately:
+                    deferred_room_refresh_result = dict(parsed)
+                    self._post_open_room_refresh_result = None
                 rospy.loginfo(
                     "[semantic_mapping_node.py] armed post-open raw OCC bridge: "
                     "result_stamp=%.6f node_id=%s node_type=%s "
@@ -2244,6 +2301,12 @@ class SemanticMappingNode:
         pending_changed = self._set_planning_interaction_pending(
             pending_node_id, False
         )
+        if refresh_room_immediately:
+            self._enqueue_room_refresh(
+                force_stable=bool(getattr(self, "room_post_open_force_refresh", True)),
+                post_open_result=deferred_room_refresh_result,
+                reason="post_open_result",
+            )
         if (changed or pending_changed) and not is_portal_open:
             self._collect_and_publish_bundle()
 
@@ -2337,10 +2400,41 @@ class SemanticMappingNode:
         with self.lock:
             for patch in parsed.get("updates") or []:
                 if isinstance(patch, dict):
-                    changed = (
-                        self.graph_store.apply_room_attribute_patch(patch, stamp=stamp)
-                        or changed
+                    room_key = str(patch.get("room_node_id") or "")
+                    if not room_key and patch.get("room_id") is not None:
+                        try:
+                            room_key = f"room_{int(patch.get('room_id'))}"
+                        except (TypeError, ValueError):
+                            room_key = ""
+                    status = str(
+                        patch.get("room_attribute_status")
+                        or patch.get("attribute_status")
+                        or ""
+                    ).casefold()
+                    # Rule fallback is useful immediately, but it must not
+                    # clear the dirty bit: the same room will be retried after
+                    # the failure refresh interval.  Only an actual MLLM
+                    # result commits the evidence signature.
+                    applied = self.graph_store.apply_room_attribute_patch(
+                        patch, stamp=stamp
                     )
+                    if (
+                        status == "ready"
+                        and not bool(patch.get("fallback"))
+                        and room_key
+                        and applied
+                    ):
+                        signature = str(patch.get("observation_signature") or "")
+                        if signature:
+                            committed = getattr(
+                                self, "_room_mllm_committed_signatures", None
+                            )
+                            if committed is None:
+                                committed = {}
+                                self._room_mllm_committed_signatures = committed
+                            committed[room_key] = signature
+                            self._room_mllm_committed_at[room_key] = time.monotonic()
+                    changed = applied or changed
         if changed:
             self._collect_and_publish_bundle()
 
@@ -2498,9 +2592,13 @@ class SemanticMappingNode:
 
     @staticmethod
     def _is_successful_open_result(result):
-        if (
-            result.get("success") is not True
-            or str(result.get("action") or "").casefold() != "open"
+        action = str(result.get("action") or "").strip().casefold()
+        observation_only = (
+            str(result.get("observation_outcome") or "").strip().casefold()
+            == "finish_without_action"
+        )
+        if result.get("success") is not True or (
+            action not in {"", "open"} or (not action and not observation_only)
         ):
             return False
         state = str(
@@ -2512,6 +2610,16 @@ class SemanticMappingNode:
             or ""
         ).strip().casefold()
         source = str(result.get("source") or "").strip().casefold()
+        if (
+            observation_only
+            and state in {"open", "opened", "ajar", "static_open"}
+            and isinstance(result.get("portal_aperture_evidence"), dict)
+        ):
+            # An already-open doorway still needs the same post-observation
+            # OCC/room refresh as a force-open result.  Without this bridge the
+            # graph says open while planning OCC waits forever and the candidate
+            # is recreated on the next graph revision.
+            return True
         # ``static_open`` is an immediate capability result, not a physical
         # transition.  Do not arm the post-open raw-OCC bridge or force a room
         # refresh for it; ordinary occupancy updates remain responsible for
@@ -2552,11 +2660,12 @@ class SemanticMappingNode:
                 planning_grid,
                 graph_payload,
             )
+        self.planning_occupancy_grid_pub.publish(effective_grid)
+        if overlay is not None:
             if door_clear_mask is not None:
                 self.door_clear_mask_pub.publish(door_clear_mask)
             if planning_update is not None:
                 self.planning_occupancy_grid_updates_pub.publish(planning_update)
-        self.planning_occupancy_grid_pub.publish(effective_grid)
         raw_stamp = self._occupancy_header_stamp_sec(planning_grid)
         rospy.loginfo(
             "[semantic_mapping_node.py] published post-open effective planning OCC: "
@@ -2718,7 +2827,7 @@ class SemanticMappingNode:
             ):
                 continue
             state = str((node.get("interaction") or {}).get("state") or "").casefold()
-            if state not in {"open", "ajar"}:
+            if state not in {"open", "opened", "ajar", "static_open"}:
                 continue
             center = list(
                 attributes.get("interaction_reference_aabb_center")
@@ -3027,8 +3136,27 @@ class SemanticMappingNode:
         grid.data = [int(v) for v in data]
         return grid
 
+    def _room_robot_xy(self):
+        listener = getattr(self, "tf_listener", None)
+        if listener is None:
+            return None
+        try:
+            position, _rotation = listener.lookupTransform(
+                self.world_frame, self.base_frame, rospy.Time(0)
+            )
+            return float(position[0]), float(position[1])
+        except (IndexError, TypeError, ValueError, tf.Exception):
+            return None
+
     def _build_room_attribute_request_locked(self, graph_payload):
-        """Build no-image room evidence for the independent Module-1 lane."""
+        """Build one changed, nearby room request for Module-1.
+
+        The mapper publishes at most one room per message.  A room is nearby
+        when it contains the robot, is currently visible, or is connected to
+        an anchor room through a portal.  Only a changed box/member set or an
+        expired success refresh is requested.  Failures remain eligible for a
+        retry subject to the inference lane's per-room cooldown.
+        """
 
         if not (
             self.room_mllm_enabled and self.ablation.module1 == "dynamic_mllm"
@@ -3059,7 +3187,8 @@ class SemanticMappingNode:
                 }
             )
 
-        rooms = []
+        active_rooms = []
+        room_records = []
         for node in nodes:
             if str(node.get("type") or "") != "room":
                 continue
@@ -3071,24 +3200,130 @@ class SemanticMappingNode:
                 continue
             if not attributes.get("active", True) or attributes.get("is_potential_room", False):
                 continue
+            room_box = normalized_room_box(
+                node.get("aabb_center"), node.get("aabb_size")
+            )
+            active_rooms.append({"room_id": room_id, "room_box": room_box})
             evidence = sorted(
                 evidence_by_room.get(room_id, []),
                 key=lambda item: (item["object_id"], item["node_id"]),
             )
             if len(evidence) < self.room_mllm_min_evidence_objects:
                 continue
-            rooms.append(
+            room_records.append(
                 {
                     "room_id": room_id,
                     "room_node_id": str(node.get("id") or f"room_{room_id}"),
-                    # This lane intentionally receives no RGB, crop, pose, or
-                    # geometric evidence: room ID plus room-member objects is
-                    # the complete model context.
+                    "room_box": room_box,
                     "objects": evidence,
                 }
             )
-        if not rooms:
+        if not room_records:
             return None
+
+        # Derive a small topological neighborhood from portal ``connects`` edges.
+        node_by_id = {str(node.get("id") or ""): node for node in nodes}
+        adjacency = {int(room["room_id"]): set() for room in active_rooms}
+        for edge in graph_payload.get("edges") or []:
+            if str(edge.get("relation") or "") != "connects":
+                continue
+            src = node_by_id.get(str(edge.get("src_id") or ""), {})
+            dst = node_by_id.get(str(edge.get("dst_id") or ""), {})
+            portal = src if str(src.get("type") or "") == "portal" else dst
+            other = dst if portal is src else src
+            if str(portal.get("type") or "") != "portal":
+                continue
+            try:
+                connected = [
+                    int(value)
+                    for value in (
+                        (portal.get("attributes") or {}).get("connected_room_ids")
+                        or []
+                    )
+                ]
+            except (TypeError, ValueError):
+                connected = []
+            if not connected:
+                try:
+                    value = other.get("room_id")
+                    connected = [int(value)] if value is not None else []
+                except (TypeError, ValueError):
+                    connected = []
+            for left in connected:
+                adjacency.setdefault(left, set()).update(
+                    right for right in connected if right != left
+                )
+
+        robot_xy = self._room_robot_xy()
+        containing_rooms = []
+        if robot_xy is not None:
+            for room in active_rooms:
+                box = room["room_box"]
+                center = box["center_xy"]
+                size = box["size_xy"]
+                if len(center) != 2 or len(size) != 2:
+                    continue
+                if all(
+                    abs(robot_xy[axis] - center[axis]) <= size[axis] / 2.0
+                    for axis in (0, 1)
+                ):
+                    containing_rooms.append((size[0] * size[1], room["room_id"]))
+        visible_rooms = {
+            int(room["room_id"])
+            for room in room_records
+            if any(bool(item.get("currently_visible")) for item in room["objects"])
+        }
+        anchor_rooms = (
+            {min(containing_rooms)[1]} if containing_rooms else visible_rooms
+        )
+        if not anchor_rooms:
+            return None
+        nearby_rooms = set(anchor_rooms)
+        for room_id in anchor_rooms:
+            nearby_rooms.update(adjacency.get(room_id, set()))
+
+        changed_rooms = []
+        episode_id = str(graph_payload.get("episode_id") or "")
+        now = time.monotonic()
+        state_lock = getattr(self, "lock", None)
+        with state_lock if state_lock is not None else nullcontext():
+            if episode_id and episode_id != getattr(self, "_room_mllm_episode_id", ""):
+                self._room_mllm_committed_signatures = {}
+                self._room_mllm_committed_at = {}
+                self._room_mllm_episode_id = episode_id
+                self._room_mllm_selection_cursor = 0
+            committed_signatures = getattr(self, "_room_mllm_committed_signatures", {})
+            completed_at = getattr(self, "_room_mllm_committed_at", {})
+            success_refresh_s = getattr(
+                self, "room_mllm_success_refresh_interval_s", 120.0
+            )
+            for room in room_records:
+                if int(room["room_id"]) not in nearby_rooms:
+                    continue
+                key = str(room["room_node_id"])
+                signature = room_evidence_signature(
+                    room["room_id"], room["room_box"], room["objects"]
+                )
+                if committed_signatures.get(key) == signature and (
+                    success_refresh_s <= 0.0
+                    or now - completed_at.get(key, 0.0) < success_refresh_s
+                ):
+                    continue
+                room["observation_signature"] = signature
+                changed_rooms.append(room)
+            if not changed_rooms:
+                return None
+            candidates = sorted(
+                changed_rooms,
+                key=lambda room: (
+                    0 if int(room["room_id"]) in anchor_rooms else 1,
+                    int(room["room_id"]),
+                    str(room["room_node_id"]),
+                ),
+            )
+            selection_cursor = int(getattr(self, "_room_mllm_selection_cursor", 0) or 0)
+            selected = candidates[selection_cursor % len(candidates)]
+            self._room_mllm_selection_cursor = selection_cursor + 1
         capture_step = graph_payload.get("capture_step")
         try:
             capture_step = int(capture_step)
@@ -3099,7 +3334,11 @@ class SemanticMappingNode:
             "stamp_sec": float(graph_payload.get("timestamp") or rospy.Time.now().to_sec()),
             "graph_revision": int(graph_payload.get("graph_revision", 0) or 0),
             "capture_step": capture_step,
-            "rooms": sorted(rooms, key=lambda item: (item["room_id"], item["room_node_id"])),
+            # Deliberately keep a single room in every request.  The consumer
+            # remains list-compatible for old publishers, but new traffic is
+            # isolated per room and cannot make one large request head-of-line
+            # block all neighboring rooms.
+            "rooms": [selected],
         }
 
     def _store_graph_payload_cache_locked(self, token, payload):
@@ -3263,11 +3502,11 @@ class SemanticMappingNode:
             self._planning_products_cache = None
 
     def _build_grid_from_snapshot(self, data, info):
-        grid = OccupancyGrid()
+        grid = NumpyOccupancyGrid()
         grid.header.stamp = rospy.Time.now()
         grid.header.frame_id = self.world_frame
         grid.info = info
-        grid.data = [int(value) for value in data]
+        grid.data = occupancy_data_snapshot(data)
         return grid
 
     def _build_planning_products_from_snapshot(self, raw, graph_payload):
@@ -3581,6 +3820,7 @@ class SemanticMappingNode:
             self.door_clear_mask_pub.publish(door_clear_mask)
         if planning_update is not None:
             self.planning_occupancy_grid_updates_pub.publish(planning_update)
+        graph_payload = {**graph_payload, "frame_id": self.world_frame}
         if publish_graph_products:
             self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
             if room_attribute_request is not None:
@@ -3725,14 +3965,14 @@ class SemanticMappingNode:
     def _build_occupancy_copy(self, data, *, raw=None):
         if raw is None:
             raw = self.latest_occupancy_grid
-        grid = OccupancyGrid()
+        grid = NumpyOccupancyGrid()
         # Keep the raw map timestamp so downstream consumers can pair the
         # semantic overlay and clear mask with the exact source occupancy map.
         grid.header.seq = raw.header.seq
         grid.header.stamp = raw.header.stamp
         grid.header.frame_id = raw.header.frame_id or self.world_frame
         grid.info = raw.info
-        grid.data = [int(value) for value in data]
+        grid.data = occupancy_data_snapshot(data)
         return grid
 
     def _build_room_segment_grid(self, room_ids, *, raw=None, encoded_data=None):

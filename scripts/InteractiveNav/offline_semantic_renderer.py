@@ -32,12 +32,15 @@ if str(_HELPER_DIR) not in sys.path:
 
 from explore_py_pkg.debug_semantic_viz import (  # noqa: E402
     candidate_color,
+    semantic_node_display_label,
     portal_room_node_ids,
     topology_edge_style,
     topology_edge_visible,
     topology_hierarchy_layout,
     topology_node_style,
 )
+from explore_py_pkg.subgoal_overlay import SubgoalOverlay  # noqa: E402
+from explore_py_pkg.room_colors import room_color  # noqa: E402
 
 
 def _frame_name(value: object) -> str:
@@ -400,19 +403,9 @@ def _costmap_base(grid: RawGrid) -> np.ndarray:
 def _room_base(grid: RawGrid) -> np.ndarray:
     values = grid.image_values
     image = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
-    palette = (
-        (255, 185, 185),
-        (185, 220, 255),
-        (195, 245, 195),
-        (245, 220, 170),
-        (225, 195, 245),
-        (175, 235, 230),
-        (245, 195, 225),
-        (220, 220, 170),
-    )
     valid = values >= 0
     for room_id in np.unique(values[valid]) if np.any(valid) else []:
-        image[values == int(room_id)] = palette[int(room_id) % len(palette)]
+        image[values == int(room_id)] = room_color(int(room_id))
     return image
 
 
@@ -871,37 +864,10 @@ def draw_task_subgoal_header(
 
     selection = active_semantic_selection(step)
     candidates = step.get("semantic_candidates") or {}
-    target = str((candidates.get("target_context") or {}).get("target_name") or "-")
-    behavior = str(selection.get("behavior_type") or "-")
-    name = str(selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id") or "-")
-    box_width = min(
-        panel.shape[1] - 4,
-        max(120, int(box_width_px if box_width_px is not None else 460)),
-    )
-    max_chars = max(13, int((box_width - 16) / 7.0))
-    def clipped(value: str, prefix: str) -> str:
-        available = max(4, max_chars - len(prefix))
-        return value if len(value) <= available else value[: max(1, available - 3)] + "..."
-    overlay = panel.copy()
-    cv2.rectangle(overlay, (4, 4), (box_width, 49), (255, 255, 255), -1)
-    alpha = max(0.0, min(1.0, float(background_alpha)))
-    if alpha >= 1.0:
-        panel[:] = overlay
-    elif alpha > 0.0:
-        cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0.0, panel)
-    for index, line in enumerate((f"TASK TARGET: {target}", f"MODULE2 SUBGOAL: {behavior} {name}")):
-        prefix = "TASK TARGET: " if index == 0 else "MODULE2: "
-        value = target if index == 0 else f"{behavior} {name}"
-        cv2.putText(
-            panel,
-            prefix + clipped(value, prefix),
-            (9, 20 + index * 21),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (30, 30, 30),
-            1,
-            cv2.LINE_AA,
-        )
+    target = (candidates.get("target_context") or {}).get("target_name")
+    behavior = selection.get("behavior_type")
+    name = selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id")
+    SubgoalOverlay.draw_header(panel, target, behavior, name, box_width_px=box_width_px, background_alpha=background_alpha)
 
 
 def _draw_robot_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int) -> None:
@@ -920,14 +886,9 @@ def _draw_robot_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, le
 
 
 def _draw_goal_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int, color: tuple[int, int, int] = (230, 30, 45)) -> None:
-    cx, cy = center
-    heading = np.asarray([math.cos(yaw), -math.sin(yaw)], dtype=np.float32)
-    norm = float(np.linalg.norm(heading))
-    heading = np.asarray([1.0, 0.0], dtype=np.float32) if norm <= 1e-6 else heading / norm
-    start = np.asarray([cx, cy], dtype=np.float32) - heading * float(length * 0.45)
-    end = np.asarray([cx, cy], dtype=np.float32) + heading * float(length)
-    cv2.arrowedLine(panel, tuple(start.astype(np.int32)), tuple(end.astype(np.int32)), color, 4, cv2.LINE_AA, tipLength=0.45)
-    cv2.circle(panel, (cx, cy), max(4, length // 4), color, -1, cv2.LINE_AA)
+    SubgoalOverlay.draw_marker(
+        panel, center, color, radius=max(3, int(length) // 4), selected=True, yaw=yaw
+    )
 
 
 def _draw_subgoal_marker(
@@ -941,22 +902,7 @@ def _draw_subgoal_marker(
 ) -> None:
     """Draw one behavior-independent subgoal marker above every map overlay."""
 
-    radius = max(3, int(radius))
-    # Selection is communicated by the heading arrow.  Keep the same one-pixel
-    # black ring and full interior colour as the original behavior marker;
-    # thickening the ring made the live goal look black/different.
-    border = 1
-    cv2.circle(panel, center, radius, (18, 18, 18), -1, cv2.LINE_AA)
-    cv2.circle(
-        panel,
-        center,
-        max(2, radius - border),
-        tuple(int(value) for value in color),
-        -1,
-        cv2.LINE_AA,
-    )
-    if selected and yaw is not None and math.isfinite(float(yaw)):
-        _draw_subgoal_direction(panel, center, float(yaw), radius)
+    SubgoalOverlay.draw_marker(panel, center, color, radius=radius, selected=selected, yaw=yaw)
 
 
 def _draw_subgoal_direction(
@@ -969,30 +915,7 @@ def _draw_subgoal_direction(
     """Add the original behavior colour and a readable heading to a live goal."""
 
     if math.isfinite(float(yaw)):
-        heading = np.asarray(
-            [math.cos(float(yaw)), -math.sin(float(yaw))], dtype=np.float32
-        )
-        length = max(10, int(length))
-        start = np.asarray(center, dtype=np.float32) - heading * float(length * 0.18)
-        end = np.asarray(center, dtype=np.float32) + heading * float(length)
-        cv2.arrowedLine(
-            panel,
-            tuple(start.astype(np.int32)),
-            tuple(end.astype(np.int32)),
-            (18, 18, 18),
-            4,
-            cv2.LINE_AA,
-            tipLength=0.42,
-        )
-        cv2.arrowedLine(
-            panel,
-            tuple(start.astype(np.int32)),
-            tuple(end.astype(np.int32)),
-            tuple(int(value) for value in color),
-            2,
-            cv2.LINE_AA,
-            tipLength=0.42,
-        )
+        SubgoalOverlay.draw_direction(panel, center, yaw, length, color=color)
 
 
 def _draw_interaction_target_link(
@@ -1227,6 +1150,19 @@ def active_semantic_selection(step: dict) -> dict:
     if raw_selection.get("active") is False:
         return {}
     selection = dict(raw_selection)
+    # Older recorder snapshots occasionally persisted the physical action
+    # verb (``open``/``close``) in ``behavior_type``.  The map renderer treats
+    # unknown behavior types as NAVIGATE, which made an interaction marker
+    # turn green during offline replay.  Recover the semantic type from the
+    # nested command (or the canonical candidate-id prefix) before any panel
+    # consumes the selection.
+    behavior = str(selection.get("behavior_type") or "").upper()
+    if behavior not in {"EXPLORE", "NAVIGATE", "INTERACT"}:
+        command = selection.get("interaction_command") or {}
+        action = str(command.get("action") or "").strip()
+        candidate_id = str(selection.get("candidate_id") or "").casefold()
+        if action or candidate_id.startswith("interaction:"):
+            selection["behavior_type"] = "INTERACT"
     execution = step.get("semantic_execution_state") or {}
     if (
         str(execution.get("candidate_id") or "")
@@ -1766,7 +1702,9 @@ class OfflineSixPanelRenderer:
             3,
         )
         ego_arrow_length = max(9, int(round(9 * scale)))
+        ego_pose_px = None
         if pose is not None and (robot_px := to_panel(pose)) is not None:
+            ego_pose_px = robot_px
             _draw_robot_arrow(panel, robot_px, pose[2], ego_arrow_length)
         if draw_global_plan:
             _draw_polyline(panel, [point for item in global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
@@ -1879,15 +1817,15 @@ class OfflineSixPanelRenderer:
                 radius=marker_radius,
                 selected=True,
             )
+            # Keep the selected-goal heading comparable to the robot marker.
+            # Scaling it from goal-to-ego distance made the same heading jump
+            # in size as navigation progressed and could cover nearby objects.
+            direction_length = max(6, int(ego_arrow_length))
             _draw_subgoal_direction(
                 panel,
                 live_goal_marker[0],
                 live_goal_marker[2],
-                # ``_draw_robot_arrow`` spans 1.55 * its nominal length from
-                # tail to tip.  Make the selected-goal arrow exactly half of
-                # that visible ego-pose span, rather than half of only its
-                # forward half (which was too short in Fig. 2/Fig. 4).
-                max(10, int(round(0.5 * 1.55 * ego_arrow_length))),
+                direction_length,
                 live_goal_marker[1],
             )
         return panel
@@ -2337,6 +2275,13 @@ class OfflineSixPanelRenderer:
         step_index: int,
     ) -> np.ndarray:
         """Render the complete current candidate set in deterministic order."""
+
+        return SubgoalOverlay.render_candidate_sidebar(
+            panel_size,
+            (step.get("semantic_candidates") or {}).get("candidates") or [],
+            active_semantic_selection(step),
+            step_index,
+        )
 
         width, height = panel_size
         panel = np.full((height, width, 3), (238, 242, 248), dtype=np.uint8)

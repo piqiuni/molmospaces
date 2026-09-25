@@ -1,0 +1,59 @@
+{
+  "schema_version": "interactive_nav_supplied_performance_baselines_v1",
+  "note": "Values supplied by the user; fixed 200-step runs and therefore not controlled against a dynamic-budget run.",
+  "runs": [
+    {
+      "name": "10-worker recorded",
+      "conditions": {"workers": 10, "episodes": 10, "recording": true, "step_budget": "fixed 200"},
+      "metrics": {
+        "scene_span_seconds": 711.1,
+        "weighted_loop_seconds": 1.374,
+        "throughput_steps_per_second": 2.741,
+        "mean_runner_seconds": 443.5,
+        "mean_tail_seconds": 41.5,
+        "mean_cpu_percent": 28.63,
+        "peak_cpu_percent": 45.33,
+        "peak_host_memory_gib": 56.44,
+        "gpu0_peak_memory_gib": 46.36,
+        "gpu1_peak_memory_gib": 46.16,
+        "output_gib": 2.84
+      }
+    },
+    {
+      "name": "10-worker no-recording",
+      "conditions": {"workers": 10, "episodes": 10, "recording": false, "step_budget": "fixed 200"},
+      "metrics": {
+        "scene_span_seconds": 578.7,
+        "weighted_loop_seconds": 1.254,
+        "throughput_steps_per_second": 3.332,
+        "mean_runner_seconds": 337.6,
+        "mean_tail_seconds": 7.2,
+        "mean_cpu_percent": 17.72,
+        "peak_cpu_percent": 27.96,
+        "peak_host_memory_gib": 52.31,
+        "gpu0_peak_memory_gib": 46.38,
+        "gpu1_peak_memory_gib": 46.16,
+        "output_gib": 0.56
+      }
+    },
+    {
+      "name": "30-worker no-recording",
+      "conditions": {"workers": 30, "episodes": 30, "recording": false, "step_budget": "fixed 200"},
+      "metrics": {
+        "scene_span_seconds": 1192.0,
+        "weighted_loop_seconds": 3.224,
+        "p50_seconds": 2.578,
+        "p95_seconds": 6.392,
+        "p99_seconds": 12.132,
+        "throughput_steps_per_second": 4.51,
+        "mean_cpu_percent": 23.52,
+        "peak_cpu_percent": 28.55,
+        "peak_host_memory_gib": 126.73,
+        "gpu0_peak_memory_gib": 59.33,
+        "gpu1_peak_memory_gib": 56.88,
+        "gpu0_mean_utilization_percent": 23.60,
+        "gpu1_mean_utilization_percent": 18.01
+      }
+    }
+  ]
+}

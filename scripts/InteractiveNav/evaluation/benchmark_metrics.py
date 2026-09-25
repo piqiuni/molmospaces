@@ -22,7 +22,7 @@ DEFAULT_PATH_BINS_M = (0.0, 3.0, 5.0, 8.0, 12.0, 20.0)
 # make Eq. (1) in the paper reproducible from saved episode results.  All three
 # can be overridden by the evaluator CLI and are frozen into every manifest and
 # episode result.
-PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v1"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v3"
 DEFAULT_PAPER_COST_INTERACTION_ATTEMPT = 0.30
 DEFAULT_PAPER_COST_ERROR_SURCHARGE = 1.00
 DEFAULT_PAPER_COST_FAILURE_PENALTY = 5.00
@@ -56,6 +56,9 @@ class PaperMetricConfig:
         return {
             "schema_version": PAPER_METRIC_SCHEMA_VERSION,
             "formula": "L_exec_m + lambda*A + mu*E + kappa*(1-S)",
+            "interaction_precision_definition": "new_successful_target_class_effect_attempts / all_interaction_attempts",
+            "interaction_success_definition": "episode_mean_of_best_required_plan_effect_completion_fraction",
+            "error_definition": "failed_or_effect_free_repeated_attempts",
             "interaction_attempt_cost": float(self.interaction_attempt_cost),
             "error_interaction_surcharge": float(self.error_interaction_surcharge),
             "failure_penalty": float(self.failure_penalty),
@@ -76,6 +79,7 @@ class PaperInteractionAttemptScore:
     failed_interaction_attempt_count: int
     repeated_interaction_attempt_count: int
     interaction_precision_episode: float
+    non_target_class_interaction_attempt_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -248,6 +252,9 @@ class InteractionTerminalScore:
     interaction_fractions: dict[str, float]
     valid_plan_id: str | None
     correct_action_count: int
+    required_interaction_completion_fraction: float | None = None
+    completed_required_interaction_count: int = 0
+    required_interaction_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -321,6 +328,9 @@ def score_interactions(
         valid_plan_id = None
         sequence_success = True
         non_interaction_success: bool | None = len(attempts) == 0
+        completion_fraction = None
+        completed_required_count = 0
+        required_count = 0
     else:
         valid_plan_id = next(
             (
@@ -339,6 +349,24 @@ def score_interactions(
         if plan_rows and not required_ok:
             sequence_success = False
         non_interaction_success = None
+        effect_completed = {
+            item for item in completed
+            if fractions.get(item, 0.0) >= SUCCESS_OPEN_FRACTION
+            or item in transient_satisfied
+        }
+        nonempty_plans = [ids for _, ids in plan_rows if ids]
+        if nonempty_plans:
+            best_plan = max(
+                nonempty_plans,
+                key=lambda ids: len(effect_completed & ids) / len(ids),
+            )
+            completed_required_count = len(effect_completed & best_plan)
+            required_count = len(best_plan)
+            completion_fraction = completed_required_count / required_count
+        else:
+            completion_fraction = None
+            completed_required_count = 0
+            required_count = 0
     return InteractionTerminalScore(
         required_interaction_success=bool(required_ok),
         sequence_success=bool(sequence_success),
@@ -346,6 +374,9 @@ def score_interactions(
         interaction_fractions=fractions,
         valid_plan_id=valid_plan_id,
         correct_action_count=int(correct_action_count),
+        required_interaction_completion_fraction=completion_fraction,
+        completed_required_interaction_count=completed_required_count,
+        required_interaction_count=required_count,
     )
 
 
@@ -407,17 +438,31 @@ def _attempt_effect_interaction_ids(
     return list(dict.fromkeys(value for value in candidates if value in required_ids))
 
 
+def _interaction_class(category: Any, domain: str) -> tuple[str, str] | None:
+    name = str(category or "").strip().casefold().replace("_", " ").replace("-", " ")
+    if not name or name == "unknown":
+        return None
+    return domain, " ".join(name.split())
+
+
+def _target_interaction_classes(episode: dict[str, Any]) -> set[tuple[str, str]]:
+    classes = set()
+    for row in episode["interactive_nav"].get("interactions", []):
+        domain = str(row.get("type") or "").split("_", 1)[0]
+        key = _interaction_class(row.get("object_category"), domain)
+        if key is not None:
+            classes.add(key)
+    return classes
+
+
 def paper_interaction_attempt_score(
     episode: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> PaperInteractionAttemptScore:
-    """Compute paper-IP numerator/denominator and the union-counted error set.
+    """Credit new successful effects in the target interaction class.
 
-    ``E`` counts erroneous *attempts*, rather than adding category counts: an
-    invalid request which also fails is one attempt in Eq. (1).  A repeated
-    request only becomes an error once every required effect it produces was
-    already complete; a multi-joint macro that completes a new effect is not
-    penalised merely because it also touches an earlier joint.
+    Other successful exploration is charged for the attempt but is not an
+    error. ``E`` counts failed or effect-free repeated attempts only once.
     """
 
     nav = episode["interactive_nav"]
@@ -427,7 +472,13 @@ def paper_interaction_attempt_score(
         for interaction in nav.get("interactions", [])
         if interaction.get("interaction_id") is not None
     }
+    target_classes = _target_interaction_classes(episode)
+    required_by_id = {
+        str(row["interaction_id"]): row
+        for row in nav.get("interactions", []) if row.get("interaction_id") is not None
+    }
     completed_ids: set[str] = set()
+    completed_objects: set[tuple[str, str, str]] = set()
     valid_count = 0
     error_count = 0
     irrelevant_count = 0
@@ -436,33 +487,36 @@ def paper_interaction_attempt_score(
 
     for attempt in attempts:
         targeted_ids = _attempt_targeted_interaction_ids(attempt)
-        classification = str(attempt.get("classification") or "")
-        # A failed evaluator-side resolution may have no credited ID yet still
-        # be a request for the annotated entity.  `required_valid` is assigned
-        # only after matching that entity; do not turn such a failed relevant
-        # request into an unrelated-object error in the saved breakdown.
-        targets_required = bool(required_ids.intersection(targeted_ids)) or bool(
-            required_ids and classification == "required_valid"
-        )
         effect_ids = _attempt_effect_interaction_ids(attempt, required_ids)
         has_new_effect = bool(set(effect_ids) - completed_ids)
-        repeated = bool(effect_ids) and not has_new_effect
-        # A relevant request that cannot produce its expected effect is a
-        # failed interaction even if an executor reported a benign low-level
-        # completion.  Conversely, an effect-producing ROS macro is not
-        # treated as failed just because its task-level acknowledgement waits
-        # for a later prerequisite.
-        failed = bool(
-            not effect_ids
-            and (
-                targets_required
-                or classification == "required_valid"
-                or not bool(attempt.get("success"))
-            )
+        metadata = attempt.get("metadata") or {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        object_name = str(attempt.get("resolved_object_name") or "")
+        category = metadata.get("resolved_object_category")
+        domain = str(metadata.get("resolved_object_domain") or "")
+        if not category and targeted_ids:
+            matched = next((required_by_id[item] for item in targeted_ids if item in required_by_id), None)
+            if matched is not None:
+                category = matched.get("object_category")
+                domain = str(matched.get("type") or "").split("_", 1)[0]
+        interaction_class = _interaction_class(category, domain)
+        object_key = (domain, object_name, str(attempt.get("resolved_joint_name") or attempt.get("resolved_joint_index") or ""))
+        physical_state_changed = metadata.get("physical_state_changed")
+        before = _finite_float(attempt.get("joint_fraction_before"))
+        after = _finite_float(attempt.get("joint_fraction_after"))
+        if before is not None and after is not None:
+            physical_state_changed = after > before + 1e-3
+        new_object_effect = bool(
+            attempt.get("success") and object_name
+            and physical_state_changed is not False
+            and (physical_state_changed is True or object_key not in completed_objects)
         )
-        irrelevant = not targets_required
+        new_effect = has_new_effect or new_object_effect
+        repeated = bool(effect_ids or (attempt.get("success") and object_name)) and not new_effect
+        failed = bool(not effect_ids and not attempt.get("success"))
+        irrelevant = interaction_class is not None and interaction_class not in target_classes
 
-        if has_new_effect:
+        if new_effect and interaction_class in target_classes:
             valid_count += 1
         if irrelevant:
             irrelevant_count += 1
@@ -470,9 +524,11 @@ def paper_interaction_attempt_score(
             failed_count += 1
         if repeated:
             repeated_count += 1
-        if irrelevant or failed or repeated:
+        if failed or repeated:
             error_count += 1
         completed_ids.update(effect_ids)
+        if new_effect and object_name:
+            completed_objects.add(object_key)
 
     attempt_count = len(attempts)
     if attempt_count:
@@ -487,6 +543,7 @@ def paper_interaction_attempt_score(
         failed_interaction_attempt_count=int(failed_count),
         repeated_interaction_attempt_count=int(repeated_count),
         interaction_precision_episode=float(precision),
+        non_target_class_interaction_attempt_count=int(irrelevant_count),
     )
 
 
@@ -581,9 +638,29 @@ def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
     return float(sum(bool(value) for value in values) / len(values))
 
 
-def _rate_with_fallback(rows: list[dict[str, Any]], key: str, fallback_key: str) -> float | None:
-    values = [row.get(key, row.get(fallback_key)) for row in rows]
-    values = [value for value in values if value is not None]
+def _rate_with_fallback(
+    rows: list[dict[str, Any]],
+    key: str,
+    fallback_key: str,
+    *,
+    fallback_requires_nav: bool = False,
+) -> float | None:
+    # A few transitional result writers emitted the new key with ``null``;
+    # treat that exactly like an absent key while preserving an explicit False.
+    values = []
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            value = row.get(fallback_key)
+            # Legacy ``success`` was occasionally written after a target
+            # claim even when native navigation had failed.  Do not let that
+            # stale combination become an Interactive layer success when the
+            # new field is absent/null; an explicit new field remains
+            # authoritative.
+            if fallback_requires_nav and row.get("nav_success") is False:
+                value = False
+        if value is not None:
+            values.append(value)
     if not values:
         return None
     return float(sum(bool(value) for value in values) / len(values))
@@ -675,16 +752,14 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row for row in rows if str(row.get("interaction_requirement") or "") == "required"
     ]
     paper_isr_values = [
-        None
-        if row.get("required_interaction_success") is None
-        else bool(row.get("required_interaction_success"))
+        _finite_float(row.get("required_interaction_completion_fraction"))
         for row in required_rows
     ]
     paper_ip_values = [_paper_interaction_precision(row) for row in rows]
     paper_cost_values = [_paper_total_cost(row) for row in rows]
     paper_sr = _strict_rate(paper_nav_values)
     paper_spl = _strict_mean(paper_spl_values)
-    paper_isr = _strict_rate(paper_isr_values)
+    paper_isr = _strict_mean(paper_isr_values)
     paper_ip = _strict_mean(paper_ip_values)
     paper_total_cost = _strict_mean(paper_cost_values)
     early_stops = _triggered_early_stops(rows)
@@ -706,7 +781,23 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             rows, "interaction_conditioned_success", "success"
         ),
         "nav_success_rate": paper_sr,
+        "exact_instance_success_rate": _rate_with_fallback(
+            rows, "exact_instance_success", "nav_success"
+        ),
+        "category_goal_success_rate": _rate_with_fallback(
+            rows, "category_goal_success", "nav_success"
+        ),
+        "interaction_contract_goal_success_rate": _rate_with_fallback(
+            rows, "interaction_contract_goal_success", "nav_success"
+        ),
+        "interactive_episode_success_rate": _rate_with_fallback(
+            rows,
+            "interactive_episode_success",
+            "interaction_conditioned_success",
+            fallback_requires_nav=True,
+        ),
         "required_interaction_success_rate": paper_isr,
+        "full_required_interaction_success_rate": _rate(required_rows, "required_interaction_success"),
         "sequence_success_rate": _rate(rows, "sequence_success"),
         "non_interaction_success_rate": _rate(rows, "non_interaction_success"),
         "interaction_precision": paper_ip,

@@ -20,17 +20,15 @@ results.
 
 ## Fixed input
 
-The formal validation input is the runtime-qualified v1.1 release:
+The default evaluation input is the repaired v1.2 release:
 
 ```text
-scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json
+scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json
 ```
 
-The source candidate contained 3000 episodes.  After the frozen runtime quality
-gate, the formal scoring denominator is 2968: 1000 Channel, 976 Container and
-992 Mixed.  The 32 excluded candidate rows remain in
-`scoring/scoring_manifest.jsonl`; they are not policy failures and must not be
-included in aggregate metrics.  The evaluator must not modify the formal JSON.
+The repaired input contains 3000 episodes: 1000 each for Channel, Container and
+Mixed. The historical v1.1 release had 2968 episodes; its quality-gate signature
+must not be reused for v1.2. The evaluator must not modify the benchmark JSON.
 Each episode's `scene_modifications` is the authoritative initial
 object/articulation state.
 
@@ -68,6 +66,30 @@ names, joint names/indices, joint values, open/closed state, container
 relations, visibility privilege, oracle records, and task-selected instance
 IDs at this boundary.  The RLE remains compact on the ROS wire and semantic
 mapping counts it without materialising a dense mask.
+
+The public target context also carries `success_distance_threshold_m`, the
+task's distance criterion (1.5 m in the current release), without the selected
+target position or identity. The method compares this against the observed
+target position, not the distance to a container approach waypoint. The
+evaluator independently verifies the selected instance and strict distance
+inequality. Door frame/leaf render components belonging to one private asset
+instance share a public door identity; their combined mask does not expose the
+underlying component or joint names.
+
+A currently visible, reliably observed target already within the public arrival
+criterion remains eligible for completion verification even when its unused
+navigation standoff is blocked. This candidate requests verification without
+navigation; distant or currently invisible targets retain clearance checks.
+
+The current benchmark interaction profile bypasses refrigerator open-sweep
+preflight and uses ten observation steps after fully opening each drawer.
+An object-goal completion claim during opening is deferred until that drawer
+has completed these ten observation steps. A verified terminal interrupts the
+remaining scan before closing or restoring the view; its public final state is
+open. Pure exploration continues the full open-observe-close scan. Physical
+open success and required-interaction scoring remain separate from target
+discovery; a partly open drawer is not credited merely because its target can
+already be seen.
 
 ## Terminal conditions
 
@@ -114,6 +136,23 @@ For backward compatibility, result field `success` is the same as
 along with navigation success, required interaction success, sequence success,
 wrong interaction count, path length, and terminal reason.
 
+Paper metric schema `interactive_nav_v3_paper_metrics_v3` scores ISR as the
+episode mean of the completed-required-effect fraction for the best valid
+required plan. A scene completing one of two required effects receives 0.5;
+the existing `required_interaction_success` flag still records full-plan
+completion for task logic. Schema v2 ISR was an all-or-nothing episode rate,
+so v2 and v3 ISR are not comparable without rescoring the underlying
+interactions. The v3 schema scores interaction
+precision per episode as the number of attempts producing a new successful
+effect on an object in the target interaction **category** divided by all
+interaction attempts. Categories use evaluator-private `object_category` and
+channel/container domain; they do not require the target instance or joint ID.
+An unrelated successful exploration interaction has no IP credit, but is not
+automatically an error. The cost is `L_exec + lambda*A + mu*E + kappa*(1-S)`,
+where `E` counts failed or effect-free repeated attempts, never mere
+non-target-category exploration. Old v1 IP and Total Cost are not comparable
+to v2/v3, whose IP and cost definitions are identical.
+
 ### ROS step accounting and command liveness
 
 `--max-steps` and each dynamic `effective_max_steps` are budgets of evaluator-
@@ -130,9 +169,11 @@ waits still receive a distinct index.  Results expose both `step_count`
 `no_fresh_action_count` and the full `policy_termination` diagnostic.
 
 A single or intermittent no-fresh return never ends an episode.  By default,
-60 continuous wall-clock seconds without a fresh action or evaluator-consumed
+90 continuous wall-clock seconds without a fresh action or evaluator-consumed
 interaction ends it as `ros_bridge_command_starvation`; any real command resets
-that interval.  `--ros-command-starvation-timeout-s 0` disables this wall guard.
+that interval.  The 90-second default leaves headroom for one 30-second M2
+timeout, a 1-second backoff, and one bounded retry.
+`--ros-command-starvation-timeout-s 0` disables this wall guard.
 An independent default hard limit of four observation turns per applied-action
 budget prevents an unbounded loop even when the wall guard is disabled; configure
 it with `--ros-observation-turn-multiplier`.
@@ -228,7 +269,7 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
 
 ```bash
 MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
-  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
   --output-dir scripts/InteractiveNav/output/v3_eval_current_ros_5x100 \
   --policy ros_bridge --ros-action-timeout-s 1.0 \
   --no-require-runtime-goal-consistency \
@@ -282,7 +323,7 @@ Then run one evaluator process against that ROS master:
 
 ```bash
 MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
-  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
   --output-dir scripts/InteractiveNav/output/v3_eval_object_goal_rule_smoke \
   --policy ros_object_goal_rule --workers 1 \
   --ros-action-timeout-s 1.0 --max-steps 500 --max-episodes 5
@@ -302,3 +343,82 @@ oracle recipe, source name, or joint state.  After a successful command, the
 decision node may record an episode-local `command_outcome_belief` from its own
 requested action; this prevents duplicate open commands but is not a simulator
 state read.  The default ROS configuration remains `rule_verified`.
+
+## Post-hoc goal-equivalence scoring (v2)
+
+`rescore_benchmark_goals.py` produces a separate, versioned result set. It does
+not mutate the released benchmark, the original results, the online v17 terminal
+verifier, or the policy's observations. Report this as a changed evaluation
+definition, not an algorithm improvement or a replacement for frozen-instance SR.
+
+Only an eligible, completed episode with a saved category-level `verified`
+success claim can enter the relaxed layers. That existing verifier requires
+public observation evidence for the same opaque instance and robot-to-object
+distance below 1.5 m. The alternative must have the same metadata category.
+Explicit unique/attribute grounding is not relaxed automatically. The report
+keeps four independent endpoints: `exact_instance_success`,
+`category_goal_success`, `interaction_contract_goal_success`, and
+`interactive_episode_success`.
+
+Category equivalence is accepted when either:
+
+- The alternative's metadata ancestor is the target container and its frozen
+  position lies inside the closed-container AABB, excluding the top 1 cm; room
+  IDs must also match. Metadata `parent` alone is insufficient because it also
+  represents objects supported *on* furniture.
+- Its planar position is within 0.30 m of the original target, room IDs match,
+  and both have the same support/parent or both are outside known containers.
+  This is a target-to-target tolerance; the robot's arrival threshold is unchanged.
+- It is another same-category object in the same observed room. This includes
+  a target inside a container and a found object on a surface, but excludes a
+  known different-container substitution and inconsistent container geometry.
+
+An accepted same-container, near, or same-room candidate is **Category-only**
+unless the dataset's frozen `identity_contract` or a reviewed candidate-specific
+interaction-plan audit proves the complete interaction contract. A shared room or
+door topology is not, by itself, that proof. Objects in another room, a known
+different required container, or without verified public evidence remain failures.
+
+The original `nav_success`, `task_success`, `success`,
+`interaction_conditioned_success`, SPL, Total Cost, interaction precision,
+eligibility, executed path, steps, and terminal facts are never rewritten.
+Thus finding a nearby CD without opening the required drawer can raise
+`category_goal_success` while leaving the strict navigation and
+interaction-conditioned scores unchanged. No Category-SPL is computed because
+the candidate-specific reference path is unavailable; `spl_original_reference`
+is only a fixed-reference diagnostic.
+
+Legacy v17 identity recovery uses scene metadata/XML, the deterministic sorted
+registry construction, and a cross-check against the recorded full channel
+alias set. Double-leaf door roots have no skill alias. When recordings exist,
+the accepted public opaque ID's geometry is also cross-checked. Missing or
+inconsistent evidence fails closed. Reports include input hashes and per-episode
+reasons; original files are preserved and existing report directories are never
+overwritten. No simulation, model inference, asset downloads, or installation
+is performed by the rescoring command.
+
+### Mixed quality audit subsets
+
+`audit_mixed_benchmark_run.py` consumes an existing goal-equivalence report and
+audits **all** mixed episodes, including successes. It does not edit any success
+label. Four explicitly named subsets retain their own denominators:
+
+1. `all_planned`: unchanged goal-equivalence scores.
+2. `original_eligible`: the existing runtime consistency gate.
+3. `scene_valid`: additionally quarantine a strict original-target completion
+   with only portal interactions while the frozen task requires opening a closed
+   container to reveal that target. This is a runtime counterexample to interaction
+   necessity, not proof of a particular mesh or physics defect. Relaxed-category
+   goal completion alone is insufficient for this exclusion.
+4. `scene_and_execution_valid`: additionally quarantine a matching public/private
+   drawer-scan command that scanned all regions and closed successfully but failed
+   the checked pose-restoration convergence bound. This establishes an execution
+   fault, not that the policy would otherwise have found its intended target.
+
+The quarantine is specific to these evaluation attempts and requires revalidation
+or rerunning before reuse; it never deletes benchmark data. Private transient GT
+visibility without public completion, navigation/planning warnings, and shutdown
+exceptions are recorded for review but do not automatically exclude a scene.
+System-wide planning/actionlib races must not be used to select only failed
+episodes for removal. These post-hoc conditional subsets are diagnostic and must
+be reported alongside the unfiltered score, not as an unbiased algorithm gain.

@@ -55,6 +55,7 @@ class RosBridgePolicy(BasePolicy):
         odom_topic: str = "/odom",
         publish_odom: bool = True,
         publish_odom_twist: bool = False,
+        odom_twist_source: str = "instantaneous",
         map_frame_id: str = "tf_frame_map",
         odom_frame_id: str = "tf_frame_odom",
         base_frame_id: str = "tf_frame_base_link",
@@ -105,6 +106,7 @@ class RosBridgePolicy(BasePolicy):
         step_ready_bootstrap_timeout_s: float | None = None,
         step_ready_bootstrap_republish_period_s: float = 0.5,
         tf_keepalive_period_s: float = 0.25,
+        allow_lateral_cmd_vel: bool = True,
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -142,6 +144,9 @@ class RosBridgePolicy(BasePolicy):
         self.odom_topic = odom_topic
         self.publish_odom = bool(publish_odom)
         self.publish_odom_twist = bool(publish_odom_twist)
+        if odom_twist_source not in {"instantaneous", "step_delta"}:
+            raise ValueError("odom_twist_source must be instantaneous or step_delta")
+        self.odom_twist_source = odom_twist_source
         self.map_frame_id = map_frame_id
         self.odom_frame_id = odom_frame_id
         self.base_frame_id = base_frame_id
@@ -158,6 +163,9 @@ class RosBridgePolicy(BasePolicy):
         self.cmd_vel_topic = cmd_vel_topic
         self.cmd_vel_timeout_s = float(cmd_vel_timeout_s)
         self.cmd_vel_linear_gain = max(0.0, float(cmd_vel_linear_gain))
+        self.allow_lateral_cmd_vel = bool(allow_lateral_cmd_vel)
+        self.last_cmd_vel_lateral_rejected = False
+        self.lateral_cmd_vel_rejection_count = 0
         self.require_fresh_cmd_vel = bool(require_fresh_cmd_vel)
         self.require_move_base_active_for_cmd_vel = bool(require_move_base_active_for_cmd_vel)
         self.move_base_status_topic = move_base_status_topic
@@ -242,6 +250,7 @@ class RosBridgePolicy(BasePolicy):
         self._move_base_active: bool = False
         self._last_base_position_xyz: np.ndarray | None = None
         self._last_base_pose_xyyaw: np.ndarray | None = None
+        self._odom_step_sample = None
         self._last_common_stamp_s: float | None = None
         self._stamp_lock = threading.Lock()
         self._tf_cache_lock = threading.Lock()
@@ -787,6 +796,7 @@ class RosBridgePolicy(BasePolicy):
             self._latest_step_capture_ack_mono_s = 0.0
         self._last_base_position_xyz = None
         self._last_base_pose_xyyaw = None
+        self._odom_step_sample = None
         with self._tf_cache_lock:
             # Do not let the keepalive publish a previous house's transform
             # while the navigation stack is resetting its map/costmaps.
@@ -808,6 +818,22 @@ class RosBridgePolicy(BasePolicy):
         if payload is not None:
             self._latest_gt_payload = payload
         return payload
+
+    def publish_public_rgb_frame(self, observation: Any, *, stamp_sec: float) -> None:
+        """Publish RGB for an evaluator-owned observation, including macro views.
+
+        This does not consume an action step or emit a recorder step marker.
+        The evaluator supplies the timestamp of the same-state public GT frame.
+        """
+        stamp = self._rospy.Time.from_sec(float(stamp_sec))
+        frame = self._extract_image_from_observation(observation)
+        if frame is None:
+            raise ValueError("Evaluator public observation has no RGB frame")
+        msg = self._to_image_msg(frame, stamp=stamp, seq=self._step_idx)
+        if msg is None:
+            raise ValueError("Cannot encode evaluator public RGB frame")
+        self._publish_odom_and_tf(observation, stamp)
+        self._obs_pub.publish(msg)
 
     def queue_step_frame_public_payload(self, payload: Mapping[str, Any]) -> bool:
         """Attach an already-published public perception frame to next RGB.
@@ -1100,6 +1126,21 @@ class RosBridgePolicy(BasePolicy):
         )
         yaw = self._quat_wxyz_to_yaw(qw, qx, qy, qz)
         vx, vy, wz = float(cmd_vel[0]), float(cmd_vel[1]), float(cmd_vel[2])
+        self.last_cmd_vel_lateral_rejected = False
+        if not getattr(self, "allow_lateral_cmd_vel", True):
+            if not np.isfinite(vy) or abs(vy) > 1e-6:
+                # Reject the whole trajectory, not just its lateral component:
+                # the remaining forward/turn motion has not been collision checked.
+                self.last_cmd_vel_lateral_rejected = True
+                self.lateral_cmd_vel_rejection_count += 1
+                self._rospy.logwarn_throttle(
+                    2.0,
+                    "RosBridgePolicy: rejecting lateral cmd_vel in nonholonomic mode "
+                    "(vx=%.6f vy=%.6f wz=%.6f, rejected=%d); holding pose.",
+                    vx, vy, wz, self.lateral_cmd_vel_rejection_count,
+                )
+                vx = wz = 0.0
+            vy = 0.0
         vx *= self.cmd_vel_linear_gain
         vy *= self.cmd_vel_linear_gain
         dt = self.cmd_vel_control_dt_s
@@ -1557,6 +1598,20 @@ class RosBridgePolicy(BasePolicy):
         vy = -np.sin(yaw) * vx_world + np.cos(yaw) * vy_world
         return float(vx), float(vy), float(wz)
 
+    def _step_delta_twist(self, pose_xyyaw: np.ndarray, *, position_jump: bool = False):
+        """Report executed motion once per control step, stable under republish."""
+        sample = getattr(self, "_odom_step_sample", None)
+        step = int(self._step_idx)
+        if sample is not None and sample[0] == step and not position_jump:
+            return sample[2]
+        twist = (0.0, 0.0, 0.0)
+        if sample is not None and step > sample[0] and not position_jump:
+            twist = self._estimate_planar_twist(
+                sample[1], pose_xyyaw, self.cmd_vel_control_dt_s * (step - sample[0])
+            )
+        self._odom_step_sample = (step, pose_xyyaw.copy(), twist)
+        return twist
+
     def _extract_planar_twist_from_task(self, yaw: float) -> tuple[float, float, float] | None:
         if self.task is None:
             return None
@@ -1706,7 +1761,11 @@ class RosBridgePolicy(BasePolicy):
                     pz,
                     self._step_idx,
                 )
-        if self.publish_odom_twist and not position_jump:
+        if self.publish_odom_twist and getattr(self, "odom_twist_source", "instantaneous") == "step_delta":
+            twist_x, twist_y, twist_yaw = self._step_delta_twist(
+                curr_pose_xyyaw, position_jump=position_jump
+            )
+        elif self.publish_odom_twist and not position_jump:
             instantaneous_twist = self._extract_planar_twist_from_task(curr_yaw)
             if instantaneous_twist is not None:
                 twist_x, twist_y, twist_yaw = instantaneous_twist
@@ -1994,7 +2053,7 @@ class RosBridgePolicy(BasePolicy):
             finally:
                 self._step_frame_queue.task_done()
 
-    def get_action(self, observation):
+    def get_action(self, observation, *, hold_navigation: bool = False):
         self.last_action_timed_out = False
         self.last_action_source = ""
         frame_t0 = time.perf_counter()
@@ -2310,7 +2369,18 @@ class RosBridgePolicy(BasePolicy):
             else None
         )
         chosen_action = None
-        while not self._rospy.is_shutdown():
+        if (
+            hold_navigation
+            and (
+                not self.step_ready_barrier_enabled
+                or self.last_step_ready_diagnostics.get("ready_satisfied", False)
+            )
+            and not self._rospy.is_shutdown()
+        ):
+            # The caller owns navigation for this step; retain ready/capture barriers.
+            chosen_action = self._build_noop_action()
+            self.last_action_source = "navigation_hold"
+        while chosen_action is None and not self._rospy.is_shutdown():
             now_mono = time.monotonic()
             if deadline is not None and now_mono >= deadline:
                 break
@@ -2356,7 +2426,10 @@ class RosBridgePolicy(BasePolicy):
                 cmd_action = self._cmd_vel_to_base_action(cmd_vel, observation)
                 if cmd_action is not None:
                     chosen_action = cmd_action
-                    self.last_action_source = "cmd_vel"
+                    self.last_action_source = (
+                        "lateral_cmd_vel_rejected"
+                        if self.last_cmd_vel_lateral_rejected else "cmd_vel"
+                    )
                     stage_ms["fresh_cmd_after_gate"] = max(
                         0.0, (cmd_vel_ts - wait_start_mono) * 1000.0
                     )

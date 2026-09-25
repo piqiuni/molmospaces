@@ -330,6 +330,9 @@ class RosBridgePolicyAdapter(ExternalPolicyAdapter):
                 )
         return normalize_policy_action(raw_action)
 
+    def publish_public_rgb_frame(self, observation: Any, *, stamp_sec: float) -> None:
+        self.policy.publish_public_rgb_frame(observation, stamp_sec=stamp_sec)
+
     def queue_step_frame_public_payload(self, payload: dict[str, Any]) -> bool:
         """Forward evaluator-owned public perception to the bridge recorder.
 
@@ -394,6 +397,7 @@ class RosConfigFacade:
     """Minimal config accepted by RosBridgePolicy without task-level GT."""
 
     policy_dt_ms: float
+    policy_config: Any
 
 
 def build_ros_bridge_policy(
@@ -422,7 +426,10 @@ def build_ros_bridge_policy(
     from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 
     policy = RosBridgePolicy(
-        config=RosConfigFacade(policy_dt_ms=float(policy_dt_ms)),
+        config=RosConfigFacade(
+            policy_dt_ms=float(policy_dt_ms),
+            policy_config=type("RosPolicyConfig", (), {"force_enable_depth": False})(),
+        ),
         task=None,
         observation_topic=observation_topic,
         action_topic=action_topic,

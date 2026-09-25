@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,326 @@ from scripts.InteractiveNav.force_interaction_bridge import (
     drawer_sequence_task_step_budget,
     ground_drawer_open_regions,
 )
+
+
+def test_execution_progress_does_not_disclose_private_object_identity(monkeypatch):
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    controller._feedback_publisher = object()
+    controller._execution_command = {
+        "command_id": "command", "decision_id": "decision", "object_id": "door_0001",
+        "_execution_object_id": "private_simulator_root",
+    }
+    controller._execution_step = 432
+    controller._execution_progress_at = 100.0
+    monkeypatch.setattr("scripts.InteractiveNav.force_interaction_bridge.time.monotonic", lambda: 114.0)
+    published = []
+    monkeypatch.setattr(controller, "_publish", lambda _pub, payload: published.append(payload))
+    controller._publish_execution_progress()
+    assert published[0]["execution_active"]
+    assert published[0]["progress_age_s"] == 14.0
+    assert published[0]["execution_step"] == 432
+    assert published[0]["object_id"] == "door_0001"
+    assert "private_simulator_root" not in str(published)
+
+
+def _front_pose_task(pose):
+    x, y, yaw = pose
+    base_pose = np.eye(4)
+    base_pose[:2, :2] = [
+        [math.cos(yaw), -math.sin(yaw)],
+        [math.sin(yaw), math.cos(yaw)],
+    ]
+    base_pose[0, 3], base_pose[1, 3] = x, y
+    return SimpleNamespace(env=SimpleNamespace(current_robot=SimpleNamespace(
+        robot_view=SimpleNamespace(base=SimpleNamespace(pose=base_pose)),
+    )))
+
+
+def _front_pose_command(**overrides):
+    return {
+        "command_id": "front_precondition",
+        "object_id": "public_container",
+        "node_type": "container",
+        "action": "open",
+        "interaction_approach_pose_xyyaw": [1.0, 0.0, math.pi],
+        "interaction_approach_axis_xy": [1.0, 0.0],
+        "interaction_target_center_xy": [0.0, 0.0],
+        "interaction_front_axis_validation_required": True,
+        "navigation_goal_position_tolerance_m": 0.15,
+        "navigation_goal_yaw_tolerance_rad": 0.2,
+        "interaction_front_position_tolerance_rad": math.radians(15),
+        "interaction_front_yaw_tolerance_rad": math.radians(15),
+        **overrides,
+    }
+
+
+def _front_pose_rejection(monkeypatch, pose, command, physical_front):
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        object_id_resolver=lambda _public_id: "private_container_root",
+    )
+    published = []
+    monkeypatch.setattr(controller, "_already_open_refrigerator", lambda *_args: None)
+    monkeypatch.setattr(controller, "_publish", lambda _publisher, payload: published.append(payload))
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.infer_articulation_front_axis_xy",
+        lambda *_args: physical_front,
+    )
+
+    def forbid_force(*_args, **_kwargs):
+        pytest.fail("A rejected pose must not prepare or apply articulation force")
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        forbid_force,
+    )
+    monkeypatch.setattr(controller, "_start_drawer_sequence", forbid_force)
+    assert controller.enqueue_command(command)
+    result = controller.before_step(_front_pose_task(pose), step=412)
+    assert result["success"] is False
+    assert result["status"] == "FAILED"
+    assert result["retryable"] is True
+    assert result["verification_source"] == "executor_pose_precondition"
+    assert result["sim_steps_consumed"] == result["physics_substeps"] == result["task_steps_consumed"] == 0
+    assert result["interaction_pose_validation"]["valid"] is False
+    assert result["failure_reason"] == result["interaction_pose_validation"]["reason"]
+    assert result["recovery_action"] == result["interaction_pose_validation"]["recovery_action"]
+    assert result["reject_selected_face"] == (result["failure_reason"] == "interaction_wrong_face")
+    assert published == [result, controller._events[-1]["feedback"]]
+    assert published[1]["interaction_result"] == result
+    assert controller.should_pause_navigation() is False
+    assert "private_container_root" not in str(published)
+    assert "private_front_geometry" not in str(published)
+    # Public AABB geometry may be echoed, but numerical physical-front geometry
+    # would let the planner reconstruct a GT correction without observing it.
+    validation = result["interaction_pose_validation"]
+    assert {key for key in validation if key.startswith("physical_front_")} == {
+        "physical_front_required", "physical_front_checked", "physical_front_valid",
+        "physical_front_position_valid", "physical_front_yaw_valid",
+    }
+    assert all(isinstance(value, bool) for key, value in validation.items() if key.startswith("physical_front_"))
+    return result
+
+
+@pytest.mark.parametrize("sequence_type", ["", "drawer_open", "drawer_scan"])
+def test_h9_same_face_physical_yaw_failure_is_recoverable_without_gt_axis(
+    monkeypatch, sequence_type,
+) -> None:
+    actual = [0.6658365, 7.6951334, 1.8134812]
+    physical_front_yaw = actual[2] - 0.3705016
+    command = _front_pose_command(
+        sequence_type=sequence_type,
+        interaction_approach_pose_xyyaw=[0.6726507, 7.6294561, 1.6580628],
+        interaction_approach_axis_xy=[0.0, -1.0],
+        interaction_target_center_xy=[0.540535, 9.13954],
+    )
+    result = _front_pose_rejection(monkeypatch, actual, command, {
+        "checked": True,
+        "axis_xy": [-math.cos(physical_front_yaw), -math.sin(physical_front_yaw)],
+        "source": "private_front_geometry",
+    })
+    validation = result["interaction_pose_validation"]
+    assert validation["position_error_m"] == pytest.approx(0.06603, abs=1e-5)
+    assert validation["yaw_error_rad"] == pytest.approx(0.1554184)
+    assert validation["face_valid"] is True
+    assert validation["physical_front_position_valid"] is True
+    assert validation["physical_front_yaw_valid"] is False
+    assert validation["face_yaw_tolerance_rad"] == math.radians(15)
+    assert result["failure_reason"] == "interaction_orientation_misaligned"
+    assert result["recovery_action"] == "realign_yaw"
+    assert result["reject_selected_face"] is False
+
+
+@pytest.mark.parametrize(
+    "actual, expected, reason, recovery",
+    [
+        ([1.16, 0.0, math.pi], [1.0, 0.0, math.pi], "interaction_position_misaligned", "reposition_same_face"),
+        ([1.0, 0.0, math.pi], [1.0, 0.0, math.pi - 0.21], "interaction_orientation_misaligned", "realign_yaw"),
+        ([1.0, 0.0, math.pi + 0.3], [1.0, 0.0, math.pi + 0.3], "interaction_orientation_misaligned", "realign_yaw"),
+        ([1.0, 0.4, math.pi], [1.0, 0.4, math.pi], "interaction_position_misaligned", "reposition_same_face"),
+        # Lateral drift to a side is not evidence that the selected face is wrong.
+        ([0.0, 1.0, math.pi], [0.0, 1.0, math.pi], "interaction_position_misaligned", "reposition_same_face"),
+        ([1.0, 0.4, math.pi + 0.3], [1.0, 0.4, math.pi + 0.3], "interaction_position_misaligned", "reposition_same_face"),
+    ],
+    ids=["goal_xy", "goal_yaw", "front_yaw", "front_position", "lateral_drift", "position_before_yaw"],
+)
+def test_same_selected_face_pose_failures_do_not_reject_whole_face(
+    monkeypatch, actual, expected, reason, recovery,
+) -> None:
+    result = _front_pose_rejection(
+        monkeypatch, actual, _front_pose_command(interaction_approach_pose_xyyaw=expected),
+        {"checked": True, "axis_xy": [1.0, 0.0]},
+    )
+    assert result["failure_reason"] == reason
+    assert result["recovery_action"] == recovery
+    assert result["reject_selected_face"] is False
+
+
+@pytest.mark.parametrize("physical_axis", [[0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]])
+def test_genuinely_wrong_selected_face_still_rejects_before_force(monkeypatch, physical_axis) -> None:
+    result = _front_pose_rejection(
+        monkeypatch, [1.0, 0.0, math.pi], _front_pose_command(),
+        {"checked": True, "axis_xy": physical_axis},
+    )
+    assert result["interaction_pose_validation"]["face_valid"] is True
+    assert result["failure_reason"] == "interaction_wrong_face"
+    assert result["recovery_action"] == "select_other_face"
+    assert result["reject_selected_face"] is True
+
+
+@pytest.mark.parametrize("physical_front", [
+    {"checked": False, "reason": "geometry_unavailable"},
+    {"checked": True, "axis_xy": []},
+    {"checked": True, "axis_xy": [1.0]},
+    {"checked": True, "axis_xy": [0.0, 0.0]},
+    {"checked": True, "axis_xy": [float("nan"), 0.0]},
+    {"checked": True, "axis_xy": [float("inf"), 0.0]},
+    {"checked": True, "axis_xy": [None, 0.0]},
+    {"checked": True, "axis_xy": [1.0, 1.0]},
+    {"checked": True, "axis_xy": [1.0, -1.0]},
+])
+def test_unverified_or_ambiguous_front_does_not_claim_wrong_face(monkeypatch, physical_front) -> None:
+    result = _front_pose_rejection(
+        monkeypatch, [1.0, 0.0, math.pi], _front_pose_command(), physical_front,
+    )
+    assert result["failure_reason"] == "interaction_front_unverified"
+    assert result["recovery_action"] == "reobserve_front"
+    assert result["reject_selected_face"] is False
+
+
+@pytest.mark.parametrize("overrides", [
+    {"interaction_approach_axis_xy": []},
+    {"interaction_approach_axis_xy": [0.0, 0.0]},
+    {"interaction_target_center_xy": [1.0, 0.0]},
+])
+def test_missing_public_front_contract_fails_closed_without_face_rejection(monkeypatch, overrides) -> None:
+    result = _front_pose_rejection(
+        monkeypatch, [1.0, 0.0, math.pi], _front_pose_command(**overrides),
+        {"checked": True, "axis_xy": [1.0, 0.0]},
+    )
+    assert result["failure_reason"] == "interaction_front_unverified"
+    assert result["reject_selected_face"] is False
+
+
+@pytest.mark.parametrize("actual_yaw", [math.pi, -math.pi, math.pi - 0.19, math.pi + 0.19])
+def test_valid_front_pose_and_wrapped_yaw_remain_accepted(monkeypatch, actual_yaw) -> None:
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.infer_articulation_front_axis_xy",
+        lambda *_args: {"checked": True, "axis_xy": [1.0, 0.0]},
+    )
+    result = AtomicForceInteractionController._validate_interaction_pose(
+        _front_pose_task([1.0, 0.0, actual_yaw]), _front_pose_command(),
+    )
+    assert result["valid"] is True
+    assert result["reason"] == ""
+    assert result["reject_selected_face"] is False
+
+
+@pytest.mark.parametrize("component", ["position", "orientation"])
+@pytest.mark.parametrize("overshoot_rad", [-1e-4, 1e-4])
+def test_physical_front_fifteen_degree_safety_threshold_is_not_relaxed(
+    monkeypatch, component, overshoot_rad,
+) -> None:
+    physical_angle = math.radians(10)
+    error = math.radians(15) + overshoot_rad
+    position_angle = physical_angle - error if component == "position" else 0.0
+    yaw = math.pi + physical_angle - (error if component == "orientation" else 0.0)
+    actual = [math.cos(position_angle), math.sin(position_angle), yaw]
+    command = _front_pose_command(interaction_approach_pose_xyyaw=actual)
+    physical_front = {
+        "checked": True,
+        "axis_xy": [math.cos(physical_angle), math.sin(physical_angle)],
+    }
+    if overshoot_rad > 0:
+        result = _front_pose_rejection(monkeypatch, actual, command, physical_front)
+        assert result["interaction_pose_validation"]["face_valid"] is True
+        assert result["failure_reason"] == f"interaction_{component}_misaligned"
+        assert result["reject_selected_face"] is False
+    else:
+        monkeypatch.setattr(
+            "scripts.InteractiveNav.force_interaction_bridge.infer_articulation_front_axis_xy",
+            lambda *_args: physical_front,
+        )
+        result = AtomicForceInteractionController._validate_interaction_pose(
+            _front_pose_task(actual), command,
+        )
+        assert result["valid"] is True
+
+
+def test_portal_yaw_failure_does_not_require_articulation_or_reject_face(monkeypatch) -> None:
+    actual = [1.0, 0.0, math.pi + 0.3]
+    result = _front_pose_rejection(
+        monkeypatch, actual,
+        _front_pose_command(node_type="portal", interaction_approach_pose_xyyaw=actual),
+        {"checked": False},
+    )
+    assert result["failure_reason"] == "interaction_orientation_misaligned"
+    assert result["interaction_pose_validation"]["physical_front_required"] is False
+    assert result["reject_selected_face"] is False
+
+
+def test_h9_step250_aabb_front_pose_passes_coarse_axis_margin(monkeypatch):
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.infer_articulation_front_axis_xy",
+        lambda *_args: {"checked": True, "axis_xy": [-0.17081130010818302, -0.9853037601447344]},
+    )
+    command = _front_pose_command(
+        interaction_approach_pose_xyyaw=[0.6726507147899736, 7.629456095917035, 1.658062789394613],
+        interaction_approach_axis_xy=[0., -1.],
+        interaction_target_center_xy=[0.5405354918316372, 9.139540004321798],
+        interaction_front_axis_source="m1_selected_montage_view_aabb_cardinal_face",
+    )
+    result = AtomicForceInteractionController._validate_interaction_pose(
+        _front_pose_task([0.7848220107725296, 7.616422230415284, 1.802714909277651]), command,
+    )
+    assert result["valid"] and result["physical_front_valid"]
+    assert result["distance_tolerance_m"] == .15
+    assert result["yaw_tolerance_rad"] == .2
+    assert result["face_yaw_tolerance_rad"] == math.radians(15)
+
+
+@pytest.mark.parametrize("component", ["position", "orientation"])
+@pytest.mark.parametrize("overshoot_rad", [-1e-4, 1e-4])
+def test_only_aabb_physical_front_check_gets_twenty_five_degree_margin(monkeypatch, component, overshoot_rad):
+    physical_angle = math.radians(12)
+    error = math.radians(25) + overshoot_rad
+    position_angle = physical_angle-error if component == "position" else 0.
+    yaw = math.pi + physical_angle - (error if component == "orientation" else 0.)
+    actual = [math.cos(position_angle), math.sin(position_angle), yaw]
+    command = _front_pose_command(interaction_approach_pose_xyyaw=actual,
+                                 interaction_front_axis_source="m1_selected_montage_view_aabb_cardinal_face")
+    physical_front = {"checked": True, "axis_xy": [math.cos(physical_angle), math.sin(physical_angle)]}
+    if overshoot_rad > 0:
+        result = _front_pose_rejection(monkeypatch, actual, command, physical_front)
+        assert result["failure_reason"] == f"interaction_{component}_misaligned"
+    else:
+        monkeypatch.setattr("scripts.InteractiveNav.force_interaction_bridge.infer_articulation_front_axis_xy", lambda *_args: physical_front)
+        assert AtomicForceInteractionController._validate_interaction_pose(_front_pose_task(actual), command)["valid"]
+
+
+@pytest.mark.parametrize("actual, physical_axis, reason", [
+    ([1.16, 0., math.pi], [1., 0.], "interaction_position_misaligned"),
+    ([1., 0., math.pi+.21], [1., 0.], "interaction_orientation_misaligned"),
+    ([1., 0., math.pi], [0., 1.], "interaction_wrong_face"),
+])
+def test_aabb_margin_does_not_relax_pose_or_wrong_face_gates(monkeypatch, actual, physical_axis, reason):
+    command = _front_pose_command(interaction_front_axis_source="m1_selected_montage_view_aabb_cardinal_face")
+    result = _front_pose_rejection(monkeypatch, actual, command, {"checked": True, "axis_xy": physical_axis})
+    assert result["failure_reason"] == reason
+
+
+@pytest.mark.parametrize("prefix", ["Interaction pose invalid:", "Interaction physical front invalid:"])
+def test_unstructured_legacy_pose_failure_is_not_wrong_face(monkeypatch, prefix) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    monkeypatch.setattr(controller, "_publish", lambda *_args: None)
+    result = controller._publish_command_failure(
+        _front_pose_task([1.0, 0.0, math.pi]), _front_pose_command(),
+        step=412, exc=ValueError(prefix + " no structured evidence"),
+    )
+    assert result["failure_reason"] == "interaction_pose_invalid"
+    assert result["retryable"] is True
+    assert result["reject_selected_face"] is False
+    assert result["recovery_action"] == "reobserve_front"
 
 
 def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> None:
@@ -503,8 +824,9 @@ def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None
     ]
     assert controller._pending["all_joint_names"] == ["top", "middle", "bottom"]
 
+@pytest.mark.parametrize("transition_steps", [3, 20])
 def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
-    monkeypatch,
+    monkeypatch, transition_steps,
 ) -> None:
     advances = []
     view_profiles = []
@@ -547,7 +869,7 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         interaction_execution_mode="smooth",
-        interaction_transition_steps=3,
+        interaction_transition_steps=transition_steps,
     )
     controller._head_view_controller.command = (
         lambda _env, profile, **_kwargs: view_profiles.append(profile) or {"applied": True}
@@ -564,16 +886,20 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
 
     result = None
-    for step in range(3):
+    for step in range(transition_steps):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
+        if step < transition_steps - 1:
+            assert result is None
+            assert controller.should_pause_navigation()
 
     assert result is not None
-    assert advances == [1.0 / 3.0, 2.0 / 3.0, 1.0]
+    assert advances == [(step + 1) / transition_steps for step in range(transition_steps)]
     assert view_profiles == ["default"]
     assert result["interaction_execution_mode"] == "smooth"
-    assert result["interaction_transition_steps"] == 3
-    assert result["task_steps_consumed"] == 3
+    assert result["interaction_transition_steps"] == transition_steps
+    assert result["task_steps_consumed"] == transition_steps
+    assert result["physics_substeps"] == 2 * transition_steps
     assert result["source"] == "force_smooth_interaction"
 
 
@@ -680,7 +1006,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     )
     task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
-    for step in range(12):
+    for step in range(20):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
         if result is not None:
@@ -688,11 +1014,11 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
 
     assert result is not None
     assert result["success"] is True
-    assert result["task_steps_consumed"] == 11
+    assert result["task_steps_consumed"] == 16
     assert result["drawer_execution_mode"] == "fast"
     assert result["drawer_observation_steps"] == 3
     assert result["approach_goal_xyyaw"] == [1.0, 2.0, 0.5]
-    assert [item["observation_step"] for item in result["region_results"]] == [3, 8]
+    assert [item["observation_step"] for item in result["region_results"]] == [3, 8, 13]
     assert "interaction_group_results" not in result
     assert "joint_names" not in result
     assert "joint_infos" not in result
@@ -703,6 +1029,8 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert prepared_targets == [
         (("drawer_top",), ("drawer_bottom", "drawer_hidden")),
         ((), ("drawer_top",)),
+        (("drawer_hidden",), ("drawer_top", "drawer_bottom")),
+        ((), ("drawer_hidden",)),
         (("drawer_bottom",), ("drawer_top", "drawer_hidden")),
         ((), ("drawer_bottom",)),
     ]

@@ -65,13 +65,17 @@ model:
   history_region_size_m: 1.0
   stale_goal_position_tolerance_m: 0.35
   stale_goal_yaw_tolerance_rad: 0.50
-  timeout_s: 3.0
-  max_tokens: 256
+  # M2 is text-only and may use a stronger/slower model through
+  # SEMANTIC_M2_*.  The launcher keeps this budget independent from M1/M3.
+  timeout_s: 12.0
+  timeout_retry_count: 1
+  timeout_retry_backoff_s: 1.0
+  max_tokens: 1536
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   skill_timeout_s: 4.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 4.0
+  verification_timeout_s: 10.0
   verification_max_output_tokens: 256
 
 completion:

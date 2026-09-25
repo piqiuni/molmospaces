@@ -456,6 +456,22 @@ def _transport_report_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def _capture_observation_metadata(raw: dict, image_shape) -> dict:
+    """M1 evidence identity/pose from this capture, never latest odometry."""
+    metadata = {
+        "capture_step": int(raw["seq"]),
+        "stamp_sec": float(raw["stamp"]),
+        "image_size": [int(image_shape[1]), int(image_shape[0])],
+    }
+    telemetry = raw.get("telemetry")
+    if _capture_pose_error(telemetry) is None:
+        position = _telemetry_body_position(telemetry)
+        x, y, z, w = _telemetry_quaternion(telemetry)
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        metadata["observation_pose_xyyaw"] = [float(position[0]), float(position[1]), yaw]
+    return metadata
+
+
 def _encode_detection_overlay(
     rgb: np.ndarray,
     detections: list[dict[str, Any]],
@@ -2210,6 +2226,7 @@ class YoloeWorker:
         depth = np.asarray(depth).astype(np.float32, copy=False)
         decode_ms = (time.perf_counter() - decode_started) * 1000.0
         rgb_intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
+        transport_metadata.update(_capture_observation_metadata(raw, rgb.shape))
         depth_intr = raw.get("depth_intrinsics") or raw.get("intrinsics", {})
         depth_frame = str(raw.get("depth_frame") or raw.get("camera_frame", "d435i_depth_optical_frame"))
         fx, fy, cx, cy = [float(depth_intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]

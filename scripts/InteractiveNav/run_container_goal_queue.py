@@ -157,7 +157,7 @@ def run_task(
             "RUNTIME_TARGET_MODE": "fixed_container_object",
             "RUNTIME_TARGET_SELECTION_INPUT_PATH": str(selection_input_path),
             "SEMANTIC_ATTRIBUTE_MODEL_NAME": args.attribute_model_name,
-            "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S": "8.0",
+            "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S": "15.0",
             "SEMANTIC_MODEL_TIMEOUT_S": "3.0",
             "ENABLE_RECORDING": "true" if args.recording else "false",
             "VIDEO_PANEL_WIDTH_PX": "480",

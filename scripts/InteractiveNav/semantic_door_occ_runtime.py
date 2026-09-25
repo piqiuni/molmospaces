@@ -130,7 +130,7 @@ class DoorOccRuntimeController:
         for root_id in sorted(self.groups):
             initial_states.append(self._set_root_state(env, root_id, "closed"))
         mujoco.mj_forward(model, data)
-        center, size = body_aabb(model, data, self.target_root_id, visual_only=True)
+        center, size = body_aabb(model, data, self.target_root_id, visible_only=True)
         base_pose = env.current_robot.robot_view.base.pose
         base_yaw = math.atan2(float(base_pose[1, 0]), float(base_pose[0, 0]))
         self.payload.update(

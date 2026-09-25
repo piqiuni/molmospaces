@@ -1,0 +1,7 @@
+<library path="lib/libpath_follower">
+  <class name="nav_pkg/PathFollower"
+         type="nav_pkg::PathFollower"
+         base_class_type="nav_core::BaseLocalPlanner">
+    <description>Collision-checked local follower for updated global paths.</description>
+  </class>
+</library>

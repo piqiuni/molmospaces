@@ -1,0 +1,41 @@
+TaskName: "inav_4gpu_20w20_20260923"
+Description: "InteractiveNav custom evaluation; 20 benchmark scenes; 20 workers; one four-GPU Qwen service; non-preemptible"
+Entrypoint: "RUN_ROOT=/home/ldl/outputs/interactive-nav/custom-task-4gpu-20w20-20260923 BENCHMARK_LAUNCHER_CONFIG=scripts/InteractiveNav/configs/evaluation/benchmark_spot_4gpu_20w20_20260923.json EVALUATION_OUTPUT_DIR=/home/ldl/outputs/interactive-nav/custom-task-4gpu-20w20-20260923/evaluation EXPECTED_EPISODES=20 QWEN36_MAX_MODEL_LEN=10240 QWEN36_TP_SIZE=1 QWEN36_DP_SIZE=4 QWEN36_MAX_NUM_SEQS=16 QWEN36_API_SERVER_COUNT=1 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+Tags: [InteractiveNav, benchmark, 4gpu, 20worker, 20episode, non-preemptible]
+UserCodePath:
+RemoteMountCodePath:
+Envs: []
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04"
+ImageCredential: {}
+ResourceQueueName: "c20250503"
+Framework: "PyTorchDDP"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.14xlarge"
+ActiveDeadlineSeconds: 86400
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+Preemptible: false
+Priority: 6
+RetryOptions:
+  EnableRetry: false
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets: ["Failed"]
+EnableTensorBoard: false
+TensorBoardStorage: {}
+Storages:
+  - Type: "TosFuse"
+    MountPath: "/tos"
+    Bucket: "c20250503"
+    Prefix: /
+  - Type: "Vepfs"
+    MountPath: "/home/ldl"
+    SubPath: "/c20250503/250404017"
+    ReadOnly: false
+  - Type: "Vepfs"
+    MountPath: "/vepfs-wxy"
+    SubPath: "/c20250503/240401046"
+    ReadOnly: false

@@ -5,11 +5,76 @@ import math
 import re
 from typing import Any
 
+from .portal_approach import bounded_portal_tolerances
+from .room_context import room_context_for_xy
+
 
 BEHAVIOR_EXPLORE = "EXPLORE"
 BEHAVIOR_INTERACT = "INTERACT"
 BEHAVIOR_NAVIGATE = "NAVIGATE"
 BEHAVIOR_SCAN = "SCAN"
+
+
+def normalize_target_label(value: Any) -> str:
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(value or ""))
+    text = " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+    aliases = {
+        "cellphone": "cell phone", "mobile phone": "cell phone",
+        "cellular telephone": "cell phone", "cellulartelephone": "cell phone",
+        "fridge": "refrigerator", "couch": "sofa", "cupboard": "cabinet",
+    }
+    return aliases.get(text, text)
+
+
+def target_observation_satisfies_arrival(metadata: dict[str, Any]) -> bool:
+    """Public target evidence can establish arrival without another navigation pose."""
+    if not all(metadata.get(key) for key in ("target_goal", "target_reliably_observed")):
+        return False
+    if metadata.get("target_require_current_visibility", True) and not metadata.get("target_visible_now"):
+        return False
+    # A child observed inside a container that has just been opened is already
+    # at a valid observation/action pose when the robot is still at the
+    # successful container-interaction anchor.  The child centre can be deeper
+    # inside a fridge/drawer than the public target radius; moving toward that
+    # centre would leave the safe observation pose and can close the container.
+    if metadata.get("target_open_container_anchor_ready"):
+        return True
+    try:
+        success_threshold = metadata.get("target_success_distance_threshold_m")
+        if success_threshold is not None:
+            distance = float(metadata["target_object_distance_m"])
+            threshold = float(success_threshold)
+            return math.isfinite(distance) and math.isfinite(threshold) and 0 <= distance < threshold
+        distance = float(metadata["target_goal_distance_m"])
+        tolerance = float(metadata["target_arrival_tolerance_m"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return math.isfinite(distance) and math.isfinite(tolerance) and 0 <= distance <= tolerance
+
+
+def target_success_region_goals(candidate: BehaviorCandidate, robot_xy: tuple[float, float]) -> list[list[float]]:
+    """Offer observation poses whose arrival tolerance stays inside the goal radius."""
+    metadata = candidate.metadata
+    center = metadata.get("target_object_xy")
+    threshold = metadata.get("target_success_distance_threshold_m")
+    if center is None or threshold is None or candidate.goal_xyyaw is None:
+        return []
+    tolerance = max(float(metadata.get("navigation_goal_position_tolerance_m", .25)),
+                    float(metadata.get("direct_goal_tolerance_m", 0.0)))
+    radius = float(threshold) - tolerance - .05
+    if not math.isfinite(radius) or radius <= 0:
+        return []
+    cx, cy = map(float, center[:2])
+    angle = math.atan2(robot_xy[1] - cy, robot_xy[0] - cx)
+    goals = []
+    if math.hypot(candidate.goal_xyyaw[0] - cx, candidate.goal_xyyaw[1] - cy) <= radius:
+        goals.append(list(candidate.goal_xyyaw))
+    for offset in (0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180):
+        theta = angle + math.radians(offset)
+        x, y = cx + radius * math.cos(theta), cy + radius * math.sin(theta)
+        goals.append([x, y, math.atan2(cy - y, cx - x)])
+    return goals
+
 
 SPATIAL_CONTEXT_LABELS = {
     "bed",
@@ -131,8 +196,34 @@ class BehaviorCandidate:
         return asdict(self)
 
 
+def execution_candidates_with_reobserve_fallback(
+    candidates: list[BehaviorCandidate],
+) -> tuple[list[BehaviorCandidate], list[str]]:
+    """Keep re-observation visible, but schedule it only as a fallback.
+
+    The raw candidate snapshot feeds the video/sidebar and therefore retains
+    every remembered portal.  The execution pool excludes those NAVIGATE goals
+    whenever a normal interaction, navigation, or exploration subgoal exists.
+    """
+
+    primary = [
+        candidate
+        for candidate in candidates
+        if not bool((candidate.metadata or {}).get("reobserve_interaction_target"))
+    ]
+    if not primary:
+        return list(candidates), []
+    deferred = [
+        candidate.candidate_id
+        for candidate in candidates
+        if bool((candidate.metadata or {}).get("reobserve_interaction_target"))
+    ]
+    return primary, deferred
+
+
 @dataclass
 class CandidateGeneratorConfig:
+    frontier_center_fallback_enabled: bool = False
     max_frontier_candidates: int = 12
     interaction_types: tuple[str, ...] = ("portal", "container")
     # Optional semantic allow-list for physical interaction targets.  Empty
@@ -185,6 +276,13 @@ class CandidateGeneratorConfig:
     # Prevent a small pose/box update near the door plane from flipping every
     # generated stance to the other side. Zero preserves the legacy behavior.
     portal_side_hysteresis_m: float = 0.0
+    portal_tangent_offsets_m: tuple[float, ...] = (0.10, -0.10, 0.15, -0.15)
+    # Interaction poses stay on the observed portal side.  The opposite side is
+    # a traversal/navigation concept, never a physical interaction fallback.
+    portal_allow_opposite_side_interaction: bool = False
+    # Maximum angular deviation of the robot position/yaw from the portal AABB
+    # normal.  This is checked by the same bridge contract used for containers.
+    portal_interaction_front_angle_tolerance_rad: float = 0.15
     portal_traversal_distance_m: float = 0.8
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
@@ -265,9 +363,9 @@ class CandidateGeneratorConfig:
     # Clearances are measured from the ray/box intersection, never the centre.
     drawer_navigation_anchor_aabb_fan_enabled: bool = False
     drawer_navigation_anchor_fan_clearances_m: tuple[float, ...] = (
-        0.50,
+        0.70,
         0.85,
-        1.20,
+        1.00,
     )
     drawer_navigation_anchor_fan_angles_deg: tuple[float, ...] = (
         -30.0,
@@ -369,28 +467,114 @@ class CandidateGenerator:
         graph: dict[str, Any] | None,
         robot_xy: tuple[float, float] | None,
         target_context: dict[str, Any] | None = None,
+        room_segment_grid: dict[str, Any] | None = None,
+        clearance_check=None,
+        navigation_goal_recovery=None,
     ) -> list[BehaviorCandidate]:
+        self.clearance_rejections = []
+        self.clearance_recoveries = []
         if (explorer_status or {}).get("initial_scan_complete") is False:
             return []
         candidates = self._frontier_candidates(explorer_status or {})
         if robot_xy is not None:
-            candidates.extend(
-                self._interaction_candidates(
-                    graph or {}, robot_xy, target_context or {}
-                )
+            interaction_candidates = self._interaction_candidates(
+                graph or {}, robot_xy, target_context or {}, room_segment_grid, clearance_check
             )
+            candidates.extend(interaction_candidates)
             candidates.extend(
                 self._portal_traversal_candidates(graph or {}, robot_xy)
             )
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
-            if not candidates and self.config.remembered_portal_reobservation_enabled:
+            if self.config.remembered_portal_reobservation_enabled:
+                # A remembered re-observation is only a recovery candidate for
+                # a portal that could not produce an INTERACT candidate at all
+                # (for example, a visibility-gated or unknown portal).  Do not
+                # publish a second NAVIGATE row for the same door when its
+                # graph interaction is already present: that duplicate made
+                # the visualization look as if navigation had preempted the
+                # interaction, even though the executor would defer the row.
+                interaction_portal_ids = {
+                    str(candidate.target_id or "")
+                    for candidate in interaction_candidates
+                    if candidate.behavior_type == BEHAVIOR_INTERACT
+                    and str(candidate.target_id or "")
+                }
                 candidates.extend(
                     self._remembered_portal_reobservation_candidates(
-                        graph or {}, robot_xy
+                        graph or {},
+                        robot_xy,
+                        skip_target_ids=interaction_portal_ids,
+                        clearance_check=clearance_check,
                     )
                 )
+        for candidate in candidates:
+            if candidate.behavior_type == BEHAVIOR_NAVIGATE and candidate.metadata.get("target_goal"):
+                candidate.metadata["target_navigation_required"] = not target_observation_satisfies_arrival(candidate.metadata)
+                if candidate.metadata["target_navigation_required"] and robot_xy is not None:
+                    goals = target_success_region_goals(candidate, robot_xy)
+                    if goals:
+                        candidate.goal_xyyaw = goals[0]
+                        candidate.metadata["goal_xyyaw_candidates"] = goals
+        if clearance_check is not None:
+            admitted = []
+            for candidate in candidates:
+                if candidate.behavior_type == BEHAVIOR_NAVIGATE and target_observation_satisfies_arrival(candidate.metadata):
+                    # This row requests observation verification, not motion to its
+                    # standoff pose, which may be obstructed by the open drawer.
+                    admitted.append(candidate)
+                    continue
+                if candidate.behavior_type in {BEHAVIOR_EXPLORE, BEHAVIOR_NAVIGATE} and candidate.goal_xyyaw:
+                    tolerance = float(candidate.metadata.get("navigation_goal_position_tolerance_m", 0.25))
+                    detail = clearance_check(candidate.goal_xyyaw, tolerance,
+                                             frame_id=candidate.metadata.get("frame_id"),
+                                             **({"allow_unknown": True} if candidate.metadata.get("frontier_center_fallback") else {}))
+                    if not detail.get("clear"):
+                        if candidate.metadata.get("target_goal"):
+                            alternatives = candidate.metadata.get("goal_xyyaw_candidates", [])
+                        else:
+                            alternatives = navigation_goal_recovery(candidate) if navigation_goal_recovery is not None else []
+                        alternatives = [goal for goal in alternatives if clearance_check(
+                            goal, tolerance, frame_id=candidate.metadata.get("frame_id")
+                        ).get("clear")]
+                        if alternatives:
+                            original = list(candidate.goal_xyyaw)
+                            candidate.goal_xyyaw = list(alternatives[0])
+                            candidate.metadata.update(goal_xyyaw_candidates=alternatives,
+                                                      clearance_original_goal_xyyaw=original)
+                            if robot_xy is not None:
+                                candidate.features["distance_m"] = math.dist(robot_xy, candidate.goal_xyyaw[:2])
+                            self.clearance_recoveries.append({"candidate_id": candidate.candidate_id,
+                                "original_goal_xyyaw": original, "goal_xyyaw": candidate.goal_xyyaw,
+                                "reason": detail.get("reason"), "alternative_count": len(alternatives)})
+                            admitted.append(candidate)
+                            continue
+                        frontier_center = candidate.metadata.get("frontier_point")
+                        if self.config.frontier_center_fallback_enabled and candidate.behavior_type == BEHAVIOR_EXPLORE and frontier_center and len(frontier_center) >= 2:
+                            center_goal = [float(frontier_center[0]), float(frontier_center[1]), candidate.goal_xyyaw[2]]
+                            center_detail = clearance_check(center_goal, tolerance,
+                                frame_id=candidate.metadata.get("frame_id"), allow_unknown=True)
+                            if center_detail.get("clear"):
+                                candidate.metadata["clearance_original_goal_xyyaw"] = list(candidate.goal_xyyaw)
+                                candidate.goal_xyyaw = center_goal
+                                candidate.metadata["frontier_center_fallback"] = True
+                                if robot_xy is not None:
+                                    candidate.features["distance_m"] = math.dist(robot_xy, center_goal[:2])
+                                admitted.append(candidate)
+                                continue
+                        self.clearance_rejections.append({"candidate_id": candidate.candidate_id,
+                            "behavior_type": candidate.behavior_type, "goal_xyyaw": candidate.goal_xyyaw,
+                            "deferred": True, "recovery_attempted": navigation_goal_recovery is not None, **detail})
+                        continue
+                admitted.append(candidate)
+            candidates = admitted
+        if robot_xy is not None:
+            for candidate in candidates:
+                if candidate.metadata.get("target_goal") and candidate.goal_xyyaw:
+                    distance = math.dist(robot_xy, candidate.goal_xyyaw[:2])
+                    candidate.features["distance_m"] = distance
+                    candidate.metadata["target_goal_distance_m"] = distance
         self._attach_portal_child_room_context(candidates, graph or {})
         self._attach_frontier_room_context(candidates, graph or {}, robot_xy)
         self._attach_spatial_context(candidates, graph or {})
@@ -401,19 +585,28 @@ class CandidateGenerator:
         self,
         graph: dict[str, Any],
         robot_xy: tuple[float, float],
+        *,
+        skip_target_ids: set[str] | None = None,
+        clearance_check=None,
     ) -> list[BehaviorCandidate]:
         """Keep a concrete subgoal while unresolved doors are out of view.
 
-        Full-MLLM physical door candidates deliberately require current pixels.
-        That visibility gate must not turn remembered unresolved doors into a
-        permanently empty candidate stream.  Navigate to the ordinary safe
-        portal approach first; the next graph revision can then emit the real
-        visually-authorized INTERACT candidate.
+        Remembered doors still navigate and request a current M1 observation.
+        Carry an explicit physical contract so a missing M1 response can use
+        the configured fallback after the normal geometric arrival checks.
         """
 
         candidates: list[BehaviorCandidate] = []
+        skip_target_ids = {
+            str(value)
+            for value in (skip_target_ids or set())
+            if str(value)
+        }
         for node in graph.get("nodes") or []:
             if str(node.get("type") or "").strip().casefold() != "portal":
+                continue
+            node_id = str(node.get("id") or "")
+            if node_id in skip_target_ids:
                 continue
             interaction = node.get("interaction") or {}
             if not bool(
@@ -458,18 +651,50 @@ class CandidateGenerator:
                 node,
                 self.config.portal_standoff_m,
                 "portal",
+                portal_front_angle_tolerance_rad=min(0.20, max(0.05, float(self.config.interaction_ready_yaw_tolerance_rad))),
+            )
+            normal_goal = goals[0] if goals else None
+            goals, labels = self._clear_interaction_goals(
+                goals, labels, node, target_xy, clearance_check,
+                min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                min(0.20, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
             )
             if not goals:
                 continue
-            node_id = str(node.get("id") or "")
+            center = list(attributes.get("interaction_reference_aabb_center") or position)
+            size = list(attributes.get("interaction_reference_aabb_size") or node.get("aabb_size") or [])
+            yaw_tolerance = min(0.20, max(0.05, float(self.config.interaction_ready_yaw_tolerance_rad)))
+            position_tolerance = min(0.15, max(0.05, float(self.config.interaction_ready_distance_m)))
+            interaction_command = {
+                "node_id": node_id,
+                "node_type": "portal",
+                "object_id": str(attributes.get("instance_id") or attributes.get("source_object_name") or node.get("name") or node_id),
+                "action": "open",
+                "expected_state": "open",
+                "interaction_mode": str(interaction.get("interaction_mode") or "open_close"),
+                "interaction_approach_pose_xyyaw": list(goals[0]),
+                "interaction_approach_axis_xy": [-math.cos(normal_goal[2]), -math.sin(normal_goal[2])],
+                "interaction_target_center_xy": list(center[:2]),
+                "interaction_front_axis_source": "portal_aabb_normal" if len(size) >= 2 else "portal_cardinal_fallback",
+                "interaction_front_axis_validation_required": True,
+                "interaction_ready_distance_m": position_tolerance,
+                "interaction_ready_yaw_tolerance_rad": yaw_tolerance,
+                "navigation_goal_position_tolerance_m": position_tolerance,
+                "navigation_goal_yaw_tolerance_rad": yaw_tolerance,
+                "navigation_goal_tolerance_contract_explicit": True,
+                "interaction_front_position_tolerance_rad": yaw_tolerance,
+                "interaction_front_yaw_tolerance_rad": yaw_tolerance,
+                "portal_aperture_observation": self._portal_aperture_observation(node),
+            }
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"reobserve_portal:{node_id}",
-                    behavior_type=BEHAVIOR_NAVIGATE,
+                    behavior_type=BEHAVIOR_INTERACT,
                     source="remembered_interaction_reobserve",
                     target_id=node_id,
                     target_name=str(node.get("label") or node.get("name") or "door"),
                     goal_xyyaw=list(goals[0]),
+                    interaction_command=interaction_command,
                     features={
                         "exploration_gain": 0.8,
                         "visibility_gain": 1.0,
@@ -482,6 +707,13 @@ class CandidateGenerator:
                     },
                     metadata={
                         "reobserve_interaction_target": True,
+                        "portal_clearance_aware_approach": True,
+                        "portal_approach_base_tolerances": [position_tolerance, yaw_tolerance],
+                        "node_type": "portal",
+                        "observation_required": True,
+                        "interaction_observation_source": "mllm_attribute_inference",
+                        "portal_aabb_center_xy": list(center[:2]),
+                        "portal_aabb_size_xy": list(size[:2]),
                         "requires_approach": True,
                         "goal_xyyaw_candidates": [list(goal) for goal in goals],
                         "interaction_approach_pose_labels": list(labels),
@@ -525,14 +757,13 @@ class CandidateGenerator:
                 )
             )
             room_hops = self._room_hops(graph, robot_room_id, target_room_id)
-            if (
+            room_transition_blocked = (
                 require_same_room
                 and target_room_id is not None
                 and robot_room_id is not None
                 and int(target_room_id) != int(robot_room_id)
                 and not (allow_connected_room and room_hops is not None)
-            ):
-                continue
+            )
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.target_max_state_age_sec:
                 continue
@@ -633,6 +864,90 @@ class CandidateGenerator:
             )
             if require_current_visibility and not target_visible_now:
                 continue
+            direct_goal_tolerance = 0.45 if containing_container is not None else 0.0
+            containing_interaction = (
+                (containing_container or {}).get("interaction") or {}
+            )
+            containing_state = str(
+                containing_interaction.get("state") or ""
+            ).strip().casefold()
+            successful_open_history = any(
+                bool(event.get("success"))
+                and str(
+                    event.get("post_state") or event.get("state") or ""
+                ).strip().casefold()
+                in {"open", "opened", "ajar", "static_open"}
+                for event in list(
+                    containing_interaction.get("operation_history") or []
+                )
+                if isinstance(event, dict)
+            )
+            successful_drawer_scan = bool(
+                containing_interaction.get("drawer_scan_completed")
+            ) or any(
+                bool(event.get("success"))
+                and (
+                    str(event.get("sequence_type") or "").strip().casefold()
+                    == "drawer_scan"
+                    or str(
+                        event.get("verification_source") or ""
+                    ).strip().casefold()
+                    == "drawer_scan_backend"
+                )
+                for event in list(
+                    containing_interaction.get("operation_history") or []
+                )
+                if isinstance(event, dict)
+            )
+            opened_container_anchor_distance = None
+            if previous_interaction_goal is not None and robot_xy is not None:
+                try:
+                    opened_container_anchor_distance = math.hypot(
+                        float(previous_interaction_goal[0]) - float(robot_xy[0]),
+                        float(previous_interaction_goal[1]) - float(robot_xy[1]),
+                    )
+                except (TypeError, ValueError, IndexError):
+                    opened_container_anchor_distance = None
+            target_object_xy = self._node_xy(node, prefer_aabb=True)
+            target_object_distance = None
+            if target_object_xy is not None and robot_xy is not None:
+                try:
+                    target_object_distance = math.hypot(
+                        float(target_object_xy[0]) - float(robot_xy[0]),
+                        float(target_object_xy[1]) - float(robot_xy[1]),
+                    )
+                except (TypeError, ValueError, IndexError):
+                    target_object_distance = None
+            success_distance_threshold = target_context.get(
+                "success_distance_threshold_m"
+            )
+            try:
+                target_distance_satisfied = bool(
+                    success_distance_threshold is None
+                    or (
+                        target_object_distance is not None
+                        and math.isfinite(target_object_distance)
+                        and target_object_distance
+                        < float(success_distance_threshold)
+                    )
+                )
+            except (TypeError, ValueError):
+                target_distance_satisfied = False
+            if room_transition_blocked and not (target_visible_now and target_distance_satisfied
+                    and success_distance_threshold is not None):
+                continue
+            opened_container_anchor_ready = bool(
+                containing_container is not None
+                and previous_interaction_goal is not None
+                and (
+                    containing_state in {"open", "opened", "ajar", "static_open"}
+                    and successful_open_history
+                    or successful_drawer_scan
+                )
+                and opened_container_anchor_distance is not None
+                and math.isfinite(opened_container_anchor_distance)
+                and opened_container_anchor_distance <= direct_goal_tolerance
+            )
             verify_visibility = bool(
                 target_context.get(
                     "completion_requires_visibility",
@@ -689,6 +1004,9 @@ class CandidateGenerator:
                         "target_max_consecutive_observations": max_consecutive_observations,
                         "target_reliably_observed": reliably_observed,
                         "target_goal_distance_m": distance_m,
+                        "target_object_distance_m": target_object_distance,
+                        "target_object_xy": target_object_xy,
+                        "target_success_distance_threshold_m": target_context.get("success_distance_threshold_m"),
                         "target_arrival_tolerance_m": target_arrival_tolerance_m,
                         "target_navigation_required": (
                             distance_m > target_arrival_tolerance_m
@@ -720,11 +1038,21 @@ class CandidateGenerator:
                             if containing_container is not None
                             else ""
                         ),
-                        "direct_goal_tolerance_m": (
-                            0.45 if containing_container is not None else 0.0
-                        ),
+                        "direct_goal_tolerance_m": direct_goal_tolerance,
                         "direct_goal_yaw_tolerance_rad": (
                             0.65 if containing_container is not None else 0.0
+                        ),
+                        "target_open_container_state": containing_state,
+                        "target_open_container_anchor_xyyaw": (
+                            list(previous_interaction_goal)
+                            if previous_interaction_goal is not None
+                            else []
+                        ),
+                        "target_open_container_anchor_distance_m": (
+                            opened_container_anchor_distance
+                        ),
+                        "target_open_container_anchor_ready": (
+                            opened_container_anchor_ready
                         ),
                     },
                 )
@@ -776,12 +1104,12 @@ class CandidateGenerator:
             if value:
                 requested.append(value)
         requested_tokens = {
-            str(value).strip().casefold() for value in requested if str(value).strip()
+            normalize_target_label(value) for value in requested if normalize_target_label(value)
         }
         if not requested_tokens:
             return False
         observed = {
-            str(value).strip().casefold()
+            normalize_target_label(value)
             for value in (
                 node.get("label"),
                 node.get("name"),
@@ -789,12 +1117,10 @@ class CandidateGenerator:
                 attributes.get("semantic_name"),
                 attributes.get("source_object_name"),
             )
-            if str(value or "").strip()
+            if normalize_target_label(value)
         }
         return any(
             requested == observed_value
-            or requested in observed_value
-            or observed_value in requested
             for requested in requested_tokens
             for observed_value in observed
         )
@@ -979,22 +1305,11 @@ class CandidateGenerator:
                     0.0,
                     float(proposal.get("distance_to_robot", 0.0) or 0.0),
                 )
-            if not cluster_id:
-                continue
-            # ExplorePy may briefly publish a material unknown component
-            # before its safe-viewpoint worker has populated ``goal_xyyaw``.
-            # Do not turn that state into an empty candidate pool: a frontier
-            # point is still a useful conservative navigation subgoal and will
-            # cause the next scan to refresh the viewpoint.  Only apply this
-            # fallback to genuinely material unknown area; tiny/noisy clusters
-            # remain filtered as before.
-            if len(subgoal) < 2 and len(frontier_point) >= 2 and unknown_area_m2 > 0.0:
-                fx, fy = float(frontier_point[0]), float(frontier_point[1])
-                status_robot_xy = status.get("robot_xy")
-                rx, ry = (float(status_robot_xy[0]), float(status_robot_xy[1])) if status_robot_xy and len(status_robot_xy) >= 2 else (fx, fy)
-                subgoal = [fx, fy, math.atan2(fy - ry, fx - rx)]
-                geometry.setdefault("fallback_goal", "frontier_point")
-            if len(subgoal) < 2:
+            center_fallback = bool(proposal.get("frontier_center_fallback", False))
+            if len(subgoal) < 2 and len(frontier_point) >= 2 and self.config.frontier_center_fallback_enabled:
+                subgoal = list(frontier_point[:2])
+                center_fallback = True
+            if not cluster_id or len(subgoal) < 2:
                 continue
             yaw = (
                 float(subgoal[2])
@@ -1036,7 +1351,10 @@ class CandidateGenerator:
                     },
                     metadata={
                         "cluster_id": cluster_id,
+                        "frontier_center_fallback": center_fallback,
                         "frontier_point": frontier_point,
+                        "frame_id": str(proposal.get("frame_id") or status.get("frame_id") or ""),
+                        "frontier_recovery_targets": list(proposal.get("frontier_cells_world") or [frontier_point])[::max(1, len(proposal.get("frontier_cells_world") or [])//12)],
                         "cell_count": int(
                             raw_features.get(
                                 "frontier_cell_count", proposal.get("cell_count", 0)
@@ -1189,70 +1507,7 @@ class CandidateGenerator:
     def _room_context_for_xy(
         graph: dict[str, Any], xy: tuple[float, float] | list[float] | None
     ) -> dict[str, Any]:
-        """Return an occupancy/graph room label for a physical XY position.
-
-        Potential rooms are useful door-side labels, but they must not steal a
-        normal segmented room simply because their synthetic AABB overlaps the
-        doorway.  Prefer an observed room when both contain the point; use a
-        potential room only when it is the only available physical label.
-        """
-
-        values = list(xy or [])
-        if len(values) < 2:
-            return {}
-        matches: list[tuple[int, float, str, Any, dict[str, Any]]] = []
-        for node in graph.get("nodes") or []:
-            if str(node.get("type") or "").casefold() != "room":
-                continue
-            attributes = node.get("attributes") or {}
-            if not bool(attributes.get("active", True)):
-                continue
-            center = list(node.get("aabb_center") or node.get("centroid") or [])
-            size = list(node.get("aabb_size") or [])
-            room_id = node.get("room_id")
-            if room_id is None:
-                room_id = node.get("id")
-            if len(center) < 2 or len(size) < 2 or room_id in (None, ""):
-                continue
-            half_x = 0.5 * abs(float(size[0]))
-            half_y = 0.5 * abs(float(size[1]))
-            if (
-                abs(float(values[0]) - float(center[0])) > half_x + 1e-6
-                or abs(float(values[1]) - float(center[1])) > half_y + 1e-6
-            ):
-                continue
-            is_potential = bool(attributes.get("is_potential_room"))
-            matches.append(
-                (
-                    1 if is_potential else 0,
-                    max(half_x * half_y, 1e-6),
-                    str(room_id),
-                    room_id,
-                    node,
-                )
-            )
-        if not matches:
-            return {}
-        _potential_rank, _area, _sortable_room_id, room_id, node = min(matches)
-        attributes = node.get("attributes") or {}
-        result: dict[str, Any] = {
-            "room_id": room_id,
-            "potential_room": bool(attributes.get("is_potential_room")),
-        }
-        source_portal_id = str(attributes.get("source_portal_id") or "")
-        if source_portal_id:
-            result["source_portal_id"] = source_portal_id
-        room_attribute = str(attributes.get("room_attribute") or "").strip()
-        if room_attribute and room_attribute.casefold() != "unknown":
-            result["room_attribute"] = room_attribute
-            result["room_attribute_confidence"] = max(
-                0.0,
-                min(1.0, float(attributes.get("room_attribute_confidence", 0.0) or 0.0)),
-            )
-            scores = dict(attributes.get("room_attribute_scores") or {})
-            if scores:
-                result["room_attribute_scores"] = scores
-        return result
+        return room_context_for_xy(graph, xy)
 
     @staticmethod
     def _room_context_by_id(graph: dict[str, Any], room_id: Any) -> dict[str, Any]:
@@ -1416,6 +1671,8 @@ class CandidateGenerator:
         graph: dict[str, Any],
         robot_xy: tuple[float, float],
         target_context: dict[str, Any],
+        room_segment_grid: dict[str, Any] | None = None,
+        clearance_check=None,
     ) -> list[BehaviorCandidate]:
         candidates = []
         allowed_types = set(self.config.interaction_types)
@@ -1625,6 +1882,17 @@ class CandidateGenerator:
             )
             if position is None:
                 continue
+            if node_type == "container" and node_room_id is None:
+                node_room_id = self._room_id_for_xy(graph, position)
+                graph_has_rooms = any(
+                    str(graph_node.get("type") or "").casefold() == "room"
+                    for graph_node in (graph.get("nodes") or [])
+                )
+                if node_room_id is None and graph_has_rooms:
+                    # Without a target room there is no safe way to reject an
+                    # anchor across a wall.  Keep the graph target remembered,
+                    # but do not turn it into an executable interaction yet.
+                    continue
             object_distance = math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1])
             is_drawer_container = bool(
                 node_type == "container" and self._is_drawer_container(node)
@@ -1661,6 +1929,11 @@ class CandidateGenerator:
             visual_container_axis = (
                 self._mllm_current_view_approach_axis(node, robot_xy, position)
                 if node_type == "container"
+                else None
+            )
+            operational_container_axis = (
+                self._container_approach_axis(node)
+                if is_refrigerator_container
                 else None
             )
             node_id = str(node.get("id") or "")
@@ -1854,9 +2127,84 @@ class CandidateGenerator:
                 container_m1_face_selection_enabled=(
                     container_m1_face_selection
                 ),
+                operational_container_axis=operational_container_axis,
+            )
+            normal_goal = goal_candidates[0] if goal_candidates else None
+            if node_type == "container":
+                # Container centres normally lie in occupied/unknown cells.
+                # Resolve the containing room from free room-segmentation cells
+                # just outside the AABB instead of deleting the graph target.
+                segmented_target_room_id = self._room_segment_id_around_aabb(
+                    room_segment_grid,
+                    (float(position[0]), float(position[1])),
+                    tuple(container_geometry_aabb_size_xy[:2]),
+                )
+                target_anchor_room_id = (
+                    segmented_target_room_id
+                    if room_segment_grid is not None
+                    else node_room_id
+                )
+            else:
+                segmented_target_room_id = None
+                target_anchor_room_id = None
+            if (
+                node_type == "container" and target_anchor_room_id is not None
+                and (room_segment_grid is not None or any(
+                    item.get("type") == "room" for item in graph.get("nodes", [])
+                ))
+            ):
+                same_room_goals: list[list[float]] = []
+                same_room_labels: list[str] = []
+                for goal, label in zip(goal_candidates, approach_pose_labels):
+                    segmented_anchor_room_id = self._room_segment_id_for_xy(
+                        room_segment_grid,
+                        (float(goal[0]), float(goal[1])),
+                    )
+                    anchor_room_id = (
+                        segmented_anchor_room_id
+                        if room_segment_grid is not None
+                        else self._room_id_for_xy(
+                            graph, (float(goal[0]), float(goal[1]))
+                        )
+                    )
+                    if (
+                        anchor_room_id is not None
+                        and str(anchor_room_id).removeprefix("room_")
+                        == str(target_anchor_room_id).removeprefix("room_")
+                        and (
+                            room_segment_grid is None
+                            or self._room_segment_corridor_matches(
+                                room_segment_grid,
+                                (float(position[0]), float(position[1])),
+                                (float(goal[0]), float(goal[1])),
+                                int(target_anchor_room_id),
+                                target_aabb_size_xy=tuple(
+                                    container_geometry_aabb_size_xy[:2]
+                                ),
+                            )
+                        )
+                    ):
+                        same_room_goals.append(list(goal))
+                        same_room_labels.append(str(label))
+                goal_candidates = same_room_goals
+                approach_pose_labels = same_room_labels
+                if not goal_candidates:
+                    continue
+            goal_candidates, approach_pose_labels = self._clear_interaction_goals(
+                goal_candidates, approach_pose_labels, node, position, clearance_check,
+                container_staging_ready_distance_m if node_type == "container" else min(0.15, self.config.interaction_ready_distance_m),
+                self.config.portal_interaction_front_angle_tolerance_rad,
+                portal_normal_goal=normal_goal,
             )
             if not goal_candidates:
                 continue
+            container_face_axes_by_staging = [
+                list(axis) if axis is not None else []
+                for axis in (
+                    self._container_face_axis_from_label(label)
+                    for label in approach_pose_labels
+                )
+            ]
             raw_container_anchor_robot_distances_m = [
                 math.hypot(float(goal[0]) - robot_xy[0], float(goal[1]) - robot_xy[1])
                 for goal in goal_candidates
@@ -2054,6 +2402,90 @@ class CandidateGenerator:
             approach_distance = math.hypot(
                 approach[0] - robot_xy[0], approach[1] - robot_xy[1]
             )
+            portal_front_axis_xy: list[float] = []
+            portal_front_axis_source = ""
+            if node_type == "portal":
+                # The portal command carries the immutable outward AABB ray so
+                # the executor/bridge can validate position and yaw against the
+                # same normal that generated the candidate.
+                center = portal_aabb_center_xy or [float(position[0]), float(position[1])]
+                dx = float(normal_goal[0]) - float(center[0])
+                dy = float(normal_goal[1]) - float(center[1])
+                norm = math.hypot(dx, dy)
+                if norm > 1e-6:
+                    portal_front_axis_xy = [dx / norm, dy / norm]
+                has_portal_geometry = (
+                    len(portal_aabb_size_xy) >= 2
+                    and float(portal_aabb_size_xy[0]) > 1e-6
+                    and float(portal_aabb_size_xy[1]) > 1e-6
+                )
+                portal_front_axis_source = (
+                    "portal_aabb_normal"
+                    if has_portal_geometry
+                    else "portal_cardinal_fallback"
+                )
+            # Fan spread and final face tolerance are separate budgets.  The
+            # former generates alternate poses; the latter validates the sum
+            # of that planned offset and move_base arrival error.
+            interaction_face_angle_tolerance_rad = 0.55
+            container_anchor_max_angle_rad = 0.0
+            if node_type == "portal":
+                try:
+                    interaction_face_angle_tolerance_rad = max(
+                        0.05,
+                        min(
+                            0.55,
+                            float(self.config.portal_interaction_front_angle_tolerance_rad),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    interaction_face_angle_tolerance_rad = 0.15
+            elif node_type == "container":
+                configured_angles = (
+                    self.config.fridge_navigation_anchor_fan_angles_deg
+                    if is_refrigerator_container
+                    else self.config.drawer_navigation_anchor_fan_angles_deg
+                )
+                scale = (
+                    self.config.fridge_multiview_angular_scale
+                    if is_refrigerator_container
+                    else 1.0
+                )
+                try:
+                    max_face_angle_deg = max(
+                        (abs(float(value)) for value in configured_angles),
+                        default=0.0,
+                    ) * max(0.0, min(1.0, float(scale)))
+                    container_anchor_max_angle_rad = math.radians(
+                        max_face_angle_deg
+                    )
+                    if is_refrigerator_container:
+                        # Refrigerator force is authorized within a stable
+                        # 25-degree operational-front envelope.  Do not shrink
+                        # this envelope when the candidate fan is narrowed.
+                        interaction_face_angle_tolerance_rad = math.radians(25.0)
+                    elif max_face_angle_deg > 1e-6:
+                        interaction_face_angle_tolerance_rad = max(
+                            0.05, min(0.55, math.radians(max_face_angle_deg))
+                        )
+                except (TypeError, ValueError):
+                    pass
+            # Portals have a stricter geometric front contract than the broad
+            # generic interaction-ready envelope.  Move-base only receives a
+            # pose, so the executor's per-goal DWA lease and the bridge must use
+            # this same tight pair; otherwise DWA can report success while the
+            # robot is still laterally/yaw-offset from the AABB normal.
+            portal_navigation_distance_tolerance_m = (
+                max(
+                    0.05,
+                    min(
+                        float(self.config.interaction_ready_distance_m),
+                        0.15,
+                    ),
+                )
+                if node_type == "portal"
+                else None
+            )
             interaction_command = {
                 "node_id": node_id,
                 "object_id": object_id,
@@ -2068,7 +2500,20 @@ class CandidateGenerator:
                 # declared container front accepted here comes from a current,
                 # ready M1 view; otherwise the executor receives a bounded
                 # observation ring below.
-                "interaction_approach_axis_xy": list(visual_container_axis or []),
+                "interaction_approach_axis_xy": (
+                    list(portal_front_axis_xy)
+                    if node_type == "portal"
+                    else list(visual_container_axis or [])
+                ),
+                "interaction_target_center_xy": (
+                    list(portal_aabb_center_xy or [float(position[0]), float(position[1])])
+                    if node_type == "portal"
+                    else []
+                ),
+                "interaction_front_axis_validation_required": node_type == "portal",
+                "interaction_front_axis_source": (
+                    portal_front_axis_source if node_type == "portal" else ""
+                ),
                 "interaction_approach_pose_labels": list(approach_pose_labels),
                 "interaction_ready_distance_m": (
                     container_staging_ready_distance_m
@@ -2084,16 +2529,33 @@ class CandidateGenerator:
                 "navigation_goal_position_tolerance_m": (
                     container_staging_ready_distance_m
                     if container_two_stage_requested
-                    else self.config.interaction_ready_distance_m
+                    else (
+                        portal_navigation_distance_tolerance_m
+                        if portal_navigation_distance_tolerance_m is not None
+                        else self.config.interaction_ready_distance_m
+                    )
                 ),
                 "navigation_goal_yaw_tolerance_rad": max(
-                    0.05, float(self.config.interaction_ready_yaw_tolerance_rad)
+                    0.05,
+                    float(
+                        interaction_face_angle_tolerance_rad
+                        if node_type == "portal"
+                        else min(
+                            float(self.config.interaction_ready_yaw_tolerance_rad),
+                            interaction_face_angle_tolerance_rad
+                            - container_anchor_max_angle_rad,
+                        )
+                        if is_refrigerator_container
+                        else self.config.interaction_ready_yaw_tolerance_rad
+                    ),
                 ),
                 "navigation_goal_tolerance_contract_explicit": True,
             }
-            if node_type == "container":
+            if node_type in {"portal", "container"}:
                 interaction_command.update(
                     {
+                        "interaction_front_position_tolerance_rad": interaction_face_angle_tolerance_rad,
+                        "interaction_front_yaw_tolerance_rad": interaction_face_angle_tolerance_rad,
                         "container_staging_ready_distance_m": (
                             container_staging_ready_distance_m
                             if container_two_stage_requested
@@ -2175,6 +2637,10 @@ class CandidateGenerator:
                         "object_distance_m": object_distance,
                         "robot_room_id": robot_room_id,
                         "target_room_id": node_room_id,
+                        "target_roomseg_id": segmented_target_room_id,
+                        "roomseg_corridor_checked": bool(
+                            node_type == "container" and room_segment_grid is not None
+                        ),
                         "room_transition_required": room_hops not in {None, 0},
                         "room_hops": room_hops,
                         "room_reachable": room_hops is not None,
@@ -2233,7 +2699,10 @@ class CandidateGenerator:
                             container_m1_face_selection
                         ),
                         "container_m1_face_selection_contract": (
-                            "aabb_four_faces_m1_authorized"
+                            "operational_front_face_m1_authorized"
+                            if container_m1_face_selection
+                            and operational_container_axis is not None
+                            else "aabb_four_faces_m1_authorized"
                             if container_m1_face_selection
                             else "legacy_robot_side_or_mllm_view"
                         ),
@@ -2331,7 +2800,7 @@ class CandidateGenerator:
                         "target_match": explicit_target_reinteraction,
                         "requires_approach": True,
                         "approach_strategy": (
-                            "portal_aabb_normal"
+                            portal_front_axis_source
                             if node_type == "portal"
                             else (
                                 "container_mllm_current_view"
@@ -2577,6 +3046,11 @@ class CandidateGenerator:
                         # approach options.  The post-open continuation uses it
                         # to select an AABB-clear goal on the far side instead
                         # of recreating one radial point at the door center.
+                        "portal_clearance_aware_approach": node_type == "portal",
+                        "portal_approach_base_tolerances": [
+                            interaction_command["navigation_goal_position_tolerance_m"],
+                            interaction_command["navigation_goal_yaw_tolerance_rad"],
+                        ] if node_type == "portal" else [],
                         "portal_aabb_center_xy": portal_aabb_center_xy,
                         "portal_aabb_size_xy": portal_aabb_size_xy,
                         "portal_clearance_aabb_center_xy": (
@@ -2745,7 +3219,34 @@ class CandidateGenerator:
                 continue
             interaction = node.get("interaction") or {}
             state = str(interaction.get("state") or "unknown").casefold()
-            if state != "open":
+            attributes = node.get("attributes") or {}
+            # A door that is already open is sometimes reported as
+            # ``static_open`` because the backend cannot actuate it.  Once M1
+            # aperture and OCC connectivity have both reached the stable
+            # consensus gate, it is safe to create the same one-shot
+            # through-door goal.  A bare static label is deliberately kept
+            # fail-closed below.
+            occ_gate = attributes.get("portal_state_gate") or {}
+            occ_consensus = attributes.get("portal_state_consensus") or {}
+            unavailable_resolution = (
+                attributes.get("portal_unavailable_state_resolution") or {}
+            )
+            occ_open_confirmed = (
+                state == "static_open"
+                and interaction.get("traversable") is True
+                and bool(attributes.get("portal_state_consensus_accepted"))
+                and str(attributes.get("connectivity_status") or "").casefold()
+                == "connected"
+                and (
+                    bool(occ_gate.get("accepted"))
+                    or bool(unavailable_resolution.get("observed_open_connectivity"))
+                )
+                and bool(unavailable_resolution.get("m1_open_aperture", True))
+                and bool(occ_consensus.get("accepted", True))
+                and len(list(attributes.get("observed_connected_room_ids") or []))
+                >= 2
+            )
+            if state != "open" and not occ_open_confirmed:
                 continue
             # Do not treat a missing/unknown traversability bit as a valid
             # post-open route.  Only a confirmed backend result or an OCC/room
@@ -2761,10 +3262,15 @@ class CandidateGenerator:
                 ),
                 None,
             )
-            if open_event is None:
+            if occ_open_confirmed:
+                # OCC-only confirmation has no articulated approach event.
+                # Use a fresh robot-to-centre axis, so the goal always moves
+                # forward through the side currently occupied by the robot.
+                approach = [float(robot_xy[0]), float(robot_xy[1]), 0.0]
+            elif open_event is None:
                 continue
-            approach = list(open_event.get("approach_goal_xyyaw") or [])
-            attributes = node.get("attributes") or {}
+            else:
+                approach = list(open_event.get("approach_goal_xyyaw") or [])
             center = list(
                 attributes.get("interaction_reference_aabb_center")
                 or node.get("aabb_center")
@@ -2800,16 +3306,53 @@ class CandidateGenerator:
             traversal_distance = max(
                 0.0, float(self.config.portal_traversal_distance_m)
             )
+            if occ_open_confirmed:
+                # In an OCC-only observation the door leaf can remain in the
+                # local costmap until the robot has crossed the aperture.  A
+                # shorter first waypoint stays inside the free doorway cell;
+                # subsequent navigation can then turn around furniture in the
+                # newly entered room.
+                traversal_distance = min(traversal_distance, 0.35)
             goal = [
                 center_x + unit_x * traversal_distance,
                 center_y + unit_y * traversal_distance,
                 math.atan2(unit_y, unit_x),
             ]
+            goal_options = [goal]
+            if occ_open_confirmed:
+                # The door centre can remain inside a stale inflated leaf or
+                # a piece of furniture immediately beyond the aperture.  Let
+                # move_base preflight two small lateral offsets and choose a
+                # reachable point; this keeps the through-door transition
+                # one-shot without changing normal articulated-door goals.
+                lateral = 0.20
+                normal_x, normal_y = -unit_y, unit_x
+                goal_options.extend(
+                    [
+                        [
+                            goal[0] + normal_x * lateral,
+                            goal[1] + normal_y * lateral,
+                            goal[2],
+                        ],
+                        [
+                            goal[0] - normal_x * lateral,
+                            goal[1] - normal_y * lateral,
+                            goal[2],
+                        ],
+                    ]
+                )
             distance_m = math.hypot(
                 goal[0] - float(robot_xy[0]), goal[1] - float(robot_xy[1])
             )
             node_id = str(node.get("id") or "")
-            event_id = str(open_event.get("event_id") or "latest_open")
+            if occ_open_confirmed:
+                event_id = "occ_consensus_" + str(
+                    occ_gate.get("observation_capture_step")
+                    or interaction.get("state_observed_step")
+                    or "latest"
+                )
+            else:
+                event_id = str((open_event or {}).get("event_id") or "latest_open")
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
@@ -2844,6 +3387,17 @@ class CandidateGenerator:
             target_room_id = attributes.get("portal_child_room_id")
             if target_room_id is None and potential_room_ids:
                 target_room_id = potential_room_ids[0]
+            if target_room_id is None and occ_open_confirmed:
+                connected_room_ids = list(attributes.get("connected_room_ids") or [])
+                current_room_id = node.get("room_id")
+                target_room_id = next(
+                    (
+                        room_id
+                        for room_id in connected_room_ids
+                        if str(room_id) != str(current_room_id)
+                    ),
+                    None,
+                )
             source_room_id = attributes.get("portal_child_source_room_id")
             candidates.append(
                 BehaviorCandidate(
@@ -2875,7 +3429,13 @@ class CandidateGenerator:
                             or "door"
                         ),
                         "state": state,
+                        "portal_open_evidence_source": (
+                            "occ_consensus" if occ_open_confirmed else "interaction_result"
+                        ),
+                        "static_open_occ_confirmed": bool(occ_open_confirmed),
                         "post_interaction_traversal": True,
+                        "portal_center_xy": [center_x, center_y],
+                        "portal_through_axis_xy": [unit_x, unit_y],
                         "opened_portal_id": node_id,
                         "source_interaction_event_id": event_id,
                         "connected_room_ids": list(
@@ -2888,7 +3448,7 @@ class CandidateGenerator:
                         "room_transition_required": True,
                         "requires_approach": False,
                         "verify_target_visibility": False,
-                        "goal_xyyaw_candidates": [goal],
+                        "goal_xyyaw_candidates": goal_options,
                         # Keep the fresh geometry on the executable traversal
                         # candidate itself.  ``graph_context`` is deliberately
                         # compacted for MLLM privacy and may rename or trim a
@@ -3124,6 +3684,32 @@ class CandidateGenerator:
             ring_count = 1
         return offset, max(1, min(4, ring_count)), tangent, offset_source
 
+    def _clear_interaction_goals(self, goals, labels, node, target_xy, checker,
+                                 arrival_tolerance, front_tolerance, *, portal_normal_goal=None):
+        if checker is None or not goals:
+            return goals, labels
+        normal = portal_normal_goal or goals[0]
+        axis = [-math.cos(normal[2]), -math.sin(normal[2])]
+        center = (node.get("attributes") or {}).get("interaction_reference_aabb_center") or node.get("aabb_center") or target_xy
+        admitted, admitted_labels = [], []
+        for goal, label in zip(goals, labels):
+            tolerance = arrival_tolerance
+            if node.get("type") == "portal":
+                profile = bounded_portal_tolerances(goal, center, axis, tolerance,
+                                                   front_tolerance, front_tolerance, front_tolerance)
+                if profile is None:
+                    continue
+                tolerance = profile["distance_tolerance_m"]
+            detail = checker(goal, tolerance)
+            if detail.get("clear"):
+                admitted.append(goal)
+                admitted_labels.append(label)
+            else:
+                self.clearance_rejections.append({"target_id": node.get("id"), "goal_xyyaw": goal, **detail})
+        # Filter before deriving index-aligned capture/action arrays, never
+        # remove or renumber anchors from an already active decision.
+        return admitted, admitted_labels
+
     def _approach_candidates(
         self,
         robot_xy: tuple[float, float],
@@ -3140,6 +3726,8 @@ class CandidateGenerator:
         navigation_anchor_aabb_fan_angles_deg: tuple[float, ...] = (),
         container_multiview_angular_scale: float = 1.0,
         container_m1_face_selection_enabled: bool = False,
+        operational_container_axis: tuple[float, float] | None = None,
+        portal_front_angle_tolerance_rad: float | None = None,
     ) -> tuple[list[list[float]], list[str]]:
         candidates: list[list[float]] = []
         labels: list[str] = []
@@ -3161,6 +3749,32 @@ class CandidateGenerator:
             labels.append(str(label))
 
         if node_type == "portal":
+            if (not self.config.portal_allow_opposite_side_interaction
+                    and not self.config.portal_require_reference_yaw):
+                front_tolerance = float(portal_front_angle_tolerance_rad if portal_front_angle_tolerance_rad is not None
+                                        else self.config.portal_interaction_front_angle_tolerance_rad)
+                attributes = node.get("attributes") or {}
+                center = attributes.get("interaction_reference_aabb_center") or node.get("aabb_center") or target_xy
+                primary = self._portal_approach_pose(robot_xy, target_xy, node, standoff_m)
+                axis = [-math.cos(primary[2]), -math.sin(primary[2])]
+                offsets = [0.0] + [float(value) for value in self.config.portal_tangent_offsets_m
+                                   if math.isfinite(float(value)) and abs(float(value)) <= 0.15]
+                for extra_standoff in (0.0, 0.25, 0.50):
+                    for tangent_offset in offsets:
+                        pose = self._portal_approach_pose(
+                            robot_xy, target_xy, node, max(0.0, float(standoff_m)) + extra_standoff,
+                            tangent_offset_m=tangent_offset,
+                        )
+                        profile = bounded_portal_tolerances(
+                            pose, center, axis, min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                            min(front_tolerance, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
+                            front_tolerance, front_tolerance,
+                        )
+                        if tangent_offset and profile is None:
+                            continue
+                        append_unique(pose, "portal_source_side" if not tangent_offset
+                                      else f"portal_source_side_tangent_{tangent_offset:+.2f}")
+                return candidates, labels
             if (
                 self.config.portal_require_reference_yaw
                 and (node.get("attributes") or {}).get(
@@ -3277,6 +3891,32 @@ class CandidateGenerator:
                         (reference_yaw + math.pi, "neg_x"),
                         (reference_yaw - math.pi / 2.0, "neg_y"),
                     )
+                    # A refrigerator's public articulation geometry is a
+                    # stronger physical constraint than visual face naming.
+                    # Keep the distance/angle fan, but restrict it to the AABB
+                    # face closest to that operational normal.  M1 still
+                    # confirms frontality at the reached pose; it may no longer
+                    # authorize an opposite face that the physical verifier is
+                    # guaranteed to reject.
+                    if operational_container_axis is not None:
+                        try:
+                            operational_angle = math.atan2(
+                                float(operational_container_axis[1]),
+                                float(operational_container_axis[0]),
+                            )
+                            face_axes = (
+                                min(
+                                    face_axes,
+                                    key=lambda item: abs(
+                                        math.atan2(
+                                            math.sin(item[0] - operational_angle),
+                                            math.cos(item[0] - operational_angle),
+                                        )
+                                    ),
+                                ),
+                            )
+                        except (TypeError, ValueError, IndexError):
+                            pass
                 elif scaled_x >= scaled_y:
                     face_axes = ((0.0 if dx >= 0.0 else math.pi,
                                   "pos_x" if dx >= 0.0 else "neg_x"),)
@@ -3286,7 +3926,17 @@ class CandidateGenerator:
                 for normal_angle, face_name in face_axes:
                     for clearance in fan_clearances:
                         for angle_deg in fan_angles_deg:
-                            angle = normal_angle + math.radians(angle_deg)
+                            # ``fridge_multiview_angular_scale`` used to apply
+                            # only to the legacy radial branch below.  The
+                            # active four-face AABB/M1 branch must scale the
+                            # actual fan angles as well.
+                            effective_angle_deg = angle_deg
+                            if node_type == "container":
+                                effective_angle_deg *= max(
+                                    0.0,
+                                    min(1.0, float(container_multiview_angular_scale)),
+                                )
+                            angle = normal_angle + math.radians(effective_angle_deg)
                             axis = (math.cos(angle), math.sin(angle))
                             raw_reference_yaw = (node.get("attributes") or {}).get(
                                 "interaction_reference_yaw", node.get("yaw")
@@ -3321,7 +3971,7 @@ class CandidateGenerator:
                                     math.atan2(target_xy[1] - y, target_xy[0] - x),
                                 ],
                                 (
-                                    f"aabb_fan_{face_name}_angle_{angle_deg:+g}_"
+                                    f"aabb_fan_{face_name}_angle_{effective_angle_deg:+g}_"
                                     f"clearance_{clearance:.2f}"
                                 ),
                             )
@@ -4207,6 +4857,183 @@ class CandidateGenerator:
         return [float(values[0]), float(values[1]), float(values[2])]
 
     @staticmethod
+    def _room_segment_id_for_xy(
+        room_segment_grid: dict[str, Any] | None,
+        point_xy: tuple[float, float],
+        *,
+        majority_radius_cells: int = 1,
+    ) -> int | None:
+        """Resolve a room from the segmentation raster, rejecting boundaries.
+
+        Public room boxes intentionally grow monotonically and can overlap on
+        opposite sides of a wall.  The room segmentation has one component
+        label per cell, so use a small majority vote around the anchor instead
+        of resolving overlapping AABBs by area.
+        """
+
+        if not isinstance(room_segment_grid, dict):
+            return None
+        try:
+            width = int(room_segment_grid.get("width", 0) or 0)
+            height = int(room_segment_grid.get("height", 0) or 0)
+            resolution = float(room_segment_grid.get("resolution", 0.0) or 0.0)
+            origin_x = float(room_segment_grid.get("origin_x", 0.0) or 0.0)
+            origin_y = float(room_segment_grid.get("origin_y", 0.0) or 0.0)
+            origin_yaw = float(room_segment_grid.get("origin_yaw", 0.0) or 0.0)
+            world_x, world_y = float(point_xy[0]), float(point_xy[1])
+            data = list(room_segment_grid.get("data") or [])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if (
+            width <= 0
+            or height <= 0
+            or resolution <= 0.0
+            or len(data) != width * height
+        ):
+            return None
+        dx = world_x - origin_x
+        dy = world_y - origin_y
+        cos_yaw = math.cos(origin_yaw)
+        sin_yaw = math.sin(origin_yaw)
+        local_x = cos_yaw * dx + sin_yaw * dy
+        local_y = -sin_yaw * dx + cos_yaw * dy
+        cell_x = int(math.floor(local_x / resolution))
+        cell_y = int(math.floor(local_y / resolution))
+        radius = max(0, int(majority_radius_cells))
+        counts: dict[int, int] = {}
+        for y in range(cell_y - radius, cell_y + radius + 1):
+            if y < 0 or y >= height:
+                continue
+            for x in range(cell_x - radius, cell_x + radius + 1):
+                if x < 0 or x >= width:
+                    continue
+                try:
+                    room_id = int(data[y * width + x])
+                except (TypeError, ValueError):
+                    continue
+                if room_id < 0:
+                    continue
+                counts[room_id] = counts.get(room_id, 0) + 1
+        if not counts:
+            return None
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+            return None
+        return int(ordered[0][0])
+
+    @classmethod
+    def _room_segment_id_around_aabb(
+        cls,
+        room_segment_grid: dict[str, Any] | None,
+        center_xy: tuple[float, float],
+        size_xy: tuple[float, ...],
+    ) -> int | None:
+        """Resolve a container room from labelled free cells around its AABB."""
+
+        if not isinstance(room_segment_grid, dict) or len(size_xy) < 2:
+            return cls._room_segment_id_for_xy(room_segment_grid, center_xy)
+        try:
+            size_x = abs(float(size_xy[0]))
+            size_y = abs(float(size_xy[1]))
+            resolution = float(room_segment_grid.get("resolution", 0.0) or 0.0)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if size_x <= 0.0 or size_y <= 0.0 or resolution <= 0.0:
+            return cls._room_segment_id_for_xy(room_segment_grid, center_xy)
+        half_x = 0.5 * size_x
+        half_y = 0.5 * size_y
+        margin = max(0.10, 1.5 * resolution)
+        samples: list[tuple[float, float]] = []
+        for fraction in (-0.4, 0.0, 0.4):
+            samples.extend(
+                [
+                    (center_xy[0] + half_x + margin, center_xy[1] + fraction * size_y),
+                    (center_xy[0] - half_x - margin, center_xy[1] + fraction * size_y),
+                    (center_xy[0] + fraction * size_x, center_xy[1] + half_y + margin),
+                    (center_xy[0] + fraction * size_x, center_xy[1] - half_y - margin),
+                ]
+            )
+        counts: dict[int, int] = {}
+        for point in samples:
+            room_id = cls._room_segment_id_for_xy(
+                room_segment_grid, point, majority_radius_cells=0
+            )
+            if room_id is not None:
+                counts[int(room_id)] = counts.get(int(room_id), 0) + 1
+        if not counts:
+            return None
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+            return None
+        return int(ordered[0][0])
+
+    @classmethod
+    def _room_segment_corridor_matches(
+        cls,
+        room_segment_grid: dict[str, Any],
+        target_xy: tuple[float, float],
+        anchor_xy: tuple[float, float],
+        target_room_id: int,
+        *,
+        sample_spacing_m: float = 0.10,
+        target_aabb_size_xy: tuple[float, ...] = (),
+    ) -> bool:
+        """Require the full target-to-anchor staging corridor to stay in one room.
+
+        Endpoint-only checks can accept an anchor across a wall when both ends
+        happen to have the same merged label. Sampling the corridor in the
+        segmentation raster rejects unknown cells, room transitions, and
+        accidental wall crossings before a move_base goal is emitted.
+        """
+        try:
+            dx = float(anchor_xy[0]) - float(target_xy[0])
+            dy = float(anchor_xy[1]) - float(target_xy[1])
+            distance = math.hypot(dx, dy)
+        except (TypeError, ValueError):
+            return False
+        start_x, start_y = float(target_xy[0]), float(target_xy[1])
+        if distance > 1e-6 and len(target_aabb_size_xy) >= 2:
+            try:
+                unit_x, unit_y = dx / distance, dy / distance
+                half_x = 0.5 * abs(float(target_aabb_size_xy[0]))
+                half_y = 0.5 * abs(float(target_aabb_size_xy[1]))
+                limits = []
+                if abs(unit_x) > 1e-6:
+                    limits.append(half_x / abs(unit_x))
+                if abs(unit_y) > 1e-6:
+                    limits.append(half_y / abs(unit_y))
+                boundary_distance = min(limits) if limits else 0.0
+                resolution = float(room_segment_grid.get("resolution", 0.0) or 0.0)
+                free_offset = boundary_distance + max(resolution, 0.05)
+                start_x += unit_x * free_offset
+                start_y += unit_y * free_offset
+            except (TypeError, ValueError, IndexError):
+                return False
+        remaining_dx = float(anchor_xy[0]) - start_x
+        remaining_dy = float(anchor_xy[1]) - start_y
+        remaining_distance = math.hypot(remaining_dx, remaining_dy)
+        samples = max(
+            1,
+            int(
+                math.ceil(
+                    remaining_distance / max(float(sample_spacing_m), 1e-3)
+                )
+            ),
+        )
+        for index in range(1, samples + 1):
+            fraction = float(index) / float(samples)
+            point = (
+                start_x + remaining_dx * fraction,
+                start_y + remaining_dy * fraction,
+            )
+            room_id = cls._room_segment_id_for_xy(
+                room_segment_grid, point, majority_radius_cells=0
+            )
+            if room_id is None or int(room_id) != int(target_room_id):
+                return False
+        return True
+
+    @staticmethod
     def _room_id_for_xy(
         graph: dict[str, Any], robot_xy: tuple[float, float]
     ) -> int | None:
@@ -4444,16 +5271,40 @@ class CandidateGenerator:
             normal_y *= side * float(side_multiplier)
             boundary_distance = 0.5 * minor
         else:
-            # Rotated/nearly-square AABBs do not expose a reliable normal.
-            # Retain the old radial direction as the primary side, and mirror
-            # that direction for the opposite-side fallback.
-            dx = float(robot_xy[0]) - float(target_xy[0])
-            dy = float(robot_xy[1]) - float(target_xy[1])
-            distance = math.hypot(dx, dy)
-            if distance <= 1e-6:
-                normal_x, normal_y = -1.0, 0.0
+            # A radial robot-to-door bearing is not a door normal.  In the
+            # minimal-GT stream the portal AABB can legitimately be [0, 0, 0];
+            # using that bearing creates diagonal/side-offset interaction
+            # points (and makes the chosen face depend on where the robot
+            # happened to be).  Prefer an explicitly persisted normal when one
+            # exists.  Otherwise quantize the bearing only to select the
+            # source side of a cardinal fallback, never to define an arbitrary
+            # diagonal interaction direction.
+            explicit_axis = (
+                attributes.get("interaction_approach_axis_xy")
+                or attributes.get("portal_normal_xy")
+                or attributes.get("door_normal_xy")
+            )
+            axis_norm = 0.0
+            if isinstance(explicit_axis, (list, tuple)) and len(explicit_axis) >= 2:
+                try:
+                    candidate_x = float(explicit_axis[0])
+                    candidate_y = float(explicit_axis[1])
+                    axis_norm = math.hypot(candidate_x, candidate_y)
+                except (TypeError, ValueError):
+                    axis_norm = 0.0
+            if axis_norm > 1e-6:
+                normal_x = candidate_x / axis_norm
+                normal_y = candidate_y / axis_norm
             else:
-                normal_x, normal_y = dx / distance, dy / distance
+                dx = float(robot_xy[0]) - float(target_xy[0])
+                dy = float(robot_xy[1]) - float(target_xy[1])
+                # Use the dominant world axis for side selection.  This keeps
+                # the pose on a straight cardinal ray instead of the old
+                # robot-bearing diagonal when geometry is unavailable.
+                if abs(dx) >= abs(dy):
+                    normal_x, normal_y = (1.0 if dx >= 0.0 else -1.0), 0.0
+                else:
+                    normal_x, normal_y = 0.0, (1.0 if dy >= 0.0 else -1.0)
             if size_x > 1e-6 and size_y > 1e-6:
                 ray_denominator = abs(normal_x) / (0.5 * size_x) + abs(normal_y) / (0.5 * size_y)
                 if ray_denominator > 1e-6:

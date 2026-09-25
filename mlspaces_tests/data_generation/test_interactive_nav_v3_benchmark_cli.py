@@ -23,6 +23,8 @@ def test_v3_runner_keeps_the_expanded_m1_budget_isolated() -> None:
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}" in source
     assert 'semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}"' in source
@@ -38,10 +40,12 @@ def test_v3_runner_bounds_observation_turns_and_gives_m1_worker_pool_headroom() 
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}" in source
     assert 'semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}"' in source
-    assert "ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.2}" in source
+    assert "ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.4}" in source
     assert "ROS_STEP_READY_BARRIER_ENABLED=${ROS_STEP_READY_BARRIER_ENABLED:-true}" in source
     assert '--ros-step-ready-topic "${ROS_STEP_READY_TOPIC}"' in source
     assert "EVAL_ARGS+=(--ros-step-ready-barrier-enabled)" in source
@@ -59,6 +63,8 @@ def test_v3_runner_matches_zero_padded_episode_result_directory() -> None:
         / "run_interactive_nav_v3_ros_eval_test.zsh"
     )
     source = runner.read_text(encoding="utf-8")
+    assert 'source "${DEFAULT_EVAL_CONFIG}"' in source
+    source += (runner.parent / "configs/evaluation/benchmark_eval.conf").read_text(encoding="utf-8")
 
     assert 'EPISODE_INDEX_PADDED=$(printf \'%04d\' "${EPISODE_INDEX}")' in source
     assert '${EPISODE_INDEX_PADDED}_*/episode_result.json' in source
@@ -110,8 +116,10 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
     assert manifest["evaluation_config"]["paper_cost_error_surcharge"] == pytest.approx(1.2)
     assert manifest["evaluation_config"]["paper_cost_failure_penalty"] == pytest.approx(7.0)
     paper_metric_config = result["summary"]["paper_metric_config"]
-    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v1"
+    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v3"
+    assert paper_metric_config["interaction_success_definition"] == "episode_mean_of_best_required_plan_effect_completion_fraction"
     assert paper_metric_config["formula"] == "L_exec_m + lambda*A + mu*E + kappa*(1-S)"
+    assert paper_metric_config["error_definition"] == "failed_or_effect_free_repeated_attempts"
     assert paper_metric_config["interaction_attempt_cost"] == pytest.approx(0.4)
     assert paper_metric_config["error_interaction_surcharge"] == pytest.approx(1.2)
     assert paper_metric_config["failure_penalty"] == pytest.approx(7.0)

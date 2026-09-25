@@ -198,6 +198,12 @@ def _interaction_result_capability(result):
     capability = str(result.get("interaction_capability") or "").strip().casefold()
     state = str(result.get("state") or result.get("post_state") or "").strip().casefold()
     if (
+        str(result.get("observation_outcome") or "").strip().casefold()
+        == "finish_without_action"
+        and capability == "unavailable"
+    ):
+        return "unavailable"
+    if (
         capability == "static"
         or state in {"static", "static_open", "static_closed"}
     ):
@@ -488,6 +494,17 @@ def _portal_has_observed_open_connectivity(node):
     )
 
 
+def _portal_has_visual_and_map_open_evidence(node, aperture_evidence):
+    """Whether independent M1 aperture and occupancy evidence agree on open."""
+
+    aperture_visible = bool(
+        isinstance(aperture_evidence, dict)
+        and aperture_evidence.get("open_aperture") == "visible"
+        and float(aperture_evidence.get("confidence", 0.0) or 0.0) >= 0.70
+    )
+    return bool(aperture_visible and _portal_has_observed_open_connectivity(node))
+
+
 def _portal_visual_state_gate(
     node,
     state,
@@ -505,10 +522,16 @@ def _portal_visual_state_gate(
     """
 
     requested = str(state or "unknown").strip().casefold()
+    if (
+        node.type == "portal"
+        and requested in {"open", "ajar", "static_open", "closed"}
+        and bool(visual_evidence_truncated)
+    ):
+        # Border-clipped evidence is incomplete in both directions: it cannot
+        # prove an aperture and it cannot prove that the whole leaf is closed.
+        return False, "truncated_visual_evidence"
     if node.type != "portal" or requested not in {"open", "ajar", "static_open"}:
         return True, "not_applicable"
-    if bool(visual_evidence_truncated):
-        return False, "truncated_visual_evidence"
     aperture_visible = bool(
         isinstance(aperture_evidence, dict)
         and aperture_evidence.get("open_aperture") == "visible"
@@ -591,9 +614,23 @@ def _portal_result_state_gate(node, result, resolved_state):
         return True, "not_applicable"
     if result.get("success") is False:
         return False, "unsuccessful_result"
+    if bool(
+        result.get("visual_evidence_truncated")
+        or result.get("visual_evidence_truncated_edges")
+    ):
+        # A result may be correlated with a real observation, but an image
+        # clipped at the frame boundary cannot establish either an open gap or
+        # a closed leaf.  Preserve the prior graph state until a complete view
+        # or an authoritative simulator result arrives.
+        return False, "truncated_visual_evidence"
     action = str(result.get("action") or "").strip().casefold()
     capability = _interaction_result_capability(result)
     source = str(result.get("source") or "").strip().casefold()
+    observation_only = (
+        result.get("success") is True
+        and str(result.get("observation_outcome") or "").strip().casefold()
+        == "finish_without_action"
+    )
     trusted_verified_state = source in {
         "oracle_interaction",
         "direct_joint_readback",
@@ -607,6 +644,15 @@ def _portal_result_state_gate(node, result, resolved_state):
     )
     accepted = bool(
         static_terminal
+        or (
+            observation_only
+            and requested == "static_open"
+            and capability in {"unknown", "unavailable"}
+            and _portal_has_visual_and_map_open_evidence(
+                node,
+                result.get("portal_aperture_evidence"),
+            )
+        )
         or trusted_verified_state
         or (
             result.get("success") is True
@@ -681,6 +727,7 @@ class InteractionGraphStore:
         )
         self.room_geometries = {}
         self.room_geometry_candidates = {}
+        self._room_split_shrink_allowed = set()
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
@@ -734,6 +781,7 @@ class InteractionGraphStore:
             self.source_mode = str(source_mode)
         self.room_geometries = {}
         self.room_geometry_candidates = {}
+        self._room_split_shrink_allowed = set()
         self.room_geometry_stability_frames = 5
         self.room_redirects = {}
         self.nodes = {}
@@ -808,6 +856,9 @@ class InteractionGraphStore:
                 confidence_data,
             )
         )
+        if previous_grid is not None and not cache_hit:
+            self._room_split_shrink_allowed.update(
+                self._rooms_with_transferred_cells(previous_grid, grid_info, scene_data))
         self.last_room_grid_cache_hit = cache_hit
         if not cache_hit or room_merges:
             self._room_grid_epoch += 1
@@ -975,6 +1026,36 @@ class InteractionGraphStore:
                 )
         if node is None:
             return False
+        # M1 can finish an interaction without issuing a force command when it
+        # sees an already-open doorway.  Preserve that terminal observation as
+        # an authoritative unavailable+open portal result; otherwise the
+        # scheduler recreates the same interaction candidate on every graph
+        # revision.  The aperture evidence is retained for the OCC bridge.
+        result = dict(result)
+        observation_only_open = (
+            node.type == "portal"
+            and bool(result.get("success"))
+            and str(result.get("observation_outcome") or "").strip().casefold()
+            == "finish_without_action"
+            and str(result.get("state") or result.get("post_state") or "")
+            .strip()
+            .casefold()
+            in {"open", "opened", "ajar", "static_open"}
+        )
+        if observation_only_open:
+            result.setdefault("action", "open")
+            aperture = result.get("portal_aperture_evidence")
+            # M1 alone cannot upgrade topology.  Keep an unavailable terminal
+            # until the occupancy/room lane has observed connectivity on both
+            # sides; the later attribute patch then promotes it to static_open.
+            result["state"] = (
+                "static_open"
+                if _portal_has_visual_and_map_open_evidence(node, aperture)
+                else "unavailable"
+            )
+            result.setdefault("interaction_capability", "unavailable")
+            result.setdefault("interactable", False)
+            result.setdefault("source", "mllm_observation_finish_without_action")
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
         resolved_state, inferred_from_action = _resolved_interaction_state(result)
@@ -1010,6 +1091,18 @@ class InteractionGraphStore:
         except (TypeError, ValueError):
             observed_step = None
         sequence_type = str(result.get("sequence_type") or "").strip().casefold()
+        # The evaluator's public drawer-scan result historically omitted
+        # ``sequence_type`` and exposed only the verification source.  Treat
+        # that source as the same completed scan contract so a successful
+        # closed-after-scan result remains terminal in the graph and is not
+        # regenerated as another container interaction.
+        if (
+            not sequence_type
+            and str(result.get("verification_source") or "").strip().casefold()
+            == "drawer_scan_backend"
+            and node.type == "container"
+        ):
+            sequence_type = "drawer_scan"
         if bool(result.get("success")) and sequence_type == "drawer_scan":
             grounded_regions = [
                 str(item.get("region_id") or "")
@@ -1055,6 +1148,7 @@ class InteractionGraphStore:
             and result.get("success") is True
             and not static_capability
             and not blocked_capability
+            and not unavailable_capability
         ):
             # A successful physical action is the rule lane's only evidence
             # that the portal is actually operable.  Keep this separate from
@@ -1098,6 +1192,12 @@ class InteractionGraphStore:
             )
         elif blocked_capability or unavailable_capability:
             terminal_state = "blocked"
+            terminal_state_source = str(
+                result.get("source")
+                or result.get("verification_source")
+                or "interaction_capability_check"
+            )
+            terminal_state_evidence = "interaction_capability_feedback"
             if unavailable_capability:
                 # Capability and aperture state are orthogonal.  A fixed
                 # doorway may be permanently open or permanently closed; do
@@ -1106,36 +1206,78 @@ class InteractionGraphStore:
                 # already-gated graph state is used here, so a failed action
                 # still cannot manufacture an open passage.
                 graph_pre_state = str(pre_state or "unknown").strip().casefold()
-                result_pre_state = str(
-                    result.get("pre_state") or "unknown"
-                ).strip().casefold()
-                # The graph state was observed before this command and is more
-                # trustworthy than a capability payload that may use
-                # ``unavailable`` as both capability and placeholder state.
-                observed_pre_state = (
-                    graph_pre_state
-                    if graph_pre_state not in {"", "unknown", "unavailable"}
-                    else result_pre_state
+                # Never promote aperture state from a failed result's
+                # ``pre_state`` payload.  Open is admitted only from an already
+                # gated graph state, M1+OCC agreement below, or a separately
+                # successful force result handled by the success lane.
+                observed_pre_state = graph_pre_state
+                observation_only_open_confirmed = bool(
+                    observation_only_open
+                    and result_state_allowed
+                    and str(resolved_state or "").casefold() == "static_open"
                 )
-                if observed_pre_state in {"open", "opened", "ajar", "static_open"}:
+                if observation_only_open_confirmed:
+                    # The M1 observation itself is the authoritative aperture
+                    # result for a non-articulated/already-open portal.  Keep
+                    # executor capability unavailable while exposing the
+                    # orthogonal static-open topology state.
+                    terminal_state = "static_open"
+                    terminal_state_source = "mllm_observation_finish_without_action"
+                    terminal_state_evidence = "m1_open_aperture_observation"
+                visual_map_open = bool(
+                    node.type == "portal"
+                    and _portal_has_visual_and_map_open_evidence(
+                        node,
+                        node.attributes.get("portal_aperture_evidence"),
+                    )
+                )
+                if visual_map_open:
+                    # A failed non-articulated action only establishes executor
+                    # capability.  Keep aperture state orthogonal: M1-visible
+                    # open space plus independently observed OCC connectivity
+                    # is sufficient to classify this as unavailable/open even
+                    # when the target touches an image edge.
+                    terminal_state = "static_open"
+                    terminal_state_source = "mllm_aperture+occupancy_connectivity"
+                    terminal_state_evidence = "m1_open_aperture_and_occ_connectivity"
+                elif observation_only_open_confirmed:
+                    pass
+                elif observed_pre_state in {"open", "opened", "ajar", "static_open"}:
                     terminal_state = "static_open"
                 elif observed_pre_state in {"closed", "static_closed"}:
                     terminal_state = "static_closed"
                 else:
                     terminal_state = "unavailable"
+                node.attributes["portal_unavailable_state_resolution"] = {
+                    "state": terminal_state,
+                    "m1_open_aperture": bool(
+                        isinstance(
+                            node.attributes.get("portal_aperture_evidence"), dict
+                        )
+                        and node.attributes["portal_aperture_evidence"].get(
+                            "open_aperture"
+                        )
+                        == "visible"
+                    ),
+                    "observed_open_connectivity": bool(
+                        _portal_has_observed_open_connectivity(node)
+                    ),
+                    "reason": (
+                        "m1_open_aperture_and_occ_connectivity"
+                        if visual_map_open
+                        else "preserved_preinteraction_state"
+                    ),
+                    "event_id": str(result.get("event_id") or ""),
+                }
             node.interaction.update(
                 {
                     "is_interactable": False,
                     "interaction_mode": "none",
                     "state": terminal_state,
-                    "state_source": str(
-                        result.get("source")
-                        or result.get("verification_source")
-                        or "interaction_capability_check"
-                    ),
+                    "state_source": terminal_state_source,
                     "state_confidence": float(result.get("confidence", 1.0)),
                     "state_observed_step": observed_step,
-                    "state_evidence": "interaction_capability_feedback",
+                    "state_evidence": terminal_state_evidence,
                     "capability": resolved_capability,
                     "capability_source": "executor_feedback",
                     "capability_confidence": float(result.get("confidence", 1.0)),
@@ -1543,6 +1685,9 @@ class InteractionGraphStore:
                 )
             )
         )
+        portal_state_consensus_accepted = bool(
+            patch.get("portal_state_consensus_accepted", True)
+        )
         requested_patch_state = str(
             patch.get("coarse_state") or "unknown"
         ).strip().casefold()
@@ -1670,6 +1815,10 @@ class InteractionGraphStore:
                 "affordances": list(patch.get("affordances") or []),
                 "interaction_parts": parts,
                 "mllm_interaction_parts": parts,
+                "portal_state_consensus": dict(
+                    patch.get("portal_state_consensus") or {}
+                ),
+                "portal_state_consensus_accepted": portal_state_consensus_accepted,
             }
         )
         if is_visual_mllm_patch and (
@@ -1772,28 +1921,67 @@ class InteractionGraphStore:
             ],
             default=0.0,
         )
+        patch_state = str(
+            patch.get("coarse_state")
+            or node.interaction.get("state")
+            or "unknown"
+        )
+        unavailable_open_reconciliation = bool(
+            has_verified_interaction_state
+            and is_visual_mllm_patch
+            and node.type == "portal"
+            and portal_state_consensus_accepted
+            and str(verified_state_override.get("capability") or "").casefold()
+            == "unavailable"
+            and patch_state.casefold() in {"open", "ajar", "static_open"}
+            and _portal_has_visual_and_map_open_evidence(
+                node,
+                portal_aperture_evidence,
+            )
+        )
         state_was_updated = (
             not has_verified_interaction_state
             and latest_operation_stamp <= patch_stamp
             and is_visual_mllm_patch
+            and (node.type != "portal" or portal_state_consensus_accepted)
             and not container_state_rejected
             and not portal_type_locked
-        )
+        ) or unavailable_open_reconciliation
+        if (
+            is_visual_mllm_patch
+            and node.type == "portal"
+            and not portal_state_consensus_accepted
+        ):
+            node.attributes["portal_state_gate"] = {
+                "accepted": False,
+                "requested_state": str(patch_state).casefold(),
+                "reason": "portal_state_consensus_pending",
+                "observation_capture_step": patch_frame_index,
+            }
         if state_was_updated:
-            patch_state = str(
-                patch.get("coarse_state")
-                or node.interaction.get("state")
-                or "unknown"
-            )
-            portal_state_allowed, portal_state_gate_reason = _portal_visual_state_gate(
-                node,
-                patch_state,
-                portal_morphology,
-                portal_aperture_evidence,
-                visual_evidence_truncated=bool(
-                    patch.get("visual_evidence_truncated", False)
-                ),
-            )
+            if unavailable_open_reconciliation:
+                patch_state = "static_open"
+                portal_state_allowed = True
+                portal_state_gate_reason = (
+                    "unavailable_capability_m1_open_and_map_confirmed"
+                )
+                node.attributes["portal_unavailable_state_resolution"] = {
+                    "state": "static_open",
+                    "m1_open_aperture": True,
+                    "observed_open_connectivity": True,
+                    "reason": "m1_open_aperture_and_occ_connectivity",
+                    "event_id": str(verified_state_override.get("event_id") or ""),
+                }
+            else:
+                portal_state_allowed, portal_state_gate_reason = _portal_visual_state_gate(
+                    node,
+                    patch_state,
+                    portal_morphology,
+                    portal_aperture_evidence,
+                    visual_evidence_truncated=bool(
+                        patch.get("visual_evidence_truncated", False)
+                    ),
+                )
             if node.type == "portal":
                 node.attributes["portal_state_gate"] = {
                     "accepted": bool(portal_state_allowed),
@@ -1861,6 +2049,28 @@ class InteractionGraphStore:
                     "operation_history": previous_history,
                 }
             )
+            if unavailable_open_reconciliation:
+                # Preserve executor capability while accepting the independent
+                # visual+map aperture state.  Capability and aperture are two
+                # separate axes exposed as unavailable/open in visualization.
+                for key in (
+                    "is_interactable",
+                    "interaction_mode",
+                    "capability",
+                    "capability_source",
+                    "capability_confidence",
+                    "capability_observed_step",
+                    "capability_evidence",
+                    "failure_reason",
+                ):
+                    if key in verified_state_override:
+                        node.interaction[key] = verified_state_override[key]
+                node.interaction["state_source"] = (
+                    "mllm_aperture+occupancy_connectivity"
+                )
+                node.interaction["state_evidence"] = (
+                    "m1_open_aperture_and_occ_connectivity"
+                )
         if state_was_updated:
             self._refresh_planner_state_fields(node)
             node.attributes["interaction_state_override"] = {
@@ -1886,6 +2096,12 @@ class InteractionGraphStore:
                 if key in node.interaction
             }
             node.attributes["interaction_state_override"]["timestamp"] = patch_stamp
+            if unavailable_open_reconciliation and verified_state_override.get(
+                "event_id"
+            ):
+                node.attributes["interaction_state_override"]["event_id"] = str(
+                    verified_state_override["event_id"]
+                )
 
         # Keep the interaction mode canonical even when a repeated M1 patch
         # does not change the closed/open state.  Otherwise the first patch
@@ -2036,6 +2252,7 @@ class InteractionGraphStore:
                     patch.get("total_lag_sec", 0.0) or 0.0
                 ),
                 "room_attribute_error": str(patch.get("error") or ""),
+                "room_attribute_fallback": bool(patch.get("fallback", False)),
             }
         )
         if attribute_status == "ready":
@@ -2666,9 +2883,29 @@ class InteractionGraphStore:
                 node.type = node.attributes.get("mllm_interaction_class") or node.type
             elif node.attributes.get("m1_noninteractive_override"):
                 node.type = "object"
-        node.centroid = self._ground_non_room_centroid(observation["position"], observation["aabb_size"])
-        node.aabb_center = self._ground_non_room_centroid(observation["aabb_center"], observation["aabb_size"])
-        node.aabb_size = list(observation["aabb_size"])
+        if minimal_gt and node.type == "portal":
+            node.label = "door"
+            node.name = "door"
+        observed_aabb_center = list(observation["aabb_center"])
+        observed_aabb_size = list(observation["aabb_size"])
+        aabb_reused_previous = False
+        if (
+            not self._valid_aabb_size(observed_aabb_size)
+            and self._valid_aabb_size(node.aabb_size)
+        ):
+            # A transient publisher/geometry failure must not erase a valid
+            # portal or container footprint and force candidate generation to
+            # fall back to a robot-bearing direction.
+            observed_aabb_center = list(node.aabb_center)
+            observed_aabb_size = list(node.aabb_size)
+            aabb_reused_previous = True
+        node.centroid = self._ground_non_room_centroid(
+            observation["position"], observed_aabb_size
+        )
+        node.aabb_center = self._ground_non_room_centroid(
+            observed_aabb_center, observed_aabb_size
+        )
+        node.aabb_size = observed_aabb_size
         node.room_id = observation.get("room_id") if observation.get("room_id") is not None else node.room_id
         node.confidence = max(float(node.confidence), float(observation.get("confidence", 0.0)))
         node.observation_count += 1
@@ -2749,16 +2986,18 @@ class InteractionGraphStore:
                 ),
                 "episode_id": observation.get("episode_id"),
                 "box_3d_frame_id": observation.get("box_3d_frame_id"),
-                "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
-                "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
+                "viz_aabb_center": list(observation.get("viz_aabb_center") or observed_aabb_center),
+                "viz_aabb_size": list(observation.get("viz_aabb_size") or observed_aabb_size),
                 # Physical YOLOE publishes the oriented 3-D box in the
                 # visualization fields while ``aabb_size`` remains a world
                 # axis-aligned envelope. Preserve the oriented extent for
                 # interaction-face geometry; otherwise a rotated appliance's
                 # surface intersection is computed with the wrong half-widths.
                 "interaction_reference_obb_size": list(
-                    observation.get("viz_aabb_size") or observation["aabb_size"]
+                    observation.get("viz_aabb_size") or observed_aabb_size
                 ),
+                "aabb_valid": bool(self._valid_aabb_size(observed_aabb_size)),
+                "aabb_reused_previous": bool(aabb_reused_previous),
             }
         if not (minimal_gt and node.type == "portal"):
             observation_attributes["source_object_name"] = observation.get(
@@ -2933,12 +3172,14 @@ class InteractionGraphStore:
         }
         node.interaction = default_interaction_payload(node.type, observation)
         if node.type == "portal":
-            if "interaction_reference_aabb_center" not in node.attributes:
+            if not self._valid_aabb_size(
+                node.attributes.get("interaction_reference_aabb_size")
+            ):
                 node.attributes["interaction_reference_aabb_center"] = list(
-                    observation["aabb_center"]
+                    observed_aabb_center
                 )
                 node.attributes["interaction_reference_aabb_size"] = list(
-                    observation["aabb_size"]
+                    observed_aabb_size
                 )
             # Upgrade a legacy/reference portal yaw when a measured OBB yaw
             # arrives.  Older physical detections did not serialize yaw and
@@ -3115,14 +3356,17 @@ class InteractionGraphStore:
             xs = world_x[member_mask]
             ys = world_y[member_mask]
             cell_count = int(member_mask.sum())
+            # Bounds use the midpoint of extrema, not the cell centroid: for
+            # an L-shaped room the latter shifts the box off its own cells.
             center = [
-                float(xs.mean()),
-                float(ys.mean()),
+                float((xs.min() + xs.max()) * 0.5),
+                float((ys.min() + ys.max()) * 0.5),
                 0.5 * self.room_box_height,
             ]
+            cell_extent = resolution * (abs(cos_yaw) + abs(sin_yaw))
             size = [
-                max(resolution, float(xs.max() - xs.min()) + resolution),
-                max(resolution, float(ys.max() - ys.min()) + resolution),
+                max(resolution, float(xs.max() - xs.min()) + cell_extent),
+                max(resolution, float(ys.max() - ys.min()) + cell_extent),
                 self.room_box_height,
             ]
             room_confidence_mask = member_mask & confidence_available
@@ -3370,6 +3614,34 @@ class InteractionGraphStore:
             )
         )
 
+    @staticmethod
+    def _rooms_with_transferred_cells(previous, info, labels):
+        """Only observed reassignment, not unknown-map loss, permits shrinkage."""
+        old_info = previous["info"]
+        resolution = float(info.resolution)
+        yaw = grid_origin_yaw(info)
+        if resolution <= 0 or abs(float(old_info.resolution) - resolution) > 1e-8:
+            return set()
+        if abs(grid_origin_yaw(old_info) - yaw) > 1e-8:
+            return set()
+        old_origin, new_origin = old_info.origin.position, info.origin.position
+        dx, dy = old_origin.x - new_origin.x, old_origin.y - new_origin.y
+        offsets = ((math.cos(yaw) * dx + math.sin(yaw) * dy) / resolution,
+                   (-math.sin(yaw) * dx + math.cos(yaw) * dy) / resolution)
+        if any(abs(value - round(value)) > 1e-4 for value in offsets):
+            return set()
+        x, y = (int(round(value)) for value in offsets)
+        old = np.asarray(previous["scene_data"]).reshape(-1, int(old_info.width))
+        new = np.asarray(labels).reshape(-1, int(info.width))
+        left, bottom = max(0, x), max(0, y)
+        right, top = min(new.shape[1], x + old.shape[1]), min(new.shape[0], y + old.shape[0])
+        if right <= left or top <= bottom:
+            return set()
+        old = old[bottom-y:top-y, left-x:right-x]
+        new = new[bottom:top, left:right]
+        transferred = (old >= 0) & (new >= 0) & (old != new)
+        return set(np.unique(old[transferred]).tolist())
+
     def _accept_room_geometry(self, room_id, center, size, stability_frames):
         candidate = self.room_geometry_candidates.get(room_id)
         if candidate is None:
@@ -3386,6 +3658,29 @@ class InteractionGraphStore:
             }
             self.room_geometry_candidates[room_id] = candidate
             return list(center), list(size)
+
+        # A confirmed split can transfer cells to another room.  Preserve
+        # temporal filtering, but allow a stable smaller footprint to replace
+        # the historical envelope instead of containing the new room forever.
+        shrinks = any(float(size[i]) < float(candidate["accepted_size"][i]) - 1e-6
+                      for i in (0, 1))
+        if shrinks and room_id in getattr(self, "_room_split_shrink_allowed", set()):
+            previous = candidate.get("shrink_proposal")
+            if previous and self._room_geometry_relock_close(
+                previous["center"], previous["size"], center, size
+            ):
+                count = previous["count"] + 1
+            else:
+                count = 1
+            candidate["shrink_proposal"] = {
+                "center": list(center), "size": list(size), "count": count}
+            if count >= max(1, int(stability_frames)):
+                candidate.update(center=list(center), size=list(size), count=0,
+                                 accepted_center=list(center), accepted_size=list(size))
+                candidate.pop("shrink_proposal", None)
+                self._room_split_shrink_allowed.discard(room_id)
+            return list(candidate["accepted_center"]), list(candidate["accepted_size"])
+        candidate.pop("shrink_proposal", None)
 
         proposed_center, proposed_size = self._expanded_room_geometry(
             candidate["accepted_center"],
@@ -3479,6 +3774,13 @@ class InteractionGraphStore:
             primary = self._resolve_room_id(primary)
             if secondary == primary:
                 continue
+            # Occupancy connected-components cannot distinguish a doorway from
+            # a single room after the leaf disappears.  If the graph already
+            # knows a portal between these room IDs, retain both stable room
+            # identities; otherwise one free-space frame permanently collapses
+            # the topology and later graph revisions lose the portal context.
+            if self._room_pair_has_known_portal(secondary, primary):
+                continue
             self._merge_room_geometry_memory(secondary, primary)
             self.room_redirects[secondary] = primary
             old_node = self.nodes.get(f"room_{secondary}")
@@ -3493,6 +3795,26 @@ class InteractionGraphStore:
                     node.attributes["connected_room_ids"] = sorted(
                         {self._resolve_room_id(room_id) for room_id in room_ids}
                     )
+
+    def _room_pair_has_known_portal(self, secondary, primary):
+        target = {int(secondary), int(primary)}
+        if len(target) != 2:
+            return False
+        for node in self.nodes.values():
+            if node.type != "portal":
+                continue
+            attrs = node.attributes or {}
+            observed = attrs.get("observed_connected_room_ids") or []
+            connected = attrs.get("connected_room_ids") or []
+            for values in (observed, connected):
+                resolved = {
+                    self._resolve_room_id(value)
+                    for value in values
+                    if value is not None
+                }
+                if target.issubset(resolved):
+                    return True
+        return False
 
     def _merge_room_geometry_memory(self, secondary, primary):
         """Move both public room extents behind the surviving stable room ID."""
@@ -3755,6 +4077,16 @@ class InteractionGraphStore:
         half_height = max(float(size[2]) * 0.5, 0.01)
         grounded[2] = max(grounded[2], half_height)
         return grounded
+
+    @staticmethod
+    def _valid_aabb_size(size) -> bool:
+        try:
+            values = [float(value) for value in list(size or [])[:3]]
+        except (TypeError, ValueError):
+            return False
+        return len(values) == 3 and all(
+            math.isfinite(value) and value > 1e-6 for value in values
+        )
 
     def _grounded_center(self, center):
         grounded = list(center)

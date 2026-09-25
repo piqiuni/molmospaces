@@ -56,7 +56,7 @@ official valid viewpoint. The default detector-only profile therefore disables
 its uncalibrated STOP proxy; use its evaluation as an integration/grounding
 measurement until a separately calibrated public stopping policy is available.
 
-Start the original ROS detector with the local prompt-free YOLOE checkpoint.
+Start the original ROS detector with the local box+instance-segmentation checkpoint. In single-model mode, do not use a detect-only checkpoint such as `yolo26x.pt`: the ROS `yoloe_pf_box3d` path requires an instance mask as well as the bounding box.
 The launcher uses a separate ROS master on `13518` and HTTP relay on `12188`,
 and puts ROS/Torch/Ultralytics caches and logs under `/home/ldl/tmp`:
 
@@ -64,15 +64,11 @@ and puts ROS/Torch/Ultralytics caches and logs under `/home/ldl/tmp`:
 YOLOE_GPU_ID=0 \
 ROS_MASTER_PORT=13518 \
 MODULE1_RELAY_PORT=12188 \
-YOLOE_MODEL_PATH=/home/ldl/molmospaces-exp-setting/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt \
+YOLOE_MODEL_PATH=/home/ldl/.cache/habitat-detector-replay/weights/yolo26x-seg.pt \
 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/habitat_v2_adapter/start_ros_module1_yoloe.sh
 ```
 
-The launcher activates `/home/ldl/conda_envs/ros-noetic`, which must contain
-compatible `torch`, `torchvision`, and `ultralytics` packages. YOLOE is
-prompt-free: it predicts from RGB using its built-in vocabulary; the adapter
-then filters its predicted classes through the public ObjectGoal aliases. It
-does not transmit an ObjectGoal word prompt to the detector.
+The launcher activates `/home/ldl/conda_envs/ros-noetic`, which must contain\ncompatible `torch`, `torchvision`, and `ultralytics` packages. The default\nsingle-model checkpoint is `yolo26x-seg.pt`, a closed-set COCO model that emits\nboth boxes and instance masks. The adapter filters its fixed COCO labels through\nthe public ObjectGoal aliases; it does not transmit an ObjectGoal word prompt.\nFor open-vocabulary operation, `yoloe-26x-seg-pf.pt` remains supported, but it is\nnot the standard COCO-80 checkpoint and should be selected explicitly.
 
 Validate the profile before creating a Habitat environment:
 

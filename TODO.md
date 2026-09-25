@@ -610,14 +610,14 @@
 | `SR` | 最终任务成功率，即满足 `NavToObj` 的距离阈值和 head-camera 可见性条件 | 主结果指标 |
 | `SPL` | 成功加权路径效率，失败计 0，成功时按参考路径长度与实际路径长度的比值加权 | 参考路径应来自允许必要交互后的可行计划，而不是纯静态地图 |
 | `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 | door 看 reachability，container 看 visibility，mixed 看必要交互链是否完成并最终服务目标成功 |
-| `Interaction Precision` | 执行过的交互中，有多少是有效交互 | 用于惩罚乱开无关门、无关容器或重复无效交互 |
-| `Total Cost` | `path_length + λ * interaction_count` | 后续可扩展为 door / container / failed interaction 的不同权重 |
+| `Interaction Precision` | 全部交互尝试中，完成目标交互对象类别的新效果的比例 | 同类不同实例计入分子，失败/无新效果重复不计入 |
+| `Total Cost` | `L_exec + λ*A + μ*E + κ*(1-S)` | `E` 仅含失败或无新效果重复；其他探索对象只支付尝试成本 |
 
 说明：
 
 - `reachability`、`visibility` 和 `enablement` 是论文叙事、benchmark 构建和 `Interaction Success Rate` 判定的核心语义，不作为主表中三个并列指标。
 - `Interaction Success Rate` 在不同 split 下使用不同判定：通道交互要求恢复可达性，容器交互要求揭示目标或满足目标可见性，混合交互要求完成必要交互链并最终满足导航成功条件。
-- 无交互样本必须保留，用于评估方法是否克制；其 `Interaction Success Rate` 可记为 `N/A`，但 `Interaction Precision`、`interaction_count` 和 `Total Cost` 仍然参与分析。
+- 无交互样本必须保留，用于评估方法是否克制；其 `Interaction Success Rate` 可记为 `N/A`，但 `Interaction Precision`、`interaction_count` 和 `Total Cost` 仍然参与分析；未知环境中额外探索不自动计为错误。
 - 主结果应按 `all`、`channel`、`container`、`mixed`、`no-interaction` split 展开，并同时报告 macro average，避免某一类样本数量过大主导总体结论。
 
 ### 4.5.2 对应脚本规划

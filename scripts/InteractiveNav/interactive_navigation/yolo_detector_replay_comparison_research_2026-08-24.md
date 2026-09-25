@@ -2,9 +2,15 @@
 
 ## 结论
 
+### 单模型部署约束（当前 Habitat 感知默认）
+
+当实验配置选择“单模型”时，必须选择同时提供检测框（box）和实例分割（segmentation mask）的权重：当前默认固定为 `yolo26x-seg.pt`。它由同一个模型、同一次 RGB 推理同时产生 box、类别、置信度和 mask；下游可用 box 做目标关联/导航，用 mask 做可视化与占据区域核验。
+
+`yolo26x.pt`、`yolo11x.pt` 等 detect-only 权重只能作为明确标注的 box-only 对照，不得作为单模型主路径；`yoloe-26x-seg-pf.pt` 也满足 box+seg，但属于 prompt-free 开放词汇模式，只有在实验明确选择 YOLOE-PF 时使用。任何需要 box+seg 的单模型配置都不得把 detector 和独立 segmentation 模型拼接后冒充“单模型”。
+
 这组历史 Habitat RGB 帧应同时跑两类基线，而不是只横向替换当前的 `yoloe-26x-seg-pf.pt`：
 
-1. **闭集 COCO 检测**：`yolo26x.pt`、`yolo11x.pt`。当前 episode 的目标是 television；`tv` 属于 COCO 80 类，因此这两者能直接检测，适合检验闭集训练是否比开放词汇路径更稳定。
+1. **闭集 COCO 检测/实例分割**：`yolo26x-seg.pt`、`yolo11x-seg.pt`（若已下载）；它们同时输出 box+mask。纯检测权重 `yolo26x.pt`、`yolo11x.pt` 仅作为 box-only 对照，不得作为单模型 box3d/seg 主路径。当前 episode 的目标是 television；`tv` 属于 COCO 80 类。
 2. **文本零样本/开放词汇检测**：`yoloe-26x-seg.pt`（text prompt）与 `yolov8x-worldv2.pt`。两者都固定使用同一目标词表。
 3. **视觉样本提示**：仍使用 `yoloe-26x-seg.pt`，但用独立的 reference frame/crop 提供 visual prompt。参考样本不能取自被评分帧本身。
 4. **无提示开放词汇基线**：保留当前 `yoloe-26x-seg-pf.pt`，以其内置 4,585 类词表运行，不调用 `set_classes()`。
@@ -15,7 +21,8 @@
 
 | 模型 | 检测范式 | 本实验输入 | 输出 | 官方接口 | 适合回答的问题 |
 |---|---|---|---|---|---|
-| YOLO26 Detect (`yolo26x.pt`) | COCO 闭集 | RGB，不输入提示 | box/class | `YOLO("yolo26x.pt")(image)` | 新一代闭集 YOLO 对 TV 的准确率与端到端延时上限 |
+| YOLO26 Detect (`yolo26x.pt`) | COCO 闭集 | RGB，不输入提示 | box/class | `YOLO("yolo26x.pt")(image)` | box-only 对照，不用于 box+seg 主路径 |
+| YOLO26 Seg (`yolo26x-seg.pt`) | COCO 闭集 | RGB，不输入提示 | box/mask/class | `YOLO("yolo26x-seg.pt")(image)` | 单模型 box+seg 主基线 |
 | YOLO11 Detect (`yolo11x.pt`) | COCO 闭集 | RGB，不输入提示 | box/class | `YOLO("yolo11x.pt")(image)` | 与项目更成熟的 Ultralytics 稳定代际对照 |
 | YOLO-Worldv2 (`yolov8x-worldv2.pt`) | 开放词汇、文本零样本 | RGB + 固定 class strings | box/class | `YOLOWorld(...); model.set_classes([...]); model(image)` | 较早但成熟的实时文本开放词汇基线 |
 | YOLOE-26 Text (`yoloe-26x-seg.pt`) | 开放词汇、文本提示 | RGB + 固定 class strings | box/mask/class | `YOLOE(...); model.set_classes([...]); model.predict(image)` | prompt-free 召回不稳定是否来自无提示词表/分类头 |

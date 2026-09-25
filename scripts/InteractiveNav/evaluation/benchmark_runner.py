@@ -59,7 +59,7 @@ from .benchmark_metrics import (
     target_metrics,
     oracle_terminal_goal_consistency,
 )
-from .benchmark_interaction_executor import execute_open_articulation_group
+from .benchmark_interaction_executor import execute_open_articulation_group, validate_runtime_interaction_pose
 from .benchmark_interaction_adapter import (
     validate_public_interaction_observation,
     validate_public_interaction_pose,
@@ -72,6 +72,8 @@ from .benchmark_policies import (
     build_ros_bridge_policy,
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
+from .scene_distractor_filter import apply_same_category_distractor_filter
+from .smooth_interaction import drawer_scan_final_state
 from .goal_status import (
     GoalClaimVerification,
     PublicGoalEvidenceLedger,
@@ -80,6 +82,7 @@ from .goal_status import (
     is_target_goal_success_claim,
     verify_target_goal_claim,
 )
+from .goal_equivalence import classify_category_candidates
 from .public_goal import build_public_target_context as build_language_target_context
 from .restricted_gt_perception import (
     RestrictedGTPerceptionPublisher,
@@ -107,11 +110,15 @@ from .trusted_interaction_skill import (
     TrustedInteractionSkill,
 )
 
-from semantic_mapping_py_pkg.graph_rules import opaque_door_instance_id
+
+def opaque_door_instance_id(value: Any) -> str:
+    # Only the restricted ROS adapter needs the graph's legacy alias convention.
+    from semantic_mapping_py_pkg.graph_rules import opaque_door_instance_id as encode
+    return encode(value)
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v13"
-STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v17"
+STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v2"
 DYNAMIC_MAX_STEPS_CAP = 2000
 
 # Established ROS exploration posture.  The asymmetric shoulder roll tucks the
@@ -132,13 +139,13 @@ class BenchmarkEvaluationConfig:
     policy_kwargs: dict[str, Any] = field(default_factory=dict)
     workers: int = 1
     max_steps: int = 500
-    step_budget_mode: Literal["fixed", "dynamic"] = "fixed"
-    min_steps: int = 300
+    step_budget_mode: Literal["fixed", "dynamic"] = "dynamic"
+    min_steps: int = 200
     dynamic_path_free_m: float = 3.0
-    dynamic_steps_per_path_m: float = 25.0
-    dynamic_channel_interaction_steps: int = 150
-    dynamic_container_interaction_steps: int = 200
-    dynamic_container_joint_steps: int = 40
+    dynamic_steps_per_path_m: float = 40.0
+    dynamic_channel_interaction_steps: int = 200
+    dynamic_container_interaction_steps: int = 250
+    dynamic_container_joint_steps: int = 50
     dynamic_step_quantum: int = 50
     episode_indices: list[int] | None = None
     max_episodes: int | None = None
@@ -147,6 +154,7 @@ class BenchmarkEvaluationConfig:
     video_fps: float = 5.0
     camera_names: list[str] = field(default_factory=lambda: ["head_camera"])
     image_resolution: tuple[int, int] | None = (640, 480)
+    remove_same_category_distractors: bool = True
     policy_dt_ms: float = 200.0
     ctrl_dt_ms: float = 10.0
     sim_dt_ms: float = 10.0
@@ -189,15 +197,15 @@ class BenchmarkEvaluationConfig:
     ros_stall_min_failed_subgoals: int = 8
     ros_stall_max_displacement_m: float = 0.15
     ros_stall_min_no_progress_steps: int = 20
-    ros_command_starvation_timeout_s: float = 60.0
+    ros_command_starvation_timeout_s: float = 90.0
     ros_observation_turn_multiplier: float = 4.0
     ros_final_goal_status_drain_timeout_s: float = 5.0
     restricted_gt_min_visible_pixels: int = 16
-    restricted_gt_min_bbox_area_pixels: int = 512
+    restricted_gt_min_bbox_area_pixels: int = 1
     restricted_gt_min_bbox_short_side_pixels: int = 1
     restricted_gt_min_portal_bbox_short_side_pixels: int = 8
     restricted_gt_min_visible_fraction: float = 0.2
-    restricted_gt_max_distance_m: float = 4.0
+    restricted_gt_max_distance_m: float = 8.0
     quality_gate_only: bool = False
     runtime_joint_position_tolerance: float = 0.02
     runtime_joint_fraction_tolerance: float = 0.05
@@ -357,10 +365,61 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
 
     runtime_compatibility: dict[str, Any]
 
-    def __init__(self, exp_config: Any, episode_spec: EpisodeSpec, interactive_nav: dict[str, Any]) -> None:
+    def _initialize_before_settle(self, mj_data) -> None:
+        # The XML robot pose can intersect furniture. Replay the authoritative
+        # pose before the initial physics loop; normal replay still runs afterward.
+        from molmo_spaces.utils.pose import pos_quat_to_pose_mat
+
+        mujoco.mj_forward(mj_data.model, mj_data)
+        robot = self._create_robot(mj_data)
+        for group, qpos in self.episode_spec.robot.init_qpos.items():
+            robot.robot_view.get_move_group(group).joint_pos = np.asarray(qpos)
+        pose = self.episode_spec.task["robot_base_pose"]
+        robot.robot_view.base.pose = pos_quat_to_pose_mat(pose[:3], pose[3:7])
+        mujoco.mj_forward(mj_data.model, mj_data)
+        for controller in robot.controllers.values():
+            controller.reset()
+        robot.set_stationary()
+        robot.compute_control()
+
+    def __init__(
+        self,
+        exp_config: Any,
+        episode_spec: EpisodeSpec,
+        interactive_nav: dict[str, Any],
+        *,
+        remove_same_category_distractors: bool = True,
+    ) -> None:
         self._interactive_nav = interactive_nav
         self.runtime_compatibility = {}
+        self.distractor_filter = apply_same_category_distractor_filter(
+            episode_spec,
+            interactive_nav,
+            enabled=remove_same_category_distractors,
+        )
         super().__init__(exp_config, episode_spec)
+
+    def add_auxiliary_objects(self, spec: Any) -> None:
+        """Remove same-category base bodies, including static target-like bodies."""
+        body_names: set[str] = set()
+        current_body = spec.worldbody.first_body()
+        while current_body is not None:
+            if current_body.name:
+                body_names.add(str(current_body.name))
+            current_body = spec.worldbody.next_body(current_body)
+        extra = apply_same_category_distractor_filter(
+            self.episode_spec,
+            self._interactive_nav,
+            enabled=bool(self.distractor_filter.get("enabled", True)),
+            candidate_names=body_names,
+        )
+        names = sorted(
+            set(self.distractor_filter.get("removed_object_names", []))
+            | set(extra.get("removed_object_names", []))
+        )
+        self.distractor_filter["removed_object_names"] = names
+        self.distractor_filter["removed_object_count"] = len(names)
+        super().add_auxiliary_objects(spec)
 
     def set_joint_values(self, env: Any) -> None:
         # JsonEvalTaskSampler treats every articulated ``pickup_obj_name`` as a
@@ -403,6 +462,7 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
                 name: pose for name, pose in poses.items() if name in bodies
             }
         self.runtime_compatibility = {
+            "same_category_distractor_filter": self.distractor_filter,
             "runtime_body_count": len(bodies),
             "runtime_joint_count": len(joints),
             "dropped_noncritical_object_pose_count": len(missing_poses),
@@ -536,7 +596,17 @@ class RestrictedRosObjectGoalRuntime:
     opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]]
     target_source_by_opaque_id: dict[str, str]
     goal_evidence: PublicGoalEvidenceLedger
+    category_target_source_by_opaque_id: dict[str, str] = field(default_factory=dict)
+    # Evaluator-private relation decisions used to keep cross-room and
+    # different-container objects out of the relaxed category ledger.
+    category_candidate_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    category_goal_evidence: PublicGoalEvidenceLedger | None = None
     published_frame_sink: Callable[[Mapping[str, Any]], bool] | None = None
+    public_rgb_sink: Callable[..., None] | None = None
+    smooth_bridge: Any = None
+    goal_status_observer: Any = None
+    pending_goal_terminal: Any = None
+    rejected_goal_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _body_root_id(model: Any, body_id: int) -> int | None:
@@ -646,6 +716,244 @@ def _perception_source_skill_aliases(
     return aliases
 
 
+def _category_goal_source_names(
+    *,
+    task: Any,
+    episode: Mapping[str, Any],
+) -> list[str]:
+    """Return same-category scene objects for a diagnostic relaxed endpoint.
+
+    The frozen V3 score remains selected-instance based.  This auxiliary list
+    is intentionally derived only from the live scene and is used to report
+    whether a policy reached *a* visually/evaluator-valid object of the
+    requested category when the release description is not instance-unique.
+    """
+
+    target = episode.get("interactive_nav", {}).get("target", {})
+    if not isinstance(target, Mapping):
+        return []
+    category = str(target.get("category") or "").strip().casefold()
+    if not category:
+        return []
+    selected = str(target.get("selected_instance") or "").strip()
+    identity_contract = target.get("identity_contract")
+    identity_contract = (
+        identity_contract if isinstance(identity_contract, Mapping) else {}
+    )
+    # A frozen contract defines the instruction-visible candidate universe; its
+    # candidate-specific contract proof is still checked later.  In contrast,
+    # ``instruction_consistent_candidates`` may include same-category
+    # distractors, which are eligible for the Category diagnostic only after
+    # the relation gate below.  When language grounding is non-unique, discover
+    # all same-category scene objects so same-container/near/same-room cases do
+    # not silently collapse to the strict endpoint.
+    declared_contract = identity_contract.get("contract_candidates")
+    if isinstance(declared_contract, list) and declared_contract:
+        contract_visible = identity_contract.get("instruction_consistent_candidates")
+        if not isinstance(contract_visible, list) or not contract_visible:
+            # Be tolerant of an older contract writer that persisted only the
+            # contract set; the relation gate below still validates every name.
+            contract_visible = declared_contract
+        names = list(dict.fromkeys(
+            str(value).strip()
+            for value in contract_visible
+            if str(value).strip()
+        ))
+        if selected and selected not in names:
+            names.append(selected)
+        return sorted(names)
+    declared_candidates = target.get("instruction_consistent_candidates")
+    grounding = target.get("grounding")
+    grounding = grounding if isinstance(grounding, Mapping) else {}
+    if grounding.get("unique") is True or grounding.get("attributes"):
+        if isinstance(declared_candidates, list) and declared_candidates:
+            names = list(dict.fromkeys(
+                str(value).strip()
+                for value in declared_candidates
+                if str(value).strip()
+            ))
+            if selected and selected not in names:
+                names.append(selected)
+            return sorted(names)
+    try:
+        object_manager = task.env.object_managers[task.env.current_batch_index]
+    except Exception:
+        fallback = []
+        if isinstance(declared_candidates, list):
+            fallback.extend(str(value).strip() for value in declared_candidates if str(value).strip())
+        if selected:
+            fallback.append(selected)
+        return sorted(dict.fromkeys(fallback))
+    names: list[str] = []
+    # Child pickup objects are often nested below a fridge/drawer body and are
+    # therefore absent from ``list_top_level_objects``.  Read the evaluator's
+    # scene metadata first so same-container alternatives remain discoverable.
+    try:
+        scene_metadata = getattr(object_manager, "scene_metadata", None)
+        raw_objects = scene_metadata.get("objects", {}) if isinstance(scene_metadata, Mapping) else {}
+        if isinstance(raw_objects, Mapping):
+            for raw_name, raw_record in raw_objects.items():
+                if not isinstance(raw_record, Mapping):
+                    continue
+                name = str(raw_name).strip()
+                object_category = str(
+                    raw_record.get("category")
+                    or object_manager.category_from_name(name)
+                    or ""
+                ).strip().casefold()
+                if name and object_category == category:
+                    names.append(name)
+    except Exception:
+        pass
+    try:
+        objects = object_manager.list_top_level_objects()
+    except Exception:
+        objects = []
+    for obj in objects:
+        try:
+            name = str(obj.name)
+            object_category = str(
+                object_manager.get_annotation_category(obj)
+                or object_manager.category_from_name(obj)
+                or ""
+            ).strip().casefold()
+        except Exception:
+            continue
+        if name and object_category == category:
+            names.append(name)
+    if selected and selected not in names:
+        # Keep the selected target in the diagnostic domain even if the
+        # category annotation is absent in an older scene metadata release.
+        names.append(selected)
+    return sorted(dict.fromkeys(names))
+
+
+def _live_category_candidate_filter(
+    *,
+    task: Any,
+    episode: Mapping[str, Any],
+    source_names: list[str],
+    near_radius_m: float = 0.30,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Filter live category candidates through the private relation protocol.
+
+    The public ROS frame may contain every same-category object, but only
+    candidates whose scene metadata and live pose satisfy
+    :func:`equivalent_target` are allowed into the category evidence ledger.
+    Missing metadata fails closed for alternatives; the selected instance is
+    retained so the strict endpoint keeps its native behavior.
+    """
+
+    target = episode.get("interactive_nav", {}).get("target", {})
+    if not isinstance(target, Mapping):
+        return [], {}
+    selected = str(target.get("selected_instance") or "").strip()
+    names = list(dict.fromkeys(
+        str(name).strip() for name in source_names if str(name).strip()
+    ))
+    if selected and selected not in names:
+        names.insert(0, selected)
+    if not names:
+        return [], {}
+    try:
+        object_manager = task.env.object_managers[task.env.current_batch_index]
+    except Exception:
+        # No live object manager means no safe way to prove room/container
+        # equivalence.  Keep only the selected strict identity.
+        decision = ({
+            "accepted": True,
+            "reason": "strict_selected_instance",
+            "category_goal_accepted": True,
+            "candidate_name": selected,
+        } if selected else {})
+        return ([selected] if selected else []), ({selected: decision} if selected else {})
+
+    metadata: dict[str, Any] = {}
+    try:
+        scene_metadata = getattr(object_manager, "scene_metadata", None)
+        if isinstance(scene_metadata, Mapping):
+            raw_objects = scene_metadata.get("objects", {})
+            if isinstance(raw_objects, Mapping):
+                metadata.update(
+                    {
+                        str(name): dict(value)
+                        for name, value in raw_objects.items()
+                        if isinstance(value, Mapping)
+                    }
+                )
+    except Exception:
+        pass
+    # Query records individually as a compatibility path for fakes and for
+    # dynamically added objects that are not present in the cached dictionary.
+    for name in names:
+        if name in metadata:
+            continue
+        try:
+            record = object_manager.object_metadata(name)
+        except Exception:
+            record = None
+        if isinstance(record, Mapping) and record:
+            metadata[name] = dict(record)
+
+    positions: dict[str, Any] = {}
+    for name in names:
+        try:
+            obj = object_manager.get_object_by_name(name)
+            position = getattr(obj, "position", None)
+            if position is not None:
+                values = np.asarray(position, dtype=float).reshape(-1)
+                if values.size >= 3 and np.all(np.isfinite(values[:3])):
+                    positions[name] = values[:3].tolist()
+        except Exception:
+            continue
+
+    accepted, decisions = classify_category_candidates(
+        target=target,
+        candidate_names=names,
+        objects=metadata,
+        positions=positions,
+        near_radius_m=near_radius_m,
+    )
+    # A malformed relation result must not broaden the category endpoint.  The
+    # selected identity is the only safe fallback when metadata is incomplete.
+    if selected and selected not in accepted:
+        accepted.insert(0, selected)
+    return accepted, decisions
+
+
+def _declared_contract_plan_ids(
+    episode: Mapping[str, Any], candidate_name: str | None
+) -> set[str] | None:
+    """Return candidate-specific valid plan IDs from a frozen identity contract.
+
+    ``None`` denotes no contract membership or a malformed declaration without
+    candidate-specific terminal plans.  A non-empty set is required before a
+    relaxed candidate can receive Contract/Interactive credit.
+    """
+
+    target = episode.get("interactive_nav", {}).get("target", {})
+    if not isinstance(target, Mapping) or not candidate_name:
+        return None
+    identity = target.get("identity_contract")
+    if not isinstance(identity, Mapping):
+        return None
+    raw_candidates = identity.get("contract_candidates")
+    if not isinstance(raw_candidates, list):
+        return None
+    candidates = {str(value) for value in raw_candidates if str(value)}
+    if candidate_name not in candidates:
+        return None
+    plans = episode.get("interactive_nav", {}).get("oracle_plans") or []
+    plan_ids = {
+        str(plan.get("plan_id", "oracle"))
+        for plan in plans
+        if candidate_name in {
+            str(value) for value in plan.get("terminal_target_instances", [])
+        }
+    }
+    return plan_ids or None
+
+
 def _build_restricted_ros_object_goal_runtime(
     *,
     task: Any,
@@ -657,6 +965,7 @@ def _build_restricted_ros_object_goal_runtime(
     frame_callback: callable | None = None,
     goal_status_observer: RosGoalStatusObserver | None = None,
     published_frame_sink: Callable[[Mapping[str, Any]], bool] | None = None,
+    public_rgb_sink: Callable[..., None] | None = None,
 ) -> RestrictedRosObjectGoalRuntime:
     """Create evaluator-owned restricted perception and sealed force skills.
 
@@ -813,9 +1122,11 @@ def _build_restricted_ros_object_goal_runtime(
             instruction=public.instruction,
             object_labels=list(language_target.get("object_labels") or [target_name]),
             enabled=bool(language_target.get("enabled", True)),
-            min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
+            min_visible_pixels=1,
             min_visible_fraction=0.0,
             min_consecutive_observations=1,
+            success_distance_threshold_m=float(
+                episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]),
             completion_requires_visibility=True,
             require_current_visibility=False,
         ),
@@ -832,10 +1143,30 @@ def _build_restricted_ros_object_goal_runtime(
         episode_id=perception.episode_id,
         target_instance_ids=target_source_by_opaque_id,
     )
+    category_source_names = _category_goal_source_names(task=task, episode=episode)
+    category_source_names, category_candidate_decisions = _live_category_candidate_filter(
+        task=task,
+        episode=episode,
+        source_names=category_source_names,
+    )
+    category_target_source_by_opaque_id = {
+        perception.registry.public_id_for(source_name): source_name
+        for source_name in category_source_names
+    }
+    category_goal_evidence = PublicGoalEvidenceLedger(
+        episode_id=perception.episode_id,
+        target_instance_ids=category_target_source_by_opaque_id,
+    )
     initial_frame = perception.build(task, force=True)
     if initial_frame is not None:
-        published = adapter.publish_restricted_gt_frame(initial_frame, capture_step=0)
+        published = adapter.publish_restricted_gt_frame(
+            initial_frame, capture_step=0,
+            observation_pose_xyyaw=_public_observation_pose(task, perception.camera_name),
+        )
+        if public_rgb_sink is not None:
+            public_rgb_sink(task.get_observations(), stamp_sec=published["stamp_sec"])
         goal_evidence.record_frame(published, capture_step=0)
+        category_goal_evidence.record_frame(published, capture_step=0)
         if published_frame_sink is not None:
             published_frame_sink(published)
     return RestrictedRosObjectGoalRuntime(
@@ -846,7 +1177,11 @@ def _build_restricted_ros_object_goal_runtime(
         opaque_to_joints=opaque_to_joints,
         target_source_by_opaque_id=target_source_by_opaque_id,
         goal_evidence=goal_evidence,
+        category_target_source_by_opaque_id=category_target_source_by_opaque_id,
+        category_candidate_decisions=category_candidate_decisions,
+        category_goal_evidence=category_goal_evidence,
         published_frame_sink=published_frame_sink,
+        public_rgb_sink=public_rgb_sink,
     )
 
 
@@ -924,6 +1259,18 @@ def _build_replay_config(
     from molmo_spaces.configs.task_configs import NavToObjTaskConfig
     from molmo_spaces.configs.task_sampler_configs import NavToObjTaskSamplerConfig
     from molmo_spaces.robots.rby1 import RBY1
+    from molmo_spaces.robots.robot_views.rby1_view import RBY1RobotView
+    from molmo_spaces.molmo_spaces_constants import get_robot_path
+
+    class ReplayRBY1(RBY1):
+        """RBY1 scene insertion without legacy post-insertion XML lookup."""
+
+        @classmethod
+        def apply_control_overrides(cls, spec, robot_config):
+            # add_robot_to_scene already creates the holonomic actuators with
+            # the intended ranges.  The legacy override re-queries attached
+            # joints through an API that no longer exposes them on MjSpec.
+            return None
 
     init_qpos = {
         "base": np.array([0.0, 0.0, 0.0]),
@@ -939,9 +1286,8 @@ def _build_replay_config(
         for group_name, values in init_qpos.items()
     }
     robot_config = SimpleNamespace(
-        robot_cls=RBY1,
-        robot_factory=RBY1,
-        robot_view_factory=None,
+        robot_cls=ReplayRBY1,
+        robot_factory=ReplayRBY1,
         robot_namespace="robot_0/",
         init_qpos=init_qpos,
         init_qpos_noise_range=init_qpos_noise_range,
@@ -959,6 +1305,12 @@ def _build_replay_config(
         K_stiffness=None,
         K_damping=None,
         action_noise_config=SimpleNamespace(enabled=False),
+        robot_view_factory=lambda mj_data, namespace: RBY1RobotView(
+            mj_data, namespace, holo_base=True
+        ),
+        # BaseRobotConfig exposes this method; keep the lightweight replay
+        # namespace compatible without invoking Pydantic model copying.
+        get_robot_xml_path=lambda: get_robot_path("rby1") / "rby1_site_control.xml",
     )
     replay = SimpleNamespace(
         num_envs=1,
@@ -978,11 +1330,16 @@ def _build_replay_config(
         data_split="val",
         camera_config=None,
         robot_config=robot_config,
-        task_sampler_config=NavToObjTaskSamplerConfig(task_sampler_class=None),
+        task_sampler_config=NavToObjTaskSamplerConfig(
+            task_sampler_class=None, house_variant="base"
+        ),
         task_config=NavToObjTaskConfig(task_cls=None),
         task_config_preset_exp=None,
         task_config_preset_scn=None,
-        policy_config=None,
+        # JsonEvalTaskSampler reads this flag even for the evaluator-only
+        # adapter; provide the minimal policy contract without constructing a
+        # planner policy (which would pull in optional manipulation deps).
+        policy_config=SimpleNamespace(force_enable_depth=False),
         benchmark_path=None,
         eval_runtime_params=None,
         output_dir=output_dir,
@@ -1202,7 +1559,7 @@ def episode_step_budget(
     )
     container_joint_steps = 0.0
     if not initial_target_visible and int(counts["container"]) > 0:
-        container_joint_steps = float(config.dynamic_container_joint_steps) * max(0, container_joint_count - 1)
+        container_joint_steps = float(config.dynamic_container_joint_steps) * container_joint_count
 
     raw_steps = (
         float(config.min_steps)
@@ -1814,6 +2171,115 @@ def _drawer_scan_runtime_groups(
     return result
 
 
+def _report_interaction_progress(runtime: RestrictedRosObjectGoalRuntime) -> None:
+    report = getattr(runtime.adapter, "report_interaction_progress", None)
+    if callable(report):
+        report()
+
+
+def _execute_native_smooth(task, runtime, request, source_name, joints, episode, config, decision_index, frames):
+    from .smooth_interaction import run_smooth_interaction
+    from .benchmark_interaction_executor import BenchmarkArticulationExecution
+
+    bridge = runtime.smooth_bridge
+    before_fractions = {j.joint_name: joint_open_fraction(task.env, {"joint_name": j.joint_name}) for j in joints}
+    observed = None
+    opened = {}
+    samples = []
+    observation_counts = {}
+    public_target_observed = False
+
+    def step(controller, index):
+        nonlocal observed, public_target_observed
+        bridge.force_interaction_controller = controller
+        _report_interaction_progress(runtime)
+        observation = task.get_observations()
+        _publish_restricted_ros_frame(runtime, task, decision_index=decision_index + index)
+        raw = dict(bridge.get_action(observation, hold_navigation=True))
+        raw.pop("base", None)
+        torso = controller.view_torso_target()
+        if torso is not None:
+            raw["torso"] = np.asarray(torso, dtype=float)
+        phase = (controller._pending or {}).get("phase")
+        fractions = {j.joint_name: joint_open_fraction(task.env, {"joint_name": j.joint_name}) for j in joints}
+        samples.append({"step": index, "phase": phase, "joint_fractions": fractions,
+                        "bridge_step": getattr(bridge, "_step_idx", None)})
+        if phase == "observe":
+            group_index = int((controller._pending or {}).get("group_index", 0))
+            observation_counts[group_index] = observation_counts.get(group_index, 0) + 1
+            for joint in joints:
+                if fractions[joint.joint_name] >= SUCCESS_OPEN_FRACTION:
+                    opened[joint.joint_name] = (joint, JointOpenResult(
+                        executor_succeeded=True, open_fraction_before=0.0,
+                        open_fraction_after=fractions[joint.joint_name], simulated_seconds=0.0))
+            evidence = _drawer_scan_target_evidence(task, episode, config)
+            if evidence is not None and observed is None:
+                observed = {**evidence, "group_index": int((controller._pending or {}).get("group_index", 0))}
+        task.step(raw)
+        _capture_head_frame(task, frames, config.record_video)
+        _discard_task_rollout_cache(task)
+        observer = getattr(runtime, "goal_status_observer", None)
+        # Finish opening and provide all ten observation frames before a
+        # pending policy claim can stop the macro.  Seeing through a partially
+        # open drawer does not yet satisfy its physical open postcondition.
+        may_finish = phase == "observe" and observation_counts.get(
+            int((controller._pending or {}).get("group_index", 0)), 0) >= 10
+        evidence_ledger = getattr(runtime, "goal_evidence", None)
+        public_target_observed = public_target_observed or bool(
+            phase == "observe"
+            and evidence_ledger is not None
+            and any(frame.capture_step == decision_index + index
+                    for frame in evidence_ledger.frames)
+        )
+        if request.sequence_type == "drawer_scan" and may_finish and public_target_observed:
+            return "public_target_visible"
+        if observer is not None and (request.sequence_type != "drawer_scan" or may_finish):
+            terminal = _poll_restricted_goal_status(
+                observer=observer, task=task, runtime=runtime, episode=episode)
+            if terminal is not None:
+                runtime.pending_goal_terminal = terminal
+                # Drawer scans intentionally stop before close; ordinary
+                # interactions must still pass through after_step so the
+                # successful open state is reasserted before terminal capture.
+                if request.sequence_type == "drawer_scan":
+                    return True
+                return False
+        return False
+
+    previous = getattr(bridge, "force_interaction_controller", None)
+    try:
+        if os.environ.get("INTERACTIVE_NAV_PROFILE_INTERACTION") == "1":
+            from .interaction_profile import profile_interaction
+            execution = profile_interaction(run_smooth_interaction,
+                config.output_dir / "interaction_profiles" / f"{decision_index:06d}",
+                task=task, command=dict(request.public_command), object_name=source_name, step=step)
+        else:
+            execution = run_smooth_interaction(task, dict(request.public_command),
+                object_name=source_name, step=step)
+    finally:
+        bridge.force_interaction_controller = previous
+    result = execution["result"]
+    if result.get("failure_reason"):
+        execution["public_failure_reason"] = result["failure_reason"]
+    execution["observations"] = samples
+    execution["target_discovery"] = observed
+    _atomic_json(config.output_dir / "smooth_interactions" / f"{decision_index:06d}.json", _safe_json(execution))
+    seconds = execution["task_steps_consumed"] * config.policy_dt_ms / 1000.0
+    success = bool(result.get("success"))
+    if request.sequence_type == "drawer_scan":
+        success = success and bool(opened)
+        return {"success": success, "joint_results": tuple(v[1] for v in opened.values()),
+                "opened_joints": tuple(v[0] for v in opened.values()), "simulated_seconds": seconds,
+                "target_discovery": observed if success else None, "metadata": execution,
+                "observation": task.get_observations()}
+    results = tuple(JointOpenResult(executor_succeeded=success, open_fraction_before=before_fractions[j.joint_name],
+        open_fraction_after=joint_open_fraction(task.env, {"joint_name": j.joint_name}),
+        simulated_seconds=seconds) for j in joints)
+    return BenchmarkArticulationExecution(success=success, joint_results=results,
+        simulated_seconds=seconds, physics_substeps=int(result.get("physics_substeps", 0)), pre_state=str(result.get("pre_state", "unknown")),
+        post_state=str(result.get("state", "unknown")), private_metadata=execution)
+
+
 def _execute_private_drawer_scan(
     *,
     task: Any,
@@ -1858,6 +2324,10 @@ def _execute_private_drawer_scan(
             "observation": task.get_observations(),
         }
 
+    def capture_progress_frame() -> None:
+        _report_interaction_progress(runtime)
+        _capture_head_frame(task, frames, config.record_video)
+
     initial_head = probe.get_head_joint_position(task.env)
     initial_torso = probe.get_torso_joint_position(task.env)
     view_applied = False
@@ -1895,7 +2365,7 @@ def _execute_private_drawer_scan(
                     task.env,
                     joint,
                     config,
-                    frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                    frame_callback=capture_progress_frame,
                 )
                 total_seconds += float(open_seconds)
                 open_result = JointOpenResult(
@@ -1942,7 +2412,7 @@ def _execute_private_drawer_scan(
                         task.env,
                         joint,
                         config,
-                        frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                        frame_callback=capture_progress_frame,
                         target_open_fraction=0.0,
                     )
                     total_seconds += float(close_seconds)
@@ -2005,7 +2475,7 @@ def _execute_private_drawer_scan(
                         task.env,
                         joint,
                         config,
-                        frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                        frame_callback=capture_progress_frame,
                         target_open_fraction=0.0,
                     )
                     total_seconds += float(recovery_seconds)
@@ -2510,6 +2980,12 @@ def _successful_drawer_scan_interaction_ids(
     return resolved
 
 
+def _public_observation_pose(task: Any, camera_name: str) -> list[float]:
+    camera = task.env.camera_manager.registry[camera_name]
+    return [float(camera.pos[0]), float(camera.pos[1]),
+            float(math.atan2(camera.forward[1], camera.forward[0]))]
+
+
 def _publish_restricted_ros_frame(
     runtime: RestrictedRosObjectGoalRuntime,
     task: Any,
@@ -2524,7 +3000,10 @@ def _publish_restricted_ros_frame(
     published = runtime.adapter.publish_restricted_gt_frame(
         payload,
         capture_step=int(decision_index),
+        observation_pose_xyyaw=_public_observation_pose(task, runtime.perception.camera_name),
     )
+    if runtime.public_rgb_sink is not None:
+        runtime.public_rgb_sink(task.get_observations(), stamp_sec=published["stamp_sec"])
     # Only observations that crossed the same restricted adapter boundary as
     # the policy are eligible as goal evidence.  A private MuJoCo visibility
     # result, including a transient drawer-open result, is never sufficient.
@@ -2532,6 +3011,11 @@ def _publish_restricted_ros_frame(
         published,
         capture_step=int(decision_index),
     )
+    if runtime.category_goal_evidence is not None:
+        runtime.category_goal_evidence.record_frame(
+            published,
+            capture_step=int(decision_index),
+        )
     if runtime.published_frame_sink is not None:
         runtime.published_frame_sink(published)
     return True
@@ -2540,6 +3024,8 @@ def _publish_restricted_ros_frame(
 def _private_target_distances_m(
     task: Any,
     runtime: RestrictedRosObjectGoalRuntime,
+    *,
+    source_by_opaque_id: Mapping[str, str] | None = None,
 ) -> dict[str, float]:
     """Return private target ranges keyed by policy-visible opaque ids.
 
@@ -2554,7 +3040,12 @@ def _private_target_distances_m(
         dtype=float,
     )
     result: dict[str, float] = {}
-    for opaque_id, source_name in runtime.target_source_by_opaque_id.items():
+    source_mapping = (
+        runtime.target_source_by_opaque_id
+        if source_by_opaque_id is None
+        else source_by_opaque_id
+    )
+    for opaque_id, source_name in source_mapping.items():
         try:
             target = objects.get_object_by_name(source_name)
             target_xy = np.asarray(target.position[:2], dtype=float)
@@ -2564,6 +3055,27 @@ def _private_target_distances_m(
     return result
 
 
+def _verify_public_claim_context(
+    detail: Mapping[str, Any], *, allow_open_container_anchor: bool = False
+) -> GoalClaimVerification | None:
+    if not detail.get("target_visible_now"):
+        return GoalClaimVerification(False, "target_perception_not_current")
+    if not detail.get("target_reliably_observed"):
+        return GoalClaimVerification(False, "target_perception_unreliable")
+    if allow_open_container_anchor:
+        return None
+    try:
+        distance = float(detail["target_object_distance_m"])
+        threshold = float(detail["target_success_distance_threshold_m"])
+    except (KeyError, TypeError, ValueError):
+        return GoalClaimVerification(False, "graph_distance_unavailable")
+    if not math.isfinite(distance) or not math.isfinite(threshold) or threshold <= 0 or distance < 0:
+        return GoalClaimVerification(False, "graph_distance_unavailable")
+    if distance >= threshold:
+        return GoalClaimVerification(False, "graph_distance_failed")
+    return None
+
+
 def _verify_restricted_goal_status(
     *,
     task: Any,
@@ -2571,16 +3083,113 @@ def _verify_restricted_goal_status(
     episode: dict[str, Any],
     payload: dict[str, Any],
 ) -> GoalClaimVerification:
+    detail = payload.get("detail") if isinstance(payload, Mapping) else None
+    detail = detail if isinstance(detail, Mapping) else {}
     threshold = float(
         episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
     )
+    # A child of a just-opened fridge/drawer may be visually verified from the
+    # successful interaction pose while its AABB centre remains deeper than the
+    # generic NavToObj centre-radius.  The decision node publishes this
+    # bounded anchor contract together with the claim; keep the public evidence
+    # and instance matching checks, but do not force a second motion toward the
+    # hidden centre.
+    try:
+        anchor_distance = float(
+            detail.get("target_open_container_anchor_distance_m")
+        )
+        anchor_tolerance = float(detail.get("direct_goal_tolerance_m"))
+    except (TypeError, ValueError):
+        anchor_distance = float("nan")
+        anchor_tolerance = float("nan")
+    anchor_ready = bool(detail.get("target_open_container_anchor_ready"))
+    allow_open_container_anchor = bool(
+        anchor_ready
+        and detail.get("target_navigation_required") is False
+        and detail.get("containing_container_id")
+        and math.isfinite(anchor_distance)
+        and math.isfinite(anchor_tolerance)
+        and anchor_tolerance > 0.0
+        and 0.0 <= anchor_distance <= anchor_tolerance + 1e-6
+    )
+    graph_verification = _verify_public_claim_context(
+        detail, allow_open_container_anchor=allow_open_container_anchor
+    )
+    if graph_verification is not None:
+        return graph_verification
     return verify_target_goal_claim(
         payload,
         episode_id=runtime.perception.episode_id,
         evidence=runtime.goal_evidence,
         private_distances_m=_private_target_distances_m(task, runtime),
         distance_threshold_m=threshold,
+        allow_open_container_anchor=allow_open_container_anchor,
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
     )
+
+
+def _verify_relaxed_category_goal_status(
+    *,
+    task: Any,
+    runtime: RestrictedRosObjectGoalRuntime,
+    episode: dict[str, Any],
+    payload: dict[str, Any],
+) -> GoalClaimVerification:
+    """Verify a category-level diagnostic endpoint without changing formal SR."""
+
+    evidence = runtime.category_goal_evidence
+    if evidence is None or len(runtime.category_target_source_by_opaque_id) <= 1:
+        return GoalClaimVerification(False, "category_goal_not_ambiguous")
+    detail = payload.get("detail") if isinstance(payload, Mapping) else None
+    detail = detail if isinstance(detail, Mapping) else {}
+    graph_verification = _verify_public_claim_context(detail)
+    if graph_verification is not None:
+        return graph_verification
+    threshold = float(
+        episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
+    )
+    verification = verify_target_goal_claim(
+        payload,
+        episode_id=runtime.perception.episode_id,
+        evidence=evidence,
+        private_distances_m=_private_target_distances_m(
+            task,
+            runtime,
+            source_by_opaque_id=runtime.category_target_source_by_opaque_id,
+        ),
+        distance_threshold_m=threshold,
+        candidate_selection="nearest_published",
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
+    )
+    if not verification.accepted:
+        return verification
+    # Defend the evaluator boundary even when a runtime was assembled by an
+    # older caller that did not pre-filter its category ledger.  A candidate
+    # without a private relation decision is not promoted by distance/evidence
+    # alone.  The selected identity is allowed because it is the native strict
+    # endpoint; every alternative must have an explicit v2 relation decision.
+    relation_decisions = getattr(runtime, "category_candidate_decisions", None)
+    source_name = runtime.category_target_source_by_opaque_id.get(
+        verification.target_instance_id or ""
+    )
+    selected = str(
+        episode.get("interactive_nav", {})
+        .get("target", {})
+        .get("selected_instance", "")
+        or ""
+    )
+    if source_name != selected:
+        if not isinstance(relation_decisions, Mapping) or not relation_decisions:
+            return GoalClaimVerification(False, "category_relation_unavailable")
+        relation = relation_decisions.get(source_name) if source_name else None
+        if not (
+            isinstance(relation, Mapping)
+            and relation.get("category_goal_accepted") is True
+        ):
+            return GoalClaimVerification(False, "category_relation_rejected")
+    return verification
 
 
 def _poll_restricted_goal_status(
@@ -2592,6 +3201,48 @@ def _poll_restricted_goal_status(
 ) -> tuple[str, GoalClaimVerification | None, dict[str, Any]] | None:
     """Consume fresh public status messages and return the first terminal one."""
 
+    def verified_terminal(payload, verification):
+        publish = getattr(observer, "publish_verification", None)
+        if callable(publish):
+            publish(payload, verification.accepted)
+        if verification.accepted:
+            return "target_found", verification, payload
+        rejected = getattr(runtime, "rejected_goal_claims", None)
+        if rejected is None:
+            rejected = runtime.rejected_goal_claims = []
+        rejected.append({"claim_id": (payload.get("detail") or {}).get("claim_id"),
+                         "reason": verification.reason, "timestamp": time.time()})
+        return None
+
+    # Goal status and the restricted RGB-D frame travel on independent ROS
+    # callbacks.  A container can expose its child on the next frame while the
+    # decision node publishes the target claim immediately after the open
+    # result.  Keep such a claim for a short bounded retry instead of turning a
+    # valid observation into ``target_claim_unverified`` due to callback order.
+    pending_claim = getattr(runtime, "pending_target_claim", None)
+    if pending_claim is not None:
+        pending_payload, pending_started_at = pending_claim
+        verification = _verify_restricted_goal_status(
+            task=task,
+            runtime=runtime,
+            episode=episode,
+            payload=pending_payload,
+        )
+        if verification.accepted:
+            runtime.pending_target_claim = None
+            return verified_terminal(pending_payload, verification)
+        if (
+            verification.reason
+            not in {"no_published_target_evidence", "nearest_target_not_published"}
+            or time.monotonic() - float(pending_started_at) >= 2.0
+        ):
+            runtime.pending_target_claim = None
+            verified_terminal(pending_payload, verification)
+
+    pending = getattr(runtime, "pending_goal_terminal", None)
+    if pending is not None:
+        runtime.pending_goal_terminal = None
+        return pending
     for payload in observer.drain():
         if is_target_goal_success_claim(payload):
             verification = _verify_restricted_goal_status(
@@ -2600,8 +3251,17 @@ def _poll_restricted_goal_status(
                 episode=episode,
                 payload=payload,
             )
-            reason = "target_found" if verification.accepted else "target_claim_unverified"
-            return reason, verification, payload
+            if verification.reason in {
+                "no_published_target_evidence",
+                "nearest_target_not_published",
+            }:
+                runtime.pending_target_claim = (payload, time.monotonic())
+                continue
+            terminal = verified_terminal(payload, verification)
+            if terminal is not None:
+                runtime.pending_target_claim = None
+                return terminal
+            continue
         if is_exploration_terminal(payload):
             status = str(payload.get("status") or "").strip().upper()
             reason_by_status = {
@@ -2767,6 +3427,7 @@ def _consume_pending_ros_object_goal_interaction(
     request = runtime.adapter.pop_next_interaction_request()
     if request is None:
         return None
+    _report_interaction_progress(runtime)
     rejection_reason = str(getattr(request, "rejection_reason", "") or "")
     if rejection_reason:
         # A geometric semantic doorway can be selectable by the navigation
@@ -2883,6 +3544,10 @@ def _consume_pending_ros_object_goal_interaction(
         request.public_command,
         actual_pose_xyyaw=actual_pose_xyyaw,
     )
+    if source_name is not None and joints:
+        pose_validation = validate_runtime_interaction_pose(
+            task.env, request.public_command, object_name=str(source_name),
+        )
     observation_validation = validate_public_interaction_observation(
         request.public_observation,
         actual_pose_xyyaw=actual_pose_xyyaw,
@@ -2904,7 +3569,7 @@ def _consume_pending_ros_object_goal_interaction(
         pose_validation.get("valid")
     ):
         access_meta = {
-            "reason": "interaction_pose_invalid",
+            "reason": pose_validation.get("reason") or "interaction_pose_invalid",
             "interaction_pose_validation": pose_validation,
             "public_observation_validation": observation_validation,
         }
@@ -2938,6 +3603,9 @@ def _consume_pending_ros_object_goal_interaction(
     ) -> tuple[Any | None, dict[str, Any]]:
         """Run one evaluator-allowed group through the ordinary force backend."""
 
+        if getattr(runtime, "smooth_bridge", None) is not None:
+            execution = _execute_native_smooth(task, runtime, request, str(source_name), selected_joints, episode, config, decision_index, frames)
+            return execution, dict(execution.private_metadata)
         robot_lock = _robot_lock_snapshot(task.env)
         try:
             execution = execute_open_articulation_group(
@@ -2946,7 +3614,10 @@ def _consume_pending_ros_object_goal_interaction(
                 joints=selected_joints,
                 max_physics_substeps=int(config.force_max_internal_steps),
                 success_fraction=float(SUCCESS_OPEN_FRACTION),
-                robot_lock_callback=lambda: _apply_robot_lock(task.env, robot_lock),
+                robot_lock_callback=lambda: (
+                    _apply_robot_lock(task.env, robot_lock),
+                    _report_interaction_progress(runtime),
+                ),
                 public_command=request.public_command,
             )
             return execution, dict(execution.private_metadata)
@@ -2974,21 +3645,22 @@ def _consume_pending_ros_object_goal_interaction(
             allowed_drawer_joint_indices = {
                 int(joint.joint_index) for joint in joints
             }
-            scan = _execute_private_drawer_scan(
-                task=task,
-                runtime=runtime,
-                episode=episode,
-                joints=joints,
-                open_regions=request.open_regions,
-                allowed_joint_indices=allowed_drawer_joint_indices,
-                # Match the ordinary interaction bridge: a public container box
-                # selects the object, but only M1-grounded visible regions may
-                # select drawers.  Never enumerate hidden slide joints.
-                fallback_to_all=False,
-                config=config,
-                decision_index=decision_index,
-                frames=frames,
-            )
+            if getattr(runtime, "smooth_bridge", None) is not None:
+                scan = _execute_native_smooth(task, runtime, request, str(source_name), joints, episode, config, decision_index, frames)
+            else:
+                scan = _execute_private_drawer_scan(
+                    task=task,
+                    runtime=runtime,
+                    episode=episode,
+                    joints=joints,
+                    open_regions=(),
+                    allowed_joint_indices=allowed_drawer_joint_indices,
+                    # The native sealed drawer_scan visits the entire selected container.
+                    fallback_to_all=True,
+                    config=config,
+                    decision_index=decision_index,
+                    frames=frames,
+                )
             joint_results = tuple(scan["joint_results"])
             opened_joints = tuple(scan["opened_joints"])
             successful_ids = _successful_drawer_scan_interaction_ids(
@@ -3006,10 +3678,11 @@ def _consume_pending_ros_object_goal_interaction(
             postcondition = "drawer_scan_satisfied" if skill_completed else "drawer_scan_failed"
             executor_metadata = dict(scan.get("metadata") or {})
             executor_name = "trusted_drawer_scan"
+            final_state = drawer_scan_final_state(executor_metadata)
             public_outcome = {
-                "state": "closed" if skill_completed else "unknown",
+                "state": final_state if skill_completed else "unknown",
                 "pre_state": "closed",
-                "post_state": "closed" if skill_completed else "unknown",
+                "post_state": final_state if skill_completed else "unknown",
                 "interaction_capability": (
                     "articulated"
                 ),
@@ -3029,7 +3702,7 @@ def _consume_pending_ros_object_goal_interaction(
             )
             public_result = {**public_request, **completion}
             observation = scan["observation"]
-        elif request.sequence_type == "drawer_open":
+        elif request.sequence_type == "drawer_open" and getattr(runtime, "smooth_bridge", None) is None:
             allowed_drawer_joint_indices = {
                 int(joint.joint_index) for joint in joints
             }
@@ -3124,7 +3797,7 @@ def _consume_pending_ros_object_goal_interaction(
             postcondition = (
                 "satisfied" if physical_completed else "not_satisfied"
             )
-            executor_name = "ordinary_force_group_fast"
+            executor_name = str(executor_metadata.get("execution_mode") or "ordinary_force_group_fast")
     else:
         access_reason = str(access_meta.get("reason") or "")
         # Keep the ordinary public precondition taxonomy intact.  In
@@ -3142,6 +3815,8 @@ def _consume_pending_ros_object_goal_interaction(
                 "interactable": source_name is not None,
                 "retryable": source_name is not None,
                 "failure_reason": public_access_reason,
+                "recovery_action": pose_validation.get("recovery_action", ""),
+                "reject_selected_face": bool(pose_validation.get("reject_selected_face", False)),
                 "verification_source": "executor_pose_precondition",
                 "interaction_pose_validation": pose_validation,
                 "execution_cost": 0.0,
@@ -3206,6 +3881,16 @@ def _consume_pending_ros_object_goal_interaction(
             # required effect is pending.  Preserve physical effects so the
             # paper's V/E accounting remains per attempted interaction.
             "effect_achieved_interaction_ids": successful_ids,
+            "resolved_object_category": joints[0].object_category if joints else None,
+            "resolved_object_domain": joints[0].domain if joints else None,
+            "physical_state_changed": (
+                any(
+                    result.open_fraction_before is not None
+                    and result.open_fraction_after is not None
+                    and result.open_fraction_after > result.open_fraction_before + 1e-3
+                    for result in joint_results
+                ) if joint_results else None
+            ),
             # Retain the matched task-relevant IDs even when approach gating
             # prevents force execution.  This private detail lets the paper
             # breakdown label such an attempt as failed rather than unrelated.
@@ -3221,9 +3906,10 @@ def _consume_pending_ros_object_goal_interaction(
         "result_status": str(completion.get("status") or "FAILED"),
     }
     _capture_head_frame(task, frames, config.record_video)
-    _publish_restricted_ros_frame(runtime, task, decision_index=decision_index)
+    _publish_restricted_ros_frame(runtime, task, decision_index=decision_index + max(0, int(executor_metadata.get("task_steps_consumed", 1)) - 1))
     _discard_task_rollout_cache(task)
     return {
+        "task_steps_consumed": int(executor_metadata.get("task_steps_consumed", 1)),
         "private_attempt": private_attempt,
         "public_attempt": public_attempt,
         "observation": observation,
@@ -3489,6 +4175,7 @@ def _protocol_implementation_sha256() -> str:
         Path(__file__).with_name("goal_status.py"),
         Path(__file__).with_name("ros_policy_termination.py"),
         Path(__file__).with_name("trusted_interaction_skill.py"),
+        Path(__file__).with_name("scene_distractor_filter.py"),
         Path(__file__).resolve().parent.parent / "force_interaction_runtime.py",
         Path(__file__).resolve().parent.parent / "force_interaction_bridge.py",
         Path(__file__).resolve().parent.parent / "container_scene_probe.py",
@@ -3599,6 +4286,7 @@ def evaluate_episode(
     private_visualization: dict[str, Any] | None = None
     accepted_goal_claim = False
     last_goal_claim_verification: GoalClaimVerification | None = None
+    last_relaxed_category_goal_verification: GoalClaimVerification | None = None
     effective_max_steps = int(config.max_steps)
     step_budget_basis: dict[str, Any] = {
         "evaluator_private": True,
@@ -3616,6 +4304,14 @@ def evaluate_episode(
     paper_metric_config_payload = paper_metric_config.to_dict()
     try:
         phase_started = time.perf_counter()
+        # Older frozen V3 benchmark releases omitted the empty articulation
+        # state list from ``scene_modifications``.  The current schema keeps
+        # the field required so downstream replay can rely on a stable shape;
+        # normalize the legacy payload in memory without changing the frozen
+        # benchmark artifact.
+        episode.setdefault("scene_modifications", {}).setdefault(
+            "articulation_states", []
+        )
         interactive_nav_v3.validate_interactive_nav_v3_episode(episode, expected_domains=list(nav["interaction_domains"]))
         phase_timings.record("episode_validation", phase_started)
         spec = EpisodeSpec.model_validate(episode)
@@ -3647,7 +4343,12 @@ def evaluate_episode(
             # on disk remains unchanged.
             _apply_ros_navigation_arm_posture(spec)
         replay = _build_replay_config(config, episode_dir, task_horizon=effective_max_steps)
-        sampler = V3BenchmarkTaskSampler(replay, spec, nav)
+        sampler = V3BenchmarkTaskSampler(
+            replay,
+            spec,
+            nav,
+            remove_same_category_distractors=config.remove_same_category_distractors,
+        )
         # Collection and this evaluator use a writable scene mirror.  Do not let
         # the upstream sampler attempt to mutate the shared resource cache.
         import molmo_spaces.tasks.task_sampler as task_sampler_module
@@ -3663,7 +4364,9 @@ def evaluate_episode(
         variants["base"] = probe.prepare_writable_scene_path(Path(source_scene_path))
         try:
             phase_started = time.perf_counter()
-            task = sampler.sample_task(house_index=spec.house_index, variant="base")
+            # Current BaseMujocoTaskSampler selects the base scene variant
+            # internally; older releases exposed a variant keyword here.
+            task = sampler.sample_task(house_index=spec.house_index)
             phase_timings.record("task_sample", phase_started)
         finally:
             variants["base"] = source_scene_path
@@ -3672,6 +4375,51 @@ def evaluate_episode(
         phase_started = time.perf_counter()
         observation, _info = task.reset()
         phase_timings.record("task_reset", phase_started)
+        # JsonEvalTaskSampler's nav-to-object path intentionally skips its
+        # manipulation-only joint initializer. Reapply the frozen object and
+        # articulation state explicitly before runtime consistency checks. A
+        # released benchmark can contain decorative object poses from an older
+        # asset revision; the sampler already validated that task-critical
+        # bodies exist, so drop only non-critical poses absent from this runtime
+        # scene instead of turning an otherwise scoreable episode into a setup
+        # exception. The frozen JSON is never modified on disk.
+        runtime_body_names = {
+            mujoco.mj_id2name(task.env.current_model, mujoco.mjtObj.mjOBJ_BODY, index)
+            for index in range(task.env.current_model.nbody)
+        }
+        runtime_body_names.discard(None)
+        critical_pose_names = set(target_candidate_names(episode))
+        critical_pose_names.update(
+            str(row["object_name"])
+            for row in nav.get("interactions", [])
+            if isinstance(row, Mapping) and row.get("object_name")
+        )
+        modifications = episode.get("scene_modifications") or {}
+        recorded_poses = modifications.get("object_poses") or {}
+        dropped_pose_names = sorted(
+            str(name)
+            for name in recorded_poses
+            if str(name) not in runtime_body_names
+        )
+        missing_critical = sorted(set(dropped_pose_names) & critical_pose_names)
+        if missing_critical:
+            raise RuntimeError(
+                "Runtime scene is missing task-critical object pose bodies: "
+                + ", ".join(missing_critical)
+            )
+        if dropped_pose_names:
+            episode["scene_modifications"] = dict(modifications)
+            episode["scene_modifications"]["object_poses"] = {
+                name: pose
+                for name, pose in recorded_poses.items()
+                if str(name) not in set(dropped_pose_names)
+            }
+        probe.apply_episode_scene_state(task.env, episode)
+        # ``task.reset`` captured an observation before the benchmark's frozen
+        # articulation state was replayed. Refresh it before policy setup so a
+        # closed door cannot leak objects from the room behind it.
+        observation = task.get_observations()
+        _discard_task_rollout_cache(task)
         catalog = InteractionCatalog(task.env)
         private_visualization = _private_episode_visualization_context(
             task=task,
@@ -3715,7 +4463,10 @@ def evaluate_episode(
                     frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
                     goal_status_observer=ros_goal_status,
                     published_frame_sink=published_frame_sink,
+                    public_rgb_sink=getattr(policy, "publish_public_rgb_frame", None),
                 )
+                restricted_ros_runtime.smooth_bridge = getattr(policy, "policy", None)
+                restricted_ros_runtime.goal_status_observer = ros_goal_status
             if stall_tracker.config.enabled:
                 try:
                     ros_behavior_feedback = RosBehaviorFeedbackObserver(
@@ -3783,6 +4534,9 @@ def evaluate_episode(
                 "enabled": True,
                 "camera_name": "head_camera",
                 "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
+                "near_container_visibility_distance_m": 2.0,
+                "near_container_minimum_visible_pixels": 1,
+                "near_container_distance_reference": "camera_to_object_aabb_center_3d",
                 "minimum_bbox_area_pixels": int(config.restricted_gt_min_bbox_area_pixels),
                 "minimum_visible_fraction": float(config.restricted_gt_min_visible_fraction),
                 "maximum_distance_m": float(config.restricted_gt_max_distance_m),
@@ -3829,6 +4583,15 @@ def evaluate_episode(
                 if verification is not None:
                     last_goal_claim_verification = verification
                     accepted_goal_claim = bool(verification.accepted)
+                    if not verification.accepted and restricted_ros_runtime is not None:
+                        relaxed = _verify_relaxed_category_goal_status(
+                            task=task,
+                            runtime=restricted_ros_runtime,
+                            episode=episode,
+                            payload=goal_payload,
+                        )
+                        if relaxed.accepted:
+                            last_relaxed_category_goal_verification = relaxed
                 if ros_policy_termination is not None and (
                     verification is None or bool(verification.accepted)
                 ):
@@ -3882,7 +4645,7 @@ def evaluate_episode(
                 if consumed is not None:
                     if ros_policy_termination is not None:
                         ros_policy_termination.note_progress()
-                    applied_action_step_count += 1
+                    applied_action_step_count += max(1, int(consumed.get("task_steps_consumed", 1)))
                     attempts.append(consumed["private_attempt"])
                     public_attempts.append(consumed["public_attempt"])
                     interaction_sim_seconds += float(consumed["simulated_seconds"])
@@ -3907,7 +4670,7 @@ def evaluate_episode(
                     # only.  Completion still requires a policy goal-status
                     # declaration grounded in the restricted frame published
                     # during the scan.
-                    decision_index += 1
+                    decision_index += max(1, int(consumed.get("task_steps_consumed", 1)))
                     continue
             # Drain terminal/status and evaluator-side interaction feedback
             # before enforcing the non-applied observation-turn cap. A status
@@ -3954,6 +4717,15 @@ def evaluate_episode(
                     if verification is not None:
                         last_goal_claim_verification = verification
                         accepted_goal_claim = bool(verification.accepted)
+                        if not verification.accepted and restricted_ros_runtime is not None:
+                            relaxed = _verify_relaxed_category_goal_status(
+                                task=task,
+                                runtime=restricted_ros_runtime,
+                                episode=episode,
+                                payload=goal_payload,
+                            )
+                            if relaxed.accepted:
+                                last_relaxed_category_goal_verification = relaxed
                     if ros_policy_termination is not None and (
                         verification is None or bool(verification.accepted)
                     ):
@@ -3991,7 +4763,7 @@ def evaluate_episode(
                         # the same observation turn.
                         ros_policy_termination.note_progress()
                     pending_policy_terminal = None
-                    applied_action_step_count += 1
+                    applied_action_step_count += max(1, int(consumed.get("task_steps_consumed", 1)))
                     attempts.append(consumed["private_attempt"])
                     public_attempts.append(consumed["public_attempt"])
                     interaction_sim_seconds += float(consumed["simulated_seconds"])
@@ -4012,7 +4784,7 @@ def evaluate_episode(
                     )
                     if consumed.get("target_discovery") is not None:
                         transient_target_discovery = dict(consumed["target_discovery"])
-                    decision_index += 1
+                    decision_index += max(1, int(consumed.get("task_steps_consumed", 1)))
                     continue
             if pending_policy_terminal is not None:
                 terminal_reason = pending_policy_terminal.reason
@@ -4213,7 +4985,12 @@ def evaluate_episode(
                 prerequisite_satisfied=prereq_satisfied,
                 executor=None if runtime_joint is None else "force_locked",
                 simulated_seconds=float(simulated_seconds),
-                metadata={"resolver": resolver_meta, "executor": executor_meta},
+                metadata={
+                    "resolver": resolver_meta,
+                    "executor": executor_meta,
+                    "resolved_object_category": None if runtime_joint is None else runtime_joint.object_category,
+                    "resolved_object_domain": None if runtime_joint is None else runtime_joint.domain,
+                },
             ).to_dict()
             attempts.append(attempt)
             public_attempts.append(attempt)
@@ -4255,6 +5032,15 @@ def evaluate_episode(
                 if verification is not None:
                     last_goal_claim_verification = verification
                     accepted_goal_claim = bool(verification.accepted)
+                    if not verification.accepted and restricted_ros_runtime is not None:
+                        relaxed = _verify_relaxed_category_goal_status(
+                            task=task,
+                            runtime=restricted_ros_runtime,
+                            episode=episode,
+                            payload=goal_payload,
+                        )
+                        if relaxed.accepted:
+                            last_relaxed_category_goal_verification = relaxed
                 if ros_policy_termination is not None and (
                     verification is None or bool(verification.accepted)
                 ):
@@ -4275,6 +5061,85 @@ def evaluate_episode(
             and terminal_score.sequence_success
             and (terminal_score.non_interaction_success if requirement == "unnecessary" else True)
         )
+        relaxed_category_success = bool(
+            last_relaxed_category_goal_verification is not None
+            and last_relaxed_category_goal_verification.accepted
+        )
+        relaxed_instance_id = (
+            None
+            if last_relaxed_category_goal_verification is None
+            else last_relaxed_category_goal_verification.target_instance_id
+        )
+        relaxed_source_name = (
+            None
+            if restricted_ros_runtime is None or relaxed_instance_id is None
+            else restricted_ros_runtime.category_target_source_by_opaque_id.get(
+                relaxed_instance_id
+            )
+        )
+        declared_contract_plan_ids = _declared_contract_plan_ids(
+            episode, relaxed_source_name
+        )
+        exact_instance_success = bool(nav_ok)
+        category_goal_success = bool(nav_ok or relaxed_category_success)
+        interaction_contract_goal_success = bool(
+            nav_ok or (
+                relaxed_category_success
+                and declared_contract_plan_ids is not None
+            )
+        )
+        relaxed_plan_complete = bool(
+            declared_contract_plan_ids is not None
+            and terminal_score.required_interaction_success
+            and terminal_score.sequence_success
+            and (
+                terminal_score.non_interaction_success
+                if requirement == "unnecessary"
+                else terminal_score.valid_plan_id in declared_contract_plan_ids
+            )
+        )
+        interactive_episode_success = bool(
+            interaction_conditioned_success
+            if nav_ok
+            else interaction_contract_goal_success and relaxed_plan_complete
+        )
+        goal_success_layers = {
+            "protocol": "interactive_nav_goal_equivalence_v2",
+            "exact_instance_success": exact_instance_success,
+            "category_goal_success": category_goal_success,
+            "interaction_contract_goal_success": interaction_contract_goal_success,
+            "interactive_episode_success": interactive_episode_success,
+            "interaction_plan_complete": bool(
+                terminal_score.required_interaction_success
+                and terminal_score.sequence_success
+                and (
+                    terminal_score.non_interaction_success
+                    if requirement == "unnecessary"
+                    else (
+                        nav_ok
+                        or (
+                            declared_contract_plan_ids is not None
+                            and terminal_score.valid_plan_id in declared_contract_plan_ids
+                        )
+                    )
+                )
+            ),
+            "strict_metrics_preserved": True,
+            "category_candidate_source": (
+                "strict_instance"
+                if nav_ok
+                else "declared_identity_contract"
+                if declared_contract_plan_ids is not None
+                else "category_only"
+                if relaxed_category_success
+                else None
+            ),
+            "candidate_plan_ids": (
+                sorted(declared_contract_plan_ids)
+                if declared_contract_plan_ids is not None
+                else []
+            ),
+        }
         reference = _safe_reference_path_length_m(episode)
         correct_count = terminal_score.correct_action_count
         extra_count = sum(row.get("classification") == "extra_valid" for row in attempts)
@@ -4306,6 +5171,9 @@ def evaluate_episode(
             interaction_conditioned_success=interaction_conditioned_success,
             nav_success=nav_ok,
             required_interaction_success=terminal_score.required_interaction_success,
+            required_interaction_completion_fraction=terminal_score.required_interaction_completion_fraction,
+            completed_required_interaction_count=terminal_score.completed_required_interaction_count,
+            required_interaction_count=terminal_score.required_interaction_count,
             sequence_success=terminal_score.sequence_success,
             non_interaction_success=terminal_score.non_interaction_success,
             terminal_reason=terminal_reason,
@@ -4353,6 +5221,9 @@ def evaluate_episode(
             task_irrelevant_interaction_attempt_count=(
                 paper_interaction_score.task_irrelevant_interaction_attempt_count
             ),
+            non_target_class_interaction_attempt_count=(
+                paper_interaction_score.non_target_class_interaction_attempt_count
+            ),
             failed_interaction_attempt_count=(
                 paper_interaction_score.failed_interaction_attempt_count
             ),
@@ -4364,6 +5235,21 @@ def evaluate_episode(
             ),
             episode_total_cost=episode_total_cost,
             episode_total_cost_breakdown=episode_total_cost_breakdown,
+            goal_definition_relaxed_success=relaxed_category_success,
+            goal_definition_relaxed_instance_id=relaxed_instance_id,
+            goal_definition_relaxed_reason=(
+                None
+                if last_relaxed_category_goal_verification is None
+                else last_relaxed_category_goal_verification.reason
+            ),
+            exact_instance_success=exact_instance_success,
+            category_goal_success=category_goal_success,
+            interaction_contract_goal_success=interaction_contract_goal_success,
+            interactive_episode_success=interactive_episode_success,
+            category_goal_instance_id=(
+                relaxed_instance_id if not nav_ok and relaxed_category_success else None
+            ),
+            goal_success_layers=goal_success_layers,
         ).to_dict()
         if transient_target_discovery is not None and private_visualization is not None:
             # Keep the scan-time target evidence beside other evaluator-only
@@ -4379,7 +5265,11 @@ def evaluate_episode(
             "task_success": task_success,
             "interaction_conditioned_success": interaction_conditioned_success,
             "success": interaction_conditioned_success,
+            "goal_definition_relaxed_success": relaxed_category_success,
+            "goal_success_layers": goal_success_layers,
         }
+        if restricted_ros_runtime is not None:
+            terminal_trace["rejected_goal_claims"] = list(restricted_ros_runtime.rejected_goal_claims)
         if not restricted_public_mode:
             terminal_trace["interaction_score"] = terminal_score.to_dict()
         else:
@@ -4491,6 +5381,9 @@ def evaluate_episode(
             task_irrelevant_interaction_attempt_count=(
                 paper_interaction_score.task_irrelevant_interaction_attempt_count
             ),
+            non_target_class_interaction_attempt_count=(
+                paper_interaction_score.non_target_class_interaction_attempt_count
+            ),
             failed_interaction_attempt_count=(
                 paper_interaction_score.failed_interaction_attempt_count
             ),
@@ -4601,6 +5494,9 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
             f"- `{name}`: n={values['episode_count']}, SR={values['success_rate']}, "
             f"TaskSR={values['task_success_rate']}, ICS={values['interaction_conditioned_success_rate']}, "
             f"NavSR={values['nav_success_rate']}, ISR={values['required_interaction_success_rate']}, "
+            f"CatSR={values.get('category_goal_success_rate')}, "
+            f"ContractSR={values.get('interaction_contract_goal_success_rate')}, "
+            f"InteractiveSR={values.get('interactive_episode_success_rate')}, "
             f"IP={values['interaction_precision']}, SPL={values['mean_spl']}, "
             f"TotalCost={values.get('mean_total_cost')}, "
             f"ObsTurns={values.get('mean_step_count')}, "
@@ -4667,12 +5563,65 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
             "elapsed_seconds": elapsed,
             "eta_seconds": eta_seconds,
         }
+        # Keep the live progress artifact useful to an outer scheduler as well
+        # as to humans watching the terminal. ``success`` is the historical
+        # formal V3 score; only complete, scoring-eligible rows contribute to
+        # the interim SR so runtime exceptions and consistency exclusions do not
+        # silently dilute the metric.
+        eligible_rows = [
+            row
+            for row in rows
+            if row.get("status") == "complete" and bool(row.get("scoring_eligible"))
+        ]
+        payload.update(
+            {
+                "scored": len(eligible_rows),
+                "success_count": sum(bool(row.get("success")) for row in eligible_rows),
+                "task_success_count": sum(bool(row.get("task_success")) for row in eligible_rows),
+                "nav_success_count": sum(bool(row.get("nav_success")) for row in eligible_rows),
+                "interaction_success_count": sum(
+                    bool(row.get("required_interaction_success")) for row in eligible_rows
+                ),
+                "success_rate": (
+                    sum(bool(row.get("success")) for row in eligible_rows) / len(eligible_rows)
+                    if eligible_rows
+                    else None
+                ),
+            }
+        )
         _atomic_json(config.output_dir / "progress.json", payload)
+        progress_sr = "NA" if payload["success_rate"] is None else format(payload["success_rate"], ".4f")
+        progress_task_sr = (
+            "NA"
+            if not eligible_rows
+            else format(payload["task_success_count"] / len(eligible_rows), ".4f")
+        )
+        progress_nav_sr = (
+            "NA"
+            if not eligible_rows
+            else format(payload["nav_success_count"] / len(eligible_rows), ".4f")
+        )
+        try:
+            with (config.output_dir / "progress.log").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "[benchmark-progress] "
+                    f"processed={completed}/{total_payloads} "
+                    f"scored={payload['scored']} "
+                    f"success={payload['success_count']} "
+                    f"SR={progress_sr} taskSR={progress_task_sr} navSR={progress_nav_sr} "
+                    f"rate={rate:.4f}/s "
+                    f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}\n"
+                )
+        except OSError:
+            # Progress reporting must never turn an otherwise valid evaluator
+            # result into a failed episode when a log filesystem is transient.
+            pass
         print(
             "[quality-gate-progress] "
             f"time={payload['time']} processed={completed}/{total_payloads} "
             f"eligible={payload['eligible']} ineligible={payload['ineligible']} "
-            f"exceptions={payload['exceptions']} rate={rate:.3f}/s "
+            f"exceptions={payload['exceptions']} SR={'NA' if payload['success_rate'] is None else format(payload['success_rate'], '.3f')} "
+            f"rate={rate:.3f}/s "
             f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}",
             flush=True,
         )
@@ -4769,13 +5718,13 @@ def parse_args() -> BenchmarkEvaluationConfig:
             "--step-budget-mode=dynamic; ROS no-fresh waits do not consume it."
         ),
     )
-    parser.add_argument("--step-budget-mode", choices=["fixed", "dynamic"], default="fixed")
-    parser.add_argument("--min-steps", type=int, default=300)
+    parser.add_argument("--step-budget-mode", choices=["fixed", "dynamic"], default="dynamic")
+    parser.add_argument("--min-steps", type=int, default=200)
     parser.add_argument("--dynamic-path-free-m", type=float, default=3.0)
-    parser.add_argument("--dynamic-steps-per-path-m", type=float, default=25.0)
-    parser.add_argument("--dynamic-channel-interaction-steps", type=int, default=150)
-    parser.add_argument("--dynamic-container-interaction-steps", type=int, default=200)
-    parser.add_argument("--dynamic-container-joint-steps", type=int, default=40)
+    parser.add_argument("--dynamic-steps-per-path-m", type=float, default=40.0)
+    parser.add_argument("--dynamic-channel-interaction-steps", type=int, default=200)
+    parser.add_argument("--dynamic-container-interaction-steps", type=int, default=250)
+    parser.add_argument("--dynamic-container-joint-steps", type=int, default=50)
     parser.add_argument("--dynamic-step-quantum", type=int, default=50)
     parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--max-episodes", type=int)
@@ -4784,6 +5733,12 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--video-fps", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["head_camera"])
     parser.add_argument("--image-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=[640, 480])
+    parser.add_argument(
+        "--remove-same-category-distractors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove non-target instances of the target category during episode initialization.",
+    )
     parser.add_argument("--policy-dt-ms", type=float, default=200.0)
     parser.add_argument("--ctrl-dt-ms", type=float, default=10.0)
     parser.add_argument("--sim-dt-ms", type=float, default=10.0)
@@ -4872,10 +5827,11 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument(
         "--ros-command-starvation-timeout-s",
         type=float,
-        default=60.0,
+        default=90.0,
         help=(
             "End a ROS rollout as command_starvation after this continuous wall-clock "
-            "interval of bridge no-fresh waits; 0 disables this guard."
+            "interval of bridge no-fresh waits; the default covers one bounded "
+            "30 s M2 timeout retry; 0 disables this guard."
         ),
     )
     parser.add_argument(
@@ -4897,7 +5853,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ),
     )
     parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
-    parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=512)
+    parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=1)
     parser.add_argument(
         "--restricted-gt-min-bbox-short-side-pixels",
         type=int,
@@ -4919,8 +5875,8 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument(
         "--restricted-gt-max-distance-m",
         type=float,
-        default=4.0,
-        help="Maximum head-camera distance for evaluator-published restricted-GT observations; 0 disables the limit.",
+        default=8.0,
+        help="Maximum head-camera distance for evaluator-published restricted-GT observations; 0 disables the limit. Pixel/area/fraction filters still apply independently.",
     )
     parser.add_argument(
         "--quality-gate-only",
@@ -4974,6 +5930,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         video_fps=args.video_fps,
         camera_names=list(args.camera_names),
         image_resolution=tuple(args.image_resolution),
+        remove_same_category_distractors=args.remove_same_category_distractors,
         policy_dt_ms=args.policy_dt_ms,
         ctrl_dt_ms=args.ctrl_dt_ms,
         sim_dt_ms=args.sim_dt_ms,

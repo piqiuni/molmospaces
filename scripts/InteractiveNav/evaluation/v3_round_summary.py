@@ -26,11 +26,11 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "interactive_nav_v3_round_summary_v5"
-PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v1"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v3"
 _WORKER_INDEX_RE = re.compile(r"^worker[_-]?(?P<index>\d+)")
 _PRE_SCORE_MARKERS = {
     "pre_score_guard",
@@ -526,6 +526,39 @@ def _first_present(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
 
 
+def _interactive_episode_outcome(
+    result: Mapping[str, Any], task_summary: Mapping[str, Any]
+) -> bool | None:
+    """Read the layered Interactive outcome with a safe legacy fallback.
+
+    A pre-layer writer could persist ``success=true`` after a target claim even
+    when ``nav_success=false``.  Only apply the navigation guard when deriving
+    the new layer from those legacy fields; an explicit layered value remains
+    authoritative.
+    """
+
+    for value in (
+        result.get("interactive_episode_success"),
+        task_summary.get("interactive_episode_success"),
+    ):
+        parsed = _optional_bool(value)
+        if parsed is not None:
+            return parsed
+    legacy = _first_present(
+        result.get("interaction_conditioned_success"),
+        result.get("success"),
+        task_summary.get("interaction_conditioned_success"),
+        task_summary.get("success"),
+    )
+    parsed = _optional_bool(legacy)
+    if parsed is None:
+        return None
+    nav = _optional_bool(
+        _first_present(result.get("nav_success"), task_summary.get("nav_success"))
+    )
+    return False if nav is False else parsed
+
+
 def _first_existing_path(candidates: Iterable[Path]) -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
@@ -805,6 +838,33 @@ def _summarise_artifact(
             "nav_success": _optional_bool(
                 _first_present(result.get("nav_success"), task_summary.get("nav_success"))
             ),
+            "exact_instance_success": _optional_bool(
+                _first_present(
+                    result.get("exact_instance_success"),
+                    result.get("nav_success"),
+                    task_summary.get("exact_instance_success"),
+                    task_summary.get("nav_success"),
+                )
+            ),
+            "category_goal_success": _optional_bool(
+                _first_present(
+                    result.get("category_goal_success"),
+                    result.get("nav_success"),
+                    task_summary.get("category_goal_success"),
+                    task_summary.get("nav_success"),
+                )
+            ),
+            "interaction_contract_goal_success": _optional_bool(
+                _first_present(
+                    result.get("interaction_contract_goal_success"),
+                    result.get("nav_success"),
+                    task_summary.get("interaction_contract_goal_success"),
+                    task_summary.get("nav_success"),
+                )
+            ),
+            "interactive_episode_success": _optional_bool(
+                _interactive_episode_outcome(result, task_summary)
+            ),
             "required_interaction_success": _optional_bool(
                 _first_present(
                     result.get("required_interaction_success"),
@@ -897,6 +957,15 @@ def _summarise_artifact(
             "required_interaction_success": _optional_bool(
                 result.get("required_interaction_success")
             ),
+            "required_interaction_completion_fraction": _finite_number(
+                result.get("required_interaction_completion_fraction")
+            ),
+            "completed_required_interaction_count": _optional_int(
+                result.get("completed_required_interaction_count")
+            ),
+            "required_interaction_count": _optional_int(
+                result.get("required_interaction_count")
+            ),
             "interaction_precision": _finite_number(
                 result.get("interaction_precision_episode")
             ),
@@ -915,6 +984,9 @@ def _summarise_artifact(
             ),
             "task_irrelevant_interaction_attempt_count": _optional_int(
                 result.get("task_irrelevant_interaction_attempt_count")
+            ),
+            "non_target_class_interaction_attempt_count": _optional_int(
+                result.get("non_target_class_interaction_attempt_count")
             ),
             "failed_interaction_attempt_count": _optional_int(
                 result.get("failed_interaction_attempt_count")
@@ -1077,7 +1149,7 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
     This module deliberately does not reconstruct these values from action
     traces.  In particular, public interaction attempts do not contain the
-    evaluator-private required/irrelevant/repeat classification needed for IP
+    evaluator-private category, physical-effect and retry facts needed for IP
     and Total Cost.
     """
 
@@ -1088,7 +1160,10 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     required_rows = [
         row for row in rows if row.get("interaction_requirement") == "required"
     ]
-    isr, isr_denominator, isr_missing = _strict_paper_rate(
+    isr, isr_denominator, isr_missing = _strict_paper_mean(
+        required_rows, "required_interaction_completion_fraction"
+    )
+    full_required_rate, _, _ = _strict_paper_rate(
         required_rows, "required_interaction_success"
     )
     ip, ip_denominator, ip_missing = _strict_paper_mean(
@@ -1129,6 +1204,7 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "success_rate": sr,
         "mean_spl": spl,
         "required_interaction_success_rate": isr,
+        "full_required_interaction_success_rate": full_required_rate,
         "interaction_precision": ip,
         "mean_total_cost": total_cost,
         # Explicit denominators make N/A (for example ISR on unnecessary-only
@@ -1342,6 +1418,18 @@ def _round_diagnostics(episodes: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "outcomes": {
             "task_success": _boolean_metric(completed_rows, "task_success"),
             "nav_success": _boolean_metric(completed_rows, "nav_success"),
+            "exact_instance_success": _boolean_metric(
+                completed_rows, "exact_instance_success"
+            ),
+            "category_goal_success": _boolean_metric(
+                completed_rows, "category_goal_success"
+            ),
+            "interaction_contract_goal_success": _boolean_metric(
+                completed_rows, "interaction_contract_goal_success"
+            ),
+            "interactive_episode_success": _boolean_metric(
+                completed_rows, "interactive_episode_success"
+            ),
             "required_interaction_success": _boolean_metric(
                 required_rows, "required_interaction_success"
             ),
@@ -1490,6 +1578,7 @@ def _table(rows: Iterable[dict[str, Any]]) -> str:
         "ep",
         "ok",
         "task/nav/req/seq",
+        "exact/cat/contract/interactive",
         "terminal",
         "early-stop",
         "steps/budget",
@@ -1550,6 +1639,15 @@ def _table(rows: Iterable[dict[str, Any]]) -> str:
                         "nav_success",
                         "required_interaction_success",
                         "sequence_success",
+                    )
+                ),
+                "/".join(
+                    _format_bool(outcomes.get(key))
+                    for key in (
+                        "exact_instance_success",
+                        "category_goal_success",
+                        "interaction_contract_goal_success",
+                        "interactive_episode_success",
                     )
                 ),
                 str(
@@ -1622,6 +1720,9 @@ def render_terminal_summary(summary: dict[str, Any]) -> str:
         f"success={success_count}/{completed_result_count} ({rate}) "
         f"task={_format_ratio((outcomes.get('task_success') or {}).get('success_rate'))} "
         f"nav={_format_ratio((outcomes.get('nav_success') or {}).get('success_rate'))} "
+        f"category={_format_ratio((outcomes.get('category_goal_success') or {}).get('success_rate'))} "
+        f"contract={_format_ratio((outcomes.get('interaction_contract_goal_success') or {}).get('success_rate'))} "
+        f"interactive={_format_ratio((outcomes.get('interactive_episode_success') or {}).get('success_rate'))} "
         f"required={_format_ratio((outcomes.get('required_interaction_success') or {}).get('success_rate'))} "
         f"sequence={_format_ratio((outcomes.get('sequence_success') or {}).get('success_rate'))} "
         f"mllm={summary.get('total_mllm_call_count', 0)} "

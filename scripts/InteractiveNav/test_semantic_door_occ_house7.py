@@ -84,7 +84,7 @@ def root_observation(env, root_id, leaves):
     data = env.current_data
     root_name = str(model.body(root_id).name or f"door_root_{root_id}")
     try:
-        center, size = body_aabb(model, data, root_id, visual_only=True)
+        center, size = body_aabb(model, data, root_id, visible_only=True)
     except Exception:
         center = data.xpos[root_id]
         size = [0.1, 0.1, 0.1]

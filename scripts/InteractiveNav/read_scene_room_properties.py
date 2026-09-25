@@ -53,7 +53,13 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
     cfg.data_split = args.data_split
     cfg.num_workers = 1
     cfg.use_passive_viewer = False
-    cfg.use_filament = False
+    # ``use_filament`` existed in older MolmoSpaces configs, but was removed
+    # from the current Pydantic ``NavToObjBaseConfig``.  Keep this helper
+    # usable across both releases instead of making offline visualisation fail
+    # before it can draw a trajectory.
+    config_fields = getattr(type(cfg), "model_fields", None) or getattr(type(cfg), "__fields__", {})
+    if "use_filament" in config_fields:
+        setattr(cfg, "use_filament", False)
     cfg.task_sampler_config.task_sampler_class = SceneOnlyTaskSampler
     cfg.task_sampler_config.house_inds = [args.house_ind]
     cfg.task_sampler_config.samples_per_house = 1
@@ -79,7 +85,7 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
 
 def safe_body_aabb(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray]:
     try:
-        return body_aabb(model, data, body_id, visual_only=True)
+        return body_aabb(model, data, body_id, visible_only=True)
     except Exception as exc:
         log.debug("Failed to compute visual AABB for body %s: %s", body_id, exc)
         return data.xpos[body_id].copy(), np.zeros(3)

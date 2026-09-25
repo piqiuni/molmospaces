@@ -327,6 +327,10 @@ room_inference:
 # Object M1 uses image evidence. The object_rules room backend is separate
 # from the text-only M1 room worker configured under room_mllm below.
 attribute_inference:
+  # Preserve physical admission: two detector frames plus one valid M1 vote.
+  # Stable portal state refresh is wall-clock based, independent of camera FPS.
+  portal_state_confirmation_count: 1
+  portal_state_cooldown_s: 120.0
   # YOLO's label is a hypothesis; M1 may replace both the name and graph class.
   include_detector_class_hypothesis: true
   visual_evidence_max_side_px: 1024

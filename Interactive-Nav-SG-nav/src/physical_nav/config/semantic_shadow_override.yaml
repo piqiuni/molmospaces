@@ -7,6 +7,8 @@ ablation:
 startup_scan:
   enabled: false
 candidate:
+  progress_clock: monotonic
+  progress_clock_period_s: 0.2
   # The physical interaction graph and subgoal pool intentionally expose only
   # doors and refrigerators. ``locker`` is only a provisional detector
   # hypothesis; it cannot become an interaction candidate until the graph has
@@ -61,7 +63,6 @@ candidate:
   # action.  This avoids the legacy safe_farthest staging ring in the physical
   # lane when fridge_direct_interaction_on_arrival is enabled.
   container_anchor_shared_pose_enabled: true
-  fridge_direct_interaction_on_arrival: false
   # Treat arrival at the refrigerator interaction subgoal as sufficient for
   # invoking the physical bridge; do not spend another navigation/M1 cycle.
   fridge_direct_interaction_on_arrival: true
@@ -70,6 +71,14 @@ candidate:
   # misaligned with the door normal.
   interaction_ready_yaw_tolerance_rad: 0.15
 executor:
+  external_recovery_request_enabled: false
+  navigation_failure_recovery_enabled: false
+  rear_goal_reverse_enabled: false
+  rear_goal_prerotate_step_sync_enabled: false
+  interaction_final_align_step_sync_enabled: false
+  drawer_scan_execution_step_budget_authoritative: false
+  interaction_timeout_s: 15.0
+  verification_timeout_s: 30.0
   # After the fixed post-open traversal point is reached, observe both sides
   # of the newly opened doorway before returning to normal exploration.
   post_interaction_exit_observation_enabled: true
@@ -133,6 +142,7 @@ frontier:
   require_footprint_free: true
   require_turning_clearance: true
 model:
+  force_unentered_room_exploration: false
   mode: "http"
   endpoint: "http://127.0.0.1:18080/v1"
   model: "qwen3.6-35b-a3b-fp8"

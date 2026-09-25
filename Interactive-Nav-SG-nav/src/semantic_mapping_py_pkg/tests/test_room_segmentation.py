@@ -700,3 +700,188 @@ def test_room_merge_requires_stable_confirmations_before_report() -> None:
     assert len(merges) == 1
     secondary, primary = next(iter(merges.items()))
     assert secondary != primary
+
+
+@pytest.mark.parametrize("existing_pocket", [False, True], ids=["h9", "h1"])
+def test_pending_room_split_survives_occupancy_growth(existing_pocket):
+    """H1/H9 froze a mature map when an unconfirmed split kept changing ID."""
+    pytest.importorskip("cv2")
+    grid = _grid(width=160, height=60, resolution=0.1)
+    values = np.full((60, 160), -1, dtype=np.int8)
+    values[5:55, 5:120] = 0
+    if existing_pocket:
+        values[10:40, 135:155] = 0
+    grid.data = values.reshape(-1).tolist()
+    segmenter = RoomSegmenter(
+        room_grid_stability_frames=3,
+        room_remove_enclosed_occupied=False,
+    )
+    original, _ = segmenter.segment(grid)
+    old_room = original[30 * 160 + 40]
+    assert _room_count(original) == 1 + int(existing_pocket)
+
+    values[5:55, 85] = 100
+    values[27:33, 85] = 0
+    candidate_room = None
+    for frame in range(3):
+        values[5:55, 120:121 + frame] = 0
+        grid.data = values.reshape(-1).tolist()
+        published, _ = segmenter.segment(grid)
+        candidate = segmenter.state.candidate_room_ids
+        if candidate_room is None:
+            candidate_room = candidate[30 * 160 + 100]
+        assert candidate_room >= 0 and candidate_room != old_room
+        assert candidate[30 * 160 + 100] == candidate_room
+        assert segmenter.state.candidate_room_count == frame + 1
+        assert segmenter.consume_confirmed_merges() == {}
+        if frame < 2:
+            assert published == original
+
+    assert _room_count(published) == 2 + int(existing_pocket)
+    assert published[30 * 160 + 40] == old_room
+    assert published[30 * 160 + 122] == candidate_room
+    if existing_pocket:
+        assert published[25 * 160 + 145] == original[25 * 160 + 145]
+    settled_next_id = segmenter.state.next_room_segment_id
+    assert segmenter.segment(grid)[0] == published
+    assert segmenter.state.next_room_segment_id == settled_next_id
+
+
+def test_pending_portal_split_keeps_candidate_id_until_grid_confirmation():
+    grid = _grid()
+    segmenter = _segmenter(room_grid_stability_frames=3)
+    original, _ = segmenter.segment(grid)
+    segmenter.update_portal_hints(
+        [_door_observation()], source_mode="realtime_gt_observation"
+    )
+
+    first, _ = segmenter.segment(grid)
+    candidate = list(segmenter.state.candidate_room_ids)
+    assert first == original
+    assert _room_count(candidate) == 2
+    assert segmenter.segment(grid)[0] == original
+    assert segmenter.segment(grid)[0] == candidate
+    assert segmenter.consume_confirmed_merges() == {}
+
+
+def test_small_split_still_requires_all_stability_frames():
+    grid = _grid(width=120, height=80, resolution=1.0)
+    values = np.full((80, 120), 100, dtype=np.int8)
+    values[1:70, 1:100] = 0
+    values[30:34, 102:106] = 0
+    values[31, 100:102] = 0
+    grid.data = values.reshape(-1).tolist()
+    segmenter = _segmenter(room_grid_stability_frames=3)
+    original, _ = segmenter.segment(grid)
+    assert _room_count(original) == 1
+    segmenter.update_portal_hints(
+        [_door_observation(center_x=100.0, center_y=31.0)],
+        source_mode="realtime_gt_observation",
+    )
+    for frame in range(3):
+        published, _ = segmenter.segment(grid)
+        assert segmenter.state.candidate_room_count == frame + 1
+        if frame < 2:
+            assert published == original
+    assert _room_count(published) == 2
+    old = np.asarray(original)
+    new = np.asarray(published)
+    common = (old >= 0) & (new >= 0)
+    assert np.mean(old[common] == new[common]) > 0.97
+
+
+def test_pending_split_keeps_ids_when_component_size_order_changes():
+    grid = _grid(width=48, height=16)
+    values = np.full((16, 48), -1, dtype=np.int8)
+    values[1:15, 1:38] = 0
+    grid.data = values.reshape(-1).tolist()
+    segmenter = _segmenter(room_grid_stability_frames=3)
+    original, _ = segmenter.segment(grid)
+    values[:, 20] = 100
+    grid.data = values.reshape(-1).tolist()
+    assert segmenter.segment(grid)[0] == original
+    left_id = segmenter.state.candidate_room_ids[8 * 48 + 10]
+    right_id = segmenter.state.candidate_room_ids[8 * 48 + 30]
+    assert left_id != right_id
+
+    values[1:15, 38:44] = 0
+    grid.data = values.reshape(-1).tolist()
+    assert segmenter.segment(grid)[0] == original
+    published, _ = segmenter.segment(grid)
+    assert published[8 * 48 + 10] == left_id
+    assert published[8 * 48 + 30] == right_id
+    assert published.count(right_id) > published.count(left_id)
+    assert segmenter.consume_confirmed_merges() == {}
+
+
+@pytest.mark.parametrize("grid_frames,merge_frames", [(3, 2), (2, 4)])
+def test_merge_notification_waits_for_stable_grid_commit(grid_frames, merge_frames):
+    grid = _grid()
+    split = np.asarray(grid.data, dtype=np.int8).reshape(
+        grid.info.height, grid.info.width
+    )
+    split[:, grid.info.width // 2] = 100
+    grid.data = split.reshape(-1).tolist()
+    segmenter = _segmenter(
+        room_grid_stability_frames=grid_frames,
+        room_merge_confirmations=merge_frames,
+    )
+    original, _ = segmenter.segment(grid)
+    original_ids = {value for value in original if value >= 0}
+    assert len(original_ids) == 2
+
+    split[6:10, grid.info.width // 2] = 0
+    grid.data = split.reshape(-1).tolist()
+    for _ in range(max(grid_frames, merge_frames) - 1):
+        assert segmenter.segment(grid)[0] == original
+        assert segmenter.consume_confirmed_merges() == {}
+    published, _ = segmenter.segment(grid)
+    assert _room_count(published) == 1
+    primary = next(value for value in published if value >= 0)
+    assert segmenter.consume_confirmed_merges() == {
+        secondary: primary for secondary in original_ids if secondary != primary
+    }
+    for _ in range(3):
+        assert segmenter.segment(grid)[0] == published
+        assert segmenter.consume_confirmed_merges() == {}
+
+
+def test_transient_merge_restores_both_stable_room_ids_without_redirects():
+    grid = _grid()
+    values = np.asarray(grid.data, dtype=np.int8).reshape(
+        grid.info.height, grid.info.width
+    )
+    values[:, grid.info.width // 2] = 100
+    grid.data = values.reshape(-1).tolist()
+    segmenter = _segmenter(room_grid_stability_frames=3, room_merge_confirmations=2)
+    original, _ = segmenter.segment(grid)
+    assert _room_count(original) == 2
+
+    values[6:10, grid.info.width // 2] = 0
+    grid.data = values.reshape(-1).tolist()
+    for _ in range(2):
+        assert segmenter.segment(grid)[0] == original
+        assert segmenter.consume_confirmed_merges() == {}
+
+    values[:, grid.info.width // 2] = 100
+    grid.data = values.reshape(-1).tolist()
+    for _ in range(3):
+        assert segmenter.segment(grid)[0] == original
+        assert segmenter.consume_confirmed_merges() == {}
+
+
+def test_transient_split_does_not_redirect_the_surviving_stable_room():
+    grid = _grid()
+    segmenter = _segmenter(room_grid_stability_frames=3)
+    original, _ = segmenter.segment(grid)
+    values = np.asarray(grid.data, dtype=np.int8).reshape(
+        grid.info.height, grid.info.width
+    )
+    values[:, grid.info.width // 2] = 100
+    grid.data = values.reshape(-1).tolist()
+    assert segmenter.segment(grid)[0] == original
+    values[6:10, grid.info.width // 2] = 0
+    grid.data = values.reshape(-1).tolist()
+    for _ in range(3):
+        assert segmenter.segment(grid)[0] == original
+        assert segmenter.consume_confirmed_merges() == {}

@@ -23,7 +23,7 @@
   <arg name="semantic_attribute_inference" default="false"/>
   <arg name="semantic_attribute_model_name" default=""/>
   <arg name="semantic_attribute_max_output_tokens" default="256"/>
-  <arg name="semantic_attribute_request_timeout_s" default="8.0"/>
+  <arg name="semantic_attribute_request_timeout_s" default="15.0"/>
   <arg name="semantic_attribute_worker_count" default="1"/>
   <arg name="semantic_attribute_max_queue_size" default="8"/>
   <arg name="semantic_attribute_min_interval_s" default="5.0"/>
@@ -223,6 +223,7 @@
 
   <group if="$(arg start_nav)">
     <include file="$(find nav_pkg)/launch/nav.launch">
+      <arg name="global_planner_allow_unknown" value="true"/>
       <arg name="override_config_file" value="$(arg nav_config_override_file)"/>
       <arg name="base_local_planner" value="$(arg base_local_planner)"/>
       <arg name="global_map_topic" value="$(arg global_map_topic)"/>

@@ -3,10 +3,17 @@ ablation:
   module2: "mllm_score"
   module3: "mllm_skill_verified"
 
+runtime:
+  # Simulator-only navigation precondition: publish the live articulation
+  # normal so refrigerator anchors can be restricted to the operable face.
+  # M1 still confirms the reached RGB view before any physical action.
+  rule_oracle_gt_interaction_axis: true
+
 target:
   enabled: false
 
 candidate:
+  navigation_clearance_enabled: true
   interaction_types: ["portal", "container"]
   # Do not let the label-derived Door prior issue an interaction before the
   # visual attribute module has returned a ready result.
@@ -28,14 +35,17 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   portal_standoff_m: 0.85
+  portal_tangent_offsets_m: [0.10, -0.10, 0.15, -0.15]
+  # Opposite-side poses are reserved for traversal; interaction stays on the
+  # currently observed doorway side.
+  portal_allow_opposite_side_interaction: false
+  portal_interaction_front_angle_tolerance_rad: 0.15
   # Direct AABB-surface clearances for the shared container anchor.  The
   # selected point is used for navigation, M1, and the physical bridge in this
   # model lane; the bridge still performs its independent collision/sweep gate.
   container_action_standoff_m: 0.50
-  drawer_action_standoff_m: 0.50
-  # The closed-AABB clearance alone did not cover the hinged leaf sweep in H4
-  # and H10.  Keep M1 at its useful 0.90 m image distance, then retreat to a
-  # 1.15 m physical stance before force.
+  drawer_action_standoff_m: 0.70
+  # The shared anchor keeps M1 and physical action at the selected fan distance.
   fridge_action_standoff_m: 1.15
   # AABB supplies four cardinal candidate faces only.  Targeted M1 decides
   # which face is the real usable front before the shared anchor may act.
@@ -44,7 +54,7 @@ candidate:
   # Legacy capture aliases remain documented for old traces.  They are not
   # used to create a second pose while the shared contract is enabled.
   container_m1_capture_standoff_m: 0.50
-  drawer_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.70
   fridge_m1_capture_standoff_m: 1.15
   # These legacy navigation-ring values are retained for compatibility; the
   # shared contract below deliberately sets their effective offset to zero.
@@ -57,13 +67,15 @@ candidate:
   # Drawer outer navigation uses the real AABB surface, centred on the
   # robot-visible face normal.  This replaces the four tilted radial rings.
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_clearances_m: [0.70, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   # Refrigerators use the same four-face M1 authorization, but their physical
   # fan is narrower and remains farther away to preserve leaf/interior space.
   fridge_navigation_anchor_aabb_fan_enabled: true
   fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
-  fridge_navigation_anchor_fan_angles_deg: [-15.0, 0.0, 15.0]
+  # Keep enough angular diversity for local obstacles without consuming the
+  # 15-degree physical-front budget before move_base arrival error is added.
+  fridge_navigation_anchor_fan_angles_deg: [-5.0, 0.0, 5.0]
   # The finite anchor list bounds navigation recovery.  M1 sample/view budgets
   # are tracked separately by the executor, so a single negative M1 result
   # cannot consume an anchor merely by being a model flip.
@@ -108,6 +120,8 @@ policy:
   interaction_target_failure_cooldown_s: 60.0
   container_anchor_unreachable_cooldown_s: 60.0
   container_anchor_unreachable_cooldown_steps: 300
+  container_navigation_cooldown_steps: 20
+  container_navigation_cooldown_s: 15.0
   container_m1_inconclusive_cooldown_schedule_s: [15.0, 60.0, 180.0]
   failure_retry_delay_s: 1.0
   repeat_guard_enabled: true
@@ -115,19 +129,20 @@ policy:
   repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
-  # The local Qwen service may data-parallel across both GPUs; 12 s keeps a
-  # large real-navigation margin
-  # while preventing a stalled endpoint from freezing a scene for 30 seconds.
+  # Module 2 is text-only and can use a stronger/slower model through
+  # SEMANTIC_M2_*.  Keep its request budget independent from visual M1/M3.
   timeout_s: 12.0
+  timeout_retry_count: 1
+  timeout_retry_backoff_s: 1.0
   # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover
   # from a local Qwen response that starts to serialize long candidate context
   # instead of silently truncating its JSON and falling back to rules.
-  max_tokens: 384
+  max_tokens: 1536
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   skill_timeout_s: 12.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 12.0
+  verification_timeout_s: 10.0
   # Visual verification has a strict, compact JSON schema, but reserve enough
   # completion headroom so a local MLLM cannot cut off the enclosing object.
   verification_max_output_tokens: 256
@@ -137,11 +152,14 @@ completion:
   stagnation_failure_limit: 8
 
 executor:
+  interaction_timeout_task_steps: 120
+  interaction_step_stall_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
   # A negative M1 view must advance to a materially different anchor.  Never
   # spend another request at the same pose after a transient/front flip.
   container_m1_same_pose_flip_retry_count: 0
   interaction_observation_timeout_s: 12.0
+  interaction_fallback_on_m1_failure: true
   interaction_observation_same_pose_samples_per_view: 1
   interaction_observation_max_viewpoints: 3
   interaction_observation_max_total_requests: 3
@@ -160,7 +178,7 @@ executor:
   container_m1_capture_dwa_reconfigure_timeout_s: 1.0
   # Any remaining terminal-yaw settlement is bounded by public simulator steps,
   # independent of host load and VLM wall latency.
-  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 100
   # A capture timeout cancels move_base before the next outer viewpoint.  Wait
   # for a newer server status with no ACTIVE/PREEMPTING goal so make_plan cannot
   # observe the action client's brief local-DONE/server-PREEMPTING mismatch.
@@ -228,7 +246,7 @@ executor:
   semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
-  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_step_sync_stall_timeout_s: 30.0
   # A completed rear-safe turn is followed by a bounded DWA yaw-settle phase.
   # Rebase the translation watchdog during it, then grant a fresh normal
   # stagnation window instead of counting the turn against forward progress.
@@ -243,7 +261,7 @@ executor:
   # While move_base is still ACTIVE at a position-ready interaction pose, DWA
   # owns terminal rotation. Bound the wait in public simulator steps so a busy
   # host cannot make the same trajectory time out earlier.
-  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 100
   interaction_final_align_step_sync_enabled: true
   interaction_final_align_control_dt_s: 0.2
   # Hard cap only; the actual count is derived from yaw error, .30 rad/s,

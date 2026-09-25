@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import queue
+import threading
 from pathlib import Path
 import sys
 import time
@@ -76,6 +78,7 @@ def _capture_robot_lock(task_env) -> dict[str, Any] | None:
         robot_view = task_env.current_robot.robot_view
         base = robot_view.base
         groups: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        group_views = []
         for name in ("left_arm", "right_arm", "left_gripper", "right_gripper"):
             try:
                 group = robot_view.get_move_group(name)
@@ -86,18 +89,31 @@ def _capture_robot_lock(task_env) -> dict[str, Any] | None:
                 np.zeros_like(np.asarray(group.joint_vel, dtype=float)),
                 np.asarray(group.noop_ctrl, dtype=float).copy(),
             )
+            group_views.append((name, group))
+        base_pose = np.asarray(base.pose, dtype=float).copy()
+        base_ctrl = np.asarray(base.ctrl, dtype=float).copy()
+        base_hold_target = np.asarray(
+            [
+                float(base_pose[0, 3]),
+                float(base_pose[1, 3]),
+                math.atan2(float(base_pose[1, 0]), float(base_pose[0, 0])),
+            ],
+            dtype=float,
+        )
         return {
-            "base_pose": np.asarray(base.pose, dtype=float).copy(),
-            "base_ctrl": np.asarray(base.ctrl, dtype=float).copy(),
-            "base_hold_target": np.asarray(
-                [
-                    float(base.pose[0, 3]),
-                    float(base.pose[1, 3]),
-                    math.atan2(float(base.pose[1, 0]), float(base.pose[0, 0])),
-                ],
-                dtype=float,
-            ),
+            "base_pose": base_pose,
+            "base_ctrl": base_ctrl,
+            "base_hold_target": base_hold_target,
             "groups": groups,
+            "_position_forward": os.environ.get("INTERACTIVE_NAV_LOCK_POSITION_FORWARD") == "1",
+            "_geometry_forward": os.environ.get("INTERACTIVE_NAV_LOCK_GEOMETRY_FORWARD") == "1",
+            # Private to this macro; never reuse robot views across model/data resets.
+            "_view_cache": (
+                getattr(task_env, "current_model", None),
+                getattr(task_env, "current_data", None), robot_view, base,
+                tuple(group_views), np.zeros_like(base.joint_vel),
+                base_ctrl.shape == base_hold_target.shape,
+            ),
         }
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
@@ -110,28 +126,49 @@ def _apply_robot_lock(task_env, snapshot: dict[str, Any] | None) -> None:
         return
     try:
         robot_view = task_env.current_robot.robot_view
-        base = robot_view.base
+        cached = snapshot.get("_view_cache")
+        cache_valid = (
+            cached is not None
+            and cached[0] is not None and cached[1] is not None
+            and cached[0] is task_env.current_model
+            and cached[1] is task_env.current_data
+            and cached[2] is robot_view
+        )
+        base = cached[3] if cache_valid else robot_view.base
         base.pose = np.asarray(snapshot["base_pose"], dtype=float).copy()
-        base.joint_vel = np.zeros_like(base.joint_vel)
+        base.joint_vel = cached[5].copy() if cache_valid else np.zeros_like(base.joint_vel)
         base_hold_target = np.asarray(snapshot["base_hold_target"], dtype=float)
         base_ctrl = np.asarray(snapshot["base_ctrl"], dtype=float)
         try:
             base.ctrl = (
                 base_hold_target.copy()
-                if np.asarray(base.ctrl).shape == base_hold_target.shape
+                if (cached[6] if cache_valid else np.asarray(base.ctrl).shape == base_hold_target.shape)
                 else base_ctrl.copy()
             )
         except (AttributeError, ValueError):
             pass
-        for name, (qpos, qvel, ctrl) in dict(snapshot["groups"]).items():
-            group = robot_view.get_move_group(name)
+        group_views = cached[4] if cache_valid else (
+            (name, robot_view.get_move_group(name)) for name in dict(snapshot["groups"])
+        )
+        for name, group in group_views:
+            qpos, qvel, ctrl = snapshot["groups"][name]
             group.joint_pos = qpos.copy()
             group.joint_vel = qvel.copy()
             try:
                 group.ctrl = ctrl.copy()
             except (AttributeError, ValueError):
                 pass
-        mujoco.mj_forward(task_env.current_model, task_env.current_data)
+        # The force loop reads positions/contact geometry before its next
+        # mj_step; that step computes velocity/acceleration dynamics itself.
+        model, data = task_env.current_model, task_env.current_data
+        if snapshot.get("_geometry_forward", False) and not model.nflex:
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            mujoco.mj_camlight(model, data)
+            mujoco.mj_collision(model, data)
+        else:
+            forward = mujoco.mj_fwdPosition if snapshot.get("_position_forward", False) else mujoco.mj_forward
+            forward(model, data)
         try:
             task_env.camera_manager.registry.update_all_cameras(task_env)
         except AttributeError:
@@ -411,9 +448,18 @@ class AtomicForceInteractionController:
         self._head_view_controller = HeadViewController()
         self._last_view_restore_result: dict[str, Any] | None = None
         self._pause_navigation = False
+        self._execution_lock = threading.RLock()
+        self._execution_command: dict[str, Any] = {}
+        self._execution_step = -1
+        self._execution_progress_at = 0.0
+        self._execution_timer = None
 
     def prepare(self, task) -> None:
         self._ensure_ros()
+        with self._execution_lock:
+            self._execution_command = {}
+            self._execution_step = -1
+            self._execution_progress_at = 0.0
         self._commands = queue.Queue()
         self._seen_command_ids.clear()
         self._command_public_metadata.clear()
@@ -511,6 +557,10 @@ class AtomicForceInteractionController:
         return detail
 
     def before_step(self, task, step: int) -> dict[str, Any] | None:
+        with self._execution_lock:
+            if self._execution_command:
+                self._execution_step = int(step)
+                self._execution_progress_at = time.monotonic()
         if self._pending is not None:
             if self._pending.get("kind") == "drawer_sequence":
                 try:
@@ -535,7 +585,26 @@ class AtomicForceInteractionController:
             command = self._commands.get_nowait()
         except queue.Empty:
             return None
+        with self._execution_lock:
+            self._execution_command = command
+            self._execution_step = int(step)
+            self._execution_progress_at = time.monotonic()
+        self._publish_execution_progress()
         try:
+            # A refrigerator may already be open when the interaction command
+            # reaches the bridge (for example after a previous action or a
+            # simulator reset).  Treat the authoritative articulation state as
+            # a terminal success before validating the robot pose or applying
+            # any force.  This also prevents repeated "open" commands from
+            # trying to drive an already-open hinge/slide assembly.
+            already_open = self._already_open_refrigerator(task, command)
+            if already_open is not None:
+                return self._publish_already_open(
+                    task,
+                    command,
+                    step,
+                    already_open,
+                )
             command["interaction_pose_validation"] = self._validate_interaction_pose(
                 task, command
             )
@@ -671,6 +740,159 @@ class AtomicForceInteractionController:
         except Exception:
             self._commands.task_done()
             raise
+
+    def _already_open_refrigerator(
+        self, task, command: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return live joint evidence when a refrigerator is already open.
+
+        This check intentionally runs only for a normal refrigerator ``open``
+        command.  Drawer scans and other containers have their own state
+        machines.  ``articulation_joint_infos`` is simulator-owned and reports
+        door hinge leaves (or slide leaves for slide-door-only models) in the
+        articulation; internal refrigerator trays are not required to be open.
+        Every selected door leaf must satisfy the same open-fraction threshold
+        used by the force backend before the command can be completed without
+        action.
+        """
+
+        if str(command.get("node_type") or "").strip().casefold() != "container":
+            return None
+        if str(command.get("container_kind") or "").strip().casefold() not in {
+            "fridge",
+            "refrigerator",
+        }:
+            return None
+        if str(command.get("action") or "open").strip().casefold() != "open":
+            return None
+        if str(command.get("sequence_type") or "").strip().casefold() in {
+            "drawer_scan",
+            "drawer_open",
+        }:
+            return None
+        object_id = self._execution_object_id(command)
+        if not object_id:
+            return None
+        try:
+            infos = articulation_joint_infos(task.env, object_id)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        articulated = [
+            dict(info)
+            for info in infos
+            if str(info.get("joint_type") or "").strip().casefold()
+            in {"hinge", "slide"}
+        ]
+        if not articulated:
+            return None
+        # Refrigerator roots often include internal slide-out drawers in
+        # addition to the door hinge(s).  A visually/physically open appliance
+        # is determined by its door leaf: prefer hinge joints when present and
+        # use slide travel only for slide-door-only models.  Requiring every
+        # internal tray to be open would make an already-open fridge issue a
+        # redundant force command.
+        hinge_infos = [
+            info
+            for info in articulated
+            if str(info.get("joint_type") or "").strip().casefold() == "hinge"
+        ]
+        relevant = hinge_infos or [
+            info
+            for info in articulated
+            if str(info.get("joint_type") or "").strip().casefold() == "slide"
+        ]
+        threshold = float(self.force_config.open_fraction_threshold)
+        if not all(float(info.get("open_fraction", 0.0)) >= threshold for info in relevant):
+            return None
+        return {
+            "checked": True,
+            "state": "open",
+            "threshold": threshold,
+            # Keep the public result free of simulator joint/body names while
+            # retaining enough evidence to audit the all-door-leaf check.
+            "door_leaf_count": len(relevant),
+            "door_leaf_joint_types": [
+                str(info.get("joint_type") or "").casefold() for info in relevant
+            ],
+            "door_leaf_open_fractions": [
+                float(info.get("open_fraction", 0.0)) for info in relevant
+            ],
+            "source": "simulator_articulation_open_fraction",
+        }
+
+    def _publish_already_open(
+        self,
+        task,
+        command: dict[str, Any],
+        step: int,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish a terminal no-op success for an already-open refrigerator."""
+
+        event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
+        self._event_index += 1
+        stamp_sec = time.time()
+        result = {
+            "event_id": event_id,
+            "command_id": str(command["command_id"]),
+            "candidate_id": str(command.get("candidate_id") or ""),
+            "decision_id": str(command.get("decision_id") or ""),
+            "node_id": str(command.get("node_id") or ""),
+            "object_id": str(command.get("object_id") or ""),
+            "node_type": "container",
+            "container_kind": str(command.get("container_kind") or "refrigerator"),
+            "action": "open",
+            "interaction_mode": str(command.get("interaction_mode") or "open_close"),
+            "interaction_capability": "articulated",
+            "interactable": True,
+            "retryable": False,
+            "already_open": True,
+            "action_executed": False,
+            "observation_outcome": "finish_without_action",
+            "state": "open",
+            "pre_state": "open",
+            "post_state": "open",
+            "success": True,
+            "status": "SUCCEEDED",
+            "confidence": 1.0,
+            "execution_cost": 0.0,
+            "sim_steps_consumed": 0,
+            "physics_substeps": 0,
+            "task_steps_consumed": 0,
+            "result_published_step": int(step),
+            "source": "executor_already_open_precondition",
+            "verification_source": str(evidence.get("source") or "simulator_articulation_state"),
+            "already_open_evidence": evidence,
+            "interaction_pose_validation": {
+                "checked": False,
+                "valid": True,
+                "reason": "already_open_no_pose_required",
+            },
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        feedback = {
+            "command_id": result["command_id"],
+            "candidate_id": result["candidate_id"],
+            "decision_id": result["decision_id"],
+            "event_id": event_id,
+            "behavior_type": "INTERACT",
+            "status": "SUCCEEDED",
+            "success": True,
+            "interaction_result": result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        self._events.append({"result": result, "feedback": feedback})
+        self._pending = None
+        self._restore_view_pending = False
+        self._pause_navigation = False
+        self._force_observation_requested = True
+        self._publish(self._result_publisher, result)
+        self._publish(self._feedback_publisher, feedback)
+        self._write_snapshot()
+        self._commands.task_done()
+        return result
 
     def _publish_unsupported_interaction(
         self,
@@ -983,6 +1205,8 @@ class AtomicForceInteractionController:
                 "task_step_index": next_step,
                 "progress": float(transition.get("progress", next_step / transition_steps)),
                 "fallback": bool(transition.get("fallback", False)),
+                "position_only_settle": bool(transition.get("position_only_settle", False)),
+                "position_only_contact_guarded": bool(transition.get("position_only_contact_guarded", False)),
                 "physics_substeps": int(transition.get("physics_substeps", 0)),
             }
         )
@@ -1015,14 +1239,18 @@ class AtomicForceInteractionController:
                 body_id = int(model.jnt_bodyid[int(joint["joint_id"])])
             if body_id is not None:
                 body_heights[joint_name] = float(data.xpos[body_id][2])
+        sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
+        if sequence_type not in {"drawer_scan", "drawer_open"}:
+            raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
+        # A scan is a complete container audit: enumerate every physical slide
+        # joint even when M1 returns an incomplete visible-region list.  A normal
+        # drawer_open remains limited to the explicitly grounded visual regions.
+        scan_all_drawers = sequence_type == "drawer_scan"
         groups = ground_drawer_open_regions(
             list(articulation.get("joints") or []),
-            list(command.get("open_regions") or []),
+            [] if scan_all_drawers else list(command.get("open_regions") or []),
             body_heights,
-            # An MLLM drawer_scan may operate only on front/handle regions it
-            # actually identified.  Do not silently convert an empty visual
-            # plan into a simulator-wide sweep of hidden drawers.
-            fallback_to_all=False,
+            fallback_to_all=scan_all_drawers,
         )
         if not groups:
             raise ValueError("drawer interaction requires at least one valid visible drawer region")
@@ -1039,9 +1267,6 @@ class AtomicForceInteractionController:
         selected_joint_names = [
             name for group in groups for name in group["joint_names"]
         ]
-        sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
-        if sequence_type not in {"drawer_scan", "drawer_open"}:
-            raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
         preserve_open = sequence_type == "drawer_open"
         transition_steps = max(
             1,
@@ -1673,6 +1898,12 @@ class AtomicForceInteractionController:
 
     @staticmethod
     def _validate_interaction_pose(task, command: dict[str, Any]) -> dict[str, Any]:
+        """Reject before force; only wrong-face evidence permits face exclusion.
+
+        Orientation/position failures preserve the selected face for bounded
+        recovery from public observations. Unverified geometry requires another
+        observation, never a GT axis or corrective yaw in the public result.
+        """
         expected = list(command.get("interaction_approach_pose_xyyaw") or [])
         if len(expected) < 3:
             return {"checked": False, "reason": "no_expected_approach_pose"}
@@ -1691,19 +1922,35 @@ class AtomicForceInteractionController:
                 math.cos(actual[2] - float(expected[2])),
             )
         )
+        # The executor carries an explicit per-goal contract because
+        # MoveBaseGoal itself has no tolerance fields.  Prefer that contract
+        # here so the final physical precondition cannot silently use the
+        # broader legacy interaction-ready envelope after navigation used a
+        # stricter AABB/front constraint.
         distance_tolerance_m = max(
-            0.05, float(command.get("interaction_ready_distance_m", 0.45) or 0.45)
+            0.05,
+            float(
+                command.get(
+                    "navigation_goal_position_tolerance_m",
+                    command.get("interaction_ready_distance_m", 0.45),
+                )
+                or 0.45
+            ),
         )
         yaw_tolerance_rad = max(
             0.05,
             float(
-                command.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+                command.get(
+                    "navigation_goal_yaw_tolerance_rad",
+                    command.get("interaction_ready_yaw_tolerance_rad", 0.55),
+                )
+                or 0.55
             ),
         )
-        pose_valid = (
-            position_error_m <= distance_tolerance_m
-            and yaw_error_rad <= yaw_tolerance_rad
-        )
+        comparison_epsilon = 1e-3
+        position_valid = position_error_m <= distance_tolerance_m + comparison_epsilon
+        yaw_valid = yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
+        pose_valid = position_valid and yaw_valid
         face_required = bool(
             command.get("interaction_front_axis_validation_required", False)
         )
@@ -1711,6 +1958,8 @@ class AtomicForceInteractionController:
         center_values = list(command.get("interaction_target_center_xy") or [])
         face_checked = False
         face_valid = not face_required
+        face_position_valid = not face_required
+        face_yaw_valid = not face_required
         face_position_error_rad: float | None = None
         face_yaw_error_rad: float | None = None
         face_position_tolerance_rad = max(
@@ -1756,35 +2005,73 @@ class AtomicForceInteractionController:
                     )
                 )
                 face_checked = True
-                face_valid = (
+                face_position_valid = (
                     face_position_error_rad <= face_position_tolerance_rad
-                    and face_yaw_error_rad <= face_yaw_tolerance_rad
                 )
+                face_yaw_valid = face_yaw_error_rad <= face_yaw_tolerance_rad
+                face_valid = face_position_valid and face_yaw_valid
+        # Both containers and portals require an independent geometric front
+        # check.  A portal's arrival yaw alone is not a front-side guarantee.
+        # A portal's AABB face check above is the authoritative physical front
+        # contract.  Articulation geometry is often unavailable for static or
+        # hinge-less door assets, so requiring an inferred hinge/slide axis for
+        # portals would reject a valid AABB-front arrival for the wrong reason.
+        # Containers still require the independent articulation-front check.
         physical_front_required = bool(
             face_required
-            and str(command.get("node_type") or "").strip().casefold() == "container"
+            and str(command.get("node_type") or "").strip().casefold()
+            == "container"
         )
         physical_front_checked = False
         physical_front_valid = not physical_front_required
-        physical_front_position_error_rad: float | None = None
-        physical_front_yaw_error_rad: float | None = None
-        physical_front_source = ""
+        physical_front_position_valid = not physical_front_required
+        physical_front_yaw_valid = not physical_front_required
+        # A cardinal AABB face is a coarse normal. Only the independent
+        # physical check gets this margin; pose and selected-face gates stay.
+        cardinal_front = str(command.get("interaction_front_axis_source") or "") == "m1_selected_montage_view_aabb_cardinal_face"
+        physical_position_tolerance = max(face_position_tolerance_rad, math.radians(25.0)) if cardinal_front else face_position_tolerance_rad
+        physical_yaw_tolerance = max(face_yaw_tolerance_rad, math.radians(25.0)) if cardinal_front else face_yaw_tolerance_rad
+        selected_face_matches_physical_front: bool | None = None
         if physical_front_required:
             physical_front = infer_articulation_front_axis_xy(
                 task.env, str(command.get("_execution_object_id") or command.get("object_id") or "")
             )
-            physical_front_checked = bool(physical_front.get("checked"))
-            physical_front_source = str(
-                physical_front.get("source") or physical_front.get("reason") or ""
-            )
             physical_axis = list(physical_front.get("axis_xy") or [])
-            if physical_front_checked and len(physical_axis) >= 2 and len(center_values) >= 2:
+            # Do not substitute the M1-selected axis when simulator geometry is
+            # unavailable.  M1 is an image classifier, not an independent
+            # physical-front oracle; accepting its axis here would allow a
+            # side/rear view to authorize an action.  Fail closed and let the
+            # executor reobserve or retry a bounded anchor instead.
+            if (
+                bool(physical_front.get("checked"))
+                and len(physical_axis) >= 2
+                and face_checked
+            ):
                 offset_x = actual[0] - float(center_values[0])
                 offset_y = actual[1] - float(center_values[1])
                 offset_norm = math.hypot(offset_x, offset_y)
-                if offset_norm > 1e-6:
+                try:
                     physical_axis_x = float(physical_axis[0])
                     physical_axis_y = float(physical_axis[1])
+                except (TypeError, ValueError):
+                    physical_axis_x = physical_axis_y = float("nan")
+                physical_axis_norm = math.hypot(physical_axis_x, physical_axis_y)
+                if math.isfinite(physical_axis_norm) and physical_axis_norm > 1e-6:
+                    physical_axis_x /= physical_axis_norm
+                    physical_axis_y /= physical_axis_norm
+                    physical_front_checked = True
+                    # Classify the selected AABB face, not the robot's yaw or
+                    # lateral drift. Halfway between cardinal faces is ambiguous.
+                    # This classification never relaxes the action tolerances.
+                    selected_face_dot = (
+                        normalized_axis[0] * physical_axis_x
+                        + normalized_axis[1] * physical_axis_y
+                    )
+                    face_boundary = math.cos(math.pi / 4.0)
+                    if abs(selected_face_dot - face_boundary) > 1e-6:
+                        selected_face_matches_physical_front = (
+                            selected_face_dot > face_boundary
+                        )
                     dot = max(
                         -1.0,
                         min(
@@ -1803,25 +2090,54 @@ class AtomicForceInteractionController:
                             math.cos(actual[2] - physical_front_yaw),
                         )
                     )
-                    physical_front_valid = bool(
-                        physical_front_position_error_rad
-                        <= face_position_tolerance_rad
-                        and physical_front_yaw_error_rad <= face_yaw_tolerance_rad
+                    physical_front_position_valid = (
+                        physical_front_position_error_rad <= physical_position_tolerance
+                    )
+                    physical_front_yaw_valid = (
+                        physical_front_yaw_error_rad <= physical_yaw_tolerance
+                    )
+                    physical_front_valid = (
+                        physical_front_position_valid and physical_front_yaw_valid
                     )
         valid = pose_valid and face_valid and physical_front_valid
+        reason = ""
+        recovery_action = ""
+        if not valid:
+            if selected_face_matches_physical_front is False:
+                reason, recovery_action = "interaction_wrong_face", "select_other_face"
+            elif (face_required and not face_checked) or (
+                physical_front_required and selected_face_matches_physical_front is None
+            ):
+                reason, recovery_action = "interaction_front_unverified", "reobserve_front"
+            elif (
+                not position_valid
+                or not face_position_valid
+                or not physical_front_position_valid
+            ):
+                reason = "interaction_position_misaligned"
+                recovery_action = "reposition_same_face"
+            else:
+                reason = "interaction_orientation_misaligned"
+                recovery_action = "realign_yaw"
         result = {
             "checked": True,
             "valid": valid,
+            "reason": reason,
+            "recovery_action": recovery_action,
+            "reject_selected_face": reason == "interaction_wrong_face",
             "expected_pose_xyyaw": [float(value) for value in expected[:3]],
             "actual_pose_xyyaw": actual,
             "position_error_m": position_error_m,
             "yaw_error_rad": yaw_error_rad,
             "distance_tolerance_m": distance_tolerance_m,
             "yaw_tolerance_rad": yaw_tolerance_rad,
+            "comparison_epsilon": comparison_epsilon,
             "approach_axis_xy": normalized_axis or axis_values,
             "face_validation_required": face_required,
             "face_checked": face_checked,
             "face_valid": face_valid,
+            "face_position_valid": face_position_valid,
+            "face_yaw_valid": face_yaw_valid,
             "target_center_xy": center_values,
             "front_axis_source": str(
                 command.get("interaction_front_axis_source") or ""
@@ -1833,9 +2149,9 @@ class AtomicForceInteractionController:
             "physical_front_required": physical_front_required,
             "physical_front_checked": physical_front_checked,
             "physical_front_valid": physical_front_valid,
-            "physical_front_source": physical_front_source,
-            "physical_front_position_error_rad": physical_front_position_error_rad,
-            "physical_front_yaw_error_rad": physical_front_yaw_error_rad,
+            # Publish only pass/fail, never GT axes, angles or a corrective yaw.
+            "physical_front_position_valid": physical_front_position_valid,
+            "physical_front_yaw_valid": physical_front_yaw_valid,
         }
         if not valid:
             command["interaction_pose_validation"] = result
@@ -1872,6 +2188,8 @@ class AtomicForceInteractionController:
         invalid_physical_front = str(exc).startswith(
             "Interaction physical front invalid:"
         )
+        invalid_pose_precondition = invalid_interaction_pose or invalid_physical_front
+        pose_validation = dict(command.get("interaction_pose_validation") or {})
         unsafe_open_sweep = str(exc).strip() == "unsafe_open_sweep"
         drawer_sequence_type = str(command.get("sequence_type") or "").casefold()
         drawer_sequence_execution_failed = str(exc).startswith(
@@ -1932,13 +2250,14 @@ class AtomicForceInteractionController:
         elif drawer_sequence_execution_failed:
             verification_source = "executor_drawer_sequence_failure"
             failure_reason = f"{drawer_sequence_type or 'drawer'}_execution_failed"
-        elif invalid_physical_front:
+        elif invalid_pose_precondition:
             verification_source = "executor_pose_precondition"
-            failure_reason = "interaction_wrong_face"
-            resolved_capability = "articulated"
-        elif invalid_interaction_pose:
-            verification_source = "executor_pose_precondition"
-            failure_reason = "interaction_pose_invalid"
+            # Legacy/unstructured pose errors are not evidence for deleting a face.
+            failure_reason = str(
+                pose_validation.get("reason") or "interaction_pose_invalid"
+            )
+            if pose_validation.get("physical_front_checked"):
+                resolved_capability = "articulated"
         else:
             verification_source = "executor_resolution_failure"
             failure_reason = "articulation_resolution_failed"
@@ -1963,14 +2282,15 @@ class AtomicForceInteractionController:
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep or invalid_physical_front
+                if unsafe_open_sweep
+                or (invalid_pose_precondition and resolved_capability == "articulated")
                 else None
             ),
             "retryable": (
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep or invalid_physical_front
+                if unsafe_open_sweep or invalid_pose_precondition
                 else None
             ),
             "state": semantic_state,
@@ -2007,6 +2327,11 @@ class AtomicForceInteractionController:
             "step": int(step),
             "stamp_sec": stamp_sec,
         }
+        if invalid_pose_precondition:
+            result["recovery_action"] = str(
+                pose_validation.get("recovery_action") or "reobserve_front"
+            )
+            result["reject_selected_face"] = failure_reason == "interaction_wrong_face"
         if unsafe_open_sweep:
             result["recommended_retreat_m"] = float(
                 (command.get("_open_sweep_preflight") or {}).get(
@@ -2043,6 +2368,9 @@ class AtomicForceInteractionController:
         self._write_snapshot()
 
     def close(self) -> None:
+        if self._execution_timer is not None:
+            self._execution_timer.shutdown()
+            self._execution_timer = None
         if self._subscriber is not None:
             self._subscriber.unregister()
             self._subscriber = None
@@ -2088,8 +2416,31 @@ class AtomicForceInteractionController:
             self._command_callback,
             queue_size=8,
         )
+        self._execution_timer = rospy.Timer(
+            rospy.Duration(1.0), self._publish_execution_progress
+        )
+
+    def _publish_execution_progress(self, _event=None) -> None:
+        if self._feedback_publisher is None:
+            return
+        with self._execution_lock:
+            command = self._execution_command
+            if not command:
+                return
+            self._publish(self._feedback_publisher, {
+                "status": "RUNNING", "execution_active": True,
+                "command_id": str(command.get("command_id") or ""),
+                "decision_id": str(command.get("decision_id") or ""),
+                "object_id": str(command.get("object_id") or ""),
+                "execution_step": self._execution_step,
+                "progress_age_s": max(0.0, time.monotonic() - self._execution_progress_at),
+            })
 
     def _publish(self, publisher, payload: dict[str, Any]) -> None:
+        if publisher is not None and publisher is self._result_publisher:
+            with self._execution_lock:
+                if payload.get("command_id") == self._execution_command.get("command_id"):
+                    self._execution_command = {}
         if publisher is None or self._String is None:
             return
         public_payload = dict(payload or {})

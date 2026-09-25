@@ -1,0 +1,36 @@
+# Habitat ObjectNav-v2 limits applied after the original move_base defaults.
+global_costmap:
+  robot_radius: 0.17
+  inflation_layer:
+    inflation_radius: 0.10
+    cost_scaling_factor: 10.0
+
+local_costmap:
+  robot_radius: 0.17
+  inflation_layer:
+    inflation_radius: 0.10
+    cost_scaling_factor: 10.0
+
+DWAPlannerROS:
+  max_vel_x: 0.30
+  min_vel_x: 0.00
+  max_vel_trans: 0.30
+  min_vel_trans: 0.02
+  max_vel_theta: 0.45
+  min_vel_theta: 0.08
+  acc_lim_x: 1.5
+  acc_lim_theta: 1.0
+  controller_frequency: 10.0
+  xy_goal_tolerance: 0.20
+  yaw_goal_tolerance: 0.20
+  conditional_reverse_enabled: false
+  conditional_reverse_min_vel_x: 0.00
+
+# A public RGB-D target standoff can lie just beyond the currently observed
+# free-space boundary.  Let the global planner connect through UNKNOWN while
+# the local obstacle layer remains responsible for collision avoidance.
+GlobalPlanner:
+  allow_unknown: true
+
+controller_frequency: 10.0
+planner_frequency: 2.0

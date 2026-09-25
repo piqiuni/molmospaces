@@ -11,7 +11,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from habitat_v2_adapter.policy import _ActiveGoal, _PublicTargetTrack, HabitatInteractiveNavM2Policy, PolicyConfig
+from habitat_v2_adapter.policy import (
+    FREE,
+    OCCUPIED,
+    _ActiveGoal,
+    _PublicTargetTrack,
+    HabitatInteractiveNavM2Policy,
+    PolicyConfig,
+)
 from habitat_v2_adapter.adapter_config import load_adapter_profile
 from habitat_v2_adapter.module1_bridge import (
     Module1Detection,
@@ -178,6 +185,24 @@ class _VisionStub:
 
     def request_json(self, **_kwargs):
         return _VisionResponse(self.payload)
+
+
+class _M3Result:
+    def __init__(self, decision, confidence=0.9, reason="test", error=""):
+        self.decision = decision
+        self.confidence = confidence
+        self.reason = reason
+        self.error = error
+
+
+class _M3VerifierStub:
+    def __init__(self, *decisions):
+        self._decisions = iter(decisions)
+        self.calls = []
+
+    def verify(self, **kwargs):
+        self.calls.append(kwargs)
+        return _M3Result(next(self._decisions))
 
 
 def test_policy_only_exposes_navigation_actions() -> None:
@@ -526,7 +551,7 @@ def test_public_target_track_requires_a_separated_consistent_detection_before_pr
     assert policy._target_track is not None
     # Repeating the same camera frame can only seed the estimate, not create a
     # persistent navigation target.
-    assert not policy._update_public_target_track(np.array([0.1, 0.0], dtype=np.float32), 0.0, detection)
+    assert not policy._update_public_target_track(np.array([0.02, 0.0], dtype=np.float32), 0.0, detection)
     assert not policy._target_track.promoted
     # After a public baseline, adjust the camera-z depth to keep the projected
     # surface position consistent and allow promotion.
@@ -937,6 +962,43 @@ def test_clear_space_fallback_is_selected_through_unmodified_m2_seam() -> None:
     assert policy._active_goal.candidate_id.startswith("clear_space:")
 
 
+def test_promoted_target_uses_original_m2_target_goal_guard_context() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(policy.config, target_goal_lock_enabled=True, target_goal_pre_score=1.0)
+    model = _ModelSelectionStub(selected_index=0)
+    policy._model = model
+    policy._select_goal = HabitatInteractiveNavM2Policy._select_goal.__get__(policy, HabitatInteractiveNavM2Policy)
+    records = [
+        {
+            "candidate_id": "public_target_track",
+            "behavior_type": "NAVIGATE",
+            "target_id": "public_rgbd_target_standoff",
+            "target_name": "chair",
+            "goal_xyyaw": [1.0, 0.0, 0.0],
+            "features": {"distance_m": 1.0, "exploration_gain": 0.0},
+            "metadata": {"target_goal": True, "target_visible_now": True},
+        },
+        {
+            "candidate_id": "frontier:130:120",
+            "behavior_type": "EXPLORE",
+            "target_id": "frontier",
+            "target_name": "frontier",
+            "goal_xyyaw": [2.0, 0.0, 0.0],
+            "features": {"distance_m": 2.0, "exploration_gain": 20.0},
+            "metadata": {},
+        },
+    ]
+
+    policy._select_goal(records, np.zeros(2, dtype=np.float32), 0.0)
+
+    assert len(model.calls) == 1
+    _candidates, kwargs = model.calls[0]
+    robot_context = kwargs["robot_context"]
+    assert robot_context["candidate_pre_scores"] == {"public_target_track": 1.0}
+    assert robot_context["candidate_decision_hints"] == {"public_target_track": "TARGET_GOAL"}
+    assert "frontier:130:120" not in robot_context["candidate_pre_scores"]
+
+
 def test_frontier_arrival_scan_consumes_the_configured_turn_budget() -> None:
     policy = _NoNetworkPolicy()
     policy.config = replace(policy.config, frontier_arrival_scan_steps=3)
@@ -1258,3 +1320,361 @@ def test_module1_bridge_rejects_nonpublic_sidecar_fields() -> None:
     except RuntimeError:
         return
     raise AssertionError("Module-1 bridge accepted a forbidden world/goal field")
+
+
+def test_failed_ros_target_standoff_is_replaced_by_alternatives() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(
+        policy.config,
+        original_ros_navigation_enabled=True,
+        target_standoff_failure_radius_m=0.35,
+        target_standoff_failure_cooldown_steps=500,
+        target_standoff_retry_angles_deg=(35.0, -35.0, 70.0, -70.0),
+    )
+    policy._grid.fill(1)
+    policy._step = 20
+    policy._target_track = _PublicTargetTrack(
+        surface_xy=np.array([5.0, 0.0], dtype=np.float32),
+        seed_pose_xy=np.array([3.0, 0.0], dtype=np.float32),
+        last_seen_step=20,
+        observations=3,
+        promoted=True,
+        confidence=0.9,
+    )
+    policy._full_ros_candidate_payload = {
+        "candidates": [
+            {
+                "candidate_id": "target:object_track_tv",
+                "behavior_type": "NAVIGATE",
+                "target_id": "object_track_tv",
+                "target_name": "television",
+                "goal_xyyaw": [4.0, 0.0, 0.0],
+                "features": {"distance_m": 1.0},
+                "metadata": {"target_goal": True, "target_visible_now": True},
+                "interaction_command": None,
+            }
+        ]
+    }
+    failed = _ActiveGoal(
+        "target:object_track_tv",
+        np.array([4.0, 0.0], dtype=np.float32),
+        selected_step=1,
+    )
+    policy._record_failed_target_standoff(failed, status=4)
+
+    records = policy._full_ros_records(np.array([3.0, 0.0], dtype=np.float32), 0.0)
+
+    assert records
+    assert all(record["candidate_id"] != "target:object_track_tv" for record in records)
+    assert all(":retry:" in record["candidate_id"] for record in records)
+    assert all(record["behavior_type"] == "NAVIGATE" for record in records)
+    assert all(record["interaction_command"] is None for record in records)
+    assert all(record["metadata"]["target_goal"] for record in records)
+    assert all(
+        np.linalg.norm(np.asarray(record["goal_xyyaw"][:2]) - failed.xy)
+        > policy.config.target_standoff_failure_radius_m
+        for record in records
+    )
+
+
+def test_full_ros_target_subgoal_is_snapped_off_occupied_cell() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(policy.config, original_ros_navigation_enabled=True)
+    policy._grid.fill(OCCUPIED)
+    pose = np.array([0.0, 0.0], dtype=np.float32)
+    for x in np.arange(0.0, 1.21, 0.1):
+        gx, gy = policy._world_to_grid(np.array([[x, 0.0]], dtype=np.float32))[0]
+        policy._grid[max(0, gy - 1):gy + 2, gx] = FREE
+    requested = np.array([0.55, 0.0], dtype=np.float32)
+    requested_cell = policy._world_to_grid(requested.reshape(1, 2))[0]
+    policy._grid[requested_cell[1], requested_cell[0]] = OCCUPIED
+    policy._target_track = _PublicTargetTrack(
+        surface_xy=np.array([1.10, 0.0], dtype=np.float32),
+        seed_pose_xy=pose.copy(),
+        last_seen_step=1,
+        observations=3,
+        promoted=True,
+        confidence=0.9,
+    )
+    policy._full_ros_candidate_payload = {
+        "candidates": [{
+            "candidate_id": "target:object_track_tv",
+            "behavior_type": "NAVIGATE",
+            "target_id": "object_track_tv",
+            "target_name": "television",
+            "goal_xyyaw": [0.55, 0.0, 0.0],
+            "features": {"distance_m": 0.55},
+            "metadata": {"target_goal": True},
+            "interaction_command": None,
+        }]
+    }
+
+    records = policy._full_ros_records(pose, 0.0)
+
+    assert len(records) == 1
+    goal = np.asarray(records[0]["goal_xyyaw"][:2], dtype=np.float32)
+    goal_cell = policy._world_to_grid(goal.reshape(1, 2))[0]
+    assert policy._grid[goal_cell[1], goal_cell[0]] == FREE
+    assert not np.allclose(goal, requested)
+    assert records[0]["metadata"]["collision_free_reachable_subgoal"] is True
+    assert policy._candidate_routes[records[0]["candidate_id"]]
+
+
+def test_stale_move_base_success_does_not_arrive_new_target_candidate() -> None:
+    policy = _arrived_m3_policy("STOP")
+    policy._move_base_goal_candidate_id = policy._active_goal.candidate_id
+    policy._move_base_goal_seen_active = False
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.5, "confidence": 0.95, "depth_m": 0.60},
+    )
+
+    assert action is None
+    assert policy._objectgoal_stop_verifier.calls == []
+
+
+def test_original_ros_navigation_holds_when_cmd_vel_is_stale() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(policy.config, original_ros_navigation_enabled=True)
+    policy._step = 20
+    policy._active_goal = _ActiveGoal(
+        "target:object_track_tv",
+        np.array([1.0, 0.0], dtype=np.float32),
+        selected_step=10,
+    )
+    policy._full_ros_move_base_status = 1
+    policy._full_ros_cmd_vel = {"linear_x": 0.3, "angular_z": 0.0}
+    policy._full_ros_cmd_vel_age_s = policy.config.ros_cmd_vel_max_age_s + 0.1
+
+    action = policy._act_original_ros_navigation(
+        np.zeros(2, dtype=np.float32),
+        heading=0.0,
+        frame_updated=False,
+    )
+
+    assert action["action"] == "velocity_control"
+    assert action["action_args"]["linear_velocity"] == -1.0
+
+
+def test_public_no_motion_defers_failed_ros_target_retry() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(policy.config, original_ros_navigation_enabled=True)
+    policy._step = 30
+    policy._active_goal = _ActiveGoal(
+        "target:object_track_tv:retry:1",
+        np.array([1.0, 0.5], dtype=np.float32),
+        selected_step=20,
+    )
+    policy._last_pose = np.zeros(2, dtype=np.float32)
+    policy._last_forward_command = True
+    policy._last_forward_heading = 0.0
+
+    policy._update_stagnation(np.zeros(2, dtype=np.float32))
+
+    assert policy._active_goal is None
+    assert len(policy._failed_target_standoffs) == 1
+    failure = policy._failed_target_standoffs[0]
+    assert failure["root"] == "target:object_track_tv"
+    assert failure["reason"] == "public_no_motion"
+    assert failure["status"] == -1
+
+
+def test_new_ros_target_has_no_motion_handoff_grace() -> None:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(
+        policy.config,
+        original_ros_navigation_enabled=True,
+        ros_goal_terminal_grace_steps=3,
+    )
+    policy._step = 30
+    goal = _ActiveGoal(
+        "target:object_track_tv:retry:1",
+        np.array([1.0, 0.5], dtype=np.float32),
+        selected_step=29,
+    )
+    policy._active_goal = goal
+    policy._last_pose = np.zeros(2, dtype=np.float32)
+    policy._last_forward_command = True
+    policy._last_forward_heading = 0.0
+
+    policy._update_stagnation(np.zeros(2, dtype=np.float32))
+
+    assert policy._active_goal is goal
+    assert policy._failed_target_standoffs == []
+    assert policy._stagnant_steps == 0
+
+
+def _arrived_m3_policy(*decisions: str) -> _NoNetworkPolicy:
+    policy = _NoNetworkPolicy()
+    policy.config = replace(
+        policy.config,
+        original_ros_navigation_enabled=True,
+        module3_enabled=True,
+        module3_stop_trigger_distance_m=0.10,
+        module3_detector_confirmations=1,
+        module3_missing_target_max_steps=2,
+        module3_semantic_rejection_limit=2,
+    )
+    policy._step = 20
+    policy._last_full_ros_stack_step = 20
+    policy._full_ros_move_base_status = 3
+    policy._active_goal = _ActiveGoal(
+        "target:object_track_tv",
+        np.array([0.05, 0.0], dtype=np.float32),
+        selected_step=10,
+    )
+    policy._move_base_goal_candidate_id = policy._active_goal.candidate_id
+    policy._move_base_goal_seen_active = True
+    policy._objectgoal_stop_verifier = _M3VerifierStub(*decisions)
+    return policy
+
+
+def test_m3_only_owns_control_after_target_standoff_arrival() -> None:
+    policy = _arrived_m3_policy("STOP")
+    policy._full_ros_move_base_status = 1
+    policy._active_goal.xy = np.array([0.11, 0.0], dtype=np.float32)
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.5, "confidence": 0.95, "depth_m": 0.60},
+    )
+
+    assert action is None
+    assert policy._objectgoal_stop_verifier.calls == []
+
+
+def test_m3_off_center_box_is_sent_directly_to_verifier() -> None:
+    policy = _arrived_m3_policy("STOP")
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.8, "confidence": 0.95, "depth_m": 0.60},
+    )
+
+    assert action["action"] == "velocity_stop"
+    assert len(policy._objectgoal_stop_verifier.calls) == 1
+
+
+def test_m3_arrival_rejects_standoff_after_target_stays_invisible() -> None:
+    policy = _arrived_m3_policy("STOP")
+    observations = {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)}
+
+    first = policy._maybe_objectgoal_m3_stop(
+        observations, np.zeros(2, dtype=np.float32), 0.0, target_measurement=None
+    )
+    second = policy._maybe_objectgoal_m3_stop(
+        observations, np.zeros(2, dtype=np.float32), 0.0, target_measurement=None
+    )
+
+    assert first["action"] == "velocity_control"
+    assert first["action_args"]["angular_velocity"] == 1.0
+    assert second["action_args"]["linear_velocity"] == -1.0
+    assert policy._active_goal is None
+    assert policy._failed_target_standoffs[-1]["reason"] == "m3_target_not_visible"
+
+
+def test_public_no_motion_hands_target_to_m3_without_clearing_goal() -> None:
+    policy = _arrived_m3_policy("STOP")
+    goal = policy._active_goal
+    policy._last_pose = np.zeros(2, dtype=np.float32)
+    policy._last_forward_command = True
+    policy._last_forward_heading = 0.0
+
+    policy._update_stagnation(np.zeros(2, dtype=np.float32))
+
+    assert policy._active_goal is goal
+    assert policy._m3_navigation_terminal_candidate_id == goal.candidate_id
+    assert policy._failed_target_standoffs == []
+    assert policy._collision_recovery_steps == 0
+
+
+def test_m3_centered_confirmed_target_can_emit_explicit_stop() -> None:
+    policy = _arrived_m3_policy("STOP")
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.52, "confidence": 0.95, "depth_m": 0.60},
+    )
+
+    assert action["action"] == "velocity_stop"
+    assert len(policy._objectgoal_stop_verifier.calls) == 1
+
+
+def test_m3_receives_bbox_center_distance_when_navigation_terminal_is_far() -> None:
+    policy = _arrived_m3_policy("CONTINUE")
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.5, "confidence": 0.95, "depth_m": 1.20},
+    )
+
+    assert action["action"] == "velocity_control"
+    assert policy._active_goal is not None
+    assert len(policy._objectgoal_stop_verifier.calls) == 1
+    assert policy._objectgoal_stop_verifier.calls[0]["bbox_center_distance_m"] == 1.20
+    assert policy._objectgoal_stop_verifier.calls[0]["max_bbox_center_distance_m"] == 0.85
+
+
+def test_m3_low_detector_confidence_is_still_sent_to_verifier() -> None:
+    policy = _arrived_m3_policy("STOP")
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.5, "confidence": 0.60, "depth_m": 0.60},
+    )
+
+    assert action["action"] == "velocity_stop"
+    assert len(policy._objectgoal_stop_verifier.calls) == 1
+    assert policy._objectgoal_stop_verifier.calls[0]["detector_confidence"] == 0.60
+
+
+def test_m3_continue_keeps_exclusive_persistent_scan() -> None:
+    policy = _arrived_m3_policy("CONTINUE", "STOP")
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.zeros(2, dtype=np.float32),
+        0.0,
+        target_measurement={"center_x": 0.5, "confidence": 0.95, "depth_m": 0.60},
+    )
+
+    assert action["action"] == "velocity_control"
+    assert action["action_args"]["linear_velocity"] == -1.0
+    assert action["action_args"]["angular_velocity"] == 1.0
+
+
+def test_m3_missing_box_turns_shortest_way_toward_public_track() -> None:
+    policy = _arrived_m3_policy("STOP")
+    policy.config = replace(
+        policy.config,
+        module3_missing_target_max_steps=80,
+        module3_max_verification_steps=120,
+    )
+    policy._target_track = _PublicTargetTrack(
+        surface_xy=np.array([5.123554, -1.174100], dtype=np.float32),
+        seed_pose_xy=np.zeros(2, dtype=np.float32),
+        last_seen_step=1,
+        promoted=True,
+    )
+
+    action = policy._maybe_objectgoal_m3_stop(
+        {"rgb": np.zeros((8, 8, 3), dtype=np.uint8)},
+        np.array([4.080195, -1.264665], dtype=np.float32),
+        1.608150,
+        target_measurement=None,
+    )
+
+    assert action["action_args"]["angular_velocity"] == -1.0

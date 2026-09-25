@@ -62,16 +62,14 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         # Generate occupancy map ONCE per house (for A* planner)
         import gc
 
-        from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
+        from molmo_spaces.utils.scene_maps import ProcTHORMap
 
         if self._cached_thormap is not None:
             del self._cached_thormap
             gc.collect()
 
         log.info(f"Generating occupancy map for house {self.current_house_index}")
-        scene_dataset = str(getattr(self.config, "scene_dataset", "")).lower()
-        map_cls = iTHORMap if "ithor" in scene_dataset else ProcTHORMap
-        self._cached_thormap = map_cls.from_mj_model_path(
+        self._cached_thormap = ProcTHORMap.from_mj_model_path(
             model_path=env.current_model_path,
             agent_radius=self.config.task_sampler_config.robot_safety_radius,
             px_per_m=200,
@@ -108,15 +106,10 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
                 perturb = np.zeros_like(qpos)
             robot_view.get_move_group(group_name).joint_pos = qpos + perturb
 
-        # Reset controllers to hold current positions. The RBY1 head has
-        # actuators but no controller, so synchronize its target explicitly;
-        # otherwise mj_resetData() leaves ctrl at zero even when head qpos is not.
+        # Reset controllers to hold current positions (important for torso/head)
         for robot in env.robots:
             for controller in robot.controllers.values():
                 controller.reset()
-            if "head" in robot.robot_view.move_group_ids():
-                head_mg = robot.robot_view.get_move_group("head")
-                head_mg.ctrl = head_mg.noop_ctrl
 
         log.info("Scene setup completed.\n")
 
@@ -143,56 +136,6 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
 
         # Delegate to base class for other keys (e.g., __gripper__)
         return super().resolve_visibility_object(env, key)
-
-    @staticmethod
-    def _swap_benchmark_alias_prefix(object_name: str) -> str | None:
-        alias_prefix = {
-            "trashcan_": "ashcan_",
-            "ashcan_": "trashcan_",
-        }
-        for src_prefix, dst_prefix in alias_prefix.items():
-            if object_name.startswith(src_prefix):
-                return dst_prefix + object_name[len(src_prefix) :]
-        return None
-
-    def _normalize_benchmark_object_name(self, object_name: str, om) -> str:
-        valid_names = {obj.name for obj in self.candidate_objects or []}
-        if object_name in valid_names:
-            return object_name
-
-        alias_name = self._swap_benchmark_alias_prefix(object_name)
-        if alias_name is not None and alias_name in valid_names:
-            log.info(
-                "[NavTaskSampler] Remapped benchmark object alias '%s' -> '%s'",
-                object_name,
-                alias_name,
-            )
-            return alias_name
-
-        return object_name
-
-    def _normalize_benchmark_task_config(self, om) -> None:
-        task_cfg = self.config.task_config
-        if task_cfg.pickup_obj_name is None:
-            return
-
-        task_cfg.pickup_obj_name = self._normalize_benchmark_object_name(
-            task_cfg.pickup_obj_name, om
-        )
-
-        if task_cfg.pickup_obj_candidates is None:
-            return
-
-        normalized_candidates = []
-        seen = set()
-        for candidate_name in task_cfg.pickup_obj_candidates:
-            normalized_name = self._normalize_benchmark_object_name(candidate_name, om)
-            if normalized_name in seen:
-                continue
-            seen.add(normalized_name)
-            normalized_candidates.append(normalized_name)
-
-        task_cfg.pickup_obj_candidates = normalized_candidates
 
     def _sample_task(self, env: CPUMujocoEnv) -> NavToObjTask:
         """Sample a navigation to object task configuration and create the task."""
@@ -243,14 +186,11 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
                 ]
 
                 if len(same_type_candidates) > self.config.task_sampler_config.max_valid_candidates:
-                    max_candidates = self.config.task_sampler_config.max_valid_candidates
                     log.info(
-                        f"Capping {pickup_obj_type} candidates from {len(same_type_candidates)} to {max_candidates}."
+                        f"Skipping {pickup_obj_type} with {len(same_type_candidates)} instances in scene."
                     )
-                    # Keep selected instance and sample the rest to limit ambiguity.
-                    remaining = [n for n in same_type_candidates if n != selected_obj.name]
-                    np.random.shuffle(remaining)
-                    same_type_candidates = [selected_obj.name] + remaining[: max_candidates - 1]
+                    excluded_types.add(pickup_obj_type)
+                    continue
 
                 # Set the instance name and store all candidates
                 self.config.task_config.pickup_obj_name = selected_obj.name
@@ -267,7 +207,6 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
             else:
                 # If pickup_obj_name is pre-specified, it might be a type or specific instance
                 # Try to interpret it as a type and collect candidates
-                self._normalize_benchmark_task_config(om)
                 if self.config.task_config.pickup_obj_candidates is None:
                     pickup_obj_type = om.category_from_name(self.config.task_config.pickup_obj_name)
                     synset = om.get_annotation_synset(self.config.task_config.pickup_obj_name)
@@ -360,42 +299,22 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         log.info(f"Found {len(candidates)} candidate nav objects in the scene")
 
         if not len(candidates) > 0:
-            requested_types = self.config.task_sampler_config.pickup_types or ["<any>"]
-            log.warning(
-                "No candidate nav objects found in the scene for target types: %s",
-                requested_types,
-            )
-            self._log_available_scene_objects(env)
+            log.info("[WARN] No candidate nav objects found in the scene")
+            # print all the top-level objects in the scene for debugging
+            om = env.object_managers[env.current_batch_index]
+            all_objects = MlSpacesObject.get_top_level_bodies(model=self.env.mj_model)
+            for b in all_objects[:30]:
+                name = self.env.mj_model.body(b).name
+                pos = self.env.current_data.xpos[b]
+                possible_types = om.get_possible_object_types(b)
+                log.info(
+                    f"  - #{b:02d} {name} (types={possible_types}) pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
+                )
+
+            # log.info(f"Scene objects (no candidates): {[obj.name for obj in all_objects]}")
             raise HouseInvalidForTask("No nav candidates found in the scene")
 
         return candidates
-
-    def _log_available_scene_objects(self, env: CPUMujocoEnv) -> None:
-        """Print all non-structural top-level objects for debugging missing target types."""
-        om = env.object_managers[env.current_batch_index]
-        available_objects = om.list_top_level_objects()
-
-        if not available_objects:
-            log.warning("Scene has no non-structural top-level objects available.")
-            return
-
-        log.info(
-            "Scene exposes %d available top-level objects (name | category | possible_types):",
-            len(available_objects),
-        )
-        for obj in available_objects:
-            pos = obj.position
-            category = om.category_from_name(obj.name)
-            possible_types = om.get_possible_object_types(obj.name)
-            log.info(
-                "  - %s | category=%s | types=%s | pos=(%.3f, %.3f, %.3f)",
-                obj.name,
-                category,
-                possible_types,
-                pos[0],
-                pos[1],
-                pos[2],
-            )
 
     def _sample_and_place_robot(self, env: CPUMujocoEnv) -> None:
         """Sample a nav object, place robot using occupancy map, and return sampled params.

@@ -172,6 +172,7 @@ def test_refrigerator_open_uses_ordinary_sweep_preflight_and_applies_no_force(
             current_model=SimpleNamespace(opt=SimpleNamespace(timestep=0.002))
         ),
         object_name="private_refrigerator",
+        bypass_unsafe_open_sweep=False,
         joints=[SimpleNamespace(joint_name="private_hinge")],
         max_physics_substeps=100,
         success_fraction=0.8,

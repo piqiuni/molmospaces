@@ -5,6 +5,7 @@ import json
 import math
 import threading
 import time
+from contextlib import nullcontext
 from typing import Any
 
 from semantic_decision_py_pkg.behavior_candidates import (
@@ -13,7 +14,10 @@ from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGenerator,
     CandidateGeneratorConfig,
 )
-from semantic_decision_py_pkg.model_policy import compact_graph
+from semantic_decision_py_pkg.model_policy import public_decision_graph_context
+from semantic_decision_py_pkg.frontier_context import observed_room_frontier_summary
+from semantic_decision_py_pkg.public_robot_context import graph_robot_pose_context
+from semantic_decision_py_pkg.navigation_clearance import ArrivalClearanceGrid
 from semantic_decision_py_pkg.frontier_terminal_contract import (
     summarize_frontier_filtering,
 )
@@ -34,7 +38,10 @@ from semantic_decision_py_pkg.occupancy_path import (
 patch_roslogging_findcaller_for_py311()
 
 import rospy
+import tf
 from nav_msgs.msg import OccupancyGrid, Odometry
+from semantic_mapping_py_pkg.occupancy_transport import numpy_msg_compat as numpy_msg
+from map_msgs.msg import OccupancyGridUpdate
 from std_msgs.msg import String
 
 
@@ -73,6 +80,17 @@ class SemanticCandidateNode:
         rospy.init_node("semantic_candidate_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~candidate", {}) or {}
+        self.progress_clock = str(config.get("progress_clock", "capture_step"))
+        self.progress_clock_period_s = max(0.001, float(config.get("progress_clock_period_s", 0.2)))
+        executor_config = rospy.get_param("~executor", {}) or {}
+        self.navigation_clearance_enabled = bool(config.get("navigation_clearance_enabled", False))
+        self.map_frame = str(executor_config.get("map_frame", "tf_frame_map"))
+        self.clearance_robot_radius_m = float(executor_config.get("rear_goal_robot_radius_m", 0.25))
+        self.clearance_safety_margin_m = float(executor_config.get("rear_goal_safety_margin_m", 0.05))
+        self.clearance_map_max_age_s = float(executor_config.get("rear_goal_local_costmap_max_age_s", 0.75))
+        self.clearance_maps = {}
+        self.clearance_lock = threading.RLock()
+        self.tf_listener = tf.TransformListener()
         policy_config = rospy.get_param("~policy", {}) or {}
         ablation_config = rospy.get_param("~ablation", {}) or {}
         configured_backend = str(policy_config.get("backend", "rule")).casefold()
@@ -122,6 +140,7 @@ class SemanticCandidateNode:
         )
         self.generator = CandidateGenerator(
             CandidateGeneratorConfig(
+                frontier_center_fallback_enabled=bool(config.get("frontier_center_fallback_enabled", True)),
                 max_frontier_candidates=int(config.get("max_frontier_candidates", 12)),
                 interaction_types=tuple(
                     config.get("interaction_types", ["portal", "container"])
@@ -186,6 +205,13 @@ class SemanticCandidateNode:
                 ),
                 portal_side_hysteresis_m=max(
                     0.0, float(config.get("portal_side_hysteresis_m", 0.0))
+                ),
+                portal_tangent_offsets_m=tuple(float(value) for value in config.get("portal_tangent_offsets_m", [0.10, -0.10, 0.15, -0.15])),
+                portal_allow_opposite_side_interaction=bool(
+                    config.get("portal_allow_opposite_side_interaction", False)
+                ),
+                portal_interaction_front_angle_tolerance_rad=float(
+                    config.get("portal_interaction_front_angle_tolerance_rad", 0.15)
                 ),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.8)
@@ -302,7 +328,7 @@ class SemanticCandidateNode:
                     float(value)
                     for value in config.get(
                         "drawer_navigation_anchor_fan_clearances_m",
-                        [0.50, 0.85, 1.20],
+                        [0.50, 0.85, 1.00],
                     )
                 ),
                 drawer_navigation_anchor_fan_angles_deg=tuple(
@@ -433,6 +459,9 @@ class SemanticCandidateNode:
             )
         )
         self.explorer_status: dict = {}
+        self.explorer_status_received_ts = 0.0
+        self.explorer_proposals_received_ts = 0.0
+        self.frontier_context_max_age_s = max(0.1, float(config.get("frontier_context_max_age_s", 5.0)))
         self.explorer_proposal_stream: dict = {}
         self.has_proposal_stream = False
         self.graph: dict = {}
@@ -528,6 +557,7 @@ class SemanticCandidateNode:
             "astar_no_path_count": 0,
             "astar_search_limit_count": 0,
         }
+        self.room_segment_grid: dict | None = None
         self.sequence = 0
         self.publisher = rospy.Publisher(
             topics.get("candidates", "/semantic_decision/candidates"),
@@ -568,6 +598,12 @@ class SemanticCandidateNode:
             self._occupancy_callback,
             queue_size=1,
         )
+        rospy.Subscriber(
+            topics.get("room_segment_grid", "/semantic_mapping/room_segment_grid"),
+            OccupancyGrid,
+            self._room_segment_grid_callback,
+            queue_size=1,
+        )
         if self.startup_scan_enabled:
             rospy.Subscriber(
                 topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
@@ -576,14 +612,151 @@ class SemanticCandidateNode:
                 queue_size=10,
             )
         self.timer = rospy.Timer(rospy.Duration(1.0), self._publish)
+        if self.navigation_clearance_enabled:
+            for name, topic in (
+                ("local", topics.get("occupancy", "/move_base/local_costmap/costmap")),
+                ("planning", topics.get("planning_occupancy_grid", "/semantic_mapping/planning_occ_map")),
+                ("global", topics.get("global_costmap", "/move_base/global_costmap/costmap")),
+            ):
+                rospy.Subscriber(topic, numpy_msg(OccupancyGrid), self._clearance_map_callback,
+                                 callback_args=name, queue_size=1)
+            rospy.Subscriber(topics.get("global_costmap_updates", "/move_base/global_costmap/costmap_updates"),
+                             numpy_msg(OccupancyGridUpdate), self._clearance_global_update, queue_size=20)
+
+    def _clearance_map_callback(self, message, name):
+        try:
+            with self.clearance_lock:
+                previous = self.clearance_maps.get(name)
+            grid = ArrivalClearanceGrid.from_message(
+                message, costmap=name in {"local", "global"},
+                previous=previous[0] if previous is not None else None,
+            )
+        except (AttributeError, TypeError, ValueError):
+            with self.clearance_lock:
+                self.clearance_maps.pop(name, None)
+            return
+        with self.clearance_lock:
+            self.clearance_maps[name] = (grid, time.monotonic())
+
+    def _clearance_global_update(self, message):
+        with self.clearance_lock:
+            snapshot = self.clearance_maps.get("global")
+            if snapshot is None:
+                return
+            try:
+                grid = snapshot[0].updated(message)
+            except (TypeError, ValueError):
+                self.clearance_maps.pop("global", None)
+                return
+            self.clearance_maps["global"] = (grid, time.monotonic())
+
+    def _make_clearance_check(self):
+        if not getattr(self, "navigation_clearance_enabled", False):
+            return None
+        with self.clearance_lock:
+            snapshots = dict(self.clearance_maps)
+        transforms = {}
+        robot_xy = getattr(self, "robot_xy", None)
+        robot_frame = getattr(self, "robot_frame", self.map_frame).lstrip("/")
+
+        def convert(xy, source, destination):
+            if source == destination:
+                return xy
+            key = (destination, source)
+            if key not in transforms:
+                transforms[key] = self.tf_listener.lookupTransform(destination, source, rospy.Time(0))
+            translation, rotation = transforms[key]
+            yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+            return (translation[0]+math.cos(yaw)*xy[0]-math.sin(yaw)*xy[1],
+                    translation[1]+math.sin(yaw)*xy[0]+math.cos(yaw)*xy[1])
+
+        def check(goal, tolerance, *, frame_id=None, allow_unknown=False):
+            source = str(frame_id or self.map_frame).lstrip("/")
+            for name in ("local", "planning"):
+                snapshot = snapshots.get(name)
+                if snapshot is None:
+                    continue
+                grid, received_at = snapshot
+                destination = grid.frame_id.lstrip("/")
+                xy = goal[:2]
+                if source != destination:
+                    key = (destination, source)
+                    try:
+                        if key not in transforms:
+                            transforms[key] = self.tf_listener.lookupTransform(destination, source, rospy.Time(0))
+                        translation, rotation = transforms[key]
+                        yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+                        xy = (translation[0] + math.cos(yaw)*goal[0] - math.sin(yaw)*goal[1],
+                              translation[1] + math.sin(yaw)*goal[0] + math.cos(yaw)*goal[1])
+                    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                        return {"clear": False, "reason": "clearance_tf_unavailable"}
+                detail = grid.check(xy, tolerance, robot_radius_m=self.clearance_robot_radius_m,
+                                    safety_margin_m=self.clearance_safety_margin_m, allow_unknown=allow_unknown)
+                if name == "local" and detail["reason"] == "outside_map_window":
+                    continue
+                age = time.monotonic() - received_at
+                detail.update(costmap_source=name, costmap_age_s=age)
+                if age > self.clearance_map_max_age_s:
+                    detail.update(clear=False, reason="clearance_map_not_fresh")
+                global_snapshot = snapshots.get("global")
+                if detail.get("clear") and global_snapshot is not None and robot_xy is not None:
+                    global_grid, global_received = global_snapshot
+                    if time.monotonic()-global_received <= self.clearance_map_max_age_s:
+                        try:
+                            destination = global_grid.frame_id.lstrip("/")
+                            path = global_grid.reachable(convert(robot_xy, robot_frame, destination),
+                                                         convert(goal[:2], source, destination), allow_unknown=allow_unknown)
+                        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                            return {"clear": False, "reason": "clearance_tf_unavailable"}
+                        detail["path_connectivity"] = path
+                        if not path["clear"]:
+                            detail.update(clear=False, reason=path["reason"])
+                return detail
+            return {"clear": False, "reason": "clearance_map_unavailable"}
+
+        return check
+
+    def _recover_navigation_goal(self, candidate, check):
+        metadata = candidate.metadata
+        traverse = bool(metadata.get("post_interaction_traversal"))
+        if candidate.behavior_type != "EXPLORE" and not traverse:
+            return []
+        with self.clearance_lock:
+            snapshot = self.clearance_maps.get("planning")
+        if snapshot is None or time.monotonic()-snapshot[1] > self.clearance_map_max_age_s:
+            return []
+        grid = snapshot[0]
+        source = str(metadata.get("frame_id") or self.map_frame).lstrip("/")
+        if grid.frame_id.lstrip("/") != source:
+            return []
+        tolerance = float(metadata.get("navigation_goal_position_tolerance_m", .25))
+        targets = [p for p in (metadata.get("frontier_recovery_targets") or [metadata.get("frontier_point", [])]) if len(p) >= 2]
+        if traverse:
+            targets = [candidate.goal_xyyaw[:2]]
+        goals = grid.recovery_goals(candidate.goal_xyyaw, tolerance, targets,
+                                   robot_radius_m=self.clearance_robot_radius_m,
+                                   safety_margin_m=self.clearance_safety_margin_m)
+        admitted = []
+        for goal in goals:
+            if traverse:
+                center, axis = metadata["portal_center_xy"], metadata["portal_through_axis_xy"]
+                if sum((goal[i]-center[i])*axis[i] for i in range(2)) < max(.35, tolerance+.05):
+                    continue
+                goal[2] = candidate.goal_xyyaw[2]
+            if check(goal, tolerance, frame_id=source).get("clear"):
+                admitted.append(goal)
+                if len(admitted) == 5:
+                    break
+        return admitted
 
     def _explorer_callback(self, message: String) -> None:
-        if self.has_proposal_stream:
-            return
         try:
-            self.explorer_status = json.loads(message.data)
+            payload = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        if isinstance(payload, dict):
+            self.explorer_status = payload
+            self.explorer_status_received_ts = time.time()
 
     def _proposal_callback(self, message: String) -> None:
         try:
@@ -593,6 +766,7 @@ class SemanticCandidateNode:
         if not isinstance(payload, dict):
             return
         self.explorer_proposal_stream = payload
+        self.explorer_proposals_received_ts = time.time()
         self.has_proposal_stream = True
 
     def _graph_callback(self, message: String) -> None:
@@ -823,13 +997,17 @@ class SemanticCandidateNode:
             return True
 
     def _odom_callback(self, message: Odometry) -> None:
+        self.robot_position_frame_id = str(getattr(message.header, "frame_id", "") or "")
+        self.robot_frame = self.robot_position_frame_id or getattr(self, "map_frame", "")
+        self.robot_z = float(getattr(message.pose.pose.position, "z", 0.0))
+        self.robot_pose_stamp = getattr(message.header, "stamp", None)
         robot_xy = (
             float(message.pose.pose.position.x),
             float(message.pose.pose.position.y),
         )
         received_at = time.monotonic()
         stamp_s = self._message_stamp_s(message)
-        with self._occupancy_state_lock:
+        with getattr(self, "_occupancy_state_lock", nullcontext()):
             self.robot_xy = robot_xy
             self.robot_xy_stamp_s = stamp_s
             self.robot_xy_received_at = received_at
@@ -1404,6 +1582,66 @@ class SemanticCandidateNode:
                 return trial, pushed
         return best, pushed
 
+    def _progress_clock_context(self) -> dict:
+        capture_step = self.graph.get("capture_step")
+        mode = getattr(self, "progress_clock", "capture_step")
+        period = getattr(self, "progress_clock_period_s", 0.2)
+        return {
+            "observation_step": int(time.monotonic() / period) if mode == "monotonic" else capture_step,
+            "observation_step_clock": mode,
+            "progress_clock_period_s": period if mode == "monotonic" else None,
+            "source_capture_step": capture_step,
+        }
+
+    def _model_robot_pose_context(self, graph: dict) -> dict:
+        source_frame = str(getattr(self, "robot_position_frame_id", "") or "")
+        graph_frame = str(graph.get("frame_id") or "")
+        xy = getattr(self, "robot_xy", None)
+        xyz = [*xy, getattr(self, "robot_z", 0.0)] if xy is not None else None
+        stamp = getattr(self, "robot_pose_stamp", None)
+        stamp_sec = float(stamp.to_sec()) if stamp is not None else None
+        transform = None
+        error = ""
+        if source_frame and graph_frame and source_frame.lstrip("/") != graph_frame.lstrip("/"):
+            try:
+                transform = self.tf_listener.lookupTransform(
+                    graph_frame, source_frame, stamp if stamp is not None else rospy.Time(0),
+                )
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as exc:
+                error = f"transform_unavailable:{type(exc).__name__}"
+        return graph_robot_pose_context(
+            xyz, source_frame, graph_frame, source_stamp_sec=stamp_sec,
+            transform=transform, transform_error=error,
+        )
+
+    def _room_segment_grid_callback(self, message: OccupancyGrid) -> None:
+        origin = message.info.origin
+        quaternion = origin.orientation
+        origin_yaw = math.atan2(
+            2.0
+            * (
+                float(quaternion.w) * float(quaternion.z)
+                + float(quaternion.x) * float(quaternion.y)
+            ),
+            1.0
+            - 2.0
+            * (
+                float(quaternion.y) * float(quaternion.y)
+                + float(quaternion.z) * float(quaternion.z)
+            ),
+        )
+        self.room_segment_grid = {
+            "width": int(message.info.width),
+            "height": int(message.info.height),
+            "resolution": float(message.info.resolution),
+            "origin_x": float(origin.position.x),
+            "origin_y": float(origin.position.y),
+            "origin_yaw": float(origin_yaw),
+            "frame_id": str(message.header.frame_id or ""),
+            "stamp_sec": float(message.header.stamp.to_sec()),
+            "data": [int(value) for value in message.data],
+        }
+
     def _publish(self, _event) -> None:
         target_revision, target_context = self._target_snapshot()
         state = self._occupancy_state_snapshot()
@@ -1414,8 +1652,15 @@ class SemanticCandidateNode:
             else self.explorer_status
         )
         ready = bool(explorer_input.get("ready", False))
+        clearance_check = self._make_clearance_check()
         candidates = self.generator.generate(
-            explorer_input, self.graph, robot_xy, target_context
+            explorer_input,
+            self.graph,
+            robot_xy,
+            target_context,
+            self.room_segment_grid,
+            clearance_check=clearance_check,
+            navigation_goal_recovery=(lambda candidate: self._recover_navigation_goal(candidate, clearance_check)) if clearance_check else None,
         )
         candidates = self._filter_portal_goals_by_occupancy(candidates)
         candidates = self._filter_candidate_goals_by_occupancy(candidates)
@@ -1461,6 +1706,32 @@ class SemanticCandidateNode:
         frontier_filtering = summarize_frontier_filtering(
             explorer_input.get("frontier_debug")
         )
+        raw_frontier_proposals = list(
+            explorer_input.get("proposals")
+            or explorer_input.get("exploration_proposals")
+            or []
+        )
+        if isinstance(raw_frontier_proposals, dict):
+            raw_frontier_proposals = list(
+                raw_frontier_proposals.get("proposals") or []
+            )
+        source_frontier_candidate_ids = sorted(
+            {
+                "frontier:"
+                + str(
+                    proposal.get("proposal_id")
+                    or proposal.get("cluster_id")
+                    or ""
+                )
+                for proposal in raw_frontier_proposals
+                if isinstance(proposal, dict)
+                and str(
+                    proposal.get("proposal_id")
+                    or proposal.get("cluster_id")
+                    or ""
+                )
+            }
+        )
         retryable_filtered_frontier = bool(
             frontier_filtering["filtered_frontier_retryable"]
             and not active_navigation_frontier
@@ -1480,6 +1751,8 @@ class SemanticCandidateNode:
             and not navigation_frontiers
             and not retryable_filtered_frontier
             and not connected_unknown_area_present
+            and not any(item.get("behavior_type") in {"EXPLORE", "NAVIGATE"}
+                        for item in getattr(self.generator, "clearance_rejections", []))
         )
         interaction_frontier_exhausted = bool(
             not interaction_frontiers and unresolved_interaction_target_count == 0
@@ -1488,6 +1761,21 @@ class SemanticCandidateNode:
             navigation_frontier_exhausted and interaction_frontier_exhausted
         )
         self.sequence += 1
+        now = time.time()
+        max_age = getattr(self, "frontier_context_max_age_s", 5.0)
+        status = self.explorer_status
+        status_time = status.get("frontier_computed_ts")
+        status_fresh = bool(status_time and 0 <= now - float(status_time) <= max_age)
+        frontier_source = status if status_fresh and "frontier_clusters" in status else explorer_input
+        source_time = (
+            frontier_source.get("frontier_computed_ts")
+            if "frontier_clusters" in frontier_source
+            else frontier_source.get("timestamp")
+        )
+        frontier_context = observed_room_frontier_summary(
+            frontier_source, self.graph,
+            fresh=bool(source_time and 0 <= now - float(source_time) <= max_age),
+        )
         payload = {
             "schema_version": 1,
             "sequence": self.sequence,
@@ -1497,6 +1785,9 @@ class SemanticCandidateNode:
             "robot_xy": list(robot_xy) if robot_xy is not None else None,
             "target_context": target_context,
             "target_revision": target_revision,
+            "robot_position_frame_id": getattr(self, "robot_position_frame_id", "") or None,
+            **self._model_robot_pose_context(self.graph),
+            **frontier_context,
             "exploration_context": {
                 "ready": ready,
                 "initial_scan_complete": initial_scan_complete,
@@ -1513,6 +1804,7 @@ class SemanticCandidateNode:
                     unresolved_interaction_target_count
                 ),
                 "connected_unknown_area_present": connected_unknown_area_present,
+                "source_frontier_candidate_ids": source_frontier_candidate_ids,
                 "combined_frontier_count": len(navigation_frontiers)
                 + len(interaction_frontiers),
                 "occupancy_filtered_portal_candidate_ids": list(
@@ -1530,14 +1822,16 @@ class SemanticCandidateNode:
                 "map_resolution": float(
                     explorer_input.get("map_resolution", 0.0) or 0.0
                 ),
-                "observation_step": self.graph.get("capture_step"),
+                **self._progress_clock_context(),
                 "source": "explore_py_proposals"
                 if self.has_proposal_stream
                 else "explore_py_status_compatibility",
             },
-            "graph_context": compact_graph(self.graph),
+            "graph_context": public_decision_graph_context(self.graph),
             "occupancy_preflight": dict(self.occupancy_preflight_timing),
             "candidate_count": len(candidates),
+            "clearance_rejections": getattr(self.generator, "clearance_rejections", []),
+            "clearance_recoveries": getattr(self.generator, "clearance_recoveries", []),
             "candidates": [candidate.to_dict() for candidate in candidates],
         }
         self._publish_target_snapshot(payload, target_revision)

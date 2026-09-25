@@ -3,6 +3,7 @@
     <arg name="override_config_file" default=""/>
     <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
     <arg name="base_global_planner" default="nav_pkg/OrientedGlobalPlanner"/>
+    <arg name="global_planner_allow_unknown" default="false"/>
     <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
     <arg name="move_base_respawn" default="true"/>
     <arg name="move_base_respawn_delay" default="2.0"/>
@@ -33,9 +34,9 @@
         <param name="GlobalPlanner/use_dijkstra" value="true" />
         <param name="GlobalPlanner/use_quadratic" value="true" />
         <param name="GlobalPlanner/use_grid_path" value="false" />
-        <param name="GlobalPlanner/allow_unknown" value="false" />
+        <param name="GlobalPlanner/allow_unknown" value="$(arg global_planner_allow_unknown)" />
         <param name="GlobalPlanner/orientation_window_size" value="8" />
-        <param name="GlobalPlanner/orientation_mode" value="3" />
+        <param name="GlobalPlanner/orientation_mode" value="1" />
         <param name="GlobalPlanner/path_smoothing_enabled" value="true" />
         <param name="GlobalPlanner/path_smoothing_resample_distance" value="0.05" />
         <param name="GlobalPlanner/path_smoothing_max_skip" value="40" />
@@ -49,6 +50,9 @@
         <rosparam if="$(eval arg('override_config_file') != '')"
                   file="$(arg override_config_file)"
                   command="load" />
+        <!-- The wrapper owns path yaw; the delegate's mode 3 corrupts short paths. -->
+        <param if="$(eval arg('base_global_planner') == 'nav_pkg/OrientedGlobalPlanner')"
+               name="GlobalPlanner/orientation_mode" type="int" value="0" />
     </node>
 
 </launch>

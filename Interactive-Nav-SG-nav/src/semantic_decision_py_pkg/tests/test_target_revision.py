@@ -12,6 +12,7 @@ from std_msgs.msg import String
 from semantic_candidate_node import SemanticCandidateNode
 from semantic_rule_decision_node import SemanticRuleDecisionNode, candidate_mission_token
 from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
+from semantic_decision_py_pkg.candidate_curator import CandidateCuratorConfig
 
 
 def test_candidate_publish_rejects_goal_changed_during_generation_and_aba():
@@ -51,6 +52,8 @@ def test_late_m2_answer_is_discarded_when_mission_changes_during_model_call(chan
     node.direct_atomic_outcome_belief_enabled = False
     node._completion_snapshot_without_terminal_interactions = lambda value: (value, [])
     node.cooldown_until = {}
+    node.container_anchor_unreachable_until_step = {}
+    node.container_rejected_face_indices_by_target = {}
     node.minimum_candidate_sequence = 0
     node.mission_mode = "semantic_interaction_object_goal"
     node.target_goal_complete = False
@@ -65,9 +68,13 @@ def test_late_m2_answer_is_discarded_when_mission_changes_during_model_call(chan
     node._eligible_candidates_from_snapshot = lambda *a, **k: ([candidate], {})
     node.target_mission = SimpleNamespace(priority_target_candidate=lambda values: None)
     node._entered_rooms_snapshot = lambda: []
+    node.initial_robot_xy = None
+    node.initial_position_source = {}
+    node.room_visit_history = []
+    node._model_robot_context = lambda snapshot: {}
     curation = SimpleNamespace(candidates=[candidate], quality_by_id={}, quality_terms_by_id={},
                                decision_hint_by_id={}, entered_room_ids=[], mandatory_ids=[])
-    node.candidate_curator = SimpleNamespace(config=SimpleNamespace(region_size_m=1.0),
+    node.candidate_curator = SimpleNamespace(config=CandidateCuratorConfig(region_size_m=1.0),
                                              curate=lambda *a, **k: curation)
     node.policy_backend = "model"
     node.model_circuit_breaker = SimpleNamespace(allow_request=lambda now: True,
@@ -90,7 +97,7 @@ def test_late_m2_answer_is_discarded_when_mission_changes_during_model_call(chan
             node.latest_candidates_payload = newer
         return candidate
 
-    node.model_policy = SimpleNamespace(config=SimpleNamespace(selection_granularity="candidate"),
+    node.model_policy = SimpleNamespace(config=SimpleNamespace(selection_granularity="candidate", include_pre_scores=False),
                                         select=model_select, last_result_source="model")
     node._decide_from_snapshot(copy.deepcopy(snapshot))
     assert model_inputs == [snapshot["target_context"]]
@@ -145,6 +152,7 @@ def test_old_goal_arrival_releases_executor_without_completing_new_task(behavior
 @pytest.mark.parametrize("change", ["revision", "episode", "both"])
 def test_new_goal_clears_old_continuation_and_completion_counters(active, change):
     node = object.__new__(SemanticRuleDecisionNode)
+    node.mission_mode = "exploration"
     node.state_lock = threading.RLock()
     node.target_context = {"enabled": True, "target_name": "fridge"}
     node.latest_candidates_payload = {"episode_id": "run", "target_revision": 1,
@@ -156,6 +164,10 @@ def test_new_goal_clears_old_continuation_and_completion_counters(active, change
     node.post_interaction_refresh_gate = SimpleNamespace(clear=lambda: resets.append("refresh"))
     node.completion_tracker = SimpleNamespace(reset=lambda: resets.append("completion"))
     node.terminal_no_plan_exit_tracker = SimpleNamespace(reset=lambda: resets.append("no_plan"))
+    node.no_eligible_candidate_tracker = SimpleNamespace(reset=lambda: None)
+    node.global_navigation_progress = SimpleNamespace(reset=lambda: None)
+    node.frontier_failure_memory = SimpleNamespace(clear=lambda: None)
+    node.room_visit_history = []
     for name in (
         "terminal_post_interaction_traversal_ids", "completed_post_interaction_traversal_event_keys",
         "completed_drawer_scan_candidate_ids", "completed_drawer_scan_target_ids",
@@ -165,6 +177,7 @@ def test_new_goal_clears_old_continuation_and_completion_counters(active, change
     for name in (
         "interaction_outcome_beliefs", "cooldown_until", "failure_counts",
         "container_m1_inconclusive_counts", "container_anchor_unreachable_until_step",
+        "container_rejected_face_indices_by_target",
         "approach_exhausted_fingerprints", "decision_history", "group_history", "region_history",
     ):
         setattr(node, name, {})

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from types import SimpleNamespace
 
 from scripts.InteractiveNav.force_interaction_runtime import (
     ForceDriveConfig,
@@ -25,11 +26,25 @@ from scripts.InteractiveNav.force_interaction_runtime import (
     prepare_articulation_state_force,
 )
 from scripts.InteractiveNav.force_interaction_bridge import (
+    AtomicForceInteractionController,
     _refrigerator_open_sweep_preflight,
     _requires_refrigerator_open_sweep,
 )
 
 from .trusted_interaction_skill import JointOpenResult
+
+
+def validate_runtime_interaction_pose(env: Any, command: Mapping[str, Any], *, object_name: str) -> dict[str, Any]:
+    """Run the ordinary physical precondition without exposing its object handle."""
+    private_command = dict(command, _execution_object_id=object_name)
+    try:
+        return AtomicForceInteractionController._validate_interaction_pose(
+            SimpleNamespace(env=env), private_command,
+        )
+    except ValueError:
+        if "interaction_pose_validation" not in private_command:
+            raise
+        return private_command["interaction_pose_validation"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,7 @@ def execute_open_articulation_group(
     success_fraction: float,
     robot_lock_callback: Callable[[], None] | None = None,
     public_command: Mapping[str, Any] | None = None,
+    bypass_unsafe_open_sweep: bool = True,
 ) -> BenchmarkArticulationExecution:
     """Open the evaluator-allowed joints as one ordinary force group."""
 
@@ -69,7 +85,7 @@ def execute_open_articulation_group(
         open_joint_names=joint_names,
     )
     open_sweep_preflight: dict[str, Any] | None = None
-    if _requires_refrigerator_open_sweep(dict(public_command or {})):
+    if not bypass_unsafe_open_sweep and _requires_refrigerator_open_sweep(dict(public_command or {})):
         open_sweep_preflight = dict(
             _refrigerator_open_sweep_preflight(env, plan)
         )
@@ -188,6 +204,7 @@ def execute_open_articulation_group(
             "physical_success": bool(result.get("physical_success", False)),
             "task_steps_consumed": int(result.get("task_steps_consumed", 1) or 1),
             "open_sweep_preflight": open_sweep_preflight,
+            "open_sweep_preflight_bypassed": bool(bypass_unsafe_open_sweep),
         },
     )
 

@@ -6,11 +6,14 @@ import re
 import time
 from typing import Any
 
+from .portal_approach import is_clearance_aware_portal, portal_approach_profile
+
 from .behavior_candidates import (
     BEHAVIOR_EXPLORE,
     BEHAVIOR_INTERACT,
     BEHAVIOR_NAVIGATE,
     BEHAVIOR_SCAN,
+    target_observation_satisfies_arrival,
 )
 
 
@@ -92,6 +95,9 @@ def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> b
             "interaction_pose_poll_exhausted",
             "interaction_approach_options_exhausted",
             "interaction_wrong_face",
+            "interaction_orientation_misaligned",
+            "interaction_position_misaligned",
+            "interaction_front_unverified",
             # A refrigerator sweep is checked privately by the simulator before
             # force is applied.  Treat it like an approach precondition: retry
             # another safe public ring pose rather than mark the appliance
@@ -159,7 +165,14 @@ def interaction_observation_disposition(
             or "unknown"
         ).strip().casefold()
         if state in {"open", "opened", "static_open", "static"}:
-            return "finish_without_action"
+            # This payload is a fresh visual M1 judgement, not authoritative
+            # articulation state.  In particular, a wrong-face physical
+            # rejection must not be converted into success by one later view
+            # flickering from ``closed`` to ``open``.  Already-open containers
+            # are removed before execution by the trusted graph/force state;
+            # an in-flight visual ``open`` therefore remains bounded evidence
+            # and must reobserve another face instead of finishing the action.
+            return "retry"
         if state in {"blocked", "unavailable", "static_closed", "locked"}:
             # M1 is visual evidence, not an authoritative capability oracle.
             # A single "locked"/"unavailable" judgement is therefore only an
@@ -188,7 +201,12 @@ def interaction_observation_disposition(
     if state in {"closed", "ajar"}:
         return "execute"
     if state in {"open", "opened", "static_open", "static"}:
-        return "finish_without_action"
+        # Portal state is stabilized by the multi-view consensus module.  A
+        # single open-looking image must not finish the interaction while the
+        # graph still keeps the door unresolved/requires_interaction.
+        if merged.get("portal_state_consensus_accepted") is True:
+            return "finish_without_action"
+        return "retry"
     if state in {"blocked", "unavailable", "static_closed", "locked"}:
         # See the container branch above: M1 must not one-shot terminalize a
         # portal or container merely from a semantic label in one image.
@@ -221,11 +239,12 @@ def interaction_pose_validation(
     yaw_error_rad = abs(normalize_angle(actual[2] - expected[2]))
     distance_tolerance_m = max(0.05, float(distance_tolerance_m))
     yaw_tolerance_rad = max(0.05, float(yaw_tolerance_rad))
+    comparison_epsilon = 1e-3
     return {
         "checked": True,
         "valid": bool(
-            position_error_m <= distance_tolerance_m
-            and yaw_error_rad <= yaw_tolerance_rad
+            position_error_m <= distance_tolerance_m + comparison_epsilon
+            and yaw_error_rad <= yaw_tolerance_rad + comparison_epsilon
         ),
         "expected_pose_xyyaw": expected,
         "actual_pose_xyyaw": actual,
@@ -233,6 +252,7 @@ def interaction_pose_validation(
         "yaw_error_rad": yaw_error_rad,
         "distance_tolerance_m": distance_tolerance_m,
         "yaw_tolerance_rad": yaw_tolerance_rad,
+        "comparison_epsilon": comparison_epsilon,
     }
 
 
@@ -265,11 +285,29 @@ def candidate_with_effective_interaction_approach(
             "planned_interaction_approach_pose_xyyaw", planned_command_pose
         )
     interaction["interaction_approach_pose_xyyaw"] = list(approach)
+    if is_clearance_aware_portal(result):
+        profile = portal_approach_profile(result, approach)
+        metadata["portal_approach_profile"] = profile
+        if profile is not None:
+            for key in ("interaction_ready_distance_m", "navigation_goal_position_tolerance_m"):
+                interaction[key] = profile["distance_tolerance_m"]
+            for key in ("interaction_ready_yaw_tolerance_rad", "navigation_goal_yaw_tolerance_rad"):
+                interaction[key] = profile["yaw_tolerance_rad"]
     metadata.setdefault("planned_goal_xyyaw", list(result.get("goal_xyyaw") or []))
     metadata["effective_interaction_approach_pose_xyyaw"] = list(approach)
-    metadata["interaction_approach_goal_option_index"] = max(
-        0, int(goal_option_index)
-    )
+    effective_option_index = max(0, int(goal_option_index))
+    metadata["interaction_approach_goal_option_index"] = effective_option_index
+    if bool(metadata.get("container_two_stage_approach", False)) and str(
+        metadata.get("container_two_stage_phase") or "staging"
+    ).strip().casefold() in {"staging", "m1_capture"}:
+        # Batch preflight may choose a non-primary container anchor.  M1
+        # rejection/viewpoint bookkeeping is keyed by the canonical staging
+        # index, so bind that index to the goal actually sent to move_base.
+        # Leaving the generated primary index here caused a negative M1 result
+        # to exclude the wrong face and select the same physical anchor again.
+        metadata["container_two_stage_staging_goal_option_index"] = (
+            effective_option_index
+        )
     if attempts is not None:
         metadata["interaction_approach_attempts"] = [dict(item) for item in attempts]
     result["interaction_command"] = interaction
@@ -483,7 +521,7 @@ def container_two_stage_m1_preflight_batch_indices(
     if not staging_goals:
         return []
     metadata = (candidate or {}).get("metadata") or {}
-    excluded: set[int] = set()
+    excluded: set[int] = _container_two_stage_redundant_view_indices(candidate)
     for key in (
         "container_m1_unavailable_staging_indices",
         "interaction_observation_viewpoint_staging_indices",
@@ -571,7 +609,7 @@ def container_two_stage_next_m1_viewpoint_index(
     to the legacy linear ring order.
     """
 
-    excluded: set[int] = set()
+    excluded: set[int] = _container_two_stage_redundant_view_indices(candidate)
     for raw_index in excluded_indices:
         try:
             index = int(raw_index)
@@ -583,6 +621,31 @@ def container_two_stage_next_m1_viewpoint_index(
         if index not in excluded:
             return index
     return None
+
+
+def _container_two_stage_redundant_view_indices(candidate: dict | None) -> set[int]:
+    """Exclude aliases of sampled camera poses, not just sampled anchor IDs."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    sampled = [
+        pose for raw in metadata.get("container_m1_sampled_capture_poses_xyyaw", [])
+        if (pose := _goal_xyyaw_option(raw)) is not None
+    ]
+    viewed = metadata.get("interaction_observation_viewpoint_staging_indices") or []
+    for index in viewed:
+        pose = container_two_stage_capture_goal_for_staging(candidate, index)
+        if pose is not None:
+            sampled.append(pose)
+    excluded = set()
+    for index in container_two_stage_m1_viewpoint_order(candidate):
+        pose = container_two_stage_capture_goal_for_staging(candidate, index)
+        if pose is not None and any(
+            math.hypot(pose[0] - old[0], pose[1] - old[1]) < 0.25
+            and abs(normalize_angle(pose[2] - old[2])) < 0.25
+            for old in sampled
+        ):
+            excluded.add(index)
+    return excluded
 
 
 def container_two_stage_face_indices(
@@ -1285,9 +1348,9 @@ def target_ready_for_graph_verification(selection: dict[str, Any] | None) -> boo
         str(selection.get("behavior_type") or "").upper() == BEHAVIOR_NAVIGATE
         and metadata.get("target_goal")
         and metadata.get("verify_target_visibility", True)
-        and metadata.get("target_visible_now")
         and metadata.get("target_reliably_observed")
         and not bool(metadata.get("target_navigation_required", True))
+        and target_observation_satisfies_arrival(metadata)
     )
 
 
@@ -1337,6 +1400,11 @@ def next_interaction_approach_option_index(
         "navigation_stagnation",
         "interaction_pose_poll_exhausted",
         "interaction_pose_invalid",
+        # The bridge can identify a valid but wrong-facing approach pose.
+        # Advance the preserved face/side options so the same pose is not
+        # retried; two-stage containers additionally switch their M1 staging
+        # face through the dedicated branch in the executor.
+        "interaction_wrong_face",
         "unsafe_open_sweep",
         "visual_reposition_required",
         "navigation_timeout",
@@ -1540,8 +1608,10 @@ class SemanticNavigationProgressSupervisor:
     subgoal_reference_goal_distance_m: float | None = None
     subgoal_reference_yaw_error_rad: float | None = None
     subgoal_reference_step_index: int | None = None
+    subgoal_started_step_index: int | None = None
     mission_reference_xy: tuple[float, float] | None = None
     mission_reference_step_index: int | None = None
+    mission_grace_deadline_step_index: int | None = None
 
     @staticmethod
     def _finite(value: float | None) -> float | None:
@@ -1556,8 +1626,10 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_reference_goal_distance_m = None
         self.subgoal_reference_yaw_error_rad = None
         self.subgoal_reference_step_index = None
+        self.subgoal_started_step_index = None
         self.mission_reference_xy = None
         self.mission_reference_step_index = None
+        self.mission_grace_deadline_step_index = None
 
     def note_success(
         self, pose: tuple[float, ...] | None, task_step_index: int | None
@@ -1572,8 +1644,22 @@ class SemanticNavigationProgressSupervisor:
         self.subgoal_reference_goal_distance_m = None
         self.subgoal_reference_yaw_error_rad = None
         self.subgoal_reference_step_index = None
+        self.subgoal_started_step_index = None
         self.mission_reference_xy = xy
         self.mission_reference_step_index = step
+        self.mission_grace_deadline_step_index = None
+
+    def pause(self, task_step_index: int | None) -> None:
+        """Exclude a legitimate stationary macro from no-progress time."""
+
+        if task_step_index is None:
+            return
+        step = int(task_step_index)
+        if self.subgoal_reference_step_index is not None:
+            self.subgoal_reference_step_index = step
+        if self.mission_reference_step_index is not None:
+            self.mission_reference_step_index = step
+            self.mission_grace_deadline_step_index = None
 
     def observe(
         self,
@@ -1602,13 +1688,29 @@ class SemanticNavigationProgressSupervisor:
         if mission_displacement >= max(0.0, float(self.min_displacement_m)):
             self.mission_reference_xy = xy
             self.mission_reference_step_index = step
+            self.mission_grace_deadline_step_index = None
 
         if str(subgoal_key) != self.subgoal_key:
             self.subgoal_key = str(subgoal_key)
+            self.subgoal_started_step_index = step
             self.subgoal_reference_xy = xy
             self.subgoal_reference_goal_distance_m = goal_distance
             self.subgoal_reference_yaw_error_rad = yaw_error
             self.subgoal_reference_step_index = step
+            if (
+                self.mission_grace_deadline_step_index is not None
+                and self.mission_reference_step_index is not None
+            ):
+                subgoal_timeout = max(1, int(self.subgoal_timeout_task_steps))
+                grace_cap = (
+                    self.mission_reference_step_index
+                    + max(1, int(self.mission_timeout_task_steps))
+                    + 2 * subgoal_timeout
+                )
+                self.mission_grace_deadline_step_index = max(
+                    self.mission_grace_deadline_step_index,
+                    min(step + subgoal_timeout, grace_cap),
+                )
         else:
             displacement = math.hypot(
                 xy[0] - float(self.subgoal_reference_xy[0]),
@@ -1655,14 +1757,29 @@ class SemanticNavigationProgressSupervisor:
                 else step
             ),
         )
+        mission_timeout = max(1, int(self.mission_timeout_task_steps))
+        subgoal_timeout = max(1, int(self.subgoal_timeout_task_steps))
+        subgoal_age = step - int(
+            self.subgoal_started_step_index
+            if self.subgoal_started_step_index is not None else step
+        )
+        if mission_elapsed >= mission_timeout and self.mission_grace_deadline_step_index is None:
+            self.mission_grace_deadline_step_index = step + max(
+                0, subgoal_timeout - subgoal_age
+            )
+        mission_stalled = bool(
+            mission_elapsed >= mission_timeout
+            and self.mission_grace_deadline_step_index is not None
+            and step >= self.mission_grace_deadline_step_index
+        )
         return {
             "subgoal_stalled": subgoal_elapsed
-            >= max(1, int(self.subgoal_timeout_task_steps)),
-            "mission_stalled": mission_elapsed
-            >= max(1, int(self.mission_timeout_task_steps)),
+            >= subgoal_timeout,
+            "mission_stalled": mission_stalled,
             "subgoal_key": self.subgoal_key,
             "subgoal_elapsed_task_steps": subgoal_elapsed,
             "mission_elapsed_task_steps": mission_elapsed,
+            "mission_grace_deadline_step_index": self.mission_grace_deadline_step_index,
             "subgoal_timeout_task_steps": max(
                 1, int(self.subgoal_timeout_task_steps)
             ),
@@ -1676,9 +1793,20 @@ class SemanticNavigationProgressSupervisor:
 class ExecutionConfig:
     navigation_timeout_s: float = 180.0
     interaction_navigation_timeout_s: float = 180.0
+    # Interaction navigation and its visual barrier are measured in evaluator
+    # steps whenever the public step clock is available.  Wall time remains a
+    # compatibility fallback for unit callers and old bridges without steps.
+    interaction_navigation_timeout_task_steps: int = 360
     interaction_timeout_s: float = 30.0
+    # Physical actions own a fresh budget, separate from approach and M1.
+    interaction_timeout_task_steps: int = 120
+    interaction_step_stall_timeout_s: float = 180.0
     drawer_scan_wait_timeout_s: float = 8.0
     interaction_observation_timeout_s: float = 8.0
+    interaction_observation_timeout_task_steps: int = 48
+    # Once an ordinary physical interaction pose has been reached, a failed
+    # M1 observation must not prevent the already-planned interaction.
+    interaction_fallback_on_m1_failure: bool = True
     # A negative M1 result is treated as an inconclusive image.  By default
     # collect one fresh confirmation at the held pose before changing view.
     interaction_observation_same_pose_samples_per_view: int = 2
@@ -1694,7 +1822,7 @@ class ExecutionConfig:
     # the first capture and the physical bridge contract.
     container_m1_distinct_view_arrival_tolerance_m: float = 0.05
     container_m1_distinct_view_arrival_yaw_tolerance_rad: float = 0.08
-    verification_timeout_s: float = 30.0
+    verification_timeout_s: float = 10.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
     scan_timeout_s: float = 15.0
@@ -1710,12 +1838,23 @@ class BehaviorExecutionStateMachine:
         self.candidate: dict[str, Any] | None = None
         self.started_at = 0.0
         self.state_started_at = 0.0
+        self.latest_task_step_index: int | None = None
+        self.state_started_task_step_index: int | None = None
+        self._interaction_last_task_step_index: int | None = None
+        self._interaction_step_updated_at = 0.0
         self.error = ""
 
-    def start(self, candidate: dict[str, Any], now: float | None = None) -> list[dict[str, Any]]:
+    def start(
+        self,
+        candidate: dict[str, Any],
+        now: float | None = None,
+        *,
+        task_step_index: int | None = None,
+    ) -> list[dict[str, Any]]:
         if self.state != STATE_IDLE:
             raise RuntimeError(f"Executor is busy in state {self.state}")
         now = time.monotonic() if now is None else float(now)
+        task_step_index = self._remember_task_step(task_step_index)
         self.candidate = dict(candidate)
         self.started_at = now
         behavior_type = str(candidate.get("behavior_type") or "")
@@ -1724,14 +1863,20 @@ class BehaviorExecutionStateMachine:
                 STATE_PREPARING_EXPLORE,
                 now,
                 {"kind": "reserve_frontier", "candidate": self.candidate},
+                task_step_index=task_step_index,
             )
         if behavior_type == BEHAVIOR_NAVIGATE:
             if target_ready_for_graph_verification(candidate):
-                return self._transition(STATE_VERIFYING, now)
+                return self._transition(
+                    STATE_VERIFYING,
+                    now,
+                    task_step_index=task_step_index,
+                )
             return self._transition(
                 STATE_NAVIGATING,
                 now,
                 {"kind": "navigate", "candidate": self.candidate},
+                task_step_index=task_step_index,
             )
         if behavior_type == BEHAVIOR_INTERACT:
             requires_approach = bool((candidate.get("metadata") or {}).get("requires_approach", True))
@@ -1740,19 +1885,27 @@ class BehaviorExecutionStateMachine:
                     STATE_APPROACH_INTERACTION,
                     now,
                     {"kind": "navigate", "candidate": self.candidate},
+                    task_step_index=task_step_index,
                 )
+            self._mark_interaction_position_reached(task_step_index)
             if self._interaction_requires_observation():
-                return self._request_interaction_observation({}, now)
+                return self._request_interaction_observation(
+                    {},
+                    now,
+                    task_step_index=task_step_index,
+                )
             return self._transition(
                 STATE_INTERACTING,
                 now,
                 {"kind": "interact", "candidate": self.candidate},
+                task_step_index=task_step_index,
             )
         if behavior_type == BEHAVIOR_SCAN:
             return self._transition(
                 STATE_SCANNING,
                 now,
                 {"kind": "scan", "candidate": self.candidate},
+                task_step_index=task_step_index,
             )
         raise ValueError(f"Unsupported behavior type: {behavior_type}")
 
@@ -1808,8 +1961,12 @@ class BehaviorExecutionStateMachine:
         now: float | None = None,
         *,
         wait_for_drawer_scan: bool = False,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         now = time.monotonic() if now is None else float(now)
+        if task_step_index is None:
+            task_step_index = self._interaction_observation_capture_step(detail)
+        task_step_index = self._remember_task_step(task_step_index)
         if self.state == STATE_NAVIGATING and self._behavior_type() == BEHAVIOR_EXPLORE:
             return self._transition(
                 STATE_FINALIZING_EXPLORE,
@@ -1820,6 +1977,7 @@ class BehaviorExecutionStateMachine:
                     "success": bool(success),
                     "detail": detail or {},
                 },
+                task_step_index=task_step_index,
             )
         if self.state == STATE_NAVIGATING and self._behavior_type() == BEHAVIOR_NAVIGATE:
             if success and bool(
@@ -1827,7 +1985,11 @@ class BehaviorExecutionStateMachine:
                     "verify_target_visibility", False
                 )
             ):
-                return self._transition(STATE_VERIFYING, now)
+                return self._transition(
+                    STATE_VERIFYING,
+                    now,
+                    task_step_index=task_step_index,
+                )
             return self._finish(success, detail or {}, now)
         if self.state != STATE_APPROACH_INTERACTION:
             return []
@@ -1854,24 +2016,89 @@ class BehaviorExecutionStateMachine:
             )
             if capture_navigation:
                 return capture_navigation
+        self._mark_interaction_position_reached(task_step_index)
         if self._interaction_requires_observation():
-            return self._request_interaction_observation(detail or {}, now)
+            return self._request_interaction_observation(
+                detail or {},
+                now,
+                task_step_index=task_step_index,
+            )
         if wait_for_drawer_scan:
             return self._transition(
                 STATE_WAITING_FOR_DRAWER_SCAN,
                 now,
                 {"kind": "wait_for_drawer_scan", "candidate": self.candidate},
+                task_step_index=task_step_index,
             )
         return self._transition(
             STATE_INTERACTING,
             now,
             {"kind": "interact", "candidate": self.candidate},
+            task_step_index=task_step_index,
+        )
+
+    def on_remembered_portal_navigation_result(
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+        *,
+        object_id: str = "",
+        task_step_index: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hold a remembered portal at its view pose until M1 returns.
+
+        ``reobserve_portal`` is a navigation fallback, not a physical
+        interaction candidate.  Keeping the state machine in the ordinary
+        observation barrier prevents the selector from moving the robot away
+        before the targeted RGB+detection pair has been consumed.
+        """
+
+        if (
+            self.state != STATE_NAVIGATING
+            or self._behavior_type() != BEHAVIOR_NAVIGATE
+            or self.candidate is None
+            or not bool(
+                (self.candidate.get("metadata") or {}).get(
+                    "reobserve_interaction_target"
+                )
+            )
+        ):
+            return []
+        now = time.monotonic() if now is None else float(now)
+        task_step_index = self._remember_task_step(task_step_index)
+        if not success:
+            return self._finish(False, detail or {}, now)
+        metadata = dict(self.candidate.get("metadata") or {})
+        metadata.update(
+            {
+                "observation_required": True,
+                "reobserve": True,
+                "observation_only_reobserve": True,
+                "reobserve_object_id": str(
+                    object_id
+                    or metadata.get("reobserve_object_id")
+                    or self.candidate.get("target_id")
+                    or ""
+                ),
+                "observation_reason": "remembered_portal_reobserve",
+            }
+        )
+        self.candidate["metadata"] = metadata
+        return self._request_interaction_observation(
+            {
+                "reason": "remembered_portal_reobserve",
+            },
+            now,
+            task_step_index=task_step_index,
         )
 
     def on_interaction_observation_result(
         self,
         detail: dict[str, Any] | None = None,
         now: float | None = None,
+        *,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         """Consume one fresh M1 re-observation before a physical interaction.
 
@@ -1887,6 +2114,9 @@ class BehaviorExecutionStateMachine:
             return []
         now = time.monotonic() if now is None else float(now)
         observation = self._normalized_interaction_observation(detail)
+        if task_step_index is None:
+            task_step_index = self._interaction_observation_capture_step(observation)
+        task_step_index = self._remember_task_step(task_step_index)
         metadata = dict(self.candidate.get("metadata") or {})
         metadata["last_interaction_observation"] = dict(observation)
         metadata["interaction_observation_viewpoint_pending"] = False
@@ -1935,6 +2165,85 @@ class BehaviorExecutionStateMachine:
             )
             disposition = "retry"
 
+        if disposition == "retry" and self._should_fallback_to_interaction_after_m1_failure(
+            observation, metadata
+        ):
+            fallback_reason = str(
+                observation.get("error")
+                or observation.get("failure_reason")
+                or observation.get("reason")
+                or observation.get("attribute_status")
+                or observation.get("mllm_status")
+                or "m1_observation_failed"
+            )
+            observation.update(
+                {
+                    "action_executed": False,
+                    "observation_outcome": "m1_failed_interaction_fallback",
+                    "m1_fallback_to_interaction": True,
+                    "m1_fallback_reason": fallback_reason,
+                    "reason": "interaction_after_m1_failure",
+                }
+            )
+            metadata["interaction_observation_fallback_used"] = True
+            metadata["interaction_observation_fallback_reason"] = fallback_reason
+            self.candidate["metadata"] = metadata
+            if (
+                self._container_two_stage_staging_active(metadata)
+                or self._container_two_stage_m1_capture_active(metadata)
+            ):
+                commands = self._begin_container_two_stage_action_approach(
+                    observation, now, m1_failure_fallback=True
+                )
+                if commands:
+                    return commands
+                return self._defer_container_m1_evidence(
+                    observation, now, drawer_pre_action=drawer_pre_action,
+                    reason="m1_fallback_action_geometry_unavailable",
+                )
+            metadata["observation_required"] = False
+            metadata["reobserve"] = False
+            metadata["interaction_observation_resolved"] = False
+            metadata["interaction_observation_fallback_used"] = True
+            metadata["interaction_observation_fallback_reason"] = fallback_reason
+            self.candidate["metadata"] = metadata
+            return self._transition(
+                STATE_INTERACTING,
+                now,
+                {
+                    "kind": "interact",
+                    "candidate": self.candidate,
+                    "observation": observation,
+                },
+                task_step_index=task_step_index,
+            )
+
+        if metadata.get("observation_only_reobserve") and disposition in {
+            "execute",
+            "finish_without_action",
+        }:
+            observed_state = str(
+                observation.get("state")
+                or observation.get("interaction_state")
+                or observation.get("coarse_state")
+                or observation.get("post_state")
+                or "unknown"
+            ).strip().casefold()
+            return self._finish(
+                True,
+                {
+                    **observation,
+                    "action": "open",
+                    "state": observed_state,
+                    "post_state": observed_state,
+                    "action_executed": False,
+                    "observation_outcome": "finish_without_action",
+                    "reobserve_only": True,
+                    "reason": "remembered_portal_reobserved",
+                },
+                now,
+            )
+
         if disposition == "execute":
             if (
                 self._container_two_stage_staging_active(metadata)
@@ -1968,12 +2277,23 @@ class BehaviorExecutionStateMachine:
                         "candidate": self.candidate,
                         "observation": observation,
                     },
+                    task_step_index=task_step_index,
                 )
         if disposition == "finish_without_action":
+            already_open_payload = {
+                "action": "open",
+                "state": "open",
+                "post_state": "open",
+                "interaction_capability": "unavailable",
+                "interactable": False,
+                "requires_interaction": False,
+                "traversable": True,
+            }
             return self._finish(
                 True,
                 {
                     **observation,
+                    **already_open_payload,
                     "action_executed": False,
                     "observation_outcome": "finish_without_action",
                     "reason": "interaction_not_required_after_observation",
@@ -2014,12 +2334,17 @@ class BehaviorExecutionStateMachine:
                 attempts < max_total_requests
                 and samples_at_viewpoint < max_samples_per_view
             ):
-                return self._request_interaction_observation(observation, now)
+                return self._request_interaction_observation(
+                    observation,
+                    now,
+                    task_step_index=task_step_index,
+                )
             if attempts < max_total_requests and viewpoints < max_viewpoints:
                 return self._advance_interaction_reobservation_approach(
                     observation,
                     now,
                     drawer_pre_action=drawer_pre_action,
+                    task_step_index=task_step_index,
                 )
             precondition_kind = "drawer" if drawer_pre_action else "container"
             return self._defer_container_m1_evidence(
@@ -2029,7 +2354,11 @@ class BehaviorExecutionStateMachine:
                 reason=f"{precondition_kind}_m1_evidence_inconclusive",
             )
         if attempts < self._interaction_observation_max_attempts():
-            return self._request_interaction_observation(observation, now)
+            return self._request_interaction_observation(
+                observation,
+                now,
+                task_step_index=task_step_index,
+            )
         return self._finish(
             False,
             {
@@ -2047,6 +2376,88 @@ class BehaviorExecutionStateMachine:
         return bool(
             self._behavior_type() == BEHAVIOR_INTERACT
             and metadata.get("observation_required", False)
+        )
+
+    def _mark_interaction_position_reached(self, task_step_index: int | None) -> None:
+        if self.candidate is None or self._behavior_type() != BEHAVIOR_INTERACT:
+            return
+        metadata = dict(self.candidate.get("metadata") or {})
+        metadata["interaction_observation_position_reached"] = True
+        metadata["interaction_position_reached"] = not (
+            metadata.get("m1_observation_staging_required")
+            or
+            self._container_two_stage_staging_active(metadata)
+            or self._container_two_stage_m1_capture_active(metadata)
+        )
+        if task_step_index is not None:
+            metadata["interaction_position_arrival_task_step_index"] = int(
+                task_step_index
+            )
+        self.candidate["metadata"] = metadata
+
+    def _should_fallback_to_interaction_after_m1_failure(
+        self,
+        observation: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> bool:
+        """Allow an arrived action candidate to use its planned M1-failure path.
+
+        Containers still navigate to the mapped physical pose. Observation-only
+        navigation has no action contract and cannot be promoted here.
+        """
+
+        if not bool(self.config.interaction_fallback_on_m1_failure):
+            return False
+        if self._behavior_type() != BEHAVIOR_INTERACT:
+            return False
+        if not bool(
+            metadata.get("interaction_position_reached")
+            or metadata.get("interaction_observation_position_reached")
+        ):
+            return False
+        if bool(metadata.get("observation_only_reobserve")):
+            return False
+        if metadata.get("m1_observation_staging_required") and not metadata.get("container_two_stage_approach"):
+            return False
+        merged = dict(observation or {})
+        attributes = merged.get("attributes")
+        if isinstance(attributes, dict):
+            merged = {**attributes, **merged}
+        status = str(
+            merged.get("attribute_status") or merged.get("mllm_status") or ""
+        ).strip().casefold()
+        if status in {
+            "failed",
+            "timeout",
+            "timed_out",
+            "stale",
+            "expired",
+            "error",
+            "unavailable",
+            "no_result",
+            "noresult",
+        }:
+            return True
+        reason = str(merged.get("reason") or merged.get("error") or "").strip().casefold()
+        if reason in {
+            "interaction_observation_timeout",
+            "m1_request_timeout",
+            "m1_no_result",
+            "m1_observation_failed",
+        }:
+            return True
+        # An empty callback is the executor's explicit no-result form.  Do not
+        # treat a complete ready/side-view judgement as an M1 transport failure.
+        return not status and not any(
+            key in merged
+            for key in (
+                "state",
+                "interaction_state",
+                "coarse_state",
+                "view_state",
+                "front_surface_visible",
+                "approach_ready",
+            )
         )
 
     @staticmethod
@@ -2309,6 +2720,8 @@ class BehaviorExecutionStateMachine:
         self,
         observation: dict[str, Any],
         now: float,
+        *,
+        m1_failure_fallback: bool = False,
     ) -> list[dict[str, Any]]:
         """Replace an accepted outer M1 barrier with its paired inner goal.
 
@@ -2352,17 +2765,19 @@ class BehaviorExecutionStateMachine:
         if metadata.get("container_two_stage_mapping_ready") is False:
             return []
         evidence = metadata.get("accepted_container_m1_evidence")
-        if (
+        if not m1_failure_fallback and (
             not isinstance(evidence, dict)
             or not self._container_two_stage_evidence_matches_staging(
                 evidence, capture_goal
             )
         ):
             return []
+        if m1_failure_fallback:
+            evidence = {}
         shared_anchor_pose = bool(metadata.get("container_anchor_shared_pose", False))
         front_evidence_action = (
             None
-            if shared_anchor_pose
+            if shared_anchor_pose or m1_failure_fallback
             else container_two_stage_action_goal_options_from_m1_front_evidence(
                 candidate, evidence
             )
@@ -2388,7 +2803,10 @@ class BehaviorExecutionStateMachine:
         elif front_evidence_action is not None:
             action_goals, action_labels, front_evidence = front_evidence_action
             action_geometry_source = "m1_confirmed_capture_front_axis"
-        elif front_axis_required and metadata.get("container_geometry_anchor_xy"):
+        elif (
+            front_axis_required and metadata.get("container_geometry_anchor_xy")
+            and not m1_failure_fallback
+        ):
             # The candidate explicitly requested this contract, but the
             # executor did not bind an M1-confirmed capture ray.  Do not quietly
             # fall back to a possibly stale staging face or a graph/oracle axis.
@@ -2410,6 +2828,16 @@ class BehaviorExecutionStateMachine:
         action_label = action_labels[0]
         interaction = dict(candidate.get("interaction_command") or {})
         interaction["interaction_approach_pose_xyyaw"] = list(action_goal)
+        if m1_failure_fallback:
+            action_geometry_source = "m1_failure_planned_geometry"
+            interaction["interaction_approach_axis_xy"] = [
+                -math.cos(action_goal[2]), -math.sin(action_goal[2])
+            ]
+            interaction["interaction_front_axis_source"] = action_geometry_source
+            interaction["interaction_front_axis_validation_required"] = True
+            interaction["interaction_target_center_xy"] = list(
+                metadata.get("container_geometry_anchor_xy") or []
+            )
         if front_evidence.get("m1_front_axis_xy"):
             interaction["interaction_approach_axis_xy"] = list(
                 front_evidence["m1_front_axis_xy"]
@@ -2441,6 +2869,8 @@ class BehaviorExecutionStateMachine:
         metadata.update(
             {
                 "container_two_stage_phase": "physical_action",
+                "interaction_position_reached": False,
+                "interaction_observation_position_reached": False,
                 "container_two_stage_staging_goal_option_index": staging_index,
                 "container_two_stage_staging_pose_xyyaw": list(
                     staging_goals[staging_index]
@@ -2471,7 +2901,7 @@ class BehaviorExecutionStateMachine:
                 "container_pre_action_observation": False,
                 "drawer_pre_action_observation": False,
                 "m1_observation_staging_required": False,
-                "interaction_observation_resolved": True,
+                "interaction_observation_resolved": not m1_failure_fallback,
                 "effective_interaction_approach_pose_xyyaw": list(action_goal),
                 "interaction_approach_goal_option_index": 0,
                 "goal_xyyaw_candidates": [
@@ -2484,7 +2914,8 @@ class BehaviorExecutionStateMachine:
         candidate["interaction_command"] = interaction
         candidate["metadata"] = metadata
         self.candidate = candidate
-        if shared_anchor_pose:
+        if shared_anchor_pose and not m1_failure_fallback:
+            self._mark_interaction_position_reached(self.latest_task_step_index)
             # The selected anchor has already passed navigation arrival and the
             # accepted M1 evidence is bound to this exact pose.  There is no
             # second physical navigation target in the shared-anchor contract;
@@ -2512,7 +2943,11 @@ class BehaviorExecutionStateMachine:
                     for item in metadata.get("interaction_approach_attempts") or []
                     if isinstance(item, dict)
                 ],
-                "reason": "container_m1_ready_navigate_physical_action_pose",
+                "reason": (
+                    "container_m1_failed_navigate_planned_action_pose"
+                    if m1_failure_fallback
+                    else "container_m1_ready_navigate_physical_action_pose"
+                ),
                 "observation": observation,
             },
         )
@@ -2524,6 +2959,7 @@ class BehaviorExecutionStateMachine:
         interaction_approach_attempts: list[dict[str, Any]],
         detail: dict[str, Any] | None = None,
         now: float | None = None,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return from an inner failure to the next outer staging viewpoint.
 
@@ -2599,6 +3035,10 @@ class BehaviorExecutionStateMachine:
         metadata.update(
             {
                 "container_two_stage_phase": "staging",
+                "interaction_position_reached": False,
+                "interaction_observation_position_reached": False,
+                "interaction_observation_fallback_used": False,
+                "interaction_observation_fallback_reason": "",
                 "container_two_stage_last_inner_failure": dict(detail or {}),
                 "observation_required": bool(
                     metadata.get(
@@ -2672,6 +3112,7 @@ class BehaviorExecutionStateMachine:
                 )
                 ),
             },
+            task_step_index=task_step_index,
         )
 
     def _interaction_observation_max_attempts(self) -> int:
@@ -2741,6 +3182,16 @@ class BehaviorExecutionStateMachine:
 
         metadata = dict((self.candidate or {}).get("metadata") or {})
         precondition_kind = "drawer" if drawer_pre_action else "container"
+        rejected_face_indices: list[int] = []
+        for raw_index in metadata.get(
+            "container_m1_rejected_face_staging_indices", []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                rejected_face_indices.append(index)
         return self._finish(
             False,
             {
@@ -2767,6 +3218,13 @@ class BehaviorExecutionStateMachine:
                 "observation_max_total_requests": (
                     self._interaction_observation_max_total_requests()
                 ),
+                # A side/back M1 result or a physical-front rejection invalidates
+                # the whole canonical AABB face, not just this decision's pose.
+                # Carry that bounded face memory to the decision node so a later
+                # graph revision cannot restart the same rejected face at anchor 0.
+                "container_m1_rejected_face_staging_indices": sorted(
+                    set(rejected_face_indices)
+                ),
                 "precondition_kind": precondition_kind,
             },
             now,
@@ -2784,8 +3242,8 @@ class BehaviorExecutionStateMachine:
         object is impossible to interact with.  This is especially important
         immediately after the startup scan, when every anchor can temporarily
         return ``empty_plan`` against an incomplete map.  Preserve the same
-        retryable, non-exclusion outcome used after inconclusive visual evidence
-        instead of turning that one map generation into a permanent object fact.
+        retryable, non-exclusion policy without attributing a navigation failure
+        to visual evidence or turning one map generation into an object fact.
         """
 
         if self.candidate is None:
@@ -2806,7 +3264,6 @@ class BehaviorExecutionStateMachine:
         ):
             return []
         drawer_pre_action = bool(metadata.get("drawer_pre_action_observation"))
-        kind = "drawer" if drawer_pre_action else "container"
         staging_goal_count = len(container_two_stage_staging_goal_options(self.candidate))
         unavailable_indices: set[int] = set()
         for raw_index in list(
@@ -2824,9 +3281,28 @@ class BehaviorExecutionStateMachine:
             staging_goal_count > 0
             and len(unavailable_indices) >= staging_goal_count
         )
-        return self._defer_container_m1_evidence(
+        failure = dict(detail or {})
+        return self._finish(
+            False,
             {
-                **dict(detail or {}),
+                **failure,
+                "reason": "container_approach_navigation_unreachable",
+                "failure_reason": failure.get("failure_reason") or failure.get("reason") or "",
+                "failure_stage": "interaction_approach_navigation",
+                "action_executed": False,
+                "retryable": True,
+                "terminal_candidate_exclusion": False,
+                "observation_outcome": "navigation_unreachable",
+                "m1_evidence_inconclusive": False,
+                "observation_attempts": observation_attempts,
+                "observation_samples_per_view": self._interaction_observation_same_pose_samples_per_view(),
+                "observation_viewpoints": metadata.get("interaction_observation_viewpoint_count", 0),
+                "observation_max_viewpoints": self._interaction_observation_max_viewpoints(),
+                "observation_max_total_requests": self._interaction_observation_max_total_requests(),
+                "container_m1_rejected_face_staging_indices": list(
+                    metadata.get("container_m1_rejected_face_staging_indices") or []
+                ),
+                "precondition_kind": "drawer" if drawer_pre_action else "container",
                 "m1_viewpoint_navigation_inconclusive": True,
                 "m1_capture_not_reached": observation_attempts <= 0,
                 "all_container_anchors_unreachable": all_anchors_unreachable,
@@ -2834,8 +3310,6 @@ class BehaviorExecutionStateMachine:
                 "container_unreachable_anchor_count": len(unavailable_indices),
             },
             time.monotonic() if now is None else float(now),
-            drawer_pre_action=drawer_pre_action,
-            reason=f"{kind}_m1_evidence_inconclusive_viewpoint_navigation",
         )
 
     def _advance_interaction_reobservation_approach(
@@ -2844,6 +3318,7 @@ class BehaviorExecutionStateMachine:
         now: float,
         *,
         drawer_pre_action: bool,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         """Move to one bounded new capture viewpoint after same-pose sampling.
 
@@ -2858,9 +3333,10 @@ class BehaviorExecutionStateMachine:
             return []
         metadata = dict(self.candidate.get("metadata") or {})
         is_direct_capture = self._container_two_stage_m1_capture_active(metadata)
+        is_container_view = is_direct_capture or self._container_two_stage_staging_active(metadata)
         goal_options = (
             container_two_stage_staging_goal_options(self.candidate)
-            if is_direct_capture
+            if is_container_view
             else navigation_goal_options(self.candidate)
         )
         try:
@@ -2877,7 +3353,7 @@ class BehaviorExecutionStateMachine:
             )
         except (TypeError, ValueError):
             selected_index = 0
-        if is_direct_capture:
+        if is_container_view:
             viewed_indices: set[int] = set()
             for raw_index in list(
                 metadata.get("interaction_observation_viewpoint_staging_indices")
@@ -2892,6 +3368,8 @@ class BehaviorExecutionStateMachine:
             # The current direct capture has just returned a result even if an
             # older trace did not record its first request bookkeeping.
             viewed_indices.add(selected_index)
+            metadata["interaction_observation_viewpoint_staging_indices"] = sorted(viewed_indices)
+            self.candidate["metadata"] = metadata
             view_state = str(observation.get("view_state") or "").strip().casefold()
             if view_state in {"side", "side_or_back", "back", "rear"}:
                 rejected_face_indices = container_two_stage_face_indices(
@@ -2960,7 +3438,7 @@ class BehaviorExecutionStateMachine:
             metadata["drawer_visual_reobserve_next_goal_option_index"] = next_index
             metadata["last_drawer_visual_precondition"] = dict(observation)
         self.candidate["metadata"] = metadata
-        if is_direct_capture:
+        if is_container_view:
             # Restore the next immutable anchor and reset the per-view sample
             # counter.  ``retry_container_two_stage_staging`` also clears the
             # prior request's evidence/baseline so a delayed response cannot
@@ -2979,6 +3457,7 @@ class BehaviorExecutionStateMachine:
                     "interaction_visual_reobserve_next_goal_option_index": next_index,
                 },
                 now=now,
+                task_step_index=task_step_index,
             )
         return self._transition(
             STATE_APPROACH_INTERACTION,
@@ -2994,6 +3473,7 @@ class BehaviorExecutionStateMachine:
                 ],
                 "reason": f"{precondition_kind}_visual_reobserve_next_approach",
             },
+            task_step_index=task_step_index,
         )
 
     @staticmethod
@@ -3032,9 +3512,12 @@ class BehaviorExecutionStateMachine:
         self,
         detail: dict[str, Any],
         now: float,
+        *,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         if self.candidate is None:
             return []
+        task_step_index = self._remember_task_step(task_step_index)
         metadata = dict(self.candidate.get("metadata") or {})
         previous_capture_step = self._interaction_observation_capture_step(detail)
         baseline_capture_step = self._interaction_observation_capture_step(
@@ -3047,10 +3530,15 @@ class BehaviorExecutionStateMachine:
             baseline_capture_step = previous_capture_step
             metadata["interaction_observation_after_capture_step"] = baseline_capture_step
         viewpoints = int(metadata.get("interaction_observation_viewpoint_count", 0) or 0)
-        if self._container_two_stage_m1_capture_active(metadata):
+        if (
+            self._container_two_stage_m1_capture_active(metadata)
+            or self._container_two_stage_staging_active(metadata)
+        ):
             try:
                 staging_index = int(
                     metadata.get("container_two_stage_staging_goal_option_index", 0)
+                    if self._container_two_stage_m1_capture_active(metadata)
+                    else metadata.get("interaction_approach_goal_option_index", 0)
                 )
             except (TypeError, ValueError):
                 staging_index = 0
@@ -3116,7 +3604,11 @@ class BehaviorExecutionStateMachine:
                 "kind": "request_interaction_observation",
                 "candidate": self.candidate,
                 "node_id": interaction.get("node_id") or self.candidate.get("target_id"),
-                "object_id": interaction.get("object_id") or self.candidate.get("target_name"),
+                "object_id": (
+                    interaction.get("object_id")
+                    or metadata.get("reobserve_object_id")
+                    or self.candidate.get("target_name")
+                ),
                 "attempt": attempts,
                 "max_attempts": self._interaction_observation_max_attempts(),
                 "same_pose_sample": samples_at_viewpoint,
@@ -3136,6 +3628,7 @@ class BehaviorExecutionStateMachine:
                     "observation_reason", "mllm_portal_state_unknown"
                 ),
             },
+            task_step_index=task_step_index,
         )
 
     def retry_interaction_approach(
@@ -3182,6 +3675,8 @@ class BehaviorExecutionStateMachine:
         candidate: dict[str, Any],
         detail: dict[str, Any] | None = None,
         now: float | None = None,
+        *,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         """Start the sealed drawer scan only after a fresh public frame.
 
@@ -3203,6 +3698,7 @@ class BehaviorExecutionStateMachine:
                 "candidate": self.candidate,
                 "detail": detail or {},
             },
+            task_step_index=task_step_index,
         )
 
     def on_drawer_scan_wait_failed(
@@ -3225,6 +3721,7 @@ class BehaviorExecutionStateMachine:
         now: float | None = None,
         *,
         backend_success: bool | None = None,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         now = time.monotonic() if now is None else float(now)
         if self.state != STATE_INTERACTING:
@@ -3280,6 +3777,7 @@ class BehaviorExecutionStateMachine:
                 "backend_success": backend_success,
                 "interaction_result": detail,
             },
+            task_step_index=task_step_index,
         )
 
     def on_graph_state(
@@ -3311,6 +3809,8 @@ class BehaviorExecutionStateMachine:
         detail: dict[str, Any] | None = None,
         retry: bool = False,
         now: float | None = None,
+        *,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
         if self.state != STATE_VERIFYING or self.candidate is None:
             return []
@@ -3334,6 +3834,7 @@ class BehaviorExecutionStateMachine:
                 STATE_INTERACTING,
                 now,
                 {"kind": "interact", "candidate": self.candidate, "retry": True},
+                task_step_index=task_step_index,
             )
         return self._finish(False, detail or {"reason": "verification_failed"}, now)
 
@@ -3415,10 +3916,16 @@ class BehaviorExecutionStateMachine:
             return []
         return self._finish(True, detail or {"target_visible": True}, now)
 
-    def timeout_reason(self, now: float | None = None) -> str:
+    def timeout_reason(
+        self,
+        now: float | None = None,
+        *,
+        task_step_index: int | None = None,
+    ) -> str:
         if self.state in {STATE_IDLE, STATE_SUCCEEDED, STATE_FAILED}:
             return ""
         now = time.monotonic() if now is None else float(now)
+        task_step_index = self._remember_task_step(task_step_index)
         elapsed = now - self.state_started_at
         if self.state == STATE_PREPARING_EXPLORE:
             return (
@@ -3436,6 +3943,17 @@ class BehaviorExecutionStateMachine:
         if self.state == STATE_NAVIGATING:
             return "navigation_timeout" if elapsed > self.config.navigation_timeout_s else ""
         if self.state == STATE_APPROACH_INTERACTION:
+            elapsed_task_steps = self._elapsed_task_steps(task_step_index)
+            if (
+                elapsed_task_steps is not None
+                and self.config.interaction_navigation_timeout_task_steps > 0
+            ):
+                return (
+                    "interaction_navigation_timeout"
+                    if elapsed_task_steps
+                    >= self.config.interaction_navigation_timeout_task_steps
+                    else ""
+                )
             return (
                 "interaction_navigation_timeout"
                 if elapsed > self.config.interaction_navigation_timeout_s
@@ -3448,6 +3966,17 @@ class BehaviorExecutionStateMachine:
                 else ""
             )
         if self.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION:
+            elapsed_task_steps = self._elapsed_task_steps(task_step_index)
+            if (
+                elapsed_task_steps is not None
+                and self.config.interaction_observation_timeout_task_steps > 0
+            ):
+                return (
+                    "interaction_observation_timeout"
+                    if elapsed_task_steps
+                    >= self.config.interaction_observation_timeout_task_steps
+                    else ""
+                )
             return (
                 "interaction_observation_timeout"
                 if elapsed > self.config.interaction_observation_timeout_s
@@ -3460,12 +3989,33 @@ class BehaviorExecutionStateMachine:
                 else ""
             )
         if self.state == STATE_INTERACTING:
-            return "interaction_timeout" if elapsed > self.config.interaction_timeout_s else ""
+            detail = self._physical_interaction_timeout_detail(now, task_step_index)
+            if detail["timeout_clock"] == "task_steps":
+                expired = detail["elapsed_task_steps"] >= detail["timeout_task_steps"]
+            else:
+                expired = detail["elapsed_s"] > detail["timeout_s"]
+            return "interaction_timeout" if expired else ""
         if self.state == STATE_VERIFYING:
             return "verification_timeout" if elapsed > self.config.verification_timeout_s else ""
         return ""
 
-    def fail_timeout(self, reason: str, now: float | None = None) -> list[dict[str, Any]]:
+    def fail_timeout(
+        self,
+        reason: str,
+        now: float | None = None,
+        *,
+        task_step_index: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.state in {STATE_IDLE, STATE_SUCCEEDED, STATE_FAILED}:
+            return []
+        now = time.monotonic() if now is None else float(now)
+        # A backend result may have won the race with the timeout callback.
+        if reason == "interaction_timeout" and (
+            self.state != STATE_INTERACTING
+            or self.timeout_reason(now, task_step_index=task_step_index) != reason
+        ):
+            return []
+        task_step_index = self._remember_task_step(task_step_index)
         if self._behavior_type() == BEHAVIOR_EXPLORE and self.state in {
             STATE_PREPARING_EXPLORE,
             STATE_NAVIGATING,
@@ -3478,30 +4028,37 @@ class BehaviorExecutionStateMachine:
                     "kind": "finalize_frontier",
                     "candidate": self.candidate,
                     "success": False,
-                    "detail": {"reason": reason},
+                    "detail": self._timeout_detail(reason, task_step_index, now=now),
                 },
             )
         metadata = (self.candidate or {}).get("metadata") or {}
+        observation_barrier_active = bool(
+            metadata.get("observation_required")
+            or metadata.get("drawer_pre_action_observation")
+            or metadata.get("container_pre_action_observation")
+        )
         if (
             self.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
             and str(reason or "") == "interaction_observation_timeout"
-            and (
-                bool(metadata.get("drawer_pre_action_observation"))
-                or bool(metadata.get("container_pre_action_observation"))
-            )
+            and observation_barrier_active
         ):
             # A missing M1 reply is visual uncertainty just like an oblique
-            # reply.  Spend the bounded same-pose/viewpoint evidence plan; do
-            # not let one endpoint timeout permanently exclude the container.
+            # reply.  Spend the bounded observation plan; do not let one slow
+            # endpoint response permanently exclude a portal/container.  The
+            # attempt cap still makes an unavailable M1 service terminal.
             return self.on_interaction_observation_result(
                 {
-                    "reason": "interaction_observation_timeout",
+                    **self._timeout_detail(reason, task_step_index, now=now),
                     "attribute_status": "timeout",
-                    "is_currently_visible": False,
                 },
                 now,
+                task_step_index=task_step_index,
             )
-        return self._finish(False, {"reason": reason}, now)
+        return self._finish(
+            False,
+            self._timeout_detail(reason, task_step_index, now=now),
+            now,
+        )
 
     def summary(self) -> dict[str, Any]:
         candidate = self.candidate or {}
@@ -3522,19 +4079,155 @@ class BehaviorExecutionStateMachine:
             "interaction_observation_attempts": metadata.get(
                 "interaction_observation_attempts", 0
             ),
+            "interaction_position_reached": bool(
+                metadata.get("interaction_position_reached", False)
+            ),
+            "interaction_observation_fallback_used": bool(
+                metadata.get("interaction_observation_fallback_used", False)
+            ),
             "interaction_backend_success": metadata.get(
                 "interaction_backend_success"
+            ),
+            "state_started_task_step_index": self.state_started_task_step_index,
+            "latest_task_step_index": self.latest_task_step_index,
+            "elapsed_task_steps": self._elapsed_task_steps(
+                self.latest_task_step_index
             ),
         }
 
     def _behavior_type(self) -> str:
         return "" if self.candidate is None else str(self.candidate.get("behavior_type") or "")
 
+    @staticmethod
+    def _coerce_task_step_index(value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            parsed = int(value)
+            return parsed if parsed >= 0 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _remember_task_step(self, task_step_index: Any) -> int | None:
+        parsed = self._coerce_task_step_index(task_step_index)
+        if parsed is not None and (
+            self.latest_task_step_index is None or parsed > self.latest_task_step_index
+        ):
+            self.latest_task_step_index = parsed
+        return self.latest_task_step_index
+
+    def _elapsed_task_steps(self, task_step_index: Any = None) -> int | None:
+        current = self._remember_task_step(task_step_index)
+        started = self.state_started_task_step_index
+        if current is None or started is None:
+            return None
+        return max(0, int(current) - int(started))
+
+    def _physical_interaction_timeout_detail(
+        self, now: float, task_step_index: int | None
+    ) -> dict[str, Any]:
+        current = self._remember_task_step(task_step_index)
+        if current is not None and (
+            self._interaction_last_task_step_index is None
+            or current > self._interaction_last_task_step_index
+        ):
+            self._interaction_last_task_step_index = current
+            self._interaction_step_updated_at = now
+            # A legacy caller may first supply steps after dispatch.  Start at
+            # that first observed step, never charge an absolute episode index.
+            if self.state_started_task_step_index is None:
+                self.state_started_task_step_index = current
+        elapsed_steps = self._elapsed_task_steps(current)
+        step_budget = self.config.interaction_timeout_task_steps
+        detail = {
+            "reason": "interaction_timeout",
+            "timeout_state": STATE_INTERACTING,
+            "state_started_task_step_index": self.state_started_task_step_index,
+            "latest_task_step_index": current,
+            "elapsed_task_steps": elapsed_steps,
+            "elapsed_wall_time_s": now - self.state_started_at,
+        }
+        if elapsed_steps is not None and step_budget > 0:
+            stalled_s = now - self._interaction_step_updated_at
+            # Exhausted task steps own the outcome even if both clocks expire.
+            if elapsed_steps >= step_budget or stalled_s <= self.config.interaction_step_stall_timeout_s:
+                return {**detail, "timeout_clock": "task_steps", "timeout_task_steps": step_budget}
+            return {
+                **detail,
+                "timeout_clock": "wall_time_fallback",
+                "timeout_fallback_reason": "task_step_stream_stalled",
+                "timeout_s": self.config.interaction_step_stall_timeout_s,
+                "elapsed_s": stalled_s,
+            }
+        return {
+            **detail,
+            "timeout_clock": "wall_time_fallback",
+            "timeout_fallback_reason": "task_step_budget_disabled" if step_budget <= 0 else "no_task_steps",
+            "timeout_s": self.config.interaction_timeout_s,
+            "elapsed_s": now - self.state_started_at,
+        }
+
+    def _timeout_detail(
+        self,
+        reason: str,
+        task_step_index: int | None = None,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.monotonic() if now is None else float(now)
+        if reason == "interaction_timeout" and self.state == STATE_INTERACTING:
+            return self._physical_interaction_timeout_detail(now, task_step_index)
+        step_budget = {
+            "interaction_navigation_timeout": self.config.interaction_navigation_timeout_task_steps,
+            "interaction_observation_timeout": self.config.interaction_observation_timeout_task_steps,
+        }.get(reason, 0)
+        wall_budget = {
+            "interaction_navigation_timeout": self.config.interaction_navigation_timeout_s,
+            "interaction_observation_timeout": self.config.interaction_observation_timeout_s,
+            "navigation_timeout": self.config.navigation_timeout_s,
+            "verification_timeout": self.config.verification_timeout_s,
+            "explore_prepare_timeout": self.config.explore_prepare_timeout_s,
+            "explore_finalize_timeout": self.config.explore_finalize_timeout_s,
+            "scan_timeout": self.config.scan_timeout_s,
+            "drawer_scan_fresh_frame_timeout": self.config.drawer_scan_wait_timeout_s,
+        }.get(reason)
+        detail: dict[str, Any] = {"reason": reason, "timeout_state": self.state}
+        elapsed_task_steps = self._elapsed_task_steps(task_step_index)
+        if elapsed_task_steps is not None and step_budget > 0:
+            detail.update(
+                {
+                    "timeout_clock": "task_steps",
+                    "timeout_task_steps": step_budget,
+                    "state_started_task_step_index": (
+                        self.state_started_task_step_index
+                    ),
+                    "latest_task_step_index": self.latest_task_step_index,
+                    "elapsed_task_steps": elapsed_task_steps,
+                }
+            )
+        else:
+            detail.update({
+                "timeout_clock": "wall_time_fallback",
+                "timeout_s": wall_budget,
+                "elapsed_s": now - self.state_started_at,
+            })
+        return detail
+
     def _transition(
-        self, state: str, now: float, command: dict[str, Any] | None = None
+        self,
+        state: str,
+        now: float,
+        command: dict[str, Any] | None = None,
+        *,
+        task_step_index: int | None = None,
     ) -> list[dict[str, Any]]:
+        task_step_index = self._remember_task_step(task_step_index)
         self.state = state
         self.state_started_at = now
+        self.state_started_task_step_index = task_step_index
+        if state == STATE_INTERACTING:
+            self._interaction_last_task_step_index = task_step_index
+            self._interaction_step_updated_at = now
         return [] if command is None else [command]
 
     def _finish(

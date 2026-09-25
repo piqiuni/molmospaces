@@ -14,6 +14,7 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(path))
 
 from scripts.InteractiveNav.build_semantic_video_offline import (
+    load_jsonl,
     align_exact_sim_records,
     align_nearest_timestamp_recorder_frames,
     episode_trajectory_prefix,
@@ -31,6 +32,20 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     route_target_at_stamp,
     select_causal_receipt,
 )
+
+
+def test_final_completion_update_preserves_compressed_manifest(tmp_path: Path) -> None:
+    import gzip
+    manifest = tmp_path / "step_boundaries.jsonl"
+    compressed = manifest.with_name(manifest.name + ".gz")
+    with gzip.open(compressed, "wt") as handle:
+        handle.write(json.dumps({"step_index": 3, "unified_graph": {"nodes": []}}) + "\n")
+    status = tmp_path / "completion_status.json"
+    status.write_text(json.dumps({"requested": True, "snapshot_wall_time": 12.0}))
+    assert persist_final_completion_status_to_raw_steps(manifest, status)
+    assert not manifest.exists()
+    assert load_jsonl(manifest)[0]["completion_status"]["requested"]
+    assert not persist_final_completion_status_to_raw_steps(manifest, status)
 import scripts.InteractiveNav.offline_semantic_renderer as offline_renderer
 from scripts.InteractiveNav.offline_semantic_renderer import (
     OfflineSixPanelRenderer,
@@ -202,6 +217,10 @@ def test_manifest_public_gt_precedes_legacy_raw_snapshot_and_preserves_causality
 
     raw_step["gt_observations"]["stamp_sec"] = 10.1
     assert public_gt_payload_for_sim_frame(sim_record, raw_step) is None
+    raw_step["gt_observations"].update(
+        stamp_sec=10, stamp_nsec=100000000, capture_stamp_sec=10.1
+    )
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step) is None
 
 
 def test_episode_viewport_union_is_stable_when_known_map_expands() -> None:
@@ -334,7 +353,8 @@ def test_semantic_xy_target_only_keeps_rooms_and_hides_non_target_labels(monkeyp
         label_mode="interaction_target_only",
     )
 
-    assert "bedroom room" in drawn_labels
+    assert "bedroom" in drawn_labels
+    assert "bedroom room" not in drawn_labels
     assert "INTERACT #1 door_0001" in drawn_labels
     assert "#2 bed" not in drawn_labels
 
@@ -724,7 +744,8 @@ def test_room_panel_draws_room_name_at_room_center(monkeypatch) -> None:
         0,
         (0.0, 0.0, 10.0, 10.0),
     )
-    assert "Room 7: kitchen room" in labels
+    assert "Room 7: kitchen" in labels
+    assert "Room 7: kitchen room" not in labels
 
 
 def test_semantic_sidebar_orders_interact_navigate_explore(monkeypatch) -> None:

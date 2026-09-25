@@ -182,7 +182,7 @@ def select_far_container_target(
         metadata = dict(metadata_by_name.get(name) or {})
         try:
             body_id = int(model.body(name).id)
-            center, size = body_aabb(model, data, body_id, visual_only=True)
+            center, size = body_aabb(model, data, body_id, visible_only=True)
             structural = bool(object_manager.is_structural(name))
         except Exception:
             continue

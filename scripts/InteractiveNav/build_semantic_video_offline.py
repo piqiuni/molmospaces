@@ -237,11 +237,26 @@ def load_json(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def resolve_jsonl_path(path: Path) -> Path:
+    compressed = path.with_name(path.name + ".gz")
+    return compressed if not path.exists() and compressed.exists() else path
+
+
+def read_jsonl_text(path: Path) -> str:
+    import gzip
+    path = resolve_jsonl_path(path)
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return handle.read()
+    return path.read_text(encoding="utf-8")
+
+
 def load_jsonl(path: Path) -> list[dict]:
+    path = resolve_jsonl_path(path)
     if not path.exists():
         return []
     records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_jsonl_text(path).splitlines():
         if line.strip():
             records.append(json.loads(line))
     return sorted(records, key=lambda record: int(record.get("step_index", 0)))
@@ -263,13 +278,14 @@ def persist_final_completion_status_to_raw_steps(
     semantic state or substitutes a later map receipt.
     """
 
+    raw_step_manifest = resolve_jsonl_path(raw_step_manifest)
     status = load_json(completion_status_path)
     if not bool(status.get("requested", False)) or not raw_step_manifest.exists():
         return False
     try:
         rows = [
             json.loads(line)
-            for line in raw_step_manifest.read_text(encoding="utf-8").splitlines()
+            for line in read_jsonl_text(raw_step_manifest).splitlines()
             if line.strip()
         ]
     except (OSError, ValueError):
@@ -313,13 +329,13 @@ def persist_final_completion_status_to_raw_steps(
         f".{raw_step_manifest.name}.completion.tmp"
     )
     try:
-        temporary_path.write_text(
-            "".join(
-                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-                for row in rows
-            ),
-            encoding="utf-8",
-        )
+        import gzip
+        text = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows)
+        if raw_step_manifest.suffix == ".gz":
+            with gzip.open(temporary_path, "wt", encoding="utf-8", compresslevel=3) as handle:
+                handle.write(text)
+        else:
+            temporary_path.write_text(text, encoding="utf-8")
         temporary_path.replace(raw_step_manifest)
     except OSError:
         temporary_path.unlink(missing_ok=True)
@@ -720,7 +736,7 @@ def public_gt_payload_for_sim_frame(
     candidate = raw_step["gt_observations"]
     try:
         sim_stamp = float(sim_record.get("stamp_sec") or 0.0)
-        gt_stamp = float(candidate.get("stamp_sec") or 0.0)
+        gt_stamp = float(candidate.get("capture_stamp_sec", candidate.get("stamp_sec")) or 0.0)
     except (TypeError, ValueError):
         return None
     if sim_stamp > 0.0 and gt_stamp > sim_stamp + _CAUSAL_RECEIPT_EPSILON_SEC:
@@ -1046,7 +1062,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     """Reconstruct the established six-panel renderer from raw PNG+JSON data."""
 
     raw_dir = debug_dir / "raw"
-    raw_step_manifest = raw_dir / "step_boundaries.jsonl"
+    raw_step_manifest = resolve_jsonl_path(raw_dir / "step_boundaries.jsonl")
     completion_status_reconciled = persist_final_completion_status_to_raw_steps(
         raw_step_manifest,
         scene_dir / "completion_status.json",
@@ -1093,8 +1109,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     display_id = scene_display_id(scene_dir)
     global_replay = GlobalCostmapReplay(maps_by_id)
 
-    # Per-frame known bounds made Panel 5 visibly pan/zoom whenever one new map
-    # row arrived.  Lock all map-frame panels to the episode envelope instead.
+    # Keep the margin policy from the episode, but do not use future maps to
+    # determine the initial viewport. The renderer below maintains a monotonic
+    # union of maps causally available at each step.
     episode_occ_crop_margin_m = max(
         [
             float(
@@ -1107,16 +1124,13 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         ]
         or [2.5]
     )
-    fixed_world_bounds = episode_planning_world_bounds(
-        maps_by_stage.get("planning_occ", []),
-        margin_m=episode_occ_crop_margin_m,
-    )
-
     panel_size = (480, 270)
     videos_dir = scene_dir / "videos"
     frames_dir = videos_dir / "offline_composite_frames"
     videos_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    save_composites = bool(getattr(args, "save_composite_frames", True))
+    if save_composites:
+        frames_dir.mkdir(parents=True, exist_ok=True)
     raw_video = videos_dir / f"{args.output_stem}_offline_raw.mp4"
     temp_video = videos_dir / f"{args.output_stem}_offline_h264_tmp.mp4"
     final_video = videos_dir / f"{args.output_stem}.mp4"
@@ -1129,6 +1143,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     if not writer.isOpened():
         raise RuntimeError("Cannot open raw offline video writer")
     written = 0
+    running_world_bounds = None
     component_post_observation_receipt_count = 0
     component_causal_fallback_count = 0
     requested_future_receipt_count = 0
@@ -1221,10 +1236,20 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 semantic_xy_overview_inset = bool(
                     getattr(args, "semantic_xy_overview_inset", False)
                 )
-                world_bounds = fixed_world_bounds
+                if planning is not None:
+                    running_world_bounds = union_world_bounds(
+                        running_world_bounds,
+                        known_world_bounds(planning, margin_m=0.0),
+                    )
+                world_bounds = running_world_bounds
                 if world_bounds is None and planning is not None:
-                    world_bounds = known_world_bounds(
-                        planning, margin_m=occ_crop_margin_m
+                    world_bounds = known_world_bounds(planning, margin_m=0.0)
+                if world_bounds is not None:
+                    world_bounds = (
+                        world_bounds[0] - occ_crop_margin_m,
+                        world_bounds[1] - occ_crop_margin_m,
+                        world_bounds[2] + occ_crop_margin_m,
+                        world_bounds[3] + occ_crop_margin_m,
                     )
                 occ_world_bounds = extend_world_bounds_lower(
                     world_bounds, occ_lower_margin_m
@@ -1334,7 +1359,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 # composite as RGB here swaps the semantic-map palette (and
                 # made panel 4's cost colors look unlike the runtime view).
                 encoded_frame = frame
-                if not cv2.imwrite(str(output_path), encoded_frame):
+                if save_composites and not cv2.imwrite(str(output_path), encoded_frame):
                     raise RuntimeError(f"Failed to write offline frame {written + 1}")
                 writer.write(encoded_frame)
                 alignment_file.write(json.dumps({
@@ -1399,7 +1424,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         "fps": float(args.fps),
         "codec": codec,
         "video": str(final_video),
-        "frame_dir": str(frames_dir),
+        "frame_dir": str(frames_dir) if save_composites else None,
     }
     (scene_dir / "offline_video_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1410,6 +1435,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--save-composite-frames", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--scene-dir", required=True)
     parser.add_argument("--debug-dir", default="")
     parser.add_argument("--route-result", default="")
@@ -1440,7 +1466,7 @@ def main() -> None:
     if not sim_manifest.exists():
         sim_manifest = scene_dir / "step_frames" / "manifest.jsonl"
     sim_records = load_jsonl(sim_manifest)
-    raw_step_manifest = debug_dir / "raw" / "step_boundaries.jsonl"
+    raw_step_manifest = resolve_jsonl_path(debug_dir / "raw" / "step_boundaries.jsonl")
     raw_map_manifest = debug_dir / "raw" / "map_manifest.jsonl"
     if args.panel == "overview" and raw_step_manifest.exists() and raw_map_manifest.exists():
         if not sim_records:
@@ -1511,7 +1537,10 @@ def main() -> None:
     output_height, output_width = first_state.shape[:2]
     panel_columns = 3 if output_width >= output_height * 2.4 else 2
     output_dir = scene_dir / "videos" / "offline_composite_frames"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    save_composites = bool(getattr(args, "save_composite_frames", True))
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if save_composites:
+        output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = scene_dir / "videos"
     videos_dir.mkdir(parents=True, exist_ok=True)
     raw_video = videos_dir / f"{args.output_stem}_offline_raw.mp4"
@@ -1624,7 +1653,7 @@ def main() -> None:
                         cv2.LINE_AA,
                     )
             output_path = output_dir / f"frame_{frame_index:06d}_composite.png"
-            if not cv2.imwrite(str(output_path), state_frame):
+            if save_composites and not cv2.imwrite(str(output_path), state_frame):
                 raise RuntimeError(f"Failed to write offline frame {frame_index}")
             writer.write(state_frame)
             sync_rows.append(
@@ -1728,7 +1757,7 @@ def main() -> None:
         "codec": "h264",
         "video": str(final_video),
         "sync_csv": str(sync_csv),
-        "frame_dir": str(output_dir),
+        "frame_dir": str(output_dir) if save_composites else None,
         "route_result": str(route_path) if route_path.exists() else "",
     }
     (scene_dir / "offline_video_summary.json").write_text(

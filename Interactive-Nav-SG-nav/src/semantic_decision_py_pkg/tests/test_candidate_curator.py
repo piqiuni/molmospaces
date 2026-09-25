@@ -59,6 +59,7 @@ def make_candidate(
 def test_curator_uses_type_quotas_instead_of_global_rule_score() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(
+            pool_mode="legacy",
             candidate_top_k=8,
             navigate_quota=1,
             interaction_quota=3,
@@ -126,7 +127,7 @@ def test_curator_hard_rejects_invalid_or_already_satisfied_candidates() -> None:
 
 def test_spatial_history_survives_frontier_reclustering_and_suppresses_low_gain() -> None:
     curator = CandidateCurator(
-        CandidateCuratorConfig(candidate_top_k=4, repeat_guard_low_gain_limit=2)
+        CandidateCuratorConfig(pool_mode="legacy", candidate_top_k=4, repeat_guard_low_gain_limit=2)
     )
     old = make_candidate("frontier:old", "EXPLORE", x=1.10, y=1.10)
     reclustered = make_candidate("frontier:new", "EXPLORE", x=1.20, y=1.15)
@@ -148,6 +149,7 @@ def test_spatial_history_survives_frontier_reclustering_and_suppresses_low_gain(
 def test_curator_suppresses_low_visible_area_while_large_opening_exists() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(
+            pool_mode="legacy",
             candidate_top_k=4,
             explore_quota=4,
             explore_min_visible_gain_ratio=0.25,
@@ -171,7 +173,7 @@ def test_curator_suppresses_low_visible_area_while_large_opening_exists() -> Non
 
 def test_curator_prioritizes_reachable_unvisited_room_frontier() -> None:
     curator = CandidateCurator(
-        CandidateCuratorConfig(candidate_top_k=4, explore_quota=4)
+        CandidateCuratorConfig(pool_mode="legacy", candidate_top_k=4, explore_quota=4)
     )
     historical = make_candidate("frontier:history", "EXPLORE", x=8.0, room_id=2)
     visited = make_candidate("frontier:a_visited", "EXPLORE", x=3.0, room_id=2)
@@ -238,7 +240,7 @@ def test_curator_rejects_invisible_unreachable_container_interaction() -> None:
 
 def test_curator_prioritizes_unentered_room_over_larger_visited_area() -> None:
     curator = CandidateCurator(
-        CandidateCuratorConfig(candidate_top_k=3, explore_quota=3)
+        CandidateCuratorConfig(pool_mode="legacy", candidate_top_k=3, explore_quota=3)
     )
     historical = make_candidate("frontier:history", "EXPLORE", x=8.0, room_id=2)
     large_visited = make_candidate(
@@ -283,6 +285,7 @@ def test_curator_prioritizes_unentered_room_over_larger_visited_area() -> None:
 def test_curator_keeps_repeat_low_gain_suppression_with_new_room_bonus() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(
+            pool_mode="legacy",
             candidate_top_k=3,
             explore_quota=3,
             repeat_guard_low_gain_limit=2,
@@ -327,7 +330,7 @@ def test_curator_keeps_repeat_low_gain_suppression_with_new_room_bonus() -> None
 
 
 def test_room_selection_history_does_not_mark_room_as_entered() -> None:
-    curator = CandidateCurator(CandidateCuratorConfig(candidate_top_k=2, explore_quota=2))
+    curator = CandidateCurator(CandidateCuratorConfig(pool_mode="legacy", candidate_top_k=2, explore_quota=2))
     frontier = make_candidate("frontier:child", "EXPLORE", x=3.0, room_id=2)
     frontier.metadata.update({"robot_room_id": 1, "room_reachable": True})
     history_key = candidate_history_key(frontier)
@@ -355,6 +358,7 @@ def test_room_selection_history_does_not_mark_room_as_entered() -> None:
 def test_curator_reserves_small_unentered_room_before_visible_area_filter() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(
+            pool_mode="legacy",
             candidate_top_k=1,
             explore_quota=1,
             explore_new_room_bonus=0.0,
@@ -389,7 +393,7 @@ def test_curator_reserves_small_unentered_room_before_visible_area_filter() -> N
 
 
 def test_curator_penalizes_high_confidence_room_target_mismatch() -> None:
-    curator = CandidateCurator(CandidateCuratorConfig(candidate_top_k=3, explore_quota=3))
+    curator = CandidateCurator(CandidateCuratorConfig(pool_mode="legacy", candidate_top_k=3, explore_quota=3))
     kitchen = make_candidate("frontier:kitchen", "EXPLORE", x=3.0, room_id=2)
     bedroom = make_candidate("frontier:bedroom", "EXPLORE", x=4.0, room_id=3)
     for candidate in (kitchen, bedroom):
@@ -504,7 +508,7 @@ def test_candidate_update_rejects_moved_or_changed_interaction() -> None:
 
 
 def test_object_goal_curator_hides_semantically_conflicting_container() -> None:
-    curator = CandidateCurator()
+    curator = CandidateCurator(CandidateCuratorConfig(pool_mode="legacy"))
     dresser = make_candidate(
         "interaction:dresser:open",
         "INTERACT",
@@ -684,3 +688,121 @@ def test_post_interaction_traversal_outranks_plausible_container() -> None:
         result.quality_terms_by_id[traversal.candidate_id]["topology_priority"]
         == 1.5
     )
+
+
+def test_public_pool_keeps_all_actions_and_twelve_frontiers() -> None:
+    candidates = [
+        *[
+            make_candidate(f"navigate:{index}", "NAVIGATE", x=float(index))
+            for index in range(5)
+        ],
+        *[
+            make_candidate(
+                f"interaction:{index}", "INTERACT", x=float(index), node_type="container"
+            )
+            for index in range(8)
+        ],
+        *[
+            make_candidate(f"frontier:{index:02}", "EXPLORE", x=float(index * 2))
+            for index in range(15)
+        ],
+    ]
+    result = CandidateCurator(
+        CandidateCuratorConfig(candidate_top_k=1, max_frontiers_per_room=1)
+    ).curate(candidates)
+
+    assert {kind: sum(c.behavior_type == kind for c in result.candidates) for kind in (
+        "NAVIGATE", "INTERACT", "EXPLORE"
+    )} == {"NAVIGATE": 5, "INTERACT": 8, "EXPLORE": 12}
+    assert set(result.omitted.values()) == {"frontier_pool_limit"}
+
+
+def test_public_pool_preserves_semantically_mismatched_containers() -> None:
+    dresser = make_candidate("interaction:dresser", "INTERACT", x=1.0, node_type="container")
+    dresser.metadata["semantic_name"] = "dresser"
+    frontier = make_candidate("frontier:other", "EXPLORE", x=3.0)
+
+    result = CandidateCurator().curate(
+        [dresser, frontier], target_context={"enabled": True, "target_name": "apple"}
+    )
+
+    assert {c.candidate_id for c in result.candidates} == {dresser.candidate_id, frontier.candidate_id}
+    assert result.omitted == {}
+
+
+def test_public_pool_filters_physics_state_and_history_cooldown() -> None:
+    unsafe = make_candidate("frontier:unsafe", "EXPLORE", x=1.0)
+    unsafe.metadata["path_reachable"] = False
+    opened = make_candidate("interaction:opened", "INTERACT", x=2.0, state="open")
+    cooled = make_candidate("navigate:cooled", "NAVIGATE", x=3.0)
+    valid = make_candidate("frontier:valid", "EXPLORE", x=4.0)
+
+    result = CandidateCurator().curate(
+        [unsafe, opened, cooled, valid],
+        observation_step=10,
+        history_by_key={candidate_history_key(cooled): {"cooldown_until_step": 11}},
+    )
+
+    assert result.candidates == [valid]
+    assert result.rejected == {
+        unsafe.candidate_id: "path_reachable_false",
+        opened.candidate_id: "interaction_action_already_satisfied",
+        cooled.candidate_id: "history_region_cooldown",
+    }
+
+
+def test_public_pool_deduplicates_clusters_and_regions_and_spreads_rooms() -> None:
+    large = make_candidate("frontier:large", "EXPLORE", x=2.0, room_id=1)
+    same_cluster = make_candidate("frontier:cluster_duplicate", "EXPLORE", x=4.0, room_id=1)
+    same_region = make_candidate("frontier:region_duplicate", "EXPLORE", x=2.1, room_id=1)
+    same_room = make_candidate("frontier:second", "EXPLORE", x=6.0, room_id=1)
+    other_room = make_candidate("frontier:small", "EXPLORE", x=8.0, room_id=2)
+    for candidate, area in ((large, 20), (same_cluster, 19), (same_region, 18), (same_room, 17), (other_room, 1)):
+        candidate.metadata["expected_visible_unknown_area_m2"] = area
+    large.metadata["source_cluster_id"] = "shared"
+    same_cluster.metadata["source_cluster_id"] = "shared"
+
+    result = CandidateCurator(CandidateCuratorConfig(max_frontier_candidates=2)).curate(
+        [same_room, other_room, same_region, same_cluster, large]
+    )
+
+    assert result.candidates == [large, other_room]
+    assert result.omitted[same_cluster.candidate_id] == "duplicate_frontier_region"
+    assert result.omitted[same_region.candidate_id] == "duplicate_frontier_region"
+    assert result.omitted[same_room.candidate_id] == "frontier_pool_limit"
+
+
+def test_public_frontier_pool_does_not_depend_on_target_semantic_affinity() -> None:
+    candidates = []
+    for index in range(15):
+        candidate = make_candidate(f"frontier:{index:02}", "EXPLORE", x=index * 2.0, room_id=index % 2 + 1)
+        candidate.metadata.update({
+            "room_attribute": "kitchen" if index % 2 == 0 else "bedroom",
+            "room_attribute_confidence": 0.95,
+            "expected_visible_unknown_area_m2": 20 - index,
+        })
+        candidates.append(candidate)
+    curator = CandidateCurator()
+    apple = curator.curate(candidates, target_context={"enabled": True, "target_name": "apple"})
+    pencil = curator.curate(candidates, target_context={"enabled": True, "target_name": "pencil"})
+
+    assert [c.candidate_id for c in apple.candidates] == [c.candidate_id for c in pencil.candidates]
+    assert apple.quality_by_id != pencil.quality_by_id  # Retained only for score/guard ablations.
+
+
+def test_semantic_matching_does_not_confuse_potty_with_pot() -> None:
+    fridge = make_candidate("interaction:fridge", "INTERACT", x=1.0, node_type="container")
+    fridge.metadata["semantic_name"] = "refrigerator"
+    kitchen = make_candidate("frontier:kitchen", "EXPLORE", x=2.0)
+    kitchen.metadata.update({"room_attribute": "kitchen", "room_attribute_confidence": 0.95})
+    curator = CandidateCurator()
+
+    potty = curator.curate([fridge, kitchen], target_context={
+        "enabled": True, "target_name": "toilet", "object_labels": ["toilet", "crapper", "commode", "potty"]
+    })
+    assert potty.decision_hint_by_id.get(fridge.candidate_id) != "PLAUSIBLE_TARGET_CONTAINER"
+    assert kitchen.metadata["room_target_affinity"] == 0.0
+
+    pot = curator.curate([fridge, kitchen], target_context={"enabled": True, "target_name": "pot"})
+    assert pot.decision_hint_by_id[fridge.candidate_id] == "PLAUSIBLE_TARGET_CONTAINER"
+    assert kitchen.metadata["room_target_affinity"] == 1.0

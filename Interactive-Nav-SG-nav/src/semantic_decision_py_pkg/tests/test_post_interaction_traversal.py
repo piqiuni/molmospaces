@@ -19,6 +19,26 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
 )
 
 
+def test_post_open_uses_nearby_far_side_frontier_center_without_mutating_pending():
+    pending = {"candidate_id": "traverse:portal:event", "goal_xyyaw": [3.0, 0.0, 0.0],
+               "metadata": {"source_portal_center_xy": [0.0, 0.0],
+                            "source_interaction_approach_xyyaw": [-1.0, 0.0, 0.0]}}
+    snapshot = {"candidates": [
+        {"candidate_id": "frontier:new", "behavior_type": "EXPLORE",
+         "metadata": {"frontier_point": [0.6, 0.4]}},
+        {"candidate_id": "frontier:old", "behavior_type": "EXPLORE",
+         "metadata": {"frontier_point": [-0.2, 0.0]}},
+        {"candidate_id": "frontier:remote", "behavior_type": "EXPLORE",
+         "metadata": {"frontier_point": [5.0, 0.0]}},
+    ]}
+    assert inject_pending_traversal(snapshot, pending)
+    injected = snapshot["candidates"][-1]
+    assert injected["goal_xyyaw"] == [0.6, 0.4, 0.0]
+    assert injected["metadata"]["allow_unknown_planning"]
+    assert len(injected["metadata"]["goal_xyyaw_candidates"]) == 2
+    assert pending["goal_xyyaw"] == [3.0, 0.0, 0.0]
+
+
 def refresh_snapshot(
     *,
     sequence: int,

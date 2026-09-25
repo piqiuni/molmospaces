@@ -428,14 +428,17 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         end_on_success: bool = False,
     ):
         log.info("Starting task.reset() ...")
-        task.set_history_retention(bool(getattr(policy, "retain_task_history", False)))
+        # ``set_history_retention`` exists only on the interactive task
+        # implementation.  Latest MolmoSpaces navigation tasks do not expose
+        # that optional history hook, so keep the rollout compatible with both
+        # task APIs instead of failing before the first observation.
+        set_history_retention = getattr(task, "set_history_retention", None)
+        if callable(set_history_retention):
+            set_history_retention(bool(getattr(policy, "retain_task_history", False)))
         if hasattr(policy, "prepare_episode_reset"):
             policy.prepare_episode_reset()
         observation, _info = task.reset()
         log.info("task.reset() completed.")
-        # print(f"Observation: {observation}", flush=True)
-        if viewer is not None:
-            viewer.sync()
 
         policy.task = task
         policy.reset()
@@ -452,6 +455,12 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             observation = task.get_observations()
             if task.observation_cache:
                 task.observation_cache[0] = observation
+        # The first viewer render must happen after benchmark initial-state
+        # enforcement.  Otherwise a scene whose recorded state is closed can
+        # briefly expose an open doorway to a recorder/ROS subscriber before
+        # the force controller applies the required reset.
+        if viewer is not None:
+            viewer.sync()
         runtime_target_publisher = getattr(policy, "runtime_target_publisher", None)
         if runtime_target_publisher is not None:
             policy.runtime_target_selection = runtime_target_publisher.publish(
@@ -544,7 +553,13 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             debug_snapshot_ms = (time.perf_counter() - snapshot_t0) * 1000.0
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
-            action_cmd = policy.get_action(observation)
+            if (
+                force_interaction_controller is not None
+                and force_interaction_controller.should_pause_navigation()
+            ):
+                action_cmd = policy.get_action(observation, hold_navigation=True)
+            else:
+                action_cmd = policy.get_action(observation)
             policy_ms = (time.perf_counter() - policy_t0) * 1000.0
             if getattr(policy, "last_action_timed_out", False):
                 consecutive_action_timeouts += 1
@@ -1266,6 +1281,14 @@ def parse_args():
         help="Linear velocity gain applied to incoming /cmd_vel_stamped before stepping base.",
     )
     parser.add_argument(
+        "--allow_lateral_cmd_vel",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Allow holonomic cmd_vel; default DWA navigation rejects lateral commands.",
+    )
+    parser.add_argument(
         "--initial_arm_qpos",
         type=str,
         default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04",
@@ -1366,6 +1389,8 @@ def main():
             args.action_timeout_s, args.scene_timeout_s
         )
         policy = RosBridgePolicy(
+            publish_odom_twist=True,
+            odom_twist_source="step_delta",
             config=exp_config,
             task=None,
             observation_topic=args.observation_topic,
@@ -1397,6 +1422,7 @@ def main():
             depth_max_m=args.depth_max_m,
             cmd_vel_control_dt_s=args.policy_dt_ms / 1000.0,
             cmd_vel_linear_gain=args.cmd_vel_linear_gain,
+            allow_lateral_cmd_vel=args.allow_lateral_cmd_vel,
             require_fresh_cmd_vel=args.require_fresh_cmd_vel,
             require_move_base_active_for_cmd_vel=args.require_move_base_active_for_cmd_vel,
             map_warmup_skip_frames=args.map_warmup_skip_frames,

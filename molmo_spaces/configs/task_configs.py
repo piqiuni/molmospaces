@@ -1,7 +1,7 @@
 """Task configuration classes for MolmoSpaces experiments."""
 
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import TypeAlias
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -40,6 +40,8 @@ class BaseMujocoTaskConfig(Config):
     #  - the referral expression/description
     referral_expressions_priority: dict[str, list[tuple[float, float, str]]] = {}
 
+    robot_base_pose: list[float] | None = None  # initial robot base pose, xyz + quat
+
     # Sensor settings (common to all task types)
     use_sensors: bool = True  # Whether to use the sensor system
     tracked_object_names: list[str] | None = None  # Object names for ObjectPoseSensor
@@ -54,7 +56,6 @@ class PickTaskConfig(BaseMujocoTaskConfig):
     # Object names
     pickup_obj_start_pose: list[float] | None = None
     pickup_obj_goal_pose: list[float] | None = None
-    robot_base_pose: list[float] | None = None
     receptacle_name: str | None = None
     place_target_name: str | None = None
     pickup_obj_name: str | None = None
@@ -136,7 +137,6 @@ class DoorOpeningTaskConfig(BaseMujocoTaskConfig):
 
     # --- DoorOpening-specific task parameters ---
     door_body_name: str | None = None  # e.g., "door|2|8_Doorway_Double_7_doorway_door_7"
-    robot_base_pose: np.ndarray | None = None  # (x,y,z,w,x,y,z)
     articulated_joint_range: np.ndarray | None = None
     articulated_joint_reset_state: np.ndarray | None = None
     additional_tcp_rotation_offset_mat: np.ndarray = (
@@ -173,11 +173,8 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     pickup_obj_candidates: list[str] | None = (
         None  # List of all candidate object instances of this type
     )
-    # Legacy benchmarks navigate to any candidate; v3 container episodes set this explicitly.
-    selection_mode: Literal["specific_instance", "any_candidate"] = "any_candidate"
     pickup_obj_category: str | None = None  # Semantic category (e.g., "apple")
     pickup_obj_synset: str | None = None  # WordNet synset (e.g., "apple.n.01")
-    robot_base_pose: list[float] | None = None
 
     # For compatibility with EvalTaskSampler (not used in nav tasks, but needed for shared code)
     receptacle_name: str | None = None

@@ -1,0 +1,35 @@
+TaskName: "inav_spot_2gpu_30w500_mod4_20260923"
+Description: "InteractiveNav modulo-6 shard 4; 500 episodes; 30 workers; dynamic 200-2000 steps; 2-GPU Qwen total concurrency 32; preemptible; resume"
+Entrypoint: "RUN_ROOT=/home/ldl/outputs/interactive-nav/eval-3000-2gpu-30w-20260923/mod4 BENCHMARK_LAUNCHER_CONFIG=scripts/InteractiveNav/configs/evaluation/benchmark_spot_2gpu_30w500_mod4_20260923.json EXPECTED_EPISODES=500 QWEN36_MAX_MODEL_LEN=10240 QWEN36_TP_SIZE=1 QWEN36_MAX_NUM_SEQS=16 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04"
+ResourceQueueName: "c20250503"
+Framework: "PyTorchDDP"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.7xlarge"
+ActiveDeadlineSeconds: 604800
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+Preemptible: true
+Priority: 6
+RetryOptions:
+  EnableRetry: true
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 20
+  IntervalSeconds: 120
+  PolicySets: ["Failed"]
+EnableTensorBoard: false
+Storages:
+  - Type: "TosFuse"
+    MountPath: "/tos"
+    Bucket: "c20250503"
+    Prefix: /
+  - Type: "Vepfs"
+    MountPath: "/home/ldl"
+    SubPath: "/c20250503/250404017"
+    ReadOnly: false
+  - Type: "Vepfs"
+    MountPath: "/vepfs-wxy"
+    SubPath: "/c20250503/240401046"
+    ReadOnly: false

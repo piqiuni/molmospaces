@@ -35,6 +35,40 @@ from scripts.InteractiveNav.evaluation.benchmark_types import (
     PolicyObservation,
     PublicEpisode,
 )
+from scripts.InteractiveNav.evaluation.goal_status import PublicGoalEvidenceLedger
+
+
+def test_unverified_goal_claim_does_not_end_rollout(monkeypatch):
+    from scripts.InteractiveNav.evaluation.goal_status import GoalClaimVerification
+    payload = {"status": "SUCCEEDED", "mission_mode": "object_goal",
+               "detail": {"reason": "target_goal_succeeded", "claim_id": "new"}}
+    feedback = []
+    observer = SimpleNamespace(drain=lambda: [payload], publish_verification=lambda *args: feedback.append(args))
+    runtime = SimpleNamespace()
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(False, "distance_failed"))
+    assert benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={}) is None
+    assert feedback == [(payload, False)]
+    assert runtime.rejected_goal_claims[0]["reason"] == "distance_failed"
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(True, "verified"))
+    terminal = benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={})
+    assert terminal[0] == "target_found"
+    assert feedback[-1] == (payload, True)
+
+
+def test_expired_pending_claim_rejects_without_terminal(monkeypatch):
+    from scripts.InteractiveNav.evaluation.goal_status import GoalClaimVerification
+    payload = {"detail": {"claim_id": "pending"}}
+    runtime = SimpleNamespace(pending_target_claim=(payload, 0.0))
+    feedback = []
+    observer = SimpleNamespace(drain=lambda: [], publish_verification=lambda *args: feedback.append(args))
+    monkeypatch.setattr(benchmark_runner.time, "monotonic", lambda: 3.0)
+    monkeypatch.setattr(benchmark_runner, "_verify_restricted_goal_status",
+                        lambda **kwargs: GoalClaimVerification(False, "no_published_target_evidence"))
+    assert benchmark_runner._poll_restricted_goal_status(observer=observer, task=None, runtime=runtime, episode={}) is None
+    assert runtime.pending_target_claim is None
+    assert feedback == [(payload, False)]
 
 
 def _public_episode() -> PublicEpisode:
@@ -58,6 +92,202 @@ def _episode(requirement: str, validation: dict[str, float | None]) -> dict[str,
     }
 
 
+def test_live_category_filter_uses_same_private_relation_gate_for_nested_objects() -> None:
+    """Cross-room/different-container objects never enter the relaxed ledger."""
+
+    class _Object:
+        def __init__(self, name: str, position: list[float]) -> None:
+            self.name = name
+            self.position = np.asarray(position, dtype=float)
+
+    metadata = {
+        "egg_selected": {"category": "Egg", "parent": "fridge_a", "room_id": 2},
+        "egg_same_fridge": {"category": "Egg", "parent": "fridge_a", "room_id": 2},
+        "egg_surface": {"category": "Egg", "parent": "table", "room_id": 2},
+        "egg_other_room": {"category": "Egg", "parent": "fridge_b", "room_id": 3},
+        "fridge_a": {"category": "Fridge", "parent": "", "room_id": 2},
+        "fridge_b": {"category": "Fridge", "parent": "", "room_id": 3},
+        "table": {"category": "Table", "parent": "", "room_id": 2},
+    }
+    positions = {
+        "egg_selected": [0.0, 0.0, 1.0],
+        "egg_same_fridge": [0.2, 0.0, 0.5],
+        "egg_surface": [4.0, 0.0, 0.4],
+        "egg_other_room": [0.1, 0.0, 0.5],
+    }
+
+    class _Manager:
+        scene_metadata = {"objects": metadata}
+
+        def object_metadata(self, name: str):
+            return metadata.get(name, {})
+
+        def get_object_by_name(self, name: str):
+            return _Object(name, positions[name])
+
+        def list_top_level_objects(self):
+            return [_Object(name, positions[name]) for name in positions]
+
+        def get_annotation_category(self, obj):
+            return metadata[obj.name]["category"]
+
+        def category_from_name(self, name: str):
+            return metadata.get(name, {}).get("category", "")
+
+    target = {
+        "selected_instance": "egg_selected",
+        "category": "egg",
+        "container_name": "fridge_a",
+        "grounding": {"unique": False, "attributes": {}},
+        "container_aabb_center": [0.0, 0.0, 0.8],
+        "container_aabb_size": [1.0, 1.0, 1.5],
+    }
+    task = SimpleNamespace(env=SimpleNamespace(object_managers=[_Manager()], current_batch_index=0))
+    episode = {"interactive_nav": {"target": target}}
+    names = benchmark_runner._category_goal_source_names(task=task, episode=episode)
+    assert set(names) >= set(positions)
+    accepted, decisions = benchmark_runner._live_category_candidate_filter(
+        task=task, episode=episode, source_names=names
+    )
+    assert set(accepted) == {"egg_selected", "egg_same_fridge", "egg_surface"}
+    assert decisions["egg_same_fridge"]["reason"] == "same_container"
+    assert decisions["egg_surface"]["reason"] == "same_room_category"
+    assert decisions["egg_other_room"]["reason"] == "not_equivalent"
+
+
+def test_relaxed_category_verification_fails_closed_without_relation_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy runtime cannot promote a non-selected object by distance alone."""
+
+    evidence = PublicGoalEvidenceLedger(
+        episode_id="episode-1", target_instance_ids=["obj-selected", "obj-alt"]
+    )
+    evidence.record_frame(
+        {
+            "target_context": {"episode_id": "episode-1"},
+            "observations": [{"instance_id": "obj-alt"}],
+        },
+        capture_step=4,
+    )
+    runtime = SimpleNamespace(
+        perception=SimpleNamespace(episode_id="episode-1"),
+        category_goal_evidence=evidence,
+        category_target_source_by_opaque_id={
+            "obj-selected": "selected",
+            "obj-alt": "alternative",
+        },
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_private_target_distances_m",
+        lambda *args, **kwargs: {"obj-alt": 0.1, "obj-selected": 0.2},
+    )
+    verification = benchmark_runner._verify_relaxed_category_goal_status(
+        task=SimpleNamespace(),
+        runtime=runtime,
+        episode={
+            "interactive_nav": {
+                "target": {"selected_instance": "selected"},
+                "success_criteria": {"distance": {"threshold_m": 0.5}},
+            }
+        },
+        payload={
+            "status": "SUCCEEDED",
+            "mission_mode": "object_goal",
+            "detail": {
+                "reason": "target_goal_succeeded",
+                "target_visible_now": True,
+                "target_reliably_observed": True,
+                "target_object_distance_m": 0.1,
+                "target_success_distance_threshold_m": 0.5,
+            },
+            "target_context": {"episode_id": "episode-1"},
+        },
+    )
+    assert not verification.accepted
+    assert verification.reason == "category_relation_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected_reason"),
+    [
+        ({"target_visible_now": False, "target_reliably_observed": True,
+          "target_object_distance_m": 0.5, "target_success_distance_threshold_m": 1.5},
+         "target_perception_not_current"),
+        ({"target_visible_now": True, "target_reliably_observed": True,
+          "target_object_distance_m": 5.0, "target_success_distance_threshold_m": 1.5},
+         "graph_distance_failed"),
+        ({"target_visible_now": True, "target_reliably_observed": True},
+         "graph_distance_unavailable"),
+    ],
+)
+def test_target_claim_requires_current_perception_and_graph_distance(
+    detail: dict[str, object], expected_reason: str
+) -> None:
+    assert benchmark_runner._verify_public_claim_context(detail).reason == expected_reason
+
+
+def test_target_claim_accepts_graph_distance_within_success_radius() -> None:
+    detail = {
+        "target_visible_now": True,
+        "target_reliably_observed": True,
+        "target_object_distance_m": 1.49,
+        "target_success_distance_threshold_m": 1.5,
+    }
+    assert benchmark_runner._verify_public_claim_context(detail) is None
+
+
+def test_open_container_claim_needs_perception_and_measured_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = PublicGoalEvidenceLedger(
+        episode_id="episode-1", target_instance_ids=["obj-target"]
+    )
+    evidence.record_frame(
+        {"target_context": {"episode_id": "episode-1"},
+         "observations": [{"instance_id": "obj-target"}]},
+        capture_step=10,
+    )
+    runtime = SimpleNamespace(
+        perception=SimpleNamespace(episode_id="episode-1"),
+        goal_evidence=evidence,
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_private_target_distances_m",
+        lambda *args, **kwargs: {"obj-target": 2.2},
+    )
+    payload = {
+        "status": "SUCCEEDED", "mission_mode": "object_goal",
+        "target_context": {"episode_id": "episode-1"},
+        "detail": {
+            "reason": "target_goal_succeeded",
+            "target_visible_now": True,
+            "target_reliably_observed": True,
+            "target_navigation_required": False,
+            "containing_container_id": "container-1",
+            "target_open_container_anchor_ready": True,
+            "target_open_container_anchor_distance_m": 0.2,
+            "direct_goal_tolerance_m": 0.45,
+        },
+    }
+    episode = {"interactive_nav": {
+        "success_criteria": {"distance": {"threshold_m": 1.5}}
+    }}
+    accepted = benchmark_runner._verify_restricted_goal_status(
+        task=SimpleNamespace(), runtime=runtime, episode=episode, payload=payload
+    )
+    assert accepted.accepted
+    assert accepted.reason == "verified_open_container_anchor"
+
+    del payload["detail"]["target_open_container_anchor_distance_m"]
+    rejected = benchmark_runner._verify_restricted_goal_status(
+        task=SimpleNamespace(), runtime=runtime, episode=episode, payload=payload
+    )
+    assert not rejected.accepted
+    assert rejected.reason == "graph_distance_unavailable"
+
+
 def _result_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "domains": ["channel"],
@@ -77,9 +307,9 @@ def _result_row(**overrides: object) -> dict[str, object]:
         # These are the evaluator-owned, per-episode fields used by the paper
         # metrics.  They deliberately are not inferred from the legacy
         # ``correct_interaction_action_count`` aggregate.
-        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v1",
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v3",
         "paper_metric_config": {
-            "schema_version": "interactive_nav_v3_paper_metrics_v1",
+            "schema_version": "interactive_nav_v3_paper_metrics_v3",
             "interaction_attempt_cost": 0.3,
             "error_interaction_surcharge": 1.0,
             "failure_penalty": 5.0,
@@ -109,6 +339,11 @@ def _result_row(**overrides: object) -> dict[str, object]:
         "terminal_reason": "interactive_nav_success",
     }
     row.update(overrides)
+    if "required_interaction_completion_fraction" not in overrides:
+        row["required_interaction_completion_fraction"] = (
+            float(bool(row["required_interaction_success"]))
+            if row["interaction_requirement"] == "required" else None
+        )
     return row
 
 
@@ -313,8 +548,8 @@ def test_dynamic_step_budget_matches_short_visible_example() -> None:
         ),
     )
 
-    assert budget == 300
-    assert hidden_budget == 800
+    assert budget == 200
+    assert hidden_budget == 850
     assert basis["initial_target_visible"] is True
 
 
@@ -335,9 +570,22 @@ def test_dynamic_step_budget_accounts_for_mixed_drawer_search() -> None:
         ),
     )
 
-    assert budget == 1000
+    assert budget == 1200
     assert basis["required_interaction_type_counts"] == {"channel": 1, "container": 1, "unknown": 0}
     assert basis["container_joint_count"] == 4
+
+
+def test_dynamic_budget_counts_first_joint_and_respects_smaller_cap() -> None:
+    config = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"), output_dir=Path("out"), max_steps=2000,
+    )
+    episode = _budget_episode(path_length_m=10, interaction_types=["container_sliding_drawer"],
+                              container_joint_count=1)
+    budget, basis = benchmark_runner.episode_step_budget(config, episode)
+    assert config.step_budget_mode == "dynamic"
+    assert basis["components"]["container_joint_steps"] == 50
+    assert budget == 800
+    assert benchmark_runner.episode_step_budget(replace(config, max_steps=625), episode)[0] == 625
 
 
 def test_dynamic_step_budget_clamps_and_fixed_mode_stays_compatible() -> None:
@@ -712,6 +960,21 @@ def test_paper_isr_excludes_unnecessary_episodes_from_its_denominator() -> None:
     assert groups["requirement/unnecessary"]["required_interaction_success_rate"] is None
 
 
+def test_paper_isr_means_per_scene_completion_instead_of_all_or_nothing() -> None:
+    rows = [
+        _result_row(required_interaction_success=False,
+                    required_interaction_completion_fraction=0.5),
+        _result_row(required_interaction_success=True,
+                    required_interaction_completion_fraction=1.0),
+        _result_row(interaction_requirement="unnecessary",
+                    required_interaction_success=True),
+    ]
+    overall = summarise_results(rows)["groups"]["overall"]
+    assert overall["paper_isr"] == pytest.approx(0.75)
+    assert overall["required_interaction_success_rate"] == pytest.approx(0.75)
+    assert overall["full_required_interaction_success_rate"] == pytest.approx(0.5)
+
+
 def test_paper_ip_is_episode_macro_and_defines_both_zero_attempt_cases() -> None:
     rows = [
         _result_row(
@@ -1027,18 +1290,24 @@ def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() ->
     }
     recorded: list[tuple[dict, int]] = []
     queued: list[dict] = []
+    task = SimpleNamespace(env=SimpleNamespace(camera_manager=SimpleNamespace(
+        registry={"head_camera": SimpleNamespace(pos=[1.0, 2.0, 3.0], forward=[0.0, 1.0, 0.0])}
+    )))
 
     class Perception:
-        def build(self, task, *, step_index, force):
-            assert task == "task"
+        camera_name = "head_camera"
+
+        def build(self, observed_task, *, step_index, force):
+            assert observed_task is task
             assert step_index == 5
             assert force
             return {"private_build": "not forwarded"}
 
     class Adapter:
-        def publish_restricted_gt_frame(self, payload, *, capture_step):
+        def publish_restricted_gt_frame(self, payload, *, capture_step, observation_pose_xyyaw):
             assert payload == {"private_build": "not forwarded"}
             assert capture_step == 5
+            assert observation_pose_xyyaw == pytest.approx([1.0, 2.0, np.pi / 2])
             return published
 
     class Evidence:
@@ -1049,12 +1318,14 @@ def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() ->
         perception=Perception(),
         adapter=Adapter(),
         goal_evidence=Evidence(),
+        category_goal_evidence=None,
+        public_rgb_sink=None,
         published_frame_sink=lambda payload: queued.append(payload) or True,
     )
 
     assert benchmark_runner._publish_restricted_ros_frame(
         runtime,
-        "task",
+        task,
         decision_index=5,
     )
     assert recorded == [(published, 5)]

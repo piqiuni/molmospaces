@@ -9,12 +9,36 @@ from scripts.InteractiveNav.evaluation.restricted_gt_perception import (
     ForbiddenField,
     OpaqueEpisodeRegistry,
     PrivateObjectSpec,
+    RestrictedGTPerceptionPublisher,
+    normalize_semantic_category,
     audit_restricted_gt_payload,
     binary_mask_rle_stats,
     build_restricted_gt_frame,
     decode_binary_mask_rle,
     encode_binary_mask_rle,
 )
+
+
+@pytest.mark.parametrize("label", ["door", "doorway", "doorframe", "door_frame", "door_leaf", "DoorFrame"])
+def test_door_labels_share_public_category(label):
+    assert normalize_semantic_category(label) == "door"
+
+
+def test_small_visible_clock_is_not_rejected_by_extra_bbox_area_gate():
+    segmentation = np.zeros((30, 30, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    segmentation[2:18, 2:23] = [9, 42]
+    publisher = RestrictedGTPerceptionPublisher()
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation, registry=publisher.registry,
+        candidates=[PrivateObjectSpec(
+            source_name="private_clock", semantic_category="clock", geom_ids=(9,),
+            aabb_center=(1., 2., 3.), aabb_size=(.1, .1, .1),
+        )], geom_object_type=42,
+        min_visible_pixels=publisher.min_visible_pixels,
+        min_bbox_area_pixels=publisher.min_bbox_area_pixels,
+    )
+    assert [o["name"] for o in payload["observations"]] == ["clock"]
 
 
 def test_mask_rle_round_trip_uses_coco_column_order() -> None:
@@ -27,6 +51,38 @@ def test_mask_rle_round_trip_uses_coco_column_order() -> None:
     assert encoded["size"] == [3, 3]
     assert np.array_equal(decode_binary_mask_rle(encoded), mask)
     assert binary_mask_rle_stats(encoded) == (3, 3, int(mask.sum()))
+
+
+@pytest.mark.parametrize("distance,pixels,category,inside,expected", [
+    (2.0, 1, "refrigerator", False, True),
+    (2.001, 1, "refrigerator", False, False),
+    (1.0, 0, "refrigerator", False, False),
+    (1.0, 1, "egg", True, True),
+    (1.0, 1, "egg", False, False),
+    (1.0, 1, "door", True, False),
+])
+def test_near_container_visibility_requires_actual_pixels(distance, pixels, category, inside, expected):
+    segmentation = np.full((20, 20, 2), -1, dtype=np.int32)
+    if pixels:
+        segmentation[10, 10] = [9, 42]
+    specs = [PrivateObjectSpec(
+        source_name="private_object", semantic_category=category, geom_ids=(9,),
+        aabb_center=(0., 0., distance), aabb_size=(.1, .1, .1),
+    )]
+    if inside:
+        specs.append(PrivateObjectSpec(
+            source_name="private_container", semantic_category="cabinet", geom_ids=(10,),
+            aabb_center=(0., 0., distance), aabb_size=(1., 1., 1.),
+        ))
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation, registry=OpaqueEpisodeRegistry(), candidates=specs,
+        geom_object_type=42, min_visible_pixels=16, min_bbox_area_pixels=16,
+        min_bbox_short_side_pixels=4, min_visible_fraction=.2,
+        camera_position=(0., 0., 0.), camera_forward=(0., 0., 1.),
+        camera_up=(0., 1., 0.), camera_fov_deg=60.,
+    )
+    assert bool(payload["observations"]) is expected
+    audit_restricted_gt_payload(payload, known_private_identifiers=["private_object", "private_container"])
 
 
 def test_public_frame_is_opaque_and_allow_list_only() -> None:
@@ -278,3 +334,34 @@ def test_registry_can_start_from_the_evaluator_episode_index() -> None:
     assert registry.episode_id == "episode_000042"
     assert registry.public_id_for("private_a") == "obj_000001"
     assert registry.reset() == "episode_000043"
+def test_door_frame_leaf_share_one_render_instance_without_merging_adjacent_doors():
+    from types import SimpleNamespace
+    from scripts.InteractiveNav.evaluation.restricted_gt_perception import (
+        PrivateObjectSpec, _canonicalize_door_specs, _geom_to_spec_mapping)
+    import numpy as np
+    model = SimpleNamespace(ngeom=4, body_parentid=np.array([0, 0, 1, 0, 3]),
+                            geom_bodyid=np.array([1, 2, 3, 4]))
+    specs = [PrivateObjectSpec(source_name=f"door_{i}", body_id=i, semantic_category="door")
+             for i in range(1, 5)]
+    merged = _canonicalize_door_specs(model, specs)
+    assert len(merged) == 2
+    mapping = _geom_to_spec_mapping(model, merged)
+    assert mapping[0] == mapping[1]
+    assert mapping[2] == mapping[3]
+    assert mapping[0] != mapping[2]
+
+
+def test_separately_rooted_door_parts_keep_distinct_asset_copies():
+    from types import SimpleNamespace
+    from scripts.InteractiveNav.evaluation.restricted_gt_perception import (
+        PrivateObjectSpec, _canonicalize_door_specs, _geom_to_spec_mapping)
+    import numpy as np
+    model = SimpleNamespace(ngeom=4, body_parentid=np.zeros(5, dtype=int),
+                            geom_bodyid=np.array([1, 2, 3, 4]))
+    names = ["doorway_hash_1_0_2", "doorway_hash_1_2_2",
+             "doorway_hash_2_0_2", "doorway_hash_2_2_2"]
+    specs = [PrivateObjectSpec(source_name=name, body_id=i + 1, semantic_category="door")
+             for i, name in enumerate(names)]
+    merged = _canonicalize_door_specs(model, specs)
+    assert len(merged) == 2
+    assert _geom_to_spec_mapping(model, merged).tolist() == [0, 0, 1, 1]

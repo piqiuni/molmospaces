@@ -12,7 +12,7 @@ target:
   completion_requires_visibility: true
 
 candidate:
-  target_require_current_visibility: false
+  target_require_current_visibility: true
   target_require_same_room: false
   target_allow_connected_room: true
   target_min_visible_pixels: 128

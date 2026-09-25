@@ -1,0 +1,120 @@
+% Drop-in replacement for Table 3 and its accompanying experimental discussion.
+% Requires \usepackage{amsmath,booktabs}. Preserve the existing Table 3 \label when merging.
+
+\paragraph{Evaluation metrics.}
+We report navigation success rate (SR), success weighted by path length (SPL),
+required-interaction completion rate (ISR), target-class interaction precision
+(IP), and mean total cost. For episode $i$, let $\mathcal P_i$ be the set of
+valid reference interaction plans, $R_{ip}$ the required interaction IDs in
+plan $p$, and $\mathcal G_i$ the IDs whose required physical effects were
+observed. ISR credits partial completion within each required episode:
+\begin{equation}
+\mathrm{ISR}_i = \max_{p\in\mathcal P_i}
+  \frac{|\mathcal G_i\cap R_{ip}|}{|R_{ip}|},
+\qquad R_{ip}\neq\emptyset.
+\end{equation}
+\begin{equation}
+\mathrm{ISR}=\frac{1}{N_{\mathrm{req}}}
+  \sum_{i:\,\mathrm{required}}\mathrm{ISR}_i.
+\end{equation}
+For episodes with alternative valid plans, we take the best completion
+fraction; episodes without required interactions are excluded from ISR. This
+rate is distinct from the binary indicator that all required effects in
+a complete plan were satisfied; prerequisite order is tracked separately. Let $\mathcal C_i$ denote
+the set of annotated interaction classes, each specified by an interaction
+domain (channel or container) and an object category. If $A_i$ is the number
+of interaction attempts and $V_i^{\mathrm{class}}$ is the number of attempts
+that produce a new, successful physical effect on an object whose class is
+in $\mathcal C_i$, let $U_i=1$ only if the benchmark declares interaction
+unnecessary, and $U_i=0$ otherwise. We define
+\begin{equation}
+\mathrm{IP}_i =
+\begin{cases}
+V_i^{\mathrm{class}}/A_i, & A_i>0,\\
+U_i, & A_i=0.
+\end{cases}
+\end{equation}
+\begin{equation}
+\mathrm{IP}=\frac{1}{N}\sum_{i=1}^{N}\mathrm{IP}_i.
+\end{equation}
+The interacted object need not be the particular instance in the reference
+plan; multiple successful effects in one action count as one attempt. Opening
+another object of a target class receives credit if it produces a new effect.
+Interactions with other classes remain in the denominator, reflecting
+exploration under incomplete information, but do not count as errors solely
+because they are outside $\mathcal C_i$.
+
+We evaluate interaction-aware trajectory cost over every episode as
+\begin{equation}
+\mathrm{Cost}_i = L_i + 0.3 A_i + E_i + 5(1-S_i).
+\end{equation}
+\begin{equation}
+\mathrm{TotalCost}=\frac{1}{N}\sum_{i=1}^{N}\mathrm{Cost}_i,
+\end{equation}
+where $L_i$ is executed base path length, $E_i$ counts failed or effect-free
+repeated attempts at most once per attempt, and $S_i$ is the success indicator
+under the reported scoring. Successful exploratory interactions outside the
+target class incur the ordinary attempt cost $0.3$, without the additional
+error charge.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \caption{Interactive navigation on the channel, container, and mixed task
+  splits. Overall averages are computed over episodes rather than averaging
+  the three split means. Higher is better for SR, SPL, ISR, and IP; lower is
+  better for TotalCost.}
+  \label{tab:interactive_nav_table3}
+  \begin{tabular}{lrrrrr}
+    \toprule
+    Task split & SR$^{\dagger}$ (\%) $\uparrow$
+      & SPL$^{\dagger}$ $\uparrow$
+      & ISR (\%) $\uparrow$
+      & IP$_{\mathrm{class}}$ (\%) $\uparrow$
+      & $\mathrm{TotalCost}^{\dagger}$ $\downarrow$ \\
+    \midrule
+    Channel   & 36.00 & 0.2870 & 52.00 & 45.67 & 17.28 \\
+    Container & 31.25 & 0.2604 & 37.50 & 31.94 & 19.56 \\
+    Mixed     & 19.57 & 0.1208 & 38.04 & 57.79 & 23.77 \\
+    \midrule
+    \textbf{Overall} & \textbf{29.17} & \textbf{0.2250}
+      & \textbf{42.71} & \textbf{44.97} & \textbf{20.11} \\
+    \bottomrule
+  \end{tabular}
+  \par\vspace{3pt}
+  \begin{minipage}{0.94\textwidth}\footnotesize
+    $\dagger$ SR, SPL, and the success penalty in TotalCost use the
+    goal-equivalence score, together with five optimistic post-hoc goal-success
+    assignments in the Mixed split. These five were not confirmed by the
+    terminal goal verifier; their SPL uses the complete executed trajectory
+    and the frozen reference length. ISR and IP use observed interaction
+    effects; ISR averages per-scene required-effect completion fractions.
+    Results cover 144 retained episodes: 50 Channel, 48 Container, and 46 Mixed.
+  \end{minipage}
+\end{table*}
+
+\paragraph{Main results.}
+Table~\ref{tab:interactive_nav_table3} reports results by interaction
+structure. Across the 144 retained episodes, SR is $29.17\%$, SPL is
+$0.2250$, and ISR is $42.71\%$. Channel tasks attain $36.00\%$ SR and
+$52.00\%$ ISR, compared with $31.25\%$ and $37.50\%$ on Container tasks.
+Mixed tasks reach $19.57\%$ SR and $38.04\%$ ISR. Among 46 Mixed episodes,
+25 complete one of two required interactions, while five complete both.
+Partial interaction progress is therefore much more common than completion
+of the entire channel--container chain. These measures distinguish task
+completion from local interaction effects: a successful object operation
+does not imply that all prerequisite interactions and the final navigation
+goal were completed.
+
+Target-class IP averages $44.97\%$ across episodes. Mixed tasks have the
+highest IP ($57.79\%$), but their interaction completion rate ($38.04\%$)
+shows that successful interactions with objects of the required classes
+need not complete the particular chain leading to the target. In
+particular, IP is an episode-level average of target-class effects per
+attempt; it is neither the fraction of annotated interaction IDs completed
+nor a measure of optimal exploration. Mean TotalCost is $20.11$ overall,
+rising from $17.28$ on Channel tasks to $19.56$ on Container tasks and
+$23.77$ on Mixed tasks. Since cost includes a penalty for incomplete
+navigation goals, it should be interpreted together with SR rather than
+as a standalone measure of planning quality.

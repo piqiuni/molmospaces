@@ -73,10 +73,12 @@ class FrontierCluster:
     visible_unknown_area_m2: float = 0.0
     score: float = 0.0
     score_terms: dict[str, float] = field(default_factory=dict)
+    frontier_center_fallback: bool = False
 
 
 @dataclass
 class FrontierConfig:
+    frontier_center_fallback_enabled: bool = False
     free_max: int = 20
     occupied_min: int = 50
     hard_min_cluster_cells: int = 3
@@ -321,10 +323,26 @@ class FrontierExplorerCore:
             robot_xy,
             state=state,
         )
+        center_fallback = False
         if subgoal_cell is None:
-            return None
+            if not self.config.frontier_center_fallback_enabled:
+                return None
+            radius_cells = int(ceil((self.config.robot_radius_m + self.config.footprint_safety_margin_m)
+                                    / max(grid.spec.resolution, 1e-6)))
+            center_cells = [(round(cx), round(cy))] + sorted(
+                cells, key=lambda cell: (cell[0] - cx) ** 2 + (cell[1] - cy) ** 2
+            )
+            subgoal_cell = next((cell for cell in center_cells
+                if self._footprint_is_free(grid, cell, radius_cells, allow_unknown=True)
+                and (state is None or not state.is_goal_point_blocked(
+                    grid.spec.grid_to_world(cell[0], cell[1])))), None)
+            if subgoal_cell is None:
+                return None
+            center_fallback = True
         subgoal_world = grid.spec.grid_to_world(subgoal_cell[0], subgoal_cell[1])
         subgoal_yaw = atan2(centroid_world[1] - subgoal_world[1], centroid_world[0] - subgoal_world[0])
+        if center_fallback:
+            subgoal_yaw = atan2(subgoal_world[1] - robot_xy[1], subgoal_world[0] - robot_xy[0])
         dist = hypot(subgoal_world[0] - robot_xy[0], subgoal_world[1] - robot_xy[1])
         if dist + 1e-6 < self.config.hard_min_subgoal_distance_m:
             return None
@@ -373,6 +391,7 @@ class FrontierExplorerCore:
             unknown_component_cells,
         )
         return FrontierCluster(
+            frontier_center_fallback=center_fallback,
             cluster_id=source_cluster_id,
             cells=list(cells),
             centroid_cell=(cx, cy),
@@ -828,6 +847,8 @@ class FrontierExplorerCore:
         grid: OccupancyGridData,
         cell: tuple[int, int],
         radius_cells: int,
+        *,
+        allow_unknown: bool = False,
     ) -> bool:
         cx, cy = cell
         radius_sq = radius_cells * radius_cells
@@ -838,7 +859,7 @@ class FrontierExplorerCore:
                 if not grid.spec.in_bounds(x, y):
                     return False
                 value = grid.cell(x, y)
-                if self.config.footprint_unknown_is_free and self._is_unknown(value):
+                if (allow_unknown or self.config.footprint_unknown_is_free) and self._is_unknown(value):
                     continue
                 if not self._is_free(value):
                     return False

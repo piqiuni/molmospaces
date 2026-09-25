@@ -341,6 +341,79 @@ def test_incremental_room_object_graph_growth():
     assert len(second_graph["views"]["navigation_view"]["hints"]) >= 3
 
 
+def test_transient_zero_aabb_does_not_erase_previous_geometry():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                observation_id="obs1",
+                instance_id="door_1",
+                semantic_name="door",
+                category="door",
+                is_door=True,
+                aabb_center=[1.0, 2.0, 1.0],
+                aabb_size=[0.9, 0.12, 2.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    store.update_observations(
+        [
+            observation(
+                observation_id="obs2",
+                instance_id="door_1",
+                semantic_name="door",
+                category="door",
+                is_door=True,
+                aabb_center=[1.1, 2.1, 1.0],
+                aabb_size=[0.0, 0.0, 0.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    node = next(node for node in store.nodes.values() if node.attributes.get("instance_id") == "door_1")
+    assert node.aabb_center == [1.0, 2.0, 1.0]
+    assert node.aabb_size == [0.9, 0.12, 2.0]
+    assert node.attributes["aabb_valid"] is True
+    assert node.attributes["aabb_reused_previous"] is True
+    assert node.attributes["interaction_reference_aabb_center"] == [1.0, 2.0, 1.0]
+    assert node.attributes["interaction_reference_aabb_size"] == [0.9, 0.12, 2.0]
+
+
+def test_first_valid_portal_aabb_replaces_zero_reference():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                observation_id="obs1",
+                instance_id="door_1",
+                semantic_name="door",
+                category="door",
+                is_door=True,
+                aabb_size=[0.0, 0.0, 0.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    store.update_observations(
+        [
+            observation(
+                observation_id="obs2",
+                instance_id="door_1",
+                semantic_name="door",
+                category="door",
+                is_door=True,
+                aabb_center=[2.0, 3.0, 1.0],
+                aabb_size=[1.0, 0.15, 2.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    node = next(node for node in store.nodes.values() if node.attributes.get("instance_id") == "door_1")
+    assert node.attributes["interaction_reference_aabb_center"] == [2.0, 3.0, 1.0]
+    assert node.attributes["interaction_reference_aabb_size"] == [1.0, 0.15, 2.0]
+
+
 def test_portal_connects_two_rooms_and_navigation_hint():
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -2804,6 +2877,8 @@ def test_unavailable_portal_feedback_is_terminal_and_not_static_open() -> None:
             "action": "open",
             "success": False,
             "state": "unavailable",
+            # A failed-result hint alone must not promote the portal to open.
+            "pre_state": "open",
             "interaction_capability": "unavailable",
             "interactable": False,
             "retryable": False,
@@ -2849,6 +2924,242 @@ def test_unavailable_portal_feedback_is_terminal_and_not_static_open() -> None:
         "door_leaf": "absent",
         "confidence": 0.9,
     }
+
+
+def test_unavailable_portal_preserves_m1_and_occ_confirmed_open_aperture() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_fixed_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_fixed_open_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 7,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            # The visual-only lane remains conservative for clipped targets.
+            # The unavailable result below adds independent capability evidence.
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["bottom"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_fixed_open_1",
+            "object_id": "door_fixed_open_1",
+            "event_id": "fixed_open_unavailable_feedback",
+            "action": "open",
+            "success": False,
+            "state": "unavailable",
+            "interaction_capability": "unavailable",
+            "interactable": False,
+            "retryable": False,
+            "reason": "non_articulated",
+            "source": "force_interaction_capability_check",
+        },
+        stamp=3.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_door_fixed_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["is_interactable"] is False
+    assert interaction["traversable"] is True
+    assert interaction["requires_interaction"] is False
+    assert interaction["state_evidence"] == "m1_open_aperture_and_occ_connectivity"
+    assert portal["attributes"]["portal_unavailable_state_resolution"] == {
+        "state": "static_open",
+        "m1_open_aperture": True,
+        "observed_open_connectivity": True,
+        "reason": "m1_open_aperture_and_occ_connectivity",
+        "event_id": "fixed_open_unavailable_feedback",
+    }
+
+
+def test_finish_without_action_latches_already_open_unavailable_portal() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_finish_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=4,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_finish_open_1",
+            "object_id": "door_finish_open_1",
+            "event_id": "m1_already_open",
+            "success": True,
+            "state": "open",
+            "observation_outcome": "finish_without_action",
+            "portal_aperture_evidence": {"open_aperture": "visible", "confidence": 0.95},
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=2.0)["nodes"]
+        if node["id"] == "portal_door_finish_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["is_interactable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["traversable"] is True
+
+
+def test_finish_without_action_without_map_connectivity_stays_unavailable() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_finish_open_without_map_1",
+        semantic_name="door",
+        is_door=True,
+        frame_index=4,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_finish_open_without_map_1",
+            "object_id": "door_finish_open_without_map_1",
+            "event_id": "m1_already_open_without_map",
+            "success": True,
+            "state": "open",
+            "observation_outcome": "finish_without_action",
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=2.0)["nodes"]
+        if node["id"] == "portal_door_finish_open_without_map_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "unavailable"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["traversable"] is False
+    assert interaction["requires_interaction"] is False
+
+
+def test_known_portal_blocks_occupancy_room_merge() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_merge_guard",
+                semantic_name="door",
+                is_door=True,
+                connected_room_ids=[1, 2],
+                room_id=1,
+                position=[1.0, 0.0, 1.0],
+                aabb_center=[1.0, 0.0, 1.0],
+                aabb_size=[0.9, 0.1, 2.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    store._accept_room_geometry(1, [0.0, 0.0, 0.1], [1.0, 1.0, 0.2], 1)
+    store._accept_room_geometry(2, [2.0, 0.0, 0.1], [1.0, 1.0, 0.2], 1)
+    store._ensure_room_node(1)
+    store._ensure_room_node(2)
+    store._apply_room_merges({2: 1})
+    assert 2 not in store.room_redirects
+    assert store.nodes["room_2"].attributes.get("active", True) is True
+
+
+def test_late_m1_and_occ_open_reconciles_unavailable_portal_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_late_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_late_open_1",
+            "object_id": "door_late_open_1",
+            "event_id": "late_open_unavailable_feedback",
+            "action": "open",
+            "success": False,
+            "state": "unavailable",
+            "interaction_capability": "unavailable",
+            "interactable": False,
+            "reason": "non_articulated",
+            "source": "force_interaction_capability_check",
+        },
+        stamp=2.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_late_open_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["bottom"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=3.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_door_late_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["traversable"] is True
+    assert interaction["requires_interaction"] is False
+    assert portal["attributes"]["portal_state_gate"]["reason"] == (
+        "unavailable_capability_m1_open_and_map_confirmed"
+    )
+    assert portal["attributes"]["portal_unavailable_state_resolution"]["reason"] == (
+        "m1_open_aperture_and_occ_connectivity"
+    )
+    assert portal["attributes"]["interaction_state_override"]["event_id"] == (
+        "late_open_unavailable_feedback"
+    )
 
 
 def test_invalid_unknown_portal_result_persists_noninteractable_static_state() -> None:
@@ -3405,6 +3716,38 @@ def test_successful_drawer_scan_completion_survives_closed_observation() -> None
     ]
 
 
+def test_drawer_scan_backend_source_implies_completion_when_sequence_type_missing() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    dresser = observation(
+        instance_id="dresser_scan_source_1",
+        semantic_name="dresser",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="slide",
+        joint_range=[0.0, 0.4],
+        joint_value=0.0,
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_dresser_scan_source_1",
+            "event_id": "drawer_scan_source_1",
+            "action": "open",
+            "success": True,
+            "post_state": "closed",
+            "verification_source": "drawer_scan_backend",
+            "step": 43,
+        }
+    )
+    node = next(
+        item
+        for item in store.as_graph_dict()["nodes"]
+        if item["id"] == "container_dresser_scan_source_1"
+    )
+    assert node["interaction"]["drawer_scan_completed"] is True
+    assert node["interaction"]["drawer_scan_completed_step"] == 43
+
+
 def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     info = type("Info", (), {"width": 3, "resolution": 1.0})()
@@ -3684,6 +4027,45 @@ def test_clipped_portal_visual_open_does_not_override_closed_state() -> None:
     assert portal["attributes"]["portal_state_gate"]["reason"] == "truncated_visual_evidence"
 
 
+def test_clipped_portal_visual_closed_does_not_create_closed_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_clipped_closed_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([door], stamp=1.0, source_mode="gt_replay")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_clipped_closed_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["left"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        item
+        for item in store.as_graph_dict(stamp=2.0)["nodes"]
+        if item["id"] == "portal_door_clipped_closed_1"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["attributes"]["portal_state_gate"] == {
+        "accepted": False,
+        "requested_state": "closed",
+        "reason": "truncated_visual_evidence",
+        "observation_capture_step": 8,
+    }
+
+
 def test_portal_open_without_visible_aperture_does_not_override_closed_state():
     store = InteractionGraphStore(scene_id="test_scene")
     door = observation(
@@ -3743,6 +4125,68 @@ def test_portal_open_without_visible_aperture_does_not_override_closed_state():
         "reason": "missing_visual_open_aperture_evidence",
         "observation_capture_step": 3,
     }
+
+
+def test_portal_consensus_pending_does_not_change_graph_state():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_consensus_1",
+        semantic_name="door",
+        is_door=True,
+        frame_index=1,
+    )
+    store.update_observations(
+        [door], stamp=1.0, source_mode="realtime_gt_observation"
+    )
+    base_patch = {
+        "object_id": "door_consensus_1",
+        "attribute_status": "ready",
+        "observation_frame_index": 1,
+        "interactable": True,
+        "interaction_class": "portal",
+        "coarse_state": "closed",
+        "confidence": 0.95,
+        "source": "mllm_attribute_inference",
+    }
+    assert store.apply_attribute_patch(
+        {
+            **base_patch,
+            "portal_state_consensus_accepted": False,
+            "portal_state_consensus": {
+                "reason": "confirmation_pending",
+                "confirmation_count": 2,
+            },
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=2.0)["nodes"]
+        if node["id"] == "portal_door_consensus_1"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["attributes"]["portal_state_gate"]["reason"] == (
+        "portal_state_consensus_pending"
+    )
+
+    assert store.apply_attribute_patch(
+        {
+            **base_patch,
+            "portal_state_consensus_accepted": True,
+            "portal_state_consensus": {
+                "reason": "initial_state_confirmed",
+                "confirmation_count": 3,
+                "stable_state": "closed",
+            },
+        },
+        stamp=3.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_door_consensus_1"
+    )
+    assert portal["interaction"]["state"] == "closed"
 
 
 def test_mllm_static_open_requires_absent_leaf_and_observed_map_connectivity():
@@ -4016,3 +4460,52 @@ def test_blocked_mllm_attribute_patch_survives_later_observation() -> None:
     assert interaction["traversable"] is False
     assert interaction["requires_interaction"] is False
     assert interaction["failure_reason"] == "visual_no_operable_door_leaf"
+def test_confirmed_room_split_shrinks_old_box_after_stability_window():
+    from types import SimpleNamespace
+    store = InteractionGraphStore()
+    info = SimpleNamespace(width=4, height=1, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    store.update_room_grid(info, [1, 1, 1, 1], [100] * 4, geometry_stability_frames=3)
+    for _ in range(2):
+        store.update_room_grid(info, [1, 1, 2, 2], [100] * 4, geometry_stability_frames=3)
+        node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+        assert node["aabb_size"][0] == 4.0
+    store.update_room_grid(info, [1, 1, 2, 2], [100] * 4, geometry_stability_frames=3)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert node["aabb_size"][0] == 2.0
+    assert node["aabb_center"][0] == 1.0
+
+
+def test_unknown_loss_and_unrelated_new_room_do_not_authorize_shrink():
+    from types import SimpleNamespace
+    info = SimpleNamespace(width=4, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    previous = {"info": info, "scene_data": [1, 1, -1, -1]}
+    assert not InteractionGraphStore._rooms_with_transferred_cells(previous, info, [1, -1, -1, 2])
+    shifted = SimpleNamespace(width=3, resolution=1.0,
+                              origin=SimpleNamespace(position=SimpleNamespace(x=1., y=0.)))
+    assert InteractionGraphStore._rooms_with_transferred_cells(previous, shifted, [2, -1, -1]) == {1}
+def test_l_shaped_room_box_contains_its_cells_instead_of_using_the_cell_mean():
+    from types import SimpleNamespace
+    info = SimpleNamespace(width=3, height=3, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+    store = InteractionGraphStore()
+    labels = [1, 1, 1, 1, -1, -1, 1, -1, -1]
+    store.update_room_grid(info, labels, [100] * 9, geometry_stability_frames=1)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert node["aabb_center"][:2] == [1.5, 1.5]
+    assert node["aabb_size"][:2] == [3.0, 3.0]
+
+
+def test_rotated_room_box_includes_full_cell_corners():
+    from types import SimpleNamespace
+    import math
+    info = SimpleNamespace(width=1, height=1, resolution=1.0,
+                           origin=SimpleNamespace(position=SimpleNamespace(x=0., y=0.),
+                               orientation=SimpleNamespace(x=0., y=0., z=math.sin(math.pi/8), w=math.cos(math.pi/8))))
+    store = InteractionGraphStore()
+    store.update_room_grid(info, [1], [100], geometry_stability_frames=1)
+    node = next(n for n in store.as_graph_dict()["nodes"] if n["id"] == "room_1")
+    assert abs(node["aabb_center"][0]) < 1e-9
+    assert abs(node["aabb_center"][1] - math.sqrt(.5)) < 1e-9
+    assert all(abs(v - math.sqrt(2)) < 1e-9 for v in node["aabb_size"][:2])

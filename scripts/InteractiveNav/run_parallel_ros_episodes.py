@@ -172,7 +172,11 @@ class Worker:
         self.port = args.base_master_port + worker_id
         self.master_uri = f"http://127.0.0.1:{self.port}"
         self.worker_dir = args.output_dir / f"worker_{worker_id:03d}"
-        self.ros_home = Path("/tmp/molmospaces_ros") / f"worker_{worker_id:03d}"
+        # Keep ROS logs and XML caches on the mounted data volume.  The root
+        # filesystem is intentionally small on benchmark machines.
+        self.ros_home = (
+            args.output_dir.parent / "_ros_home" / f"worker_{worker_id:03d}"
+        )
         self.gpu_id = args.gpu_ids[worker_id % len(args.gpu_ids)] if args.gpu_ids else None
         self.roscore: subprocess.Popen | None = None
         self.roslaunch: subprocess.Popen | None = None

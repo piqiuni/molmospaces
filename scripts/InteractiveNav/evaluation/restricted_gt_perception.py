@@ -525,6 +525,8 @@ def normalize_semantic_category(category: Any, *, fallback_source_name: str | No
     """
 
     normalized = _clean_semantic_text(category)
+    if normalized in {"door", "doorway", "doorframe", "door frame", "door leaf", "door_leaf"}:
+        return "door"
     if normalized:
         return _CATEGORY_ALIASES.get(normalized, normalized)
     source = _clean_semantic_text(fallback_source_name)
@@ -779,7 +781,61 @@ def build_private_object_specs_from_env(env: Any) -> list[PrivateObjectSpec]:
                 semantic_category=None if category is None else str(category),
             )
         )
-    return specs
+    return _canonicalize_door_specs(model, specs)
+
+
+def _canonicalize_door_specs(model: Any, specs: list[PrivateObjectSpec]) -> list[PrivateObjectSpec]:
+    """Unify frame/leaf render geometry using private asset identity, never proximity."""
+    from dataclasses import replace
+    import re
+
+    door_indices = [i for i, spec in enumerate(specs)
+                    if normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name) == "door"]
+    parents = list(range(len(specs)))
+    def root(index):
+        while parents[index] != index:
+            index = parents[index]
+        return index
+    def ancestors(body_id):
+        result = []
+        while body_id is not None and int(body_id) > 0 and int(body_id) not in result:
+            result.append(int(body_id))
+            if not hasattr(model, "body_parentid"):
+                break
+            body_id = int(model.body_parentid[int(body_id)])
+        return result
+    paths = {i: ancestors(specs[i].body_id) for i in door_indices}
+    def stem(name):
+        match = re.match(r"^(door\w*_.+)_(\d+)_\d+_(\d+)$", name)
+        return (match.group(1), match.group(2), match.group(3)) if match else None
+    for offset, i in enumerate(door_indices):
+        for j in door_indices[offset + 1:]:
+            same_tree = specs[i].body_id in paths[j] or specs[j].body_id in paths[i]
+            same_asset = stem(specs[i].source_name) is not None and stem(specs[i].source_name) == stem(specs[j].source_name)
+            if same_tree or same_asset:
+                parents[root(j)] = root(i)
+    groups = {}
+    for i in door_indices:
+        groups.setdefault(root(i), []).append(i)
+    merged = {i: group for group in groups.values() if len(group) > 1 for i in group}
+    if not merged:
+        return specs
+    mapping = _geom_to_spec_mapping(model, specs)
+    result = []
+    emitted = set()
+    for i, spec in enumerate(specs):
+        group = merged.get(i)
+        if group is None:
+            result.append(spec)
+            continue
+        key = root(i)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        canonical = min(group, key=lambda j: (len(paths[j]), specs[j].source_name))
+        geom_ids = tuple(np.flatnonzero(np.isin(mapping, group)).tolist())
+        result.append(replace(specs[canonical], geom_ids=geom_ids, semantic_category="door"))
+    return result
 
 
 def _mujoco_geom_object_type() -> int:
@@ -832,7 +888,7 @@ def _runtime_aabb(spec: PrivateObjectSpec, model: Any, data: Any) -> tuple[tuple
         try:
             from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 
-            center, size = body_aabb(model, data, int(spec.body_id), visual_only=True)
+            center, size = body_aabb(model, data, int(spec.body_id), visible_only=True)
             return _triplet(center, path="private_runtime.aabb_center"), _triplet(size, path="private_runtime.aabb_size")
         except Exception:
             try:
@@ -904,6 +960,16 @@ def build_restricted_gt_frame(
         if camera_position is not None
         else None
     )
+    container_categories = {"refrigerator", "cabinet", "drawer", "dresser", "wardrobe"}
+    semantic_names = [
+        normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name)
+        for spec in private_specs
+    ]
+    container_bounds = [
+        _runtime_aabb(spec, model, data)
+        for spec, name in zip(private_specs, semantic_names)
+        if camera_xyz is not None and name in container_categories
+    ]
     object_type = _mujoco_geom_object_type() if geom_object_type is None else int(geom_object_type)
     mapping = _geom_to_spec_mapping(model, private_specs) if geom_to_spec is None else np.asarray(geom_to_spec, dtype=np.int32)
     height, width = int(array.shape[0]), int(array.shape[1])
@@ -928,7 +994,25 @@ def build_restricted_gt_frame(
         for spec_index, spec in enumerate(private_specs):
             selection = spec_indices == spec_index
             visible_count = int(np.count_nonzero(selection))
-            if visible_count < int(min_visible_pixels):
+            if visible_count == 0:
+                continue
+            center, size = _runtime_aabb(spec, model, data)
+            semantic_name = semantic_names[spec_index]
+            near_container_visible = (
+                camera_xyz is not None
+                and math.dist(center, camera_xyz) <= 2.0
+                and semantic_name != "door"
+                and (
+                    semantic_name in container_categories
+                    or any(
+                        all(abs(coordinate - origin) <= extent / 2.0
+                            for coordinate, origin, extent in zip(center, bounds_center, bounds_size))
+                        for bounds_center, bounds_size in container_bounds
+                    )
+                )
+            )
+            required_pixels = 1 if near_container_visible else int(min_visible_pixels)
+            if visible_count < required_pixels:
                 continue
             component = _largest_connected_component(
                 xs[selection],
@@ -939,10 +1023,9 @@ def build_restricted_gt_frame(
             if component is None:
                 continue
             mask, visible_count, bbox_2d = component
-            if visible_count < int(min_visible_pixels):
+            if visible_count < required_pixels:
                 continue
-            center, size = _runtime_aabb(spec, model, data)
-            if _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
+            if not near_container_visible and _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
                 continue
             semantic_name = normalize_semantic_category(
                 spec.semantic_category,
@@ -953,7 +1036,7 @@ def build_restricted_gt_frame(
                 if semantic_name == "door"
                 else int(min_bbox_short_side_pixels)
             )
-            if _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
+            if not near_container_visible and _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
                 continue
             if (
                 camera_xyz is not None
@@ -962,7 +1045,8 @@ def build_restricted_gt_frame(
             ):
                 continue
             if (
-                float(min_visible_fraction) > 0.0
+                not near_container_visible
+                and float(min_visible_fraction) > 0.0
                 and camera_xyz is not None
                 and camera_forward is not None
                 and camera_up is not None
@@ -1017,11 +1101,11 @@ class RestrictedGTPerceptionPublisher:
         camera_name: str = "head_camera",
         topic: str = "/semantic_mapping/gt_observations",
         min_visible_pixels: int = 16,
-        min_bbox_area_pixels: int = 512,
+        min_bbox_area_pixels: int = 1,
         min_bbox_short_side_pixels: int = 1,
         min_portal_bbox_short_side_pixels: int = 8,
         min_visible_fraction: float = 0.2,
-        max_distance_m: float = 4.0,
+        max_distance_m: float = 8.0,
         step_interval: int = 1,
         frame_id: str = "world",
         rospy_module: Any | None = None,

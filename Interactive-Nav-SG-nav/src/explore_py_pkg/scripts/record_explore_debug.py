@@ -48,6 +48,7 @@ import rospy
 import tf
 from explore_py_pkg.debug_semantic_viz import (
     candidate_color,
+    semantic_node_display_label,
     topology_edge_style,
     topology_edge_visible,
     topology_hierarchy_layout,
@@ -55,6 +56,8 @@ from explore_py_pkg.debug_semantic_viz import (
     portal_room_node_ids,
     topology_order_rooms,
 )
+from explore_py_pkg.subgoal_overlay import SubgoalOverlay
+from explore_py_pkg.room_colors import room_color
 from step_sync_image_cache import CachedStepImage, ExactStepImageCache
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -176,8 +179,18 @@ def _interaction_display_selection(selection: dict, command: dict) -> dict:
         merged.setdefault("target_id", target_id)
         merged.setdefault("target_name", target_id)
     action = str(command.get("action") or "")
-    if action:
-        merged.setdefault("behavior_type", action)
+    # ``latest_interaction_command`` carries the physical action (``open`` /
+    # ``close``), not the semantic candidate type.  Copying that verb into
+    # ``behavior_type`` made the map renderer fall through to its NAVIGATE
+    # default, so the same interaction marker changed from orange to green
+    # whenever the live selection message was absent or stale.
+    command_behavior = str(command.get("behavior_type") or "").upper()
+    if command_behavior not in {"EXPLORE", "INTERACT", "NAVIGATE"}:
+        command_behavior = "INTERACT" if action else ""
+    if command_behavior:
+        existing_behavior = str(merged.get("behavior_type") or "").upper()
+        if existing_behavior not in {"EXPLORE", "INTERACT", "NAVIGATE"}:
+            merged["behavior_type"] = command_behavior
     return merged
 
 
@@ -773,6 +786,20 @@ class _AsyncArtifactWriter:
                     log_handle.close()
 
 
+def compact_step_boundary(record: dict) -> dict:
+    """Keep replay state, omitting duplicated model input and verbose reasoning."""
+    result = dict(record)
+    candidates = dict(result.get("semantic_candidates") or {})
+    candidates.pop("graph_context", None)
+    result["semantic_candidates"] = candidates
+    trace = result.get("semantic_decision_trace") or {}
+    result["semantic_decision_trace"] = {
+        key: trace[key] for key in ("terminal_no_plan_exit", "completion_status") if key in trace
+    }
+    result["storage_profile"] = "replay_compact_v1"
+    return result
+
+
 class _AsyncRawRecordingWriter:
     """Serialize raw PNG+JSON persistence away from ROS callback threads.
 
@@ -788,6 +815,8 @@ class _AsyncRawRecordingWriter:
         *,
         max_queue: int,
         overflow: str = "block",
+        compress_steps: bool = False,
+        compact_steps: bool = False,
     ) -> None:
         if overflow not in {"block", "drop"}:
             raise ValueError(f"unsupported raw recording overflow policy: {overflow}")
@@ -797,9 +826,15 @@ class _AsyncRawRecordingWriter:
         self.map_manifest = (self.raw_recording_dir / "map_manifest.jsonl").open(
             "a", buffering=1
         )
-        self.step_manifest = (self.raw_recording_dir / "step_boundaries.jsonl").open(
-            "a", buffering=1
+        self.compact_steps = compact_steps
+        self.step_manifest_path = self.raw_recording_dir / (
+            "step_boundaries.jsonl.gz" if compress_steps else "step_boundaries.jsonl"
         )
+        if compress_steps:
+            import gzip
+            self.step_manifest = gzip.open(self.step_manifest_path, "at", encoding="utf-8", compresslevel=3)
+        else:
+            self.step_manifest = self.step_manifest_path.open("a", buffering=1)
         self.overflow = str(overflow)
         self.jobs: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
         self._stats_lock = threading.RLock()
@@ -934,9 +969,12 @@ class _AsyncRawRecordingWriter:
             self._increment(self.persisted, stage)
 
     def _persist_step(self, stage: str, record: dict) -> None:
+        if self.compact_steps:
+            record = compact_step_boundary(record)
         self.step_manifest.write(
             json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+        self.step_manifest.flush()
         with self._stats_lock:
             self._increment(self.persisted, stage)
 
@@ -1733,6 +1771,8 @@ class ExploreDebugRecorder:
             self.raw_recording_dir,
             max_queue=int(getattr(args, "raw_record_queue_size", 64)),
             overflow=str(getattr(args, "raw_record_queue_overflow", "block")),
+            compress_steps=bool(getattr(args, "compress_step_boundaries", False)),
+            compact_steps=bool(getattr(args, "compact_step_boundaries", False)),
         )
         # Compatibility aliases for summary tooling; only the writer thread
         # touches these handles after construction.
@@ -1984,7 +2024,10 @@ class ExploreDebugRecorder:
             self.first_person_video_error = "cv2_or_numpy_unavailable"
             self._write_optional_dependency_warning()
 
-        self.events_file = (output_dir / "events.jsonl").open("a", buffering=1)
+        self.events_file = (
+            (output_dir / "events.jsonl").open("a", buffering=1)
+            if getattr(args, "save_events", True) else None
+        )
         self.trajectory_file = (output_dir / "trajectory.csv").open("a", newline="", buffering=1)
         self.subgoals_file = (output_dir / "subgoals.csv").open("a", newline="", buffering=1)
         self.status_file = (output_dir / "move_base_status.csv").open("a", newline="", buffering=1)
@@ -2799,7 +2842,10 @@ class ExploreDebugRecorder:
             self.latest_gt_observations = payload
             if self._retain_video_state_history:
                 self.gt_observation_history.append(
-                    (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
+                    (
+                        float(payload.get("capture_stamp_sec", payload.get("stamp_sec", 0.0)) or 0.0),
+                        payload, set(self.observed_instance_ids),
+                    )
                 )
 
     def external_detections_callback(self, msg: String) -> None:
@@ -3314,6 +3360,7 @@ class ExploreDebugRecorder:
             return
         source_stamp_ns = int(round(stamp * 1_000_000_000.0))
         source_key = (source_seq, source_stamp_ns)
+        synchronized_detections = payload.get("external_detections")
         skipped_capture = False
         with self.lock:
             if self.shutting_down or self.last_step_sync_key == source_key:
@@ -3323,6 +3370,16 @@ class ExploreDebugRecorder:
             callback_index = self.step_sync_count
             self.debug_step = source_seq
             self.latest_image_step = source_seq
+            if isinstance(synchronized_detections, dict):
+                # This payload is embedded by the Habitat bridge in the exact
+                # step boundary.  Prefer it over asynchronous ROS callback
+                # ordering so camera RGB and detector boxes cannot differ by a
+                # frame while leaving the ordinary GT recorder flow untouched.
+                self.latest_external_detections = synchronized_detections
+                if self._retain_video_state_history:
+                    self.external_detection_history.append(
+                        (stamp, synchronized_detections)
+                    )
             if (callback_index - 1) % self.step_sync_capture_every:
                 self.step_sync_skipped_count += 1
                 skipped_capture = True
@@ -4033,14 +4090,7 @@ class ExploreDebugRecorder:
 
     @staticmethod
     def _semantic_node_display_label(node: dict) -> str:
-        if node.get("type") != "room":
-            return str(node.get("label") or node.get("type") or "object")
-        room_attribute = str(
-            (node.get("attributes") or {}).get("room_attribute") or "unknown"
-        ).strip()
-        if room_attribute == "livingroom":
-            return "living room"
-        return f"{room_attribute} room" if room_attribute != "unknown" else "unknown room"
+        return semantic_node_display_label(node)
 
     @staticmethod
     def _known_occupancy_world_bounds(
@@ -4077,6 +4127,7 @@ class ExploreDebugRecorder:
         observed_instance_ids: set[str] | None,
         target_id: str,
         task_target: dict | None = None,
+        semantic_candidates: dict | None = None,
     ) -> list[dict]:
         """Keep video panels legible and bounded as the persistent graph grows."""
         observed_nodes = [
@@ -4121,6 +4172,7 @@ class ExploreDebugRecorder:
         image_step: int | None = None,
         world_bounds: tuple[float, float, float, float] | None = None,
         task_target: dict | None = None,
+        semantic_candidates: dict | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -4138,6 +4190,10 @@ class ExploreDebugRecorder:
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
             self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+            sidebar_width = max(150, int(panel_width * 0.34))
+            panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
+                (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+            )
             return panel
         if world_bounds is None:
             min_x = min(position[0] for position in positions)
@@ -4263,6 +4319,10 @@ class ExploreDebugRecorder:
             center = to_px(float(pose[0]), float(pose[1]))
             self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
         self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+        sidebar_width = max(150, int(panel_width * 0.34))
+        panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
+            (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+        )
         return panel
 
     def _render_room_segment_panel_locked(
@@ -5663,6 +5723,7 @@ class ExploreDebugRecorder:
                     image_step=image_step,
                     world_bounds=occupancy_world_bounds,
                     task_target=task_target,
+                    semantic_candidates=semantic_candidates,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -5683,9 +5744,10 @@ class ExploreDebugRecorder:
                     external_panel = np.frombuffer(panel6_rgb, dtype=np.uint8).reshape(
                         (panel6_height, panel6_width, 3)
                     )
-                    semantic_topology_panel = cv2.resize(
+                    semantic_topology_panel = self._fit_panel_image_preserving_aspect(
                         external_panel[:, :, ::-1],
-                        (frame_width, frame_height),
+                        frame_width,
+                        frame_height,
                         interpolation=cv2.INTER_NEAREST,
                     )
                     self._draw_panel_title(
@@ -6477,18 +6539,8 @@ class ExploreDebugRecorder:
         rgb = np.zeros((height, width, 3), dtype=np.uint8)
         valid = values >= 0
         room_ids = np.unique(values[valid]) if np.any(valid) else []
-        palette = (
-            (255, 185, 185),
-            (185, 220, 255),
-            (195, 245, 195),
-            (245, 220, 170),
-            (225, 195, 245),
-            (175, 235, 230),
-            (245, 195, 225),
-            (220, 220, 170),
-        )
         for room_id in room_ids:
-            rgb[values == int(room_id)] = palette[int(room_id) % len(palette)]
+            rgb[values == int(room_id)] = room_color(int(room_id))
         return rgb
 
     @staticmethod
@@ -6501,37 +6553,10 @@ class ExploreDebugRecorder:
         if panel is None or cv2 is None:
             return
         target_context = semantic_candidates.get("target_context") or {}
-        target_name = str(
-            target_context.get("target_name")
-            or target_context.get("target_source_object_name")
-            or "-"
-        )
-        behavior_type = str(semantic_selection.get("behavior_type") or "-")
-        subgoal_name = str(
-            semantic_selection.get("target_name")
-            or semantic_selection.get("target_id")
-            or semantic_selection.get("candidate_id")
-            or "-"
-        )
-        max_chars = max(24, int(panel.shape[1] / 10))
-        if len(subgoal_name) > max_chars:
-            subgoal_name = subgoal_name[: max_chars - 3] + "..."
-        lines = [
-            f"TASK TARGET: {target_name}",
-            f"MODULE2 SUBGOAL: {behavior_type} {subgoal_name}",
-        ]
-        cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
-        for index, line in enumerate(lines):
-            cv2.putText(
-                panel,
-                line,
-                (9, 20 + index * 21),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                (30, 30, 30),
-                1,
-                cv2.LINE_AA,
-            )
+        target_name = target_context.get("target_name") or target_context.get("target_source_object_name")
+        behavior_type = semantic_selection.get("behavior_type")
+        subgoal_name = semantic_selection.get("target_name") or semantic_selection.get("target_id") or semantic_selection.get("candidate_id")
+        SubgoalOverlay.draw_header(panel, target_name, behavior_type, subgoal_name)
 
     @staticmethod
     def _draw_panel_title(panel, title: str, step: int | None = None) -> None:
@@ -6897,6 +6922,7 @@ class ExploreDebugRecorder:
                         interaction_goal_grid[2],
                         max(11, int(10 * scale)),
                         color=(0, 140, 255),
+                        selected=True,
                     )
                     cv2.putText(
                         panel,
@@ -6941,6 +6967,7 @@ class ExploreDebugRecorder:
                     max(9, int(9 * scale)) if selected else max(5, int(5 * scale)),
                     color=color,
                     thickness=4 if selected else 2,
+                    selected=selected,
                 )
         if goal_in_grid is not None:
             goal_px = to_panel(world_to_px(goal_in_grid[0], goal_in_grid[1]))
@@ -6955,6 +6982,7 @@ class ExploreDebugRecorder:
                     goal_in_grid[2],
                     max(9, int(9 * scale)),
                     color=goal_color,
+                    selected=True,
                 )
         self._draw_panel_title(panel, title, image_step)
         if "COSTMAP" in title.upper():
@@ -7008,6 +7036,37 @@ class ExploreDebugRecorder:
         return enlarged[offset_y : offset_y + height, offset_x : offset_x + width].copy()
 
     @staticmethod
+    def _fit_panel_image_preserving_aspect(
+        image,
+        target_width: int,
+        target_height: int,
+        *,
+        interpolation,
+    ):
+        """Fit an external diagnostic image without changing its aspect ratio."""
+        if image is None or cv2 is None or np is None:
+            return image
+        source_height, source_width = image.shape[:2]
+        if source_width <= 0 or source_height <= 0:
+            return np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        scale = min(
+            float(target_width) / float(source_width),
+            float(target_height) / float(source_height),
+        )
+        fitted_width = max(1, min(target_width, int(round(source_width * scale))))
+        fitted_height = max(1, min(target_height, int(round(source_height * scale))))
+        fitted = cv2.resize(
+            image,
+            (fitted_width, fitted_height),
+            interpolation=interpolation,
+        )
+        panel = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        offset_x = (target_width - fitted_width) // 2
+        offset_y = (target_height - fitted_height) // 2
+        panel[offset_y : offset_y + fitted_height, offset_x : offset_x + fitted_width] = fitted
+        return panel
+
+    @staticmethod
     def _draw_cv_polyline(image, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
         if len(points) < 2 or cv2 is None or np is None:
             return
@@ -7041,28 +7100,20 @@ class ExploreDebugRecorder:
         length: int,
         color: tuple[int, int, int] = (230, 30, 45),
         thickness: int = 4,
+        selected: bool = False,
     ) -> None:
         if cv2 is None or np is None:
             return
-        cx, cy = center
-        heading = np.asarray([math.cos(yaw), -math.sin(yaw)], dtype=np.float32)
-        norm = float(np.linalg.norm(heading))
-        if norm <= 1e-6:
-            heading = np.asarray([1.0, 0.0], dtype=np.float32)
-        else:
-            heading = heading / norm
-        start = np.asarray([cx, cy], dtype=np.float32) - heading * float(length * 0.45)
-        end = np.asarray([cx, cy], dtype=np.float32) + heading * float(length)
-        cv2.arrowedLine(
+        # Keep the historical call site, but route all subgoal drawing through
+        # the canonical offline-style marker implementation.
+        SubgoalOverlay.draw_marker(
             image,
-            tuple(start.astype(np.int32)),
-            tuple(end.astype(np.int32)),
+            center,
             color,
-            max(1, int(thickness)),
-            cv2.LINE_AA,
-            tipLength=0.45,
+            radius=max(3, int(length) // 4),
+            selected=selected,
+            yaw=yaw,
         )
-        cv2.circle(image, (cx, cy), max(2, length // 4), color, -1, cv2.LINE_AA)
 
     def odom_callback(self, msg: Odometry) -> None:
         if self.shutting_down:
@@ -8494,6 +8545,8 @@ class ExploreDebugRecorder:
         return [self._json_safe_record(record) for record in self.subgoal_records if isinstance(record, dict)]
 
     def _write_event(self, event_type: str, payload: dict) -> None:
+        if self.events_file is None:
+            return
         row = {
             "type": event_type,
             "wall_time": time.time(),
@@ -8779,7 +8832,7 @@ class ExploreDebugRecorder:
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
                 "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
-                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                "raw_step_manifest": str(self.raw_writer.step_manifest_path),
                 # Legacy count is source callbacks received. The detailed
                 # breakdown below distinguishes queued, durable, and explicit
                 # drops/failures for every raw stream.
@@ -8804,7 +8857,8 @@ class ExploreDebugRecorder:
                 self.move_base_log_file,
                 self.semantic_events_file,
             ]:
-                handle.flush()
+                if handle is not None:
+                    handle.flush()
             with self.video_lock:
                 self._finalize_first_person_video_locked()
                 self._finalize_external_video_locked()
@@ -8911,7 +8965,7 @@ class ExploreDebugRecorder:
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
                 "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
-                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                "raw_step_manifest": str(self.raw_writer.step_manifest_path),
                 # Legacy count is source callbacks received. The detailed
                 # breakdown below distinguishes queued, durable, and explicit
                 # drops/failures for every raw stream.
@@ -8982,13 +9036,17 @@ class ExploreDebugRecorder:
                 self.move_base_log_file,
                 self.semantic_events_file,
             ]:
-                handle.close()
+                if handle is not None:
+                    handle.close()
         self.external_video_lock.release()
         self.video_lock.release()
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record explore_py runtime debug artifacts.")
+    parser.add_argument("--save-events", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compress-step-boundaries", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-step-boundaries", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-dir", default="", help="Directory for JSONL, CSV, and PNG overlays.")
     parser.add_argument("--occupancy-grid-topic", default="/struct_mapping/occ_map")
     parser.add_argument(

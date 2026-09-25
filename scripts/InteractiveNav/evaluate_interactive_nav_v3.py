@@ -9,6 +9,8 @@ validation, reproducibility manifest, and spawn-safe multi-process execution.
 
 from __future__ import annotations
 
+import faulthandler
+import os
 import sys
 from pathlib import Path
 
@@ -16,7 +18,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+_IMPORT_DIAGNOSTICS = os.environ.get("INTERACTIVE_NAV_IMPORT_DIAGNOSTICS") == "1"
+if _IMPORT_DIAGNOSTICS:
+    print("[evaluator-import] loading benchmark_runner", flush=True)
+    faulthandler.dump_traceback_later(30, repeat=True)
+
 from scripts.InteractiveNav.evaluation.benchmark_runner import main
+
+if _IMPORT_DIAGNOSTICS:
+    faulthandler.cancel_dump_traceback_later()
+    print("[evaluator-import] benchmark_runner ready", flush=True)
 
 
 if __name__ == "__main__":

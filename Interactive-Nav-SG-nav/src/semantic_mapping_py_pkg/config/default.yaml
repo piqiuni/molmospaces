@@ -148,10 +148,9 @@ room_inference:
   min_confidence: 0.2
   evidence_window_sec: 5.0
 
-# Module-1's room lane is intentionally text-only: it receives a room ID and
-# the graph's in-room object labels, never RGB or a visual crop.  The existing
-# weighted object rules remain active while this asynchronous lane is pending
-# or low confidence.
+# Module-1's room lane is text-only: it receives a room ID, an XY box rounded
+# to 0.1 m, and in-room object labels, never RGB or a visual crop.  Weighted
+# object rules remain active while this lane is pending or low confidence.
 room_mllm:
   enabled: true
   min_evidence_objects: 1
@@ -161,7 +160,14 @@ room_mllm:
   min_interval_s: 2.0
   # Optional shared room-worker dispatch spacing; physical profile sets 1 s.
   dispatch_interval_s: 0.0
+  # Refresh successful nearby rooms after this interval, even if unchanged.
   success_refresh_interval_s: 120.0
+  # A failed text request is not retried in a tight loop.  The mapper keeps
+  # the room dirty, publishes a rule fallback, and admits a refresh after this
+  # cooldown.
+  failure_refresh_interval_s: 30.0
+  fallback_enabled: true
+  request_timeout_s: 15.0
   max_output_tokens: 96
 
 # Module-1 visual evidence and decision-layer targeted refresh controls.
@@ -171,6 +177,13 @@ room_mllm:
 attribute_inference:
   # Keep simulator/GT category metadata out of image-only M1 by default.
   include_detector_class_hypothesis: false
+  # Per episode and detected object: at most ten real M1 model calls.
+  # Keep two slots for decision-triggered views after passive discovery.
+  max_calls_per_object: 10
+  targeted_call_reserve: 2
+  # The first failed/expired attempt may be retried twice; a successful
+  # result resets this streak, but never resets the total call budget.
+  max_failure_retries_per_object: 2
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
   # One M1 call may use earlier target views, but only when they are separated
@@ -181,6 +194,23 @@ attribute_inference:
   targeted_multiview_min_position_gap_m: 0.25
   targeted_multiview_min_yaw_gap_rad: 0.25
   target_bbox_mask_containment_required: true
+  # Portals need a complete lateral view before M1 can claim open or closed.
+  # The first stable full-frame detection is still only a candidate; the local
+  # two-frame streak below prevents a just-entered detection from authorizing
+  # state inference.
+  portal_m1_require_full_frame: true
+  portal_m1_border_margin_px: 2
+  portal_m1_required_consecutive_observations: 2
+  # Retain recent RGB frames so delayed detector packets can be paired by ID.
+  image_history_size: 32
+  targeted_refresh_timeout_s: 20.0
+  # Door state is committed only after three consecutive equal M1 answers
+  # from materially separated camera poses. A committed result suppresses M1
+  # for this many evaluator steps; changing it requires the same evidence.
+  portal_state_confirmation_count: 3
+  portal_state_cooldown_steps: 300
+  portal_state_min_position_gap_m: 0.25
+  portal_state_min_yaw_gap_rad: 0.25
 
 semantic_map:
   enable_object_mapping: true
@@ -273,7 +303,9 @@ semantic_occ_overlay:
   # Signed aperture inset: negative contracts the closed-door reference so a
   # rotating door leaf cannot clear adjacent wall cells in the planning map.
   clear_padding_m: -0.05
-  max_aperture_thickness_m: 0.25
+  # Widen only the wall-normal doorway clearing slab. This covers off-grid
+  # adjacent occupied rows without extending the long axis into an opened leaf.
+  max_aperture_thickness_m: 0.35
   raw_free_confirmations: 3
   open_states: ["ajar", "open"]
 

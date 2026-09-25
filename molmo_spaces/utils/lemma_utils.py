@@ -1,17 +1,13 @@
-from __future__ import annotations
-
 import functools
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from nltk.corpus.reader.wordnet import Synset
+from nltk.corpus.reader.wordnet import Synset
 
-from molmo_spaces.utils.synset_utils import wn
+from molmo_spaces.utils.synset_utils import get_wordnet
 
 
 @functools.cache
-def _physical_entity_synset():
-    return wn.synset("physical_entity.n.01")
+def _physical_entity_synset() -> Synset:
+    return get_wordnet().synset("physical_entity.n.01")
 
 
 def normalize_expression(text: str) -> str:
@@ -23,13 +19,14 @@ def normalize_expression(text: str) -> str:
 
 def is_physical_entity(synset: Synset | str) -> bool:
     if isinstance(synset, str):
-        synset = wn.synset(synset)
+        synset = get_wordnet().synset(synset)
     physical_entity = _physical_entity_synset()
     return physical_entity in synset.lowest_common_hypernyms(physical_entity)
 
 
 @functools.lru_cache(maxsize=1000)
 def best_lemma_via_specificity(synset_str: str, enforce_physical_entity: bool = True) -> str:
+    wn = get_wordnet()
     synset = wn.synset(synset_str)
     cur_synset_is_physical_entity = is_physical_entity(synset)
     min_num_synsets = 100000
@@ -52,4 +49,4 @@ def best_lemma_via_specificity(synset_str: str, enforce_physical_entity: bool = 
 
 
 def simple_lemma(synset_str: str) -> str:
-    return wn.synset(synset_str).lemma_names()[0]
+    return get_wordnet().synset(synset_str).lemma_names()[0]

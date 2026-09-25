@@ -94,6 +94,8 @@ class HabitatV2AdapterProfile:
             "mllm_endpoint": str(module2["endpoint"]),
             "mllm_model": str(module2["model"]),
             "mllm_timeout_s": float(module2["timeout_s"]),
+            "target_goal_lock_enabled": bool(module2.get("target_goal_lock_enabled", False)),
+            "target_goal_pre_score": float(module2.get("target_goal_pre_score", 1.0)),
             "module1_detector_enabled": bool(module1["enabled"] and module1["mode"] == "detector_only_sidecar"),
             "module1_detector_endpoint": str(sidecar["endpoint"]),
             "module1_detector_timeout_s": float(sidecar["timeout_s"]),
@@ -107,13 +109,22 @@ class HabitatV2AdapterProfile:
             "full_ros_stack_timeout_s": float(sidecar["timeout_s"]),
             "full_ros_stack_interval_steps": int(sidecar["interval_steps"]),
             "full_ros_stack_require_healthy": bool(sidecar["require_healthy"]),
+            "original_ros_navigation_enabled": bool(
+                module1["enabled"] and module1["mode"] == "full_ros_navigation_stack"
+            ),
             "mllm_visual_enabled": bool(self.raw["modules"]["module2"].get("vision_localization_enabled", False)),
             "module3_enabled": bool(self.module3["enabled"]),
             "module3_fail_closed": bool(self.module3["fail_closed"]),
             "module3_mode": str(self.module3["mode"]),
             "module3_stop_trigger_distance_m": float(self.module3.get("stop_trigger_distance_m", 0.25)),
-            "module3_detector_confirmations": int(self.module3.get("detector_confirmations", 2)),
+            "module3_detector_confirmations": int(self.module3.get("detector_confirmations", 1)),
             "module3_min_confidence": float(self.module3.get("min_confidence", 0.80)),
+            "module3_max_bbox_center_distance_m": float(
+                self.module3.get("max_bbox_center_distance_m", 0.85)
+            ),
+            "module3_missing_target_max_steps": int(self.module3.get("missing_target_max_steps", 18)),
+            "module3_max_verification_steps": int(self.module3.get("max_verification_steps", 48)),
+            "module3_semantic_rejection_limit": int(self.module3.get("semantic_rejection_limit", 3)),
             "allowed_behavior_types": tuple(str(item) for item in self.module3["allowed_behavior_types"]),
             "vision_min_depth_m": float(approach["min_depth_m"]),
             "vision_navigate_max_depth_m": float(approach["max_target_depth_m"]),
@@ -121,7 +132,21 @@ class HabitatV2AdapterProfile:
             "vision_waypoint_reached_distance_m": float(approach["waypoint_reached_distance_m"]),
             "visual_goal_max_contiguous_steps": int(approach["max_contiguous_steps"]),
             "target_track_standoff_m": float(approach["target_track_standoff_m"]),
+            "target_track_standoff_tolerance_m": float(
+                approach.get("target_track_standoff_tolerance_m", 0.10)
+            ),
             "goal_reached_distance_m": float(approach["route_goal_reached_distance_m"]),
+            "ros_goal_terminal_grace_steps": int(approach.get("ros_goal_terminal_grace_steps", 3)),
+            "target_standoff_failure_radius_m": float(
+                approach.get("target_standoff_failure_radius_m", 0.35)
+            ),
+            "target_standoff_failure_cooldown_steps": int(
+                approach.get("target_standoff_failure_cooldown_steps", 500)
+            ),
+            "target_standoff_retry_angles_deg": tuple(
+                float(value)
+                for value in approach.get("target_standoff_retry_angles_deg", [35.0, -35.0, 70.0, -70.0])
+            ),
             "vision_stop_enabled": bool(stop_proxy["enabled"]),
             "vision_stop_depth_m": float(stop_proxy["depth_m"]),
             "vision_stop_center_tolerance": float(stop_proxy["center_tolerance"]),
@@ -148,13 +173,27 @@ class HabitatV2AdapterProfile:
             "module2": {
                 "enabled": bool(self.module2["enabled"]),
                 "mode": str(self.module2["mode"]),
+                "target_goal_lock_enabled": bool(self.module2.get("target_goal_lock_enabled", False)),
+                "target_goal_pre_score": float(self.module2.get("target_goal_pre_score", 1.0)),
             },
             "module3": {
                 "enabled": bool(self.module3["enabled"]),
                 "fail_closed": bool(self.module3["fail_closed"]),
+                "max_bbox_center_distance_m": float(
+                    self.module3.get("max_bbox_center_distance_m", 0.85)
+                ),
                 "allowed_behavior_types": list(self.module3["allowed_behavior_types"]),
                 "forbidden_behavior_types": list(self.module3["forbidden_behavior_types"]),
                 "forbidden_habitat_actions": list(self.module3["forbidden_habitat_actions"]),
+            },
+            "approach": {
+                "target_track_standoff_m": float(self.raw["approach"]["target_track_standoff_m"]),
+                "target_track_standoff_tolerance_m": float(
+                    self.raw["approach"].get("target_track_standoff_tolerance_m", 0.10)
+                ),
+                "route_goal_reached_distance_m": float(
+                    self.raw["approach"]["route_goal_reached_distance_m"]
+                ),
             },
             "official_task_assertions": dict(self.raw["official_task_assertions"]),
             "stop_proxy": dict(self.raw["stop_proxy"]),
@@ -266,7 +305,20 @@ def load_adapter_profile(path: Path) -> HabitatV2AdapterProfile:
         raise AdapterProfileError("modules.module1.sidecar.original_module1_scripts must be an existing directory")
 
     module2 = _mapping(modules["module2"], "modules.module2")
-    _keys(module2, {"enabled", "mode", "endpoint", "model", "timeout_s", "vision_localization_enabled"}, "modules.module2")
+    _keys(
+        module2,
+        {
+            "enabled",
+            "mode",
+            "endpoint",
+            "model",
+            "timeout_s",
+            "vision_localization_enabled",
+            "target_goal_lock_enabled",
+            "target_goal_pre_score",
+        },
+        "modules.module2",
+    )
     _required(module2, {"enabled", "mode", "endpoint", "model", "timeout_s", "vision_localization_enabled"}, "modules.module2")
     if not _bool(module2["enabled"], "modules.module2.enabled"):
         raise AdapterProfileError("modules.module2.enabled must be true")
@@ -278,9 +330,15 @@ def load_adapter_profile(path: Path) -> HabitatV2AdapterProfile:
         raise AdapterProfileError("modules.module2.model must be a non-empty string")
     _positive(module2["timeout_s"], "modules.module2.timeout_s")
     _bool(module2["vision_localization_enabled"], "modules.module2.vision_localization_enabled")
+    if "target_goal_lock_enabled" in module2:
+        _bool(module2["target_goal_lock_enabled"], "modules.module2.target_goal_lock_enabled")
+    if "target_goal_pre_score" in module2:
+        score = float(module2["target_goal_pre_score"])
+        if not 0.0 <= score <= 1.0:
+            raise AdapterProfileError("modules.module2.target_goal_pre_score must be in [0, 1]")
 
     module3 = _mapping(modules["module3"], "modules.module3")
-    _keys(module3, {"enabled", "mode", "fail_closed", "allowed_behavior_types", "forbidden_behavior_types", "forbidden_habitat_actions", "allowed_outputs", "stop_trigger_distance_m", "detector_confirmations", "min_confidence"}, "modules.module3")
+    _keys(module3, {"enabled", "mode", "fail_closed", "allowed_behavior_types", "forbidden_behavior_types", "forbidden_habitat_actions", "allowed_outputs", "stop_trigger_distance_m", "detector_confirmations", "min_confidence", "max_bbox_center_distance_m", "missing_target_max_steps", "max_verification_steps", "semantic_rejection_limit"}, "modules.module3")
     _required(module3, {"enabled", "mode", "fail_closed", "allowed_behavior_types", "forbidden_behavior_types", "forbidden_habitat_actions"}, "modules.module3")
     module3_enabled = _bool(module3["enabled"], "modules.module3.enabled")
     expected_mode = "objectgoal_stop_verified" if module3_enabled else "disabled"
@@ -307,6 +365,18 @@ def load_adapter_profile(path: Path) -> HabitatV2AdapterProfile:
         confidence = _number(module3.get("min_confidence"), "modules.module3.min_confidence")
         if not 0.0 <= confidence <= 1.0:
             raise AdapterProfileError("modules.module3.min_confidence must be in [0,1]")
+        _positive(
+            module3.get("max_bbox_center_distance_m", 0.85),
+            "modules.module3.max_bbox_center_distance_m",
+        )
+        for key in (
+            "missing_target_max_steps",
+            "max_verification_steps",
+            "semantic_rejection_limit",
+        ):
+            value = _positive(module3.get(key), f"modules.module3.{key}")
+            if int(value) != value:
+                raise AdapterProfileError(f"modules.module3.{key} must be an integer")
 
     approach = _mapping(raw["approach"], "approach")
     _keys(
@@ -318,7 +388,12 @@ def load_adapter_profile(path: Path) -> HabitatV2AdapterProfile:
             "waypoint_reached_distance_m",
             "max_contiguous_steps",
             "target_track_standoff_m",
+            "target_track_standoff_tolerance_m",
             "route_goal_reached_distance_m",
+            "ros_goal_terminal_grace_steps",
+            "target_standoff_failure_radius_m",
+            "target_standoff_failure_cooldown_steps",
+            "target_standoff_retry_angles_deg",
         },
         "approach",
     )
@@ -337,11 +412,44 @@ def load_adapter_profile(path: Path) -> HabitatV2AdapterProfile:
     )
     for name in ("min_depth_m", "max_target_depth_m", "waypoint_standoff_m", "waypoint_reached_distance_m", "target_track_standoff_m", "route_goal_reached_distance_m"):
         _positive(approach[name], f"approach.{name}", allow_zero=name == "min_depth_m")
+    if "target_track_standoff_tolerance_m" in approach:
+        _positive(
+            approach["target_track_standoff_tolerance_m"],
+            "approach.target_track_standoff_tolerance_m",
+        )
     if float(approach["max_target_depth_m"]) < float(approach["min_depth_m"]):
         raise AdapterProfileError("approach.max_target_depth_m must be >= approach.min_depth_m")
     steps = _positive(approach["max_contiguous_steps"], "approach.max_contiguous_steps")
     if int(steps) != steps:
         raise AdapterProfileError("approach.max_contiguous_steps must be an integer")
+    if "ros_goal_terminal_grace_steps" in approach:
+        value = _positive(
+            approach["ros_goal_terminal_grace_steps"],
+            "approach.ros_goal_terminal_grace_steps",
+            allow_zero=True,
+        )
+        if int(value) != value:
+            raise AdapterProfileError("approach.ros_goal_terminal_grace_steps must be an integer")
+    if "target_standoff_failure_radius_m" in approach:
+        _positive(
+            approach["target_standoff_failure_radius_m"],
+            "approach.target_standoff_failure_radius_m",
+        )
+    if "target_standoff_failure_cooldown_steps" in approach:
+        value = _positive(
+            approach["target_standoff_failure_cooldown_steps"],
+            "approach.target_standoff_failure_cooldown_steps",
+        )
+        if int(value) != value:
+            raise AdapterProfileError(
+                "approach.target_standoff_failure_cooldown_steps must be an integer"
+            )
+    if "target_standoff_retry_angles_deg" in approach:
+        values = approach["target_standoff_retry_angles_deg"]
+        if not isinstance(values, list) or not values:
+            raise AdapterProfileError("approach.target_standoff_retry_angles_deg must be a non-empty list")
+        for index, value in enumerate(values):
+            _number(value, f"approach.target_standoff_retry_angles_deg[{index}]")
 
     stop_proxy = _mapping(raw["stop_proxy"], "stop_proxy")
     _keys(stop_proxy, {"enabled", "habitat_action", "depth_m", "center_tolerance", "confirmations"}, "stop_proxy")

@@ -44,7 +44,17 @@ class PolicyConfig:
     mllm_model: str = "qwen3.6-35b-a3b-fp8"
     mllm_timeout_s: float = 30.0
     mllm_max_tokens: int = 128
-    vision_max_tokens: int = 64
+    # Keep target commitment inside the original Module-2 interface.  A
+    # promoted public RGB-D/ROS target candidate is still presented alongside
+    # exploration candidates and M2 is still queried; these fields activate
+    # ModelPolicyClient's existing TARGET_GOAL pre-score guard rather than
+    # bypassing the selector with an adapter-owned direct action.
+    target_goal_lock_enabled: bool = False
+    target_goal_pre_score: float = 1.0
+    # The STOP verifier returns a strict JSON object with several required
+    # fields; 64 tokens was occasionally truncated by the local MLLM and
+    # turned valid near-goal views into parser failures.
+    vision_max_tokens: int = 256
     vision_interval_steps: int = 10
     # A Habitat-v2 profile can replace the auxiliary direct MLLM visual-control
     # lane with the original Module-1 detector-only seam.  Module-2 remains the
@@ -66,14 +76,35 @@ class PolicyConfig:
     full_ros_stack_timeout_s: float = 20.0
     full_ros_stack_interval_steps: int = 5
     full_ros_stack_require_healthy: bool = True
+    # Let the original ROS mapper, move_base global planner, DWA local planner,
+    # and /cmd_vel chain own navigation.  The Habitat adapter then acts only as
+    # the simulator driver and STOP boundary.
+    original_ros_navigation_enabled: bool = False
+    ros_cmd_vel_max_age_s: float = 1.0
+    ros_linear_speed_limit_mps: float = 0.30
+    ros_angular_speed_limit_rps: float = 0.45
+    # A failed target standoff must not be submitted forever.  These settings
+    # keep the recovery entirely inside the Habitat adapter: the original graph
+    # still supplies the target and M2 still chooses among candidates, while a
+    # terminal move_base result exposes alternative detector-backed viewpoints.
+    ros_goal_terminal_grace_steps: int = 3
+    target_standoff_failure_radius_m: float = 0.35
+    target_standoff_failure_cooldown_steps: int = 500
+    target_standoff_retry_angles_deg: tuple[float, ...] = (35.0, -35.0, 70.0, -70.0)
     # ObjectGoal-v2 uses a navigation-only Module-3 verifier.  It is not the
     # interaction executor: its closed vocabulary is STOP/CONTINUE/RESCAN.
     module3_enabled: bool = False
     module3_fail_closed: bool = True
     module3_mode: str = "disabled"
     module3_stop_trigger_distance_m: float = 0.25
-    module3_detector_confirmations: int = 2
+    module3_detector_confirmations: int = 1
     module3_min_confidence: float = 0.80
+    # Public RGB-D distance from the robot to the detected box-centre ray. A
+    # reached navigation subgoal alone is not sufficient evidence for STOP.
+    module3_max_bbox_center_distance_m: float = 0.85
+    module3_missing_target_max_steps: int = 18
+    module3_max_verification_steps: int = 48
+    module3_semantic_rejection_limit: int = 3
     allowed_behavior_types: tuple[str, ...] = ("EXPLORE", "NAVIGATE")
     # GroundingDINO is an optional external RGB-only verifier.  It runs in the
     # existing VLFM environment through a loopback worker so the Challenge 2023
@@ -148,24 +179,35 @@ class PolicyConfig:
     # after the robot has moved before it can become a navigation candidate.
     # Keep this opt-in until focused official-v2 traces establish that it helps.
     persistent_target_tracking: bool = False
-    target_track_min_baseline_m: float = 0.25
+    # A detector observation can remain geometrically consistent after only a
+    # short public-motion baseline.  The previous 0.25 m gate was too strict
+    # for the sparse full-ROS cadence (and often expired before promotion).
+    target_track_min_baseline_m: float = 0.10
     # The image query cadence is 10 control actions, or roughly 0.3 m of
     # forward travel.  Accept a small tolerance for the public GPS/action
     # discretization so the second view can actually satisfy the baseline gate.
     target_track_baseline_tolerance_m: float = 0.06
     target_track_association_base_m: float = 0.45
     target_track_association_depth_fraction: float = 0.15
-    target_track_standoff_m: float = 1.00
-    target_track_standoff_tolerance_m: float = 0.45
+    target_track_standoff_m: float = 0.55
+    target_track_standoff_tolerance_m: float = 0.10
     target_track_max_path_m: float = 8.00
-    target_track_expire_steps: int = 90
+    target_track_expire_steps: int = 300
+    # A promoted target is a world-frame estimate, not a per-frame detection.
+    # Keep it available through ordinary detector dropouts; only clear it after
+    # this longer lease.  While stale, records are marked not-visible so M2
+    # never mistakes the old observation for current RGB evidence.
+    target_track_stale_lease_steps: int = 1000
     metrics_path: str = "/home/ldl/outputs/habitat_objectnav_v2_m2/mllm_requests.jsonl"
     map_resolution_m: float = 0.10
     # GPS is relative to the episode start.  Keep a generously sized local
     # window so normal exploration does not silently clamp depth endpoints onto
     # an artificial map boundary.
     map_extent_m: float = 64.0
-    obstacle_inflation_m: float = 0.20
+    # Match the original Struct-Mapping occupancy layer.  The physical Stretch
+    # footprint is still enforced by route/clearance checks; the displayed and
+    # hard planning OCC layer must not add a second 0.20 m buffer.
+    obstacle_inflation_m: float = 0.10
     min_depth_m: float = 0.50
     max_depth_m: float = 5.00
     # Project public depth into a height-filtered 2D obstacle layer.  The
@@ -232,6 +274,10 @@ class PolicyConfig:
     replan_interval_steps: int = 12
     replan_retry_interval_steps: int = 12
     route_invalid_confirmations: int = 4
+    # Target routes are backed by a promoted public RGB-D track.  Tolerate a
+    # longer burst of transient occupancy-map invalidations before abandoning
+    # them; forward-clearance and no-motion safety checks still preempt first.
+    target_route_invalid_confirmations: int = 12
     goal_reached_distance_m: float = 0.35
     path_lookahead_m: float = 0.60
     path_waypoint_reached_distance_m: float = 0.18
@@ -283,6 +329,10 @@ class _ActiveGoal:
     best_goal_distance_m: float = float("inf")
     last_goal_progress_step: int = 0
     candidate_history_key: str = ""
+    # Public candidate orientation. Target standoffs face the RGB-D tracked
+    # surface; preserving it prevents M3 from guessing a scan direction after
+    # move_base finishes the translational approach.
+    goal_yaw: float = 0.0
 
 
 @dataclass
@@ -294,6 +344,7 @@ class _PublicTargetTrack:
     last_seen_step: int
     observations: int = 1
     promoted: bool = False
+    confidence: float = 0.0
 
 
 class HabitatInteractiveNavM2Policy:
@@ -452,6 +503,12 @@ class HabitatInteractiveNavM2Policy:
         self._full_ros_graph: dict[str, Any] = {}
         self._full_ros_candidate_payload: dict[str, Any] = {}
         self._full_ros_detections: dict[str, Any] = {}
+        self._full_ros_cmd_vel: dict[str, float] | None = None
+        self._full_ros_cmd_vel_age_s: float | None = None
+        self._full_ros_move_base_status = 0
+        self._full_ros_global_plan: tuple[tuple[float, float, float], ...] = ()
+        self._full_ros_local_plan: tuple[tuple[float, float, float], ...] = ()
+        self._failed_target_standoffs: list[dict[str, Any]] = []
         self._full_ros_queries = 0
         self._full_ros_failed = 0
         self._last_public_detection_step = -1
@@ -475,6 +532,7 @@ class HabitatInteractiveNavM2Policy:
         self._target_track_updated = 0
         self._target_track_rejected = 0
         self._target_track_expired = 0
+        self._target_track_stale_reported = False
         self._awaiting_visual_confirmation = False
         self._route_invalid_streak = 0
         self._empty_frontier_forward_count = 0
@@ -518,6 +576,17 @@ class HabitatInteractiveNavM2Policy:
         self._m3_queries = 0
         self._m3_stop_emitted = 0
         self._m3_failed = 0
+        self._m3_verify_candidate_id: str | None = None
+        self._m3_verify_steps = 0
+        self._m3_missing_target_steps = 0
+        self._m3_semantic_rejections = 0
+        self._m3_scan_direction = 1.0
+        self._m3_scan_target_heading: float | None = None
+        self._m3_navigation_terminal_candidate_id: str | None = None
+        self._move_base_goal_candidate_id: str | None = None
+        self._move_base_goal_seen_active = False
+        if getattr(self, "_full_ros_stack", None) is not None and episode_public:
+            self._full_ros_stack.reset_navigation(self._episode)
 
     def decision_stats(self) -> dict[str, int]:
         """Expose auditable M2 decision provenance without simulator internals."""
@@ -644,15 +713,34 @@ class HabitatInteractiveNavM2Policy:
         self._trace_heading = float(heading)
         self._expire_public_target_track()
         full_ros_frame_updated = self._update_full_ros_stack(observations, pose_xy, heading)
+        full_ros_measurement: dict[str, float] | None = None
+        full_ros_track_promoted = False
         if full_ros_frame_updated:
-            measurement = self._full_ros_target_detection(observations)
-            if measurement is not None:
-                self._latest_public_visual_measurement = dict(measurement)
+            full_ros_measurement = self._full_ros_target_detection(observations)
+            if full_ros_measurement is not None:
+                self._latest_public_visual_measurement = dict(full_ros_measurement)
                 self._last_public_detection_step = self._step
+                # Recovery/scan branches below may return before the normal
+                # visual-control section. Consume this same-frame public
+                # detector evidence now so a YOLOE observation is not silently
+                # dropped merely because the robot is turning or probing.
+                full_ros_track_promoted = self._update_public_target_track(
+                    pose_xy, heading, full_ros_measurement
+                )
 
-        m3_action = self._maybe_objectgoal_m3_stop(observations, pose_xy)
+        m3_action = self._maybe_objectgoal_m3_stop(
+            observations,
+            pose_xy,
+            heading,
+            target_measurement=full_ros_measurement,
+        )
         if m3_action is not None:
             return self._emit_action(m3_action)
+
+        if self.config.original_ros_navigation_enabled:
+            return self._emit_action(
+                self._act_original_ros_navigation(pose_xy, heading, full_ros_frame_updated)
+            )
 
         if self._collision_recovery_steps > 0:
             self._collision_recovery_steps -= 1
@@ -676,16 +764,34 @@ class HabitatInteractiveNavM2Policy:
         # move naturally with the robot.
         track_measurement = visual_goal
         if track_measurement is None and self._last_public_detection_step == self._step:
-            track_measurement = self._latest_public_visual_measurement
-        track_promoted_now = False
+            # _visible_goal_detection() clears its temporary MLLM measurement
+            # before checking whether a visual query is due. Preserve the
+            # independent Full-ROS/Module-1 result from this same control step
+            # so a current YOLOE observation is not lost before tracking.
+            track_measurement = full_ros_measurement or self._latest_public_visual_measurement
+        track_promoted_now = full_ros_track_promoted
         if track_measurement is not None:
-            track_promoted_now = self._update_public_target_track(pose_xy, heading, track_measurement)
+            # The Full-ROS measurement was already consumed above, before any
+            # early recovery return. Avoid counting it twice in this section.
+            if track_measurement is not full_ros_measurement:
+                track_promoted_now = self._update_public_target_track(pose_xy, heading, track_measurement)
         if track_promoted_now:
             # Offer the public target standoff and frontier options to the
             # unmodified M2 selector; never turn it into a direct action.
             self._active_goal = None
             self._try_replan(pose_xy, heading)
             if self._active_goal is not None:
+                # M3 is normally checked before replanning so an already active
+                # target route can stop on the current frame.  A newly promoted
+                # detector track can be selected by M2 on this same frame,
+                # however, so run the gate once more after the route exists.
+                post_select_m3_action = self._maybe_objectgoal_m3_stop(
+                    observations,
+                    pose_xy,
+                    heading,
+                )
+                if post_select_m3_action is not None:
+                    return self._emit_action(post_select_m3_action)
                 return self._emit_action(self._drive_to_goal(pose_xy, heading, self._active_goal, observations=observations))
         if visual_goal is not None and bool(visual_goal.get("track_only", 0.0)):
             # Detector-first evidence may only create a public target track.  It
@@ -811,9 +917,17 @@ class HabitatInteractiveNavM2Policy:
         # A commanded in-place turn or a visual-confirmation hold legitimately
         # has zero GPS displacement.  Count stagnation only after a command that
         # actually requested forward motion in the preceding simulator step.
+        fresh_ros_target = bool(
+            self.config.original_ros_navigation_enabled
+            and self._active_goal is not None
+            and self._active_goal.candidate_id.startswith(("target:", "public_target_track"))
+            and self._step - self._active_goal.selected_step
+            <= max(0, int(self.config.ros_goal_terminal_grace_steps))
+        )
         blocked_forward_motion = (
             self._last_forward_command
             and self._last_pose is not None
+            and not fresh_ros_target
             and float(np.linalg.norm(pose_xy - self._last_pose)) < self.config.stagnation_motion_threshold_m
         )
         if blocked_forward_motion:
@@ -823,6 +937,41 @@ class HabitatInteractiveNavM2Policy:
         self._last_pose = pose_xy.copy()
         if blocked_forward_motion and self._stagnant_steps == 1:
             self._record_motion_obstacle()
+            m3_target_handoff = bool(
+                self.config.module3_enabled
+                and self.config.original_ros_navigation_enabled
+                and self._active_goal is not None
+                and self._active_goal.candidate_id.startswith(("target:", "public_target_track"))
+            )
+            if m3_target_handoff:
+                # Habitat's public GPS proves that move_base cannot advance the
+                # final target approach.  This is a navigation terminal, not an
+                # automatic target failure: hand exclusive control to the
+                # navigation-only M3 verifier so it can center/inspect the
+                # current view before either STOP or a new standoff is chosen.
+                self._m3_navigation_terminal_candidate_id = self._active_goal.candidate_id
+                self._last_forward_command = False
+                self._stagnant_steps = 0
+                self._trace_public_event(
+                    "objectgoal_m3_navigation_terminal",
+                    candidate_id=self._active_goal.candidate_id,
+                    reason="public_no_motion",
+                )
+                return
+            if (
+                self.config.original_ros_navigation_enabled
+                and self._active_goal is not None
+                and self._active_goal.candidate_id.startswith(("target:", "public_target_track"))
+            ):
+                # A fresh move_base goal can remain ACTIVE even when Habitat's
+                # public GPS proves that its commanded forward step made no
+                # progress. Treat that standoff exactly like an ABORTED target
+                # goal so the next M2 call receives another target viewpoint.
+                self._record_failed_target_standoff(
+                    self._active_goal,
+                    status=-1,
+                    reason="public_no_motion",
+                )
             if self._active_goal is not None and self._active_goal.candidate_id == "visible_goal":
                 self._visual_goal_contiguous_steps = 0
             self._defer_active_frontier("public_no_motion")
@@ -1045,7 +1194,10 @@ class HabitatInteractiveNavM2Policy:
             return False
         if not self._route_is_usable(pose_xy, self._active_goal):
             self._route_invalid_streak += 1
-            if self._route_invalid_streak >= self.config.route_invalid_confirmations:
+            invalid_limit = self.config.route_invalid_confirmations
+            if self._active_goal.candidate_id.startswith(("target:", "public_target_track")):
+                invalid_limit = max(invalid_limit, int(self.config.target_route_invalid_confirmations))
+            if self._route_invalid_streak >= invalid_limit:
                 self._last_replan_reason = "route_invalid"
                 return True
             return False
@@ -1075,7 +1227,11 @@ class HabitatInteractiveNavM2Policy:
         self._last_replan_attempt_step = self._step
         if getattr(self, "_full_ros_stack", None) is not None:
             records = self._full_ros_records(pose_xy, heading)
-            tracked_record = self._public_target_track_record(pose_xy)
+            tracked_record = (
+                None
+                if self.config.original_ros_navigation_enabled
+                else self._public_target_track_record(pose_xy)
+            )
             if tracked_record is not None:
                 records.append(tracked_record)
         else:
@@ -1084,6 +1240,12 @@ class HabitatInteractiveNavM2Policy:
             if tracked_record is not None:
                 records.append(tracked_record)
         self._active_goal = self._select_goal(records, pose_xy, heading) if records else None
+        selected_candidate_id = (
+            self._active_goal.candidate_id if self._active_goal is not None else None
+        )
+        if selected_candidate_id != self._move_base_goal_candidate_id:
+            self._move_base_goal_candidate_id = selected_candidate_id
+            self._move_base_goal_seen_active = False
         if self._active_goal is not None:
             self._active_goal.best_goal_distance_m = float(np.linalg.norm(self._active_goal.xy - pose_xy))
             self._active_goal.last_goal_progress_step = self._step
@@ -1171,6 +1333,29 @@ class HabitatInteractiveNavM2Policy:
         self._full_ros_graph = self._graph_ros_to_public(result.graph)
         self._full_ros_candidate_payload = result.candidate_payload
         self._full_ros_detections = result.detections
+        self._full_ros_cmd_vel = dict(result.cmd_vel) if result.cmd_vel is not None else None
+        self._full_ros_cmd_vel_age_s = result.cmd_vel_age_s
+        self._full_ros_move_base_status = int(result.move_base_status)
+        active = self._active_goal
+        active_id = active.candidate_id if active is not None else None
+        if active_id == self._move_base_goal_candidate_id:
+            if self._full_ros_move_base_status in {0, 1, 2, 6, 7}:
+                self._move_base_goal_seen_active = True
+            if (
+                self._move_base_goal_seen_active
+                and active is not None
+                and active.candidate_id.startswith(("target:", "public_target_track"))
+                and self._full_ros_move_base_status in {3, 4, 5, 8, 9}
+            ):
+                self._m3_navigation_terminal_candidate_id = active.candidate_id
+                self._trace_public_event(
+                    "objectgoal_m3_navigation_terminal",
+                    candidate_id=active.candidate_id,
+                    reason="move_base_terminal",
+                    move_base_status=self._full_ros_move_base_status,
+                )
+        self._full_ros_global_plan = tuple(result.global_plan_xyyaw)
+        self._full_ros_local_plan = tuple(result.local_plan_xyyaw)
         self._trace_public_event(
             "full_ros_stack_update",
             candidate_sequence=result.candidate_sequence,
@@ -1178,15 +1363,101 @@ class HabitatInteractiveNavM2Policy:
             graph_nodes=len(result.graph.get("nodes") or []),
             graph_edges=len(result.graph.get("edges") or []),
             detection_count=len(result.detections.get("detections") or []),
+            move_base_status=int(result.move_base_status),
+            cmd_vel_age_s=result.cmd_vel_age_s,
+            global_plan_points=len(result.global_plan_xyyaw),
+            local_plan_points=len(result.local_plan_xyyaw),
         )
         return True
+
+    def _act_original_ros_navigation(
+        self,
+        pose_xy: np.ndarray,
+        heading: float,
+        frame_updated: bool,
+    ) -> dict[str, Any]:
+        """Execute only the command produced by the original move_base stack."""
+
+        status = int(self._full_ros_move_base_status)
+        target_active = bool(
+            self._active_goal is not None
+            and self._active_goal.candidate_id.startswith(("target:", "public_target_track"))
+        )
+        # GoalStatus: 3=SUCCEEDED.  At a target standoff, keep the goal and scan
+        # until the navigation-only M3 verifier authorizes explicit STOP.
+        terminal_status = status in {4, 5, 8, 9}
+        terminal_is_fresh = bool(
+            terminal_status
+            and self._active_goal is not None
+            and self._move_base_goal_seen_active
+            and self._step - self._active_goal.selected_step
+            > max(0, int(self.config.ros_goal_terminal_grace_steps))
+        )
+        if status == 3 and not target_active:
+            self._active_goal = None
+            self._last_replan_reason = "move_base_succeeded"
+        elif terminal_is_fresh and not target_active:
+            if target_active and self._active_goal is not None:
+                self._record_failed_target_standoff(
+                    self._active_goal,
+                    status,
+                    reason="move_base_terminal",
+                )
+            self._active_goal = None
+            self._last_replan_reason = f"move_base_terminal_{status}"
+
+        if self._active_goal is None and (
+            frame_updated
+            or self._step - self._last_replan_attempt_step >= self.config.replan_retry_interval_steps
+        ):
+            self._try_replan(pose_xy, heading)
+
+        if status == 3 and target_active:
+            return self._rotate_recovery_action()
+
+        command = self._full_ros_cmd_vel
+        if self._active_goal is None or command is None:
+            # Rotate in place to bootstrap the original mapper/frontier graph.
+            return self._rotate_recovery_action()
+        # Never execute the last non-zero command after move_base has already
+        # terminated or when the bridge reports that /cmd_vel is stale.
+        if terminal_status or (
+            self._full_ros_cmd_vel_age_s is not None
+            and self._full_ros_cmd_vel_age_s > self.config.ros_cmd_vel_max_age_s
+        ):
+            return self._hold_action()
+        linear_mps = float(np.clip(
+            command.get("linear_x", 0.0),
+            0.0,
+            self.config.ros_linear_speed_limit_mps,
+        ))
+        angular_rps = float(np.clip(
+            command.get("angular_z", 0.0),
+            -self.config.ros_angular_speed_limit_rps,
+            self.config.ros_angular_speed_limit_rps,
+        ))
+        # Challenge-v2 maps normalized [-1,1] to linear [0,0.3] m/s and
+        # angular [-0.45,0.45] rad/s.  A stationary command is therefore -1.
+        linear_normalized = 2.0 * linear_mps / max(self.config.ros_linear_speed_limit_mps, 1e-6) - 1.0
+        angular_normalized = angular_rps / max(self.config.ros_angular_speed_limit_rps, 1e-6)
+        return {
+            "action": "velocity_control",
+            "action_args": {
+                "linear_velocity": float(np.clip(linear_normalized, -1.0, 1.0)),
+                "angular_velocity": float(np.clip(angular_normalized, -1.0, 1.0)),
+                "camera_pitch_angular_velocity": 0.0,
+            },
+        }
 
     def _maybe_objectgoal_m3_stop(
         self,
         observations: dict[str, Any],
         pose_xy: np.ndarray,
+        heading: float,
+        *,
+        target_measurement: dict[str, float] | None = None,
     ) -> dict[str, Any] | None:
-        """Run the fail-closed ObjectGoal M3 only at a detector-backed standoff."""
+        """Give M3 exclusive STOP authority after a close target-route arrival."""
 
         verifier = getattr(self, "_objectgoal_stop_verifier", None)
         if verifier is None or self._last_full_ros_stack_step != self._step:
@@ -1201,45 +1472,103 @@ class HabitatInteractiveNavM2Policy:
             if active is not None
             else float("inf")
         )
-        aliases = {value.replace("_", " ").casefold() for value in goal_label_aliases(
-            str(self._episode.get("object_category") or "object")
-        )}
-        target_rows: list[dict[str, Any]] = []
-        for row in self._full_ros_detections.get("detections") or []:
-            if not isinstance(row, dict):
-                continue
-            labels = {
-                str(row.get("semantic_class") or "").replace("_", " ").casefold(),
-                str(row.get("semantic_class_raw") or "").replace("_", " ").casefold(),
-            }
-            if aliases.intersection(labels):
-                target_rows.append(row)
-        # Accumulate detector agreement independently from route arrival.  The
-        # target can be seen one frame before M2 selects its final short standoff;
-        # coupling the streak to active-goal state would discard that evidence.
-        self._m3_detector_streak = self._m3_detector_streak + 1 if target_rows else 0
-        gate = bool(
-            is_target_route
-            and distance_m <= self.config.module3_stop_trigger_distance_m
-            and target_rows
+        candidate_id = active.candidate_id if active is not None else None
+        navigation_terminal = bool(
+            (
+                int(self._full_ros_move_base_status) == 3
+                and self._move_base_goal_seen_active
+                and self._move_base_goal_candidate_id == candidate_id
+            )
+            or self._m3_navigation_terminal_candidate_id == candidate_id
         )
+        # move_base owns both translation and final standoff yaw.  In the full
+        # ROS path, a distance-only gate would preempt its orientation phase;
+        # the geometric tolerance remains valid only for adapter-owned control.
+        arrived = bool(
+            is_target_route
+            and (
+                navigation_terminal
+                if self.config.original_ros_navigation_enabled
+                else distance_m <= self.config.module3_stop_trigger_distance_m
+            )
+        )
+        if not arrived:
+            self._m3_detector_streak = 0
+            self._m3_verify_candidate_id = None
+            self._m3_verify_steps = 0
+            self._m3_missing_target_steps = 0
+            self._m3_semantic_rejections = 0
+            self._m3_navigation_terminal_candidate_id = None
+            self._m3_scan_target_heading = None
+            return None
+        if self._m3_verify_candidate_id != candidate_id:
+            self._m3_verify_candidate_id = candidate_id
+            self._m3_verify_steps = 0
+            self._m3_missing_target_steps = 0
+            self._m3_semantic_rejections = 0
+            self._m3_detector_streak = 0
+            self._m3_scan_target_heading = None
+        self._m3_verify_steps += 1
+        detector_confidence = (
+            float(target_measurement.get("confidence", 0.0))
+            if target_measurement is not None
+            else 0.0
+        )
+        # Detector confidence is evidence for M3, not a precondition for calling
+        # it. The verifier sees the current RGB plus this score and owns the
+        # semantic decision; only missing geometry or excessive range stays a
+        # fail-closed adapter gate.
+        evidence_present = target_measurement is not None
+        bbox_center_distance_m = (
+            self._bbox_center_planar_distance_m(target_measurement, observations)
+            if evidence_present and target_measurement is not None
+            else float("inf")
+        )
+        bbox_center_close_enough = bool(
+            math.isfinite(bbox_center_distance_m)
+            and bbox_center_distance_m
+            <= float(self.config.module3_max_bbox_center_distance_m)
+        )
+        self._m3_detector_streak = self._m3_detector_streak + 1 if evidence_present else 0
         self._trace_public_event(
             "objectgoal_m3_gate",
-            eligible=gate,
+            eligible=True,
+            arrived=True,
             detector_streak=self._m3_detector_streak,
-            target_detections=len(target_rows),
+            target_detections=int(evidence_present),
+            detector_confidence=detector_confidence,
+            bbox_center_distance_m=(
+                bbox_center_distance_m if math.isfinite(bbox_center_distance_m) else None
+            ),
+            max_bbox_center_distance_m=float(self.config.module3_max_bbox_center_distance_m),
+            bbox_center_close_enough=bbox_center_close_enough,
             active_candidate_id=(active.candidate_id if active is not None else None),
             public_candidate_distance_m=(distance_m if math.isfinite(distance_m) else None),
+            verification_steps=self._m3_verify_steps,
         )
-        if self._m3_detector_streak < max(1, int(self.config.module3_detector_confirmations)):
-            return None
+        if self._m3_verify_steps >= max(1, int(self.config.module3_max_verification_steps)):
+            return self._fail_objectgoal_m3_standoff("m3_verification_timeout")
+        if not evidence_present:
+            self._m3_missing_target_steps += 1
+            if self._m3_missing_target_steps >= max(
+                1, int(self.config.module3_missing_target_max_steps)
+            ):
+                return self._fail_objectgoal_m3_standoff("m3_target_not_visible")
+            return self._m3_search_turn_action(pose_xy, heading, active)
+
+        self._m3_missing_target_steps = 0
+        self._m3_scan_target_heading = None
+        required_confirmations = max(1, int(self.config.module3_detector_confirmations))
+        if self._m3_detector_streak < required_confirmations:
+            return self._hold_action()
         self._m3_queries += 1
-        detector_confidence = max(float(row.get("confidence", 0.0) or 0.0) for row in target_rows)
         result = verifier.verify(
             target_name=str(self._episode.get("object_category") or "object"),
             image_data_url=self._rgb_data_url(np.asarray(observations["rgb"], dtype=np.uint8)),
             detector_confidence=detector_confidence,
             public_candidate_distance_m=distance_m,
+            bbox_center_distance_m=bbox_center_distance_m,
+            max_bbox_center_distance_m=float(self.config.module3_max_bbox_center_distance_m),
             metrics_context={
                 "episode_id": str(self._episode.get("episode_id") or ""),
                 "scene_id": str(self._episode.get("scene_id") or ""),
@@ -1260,9 +1589,132 @@ class HabitatInteractiveNavM2Policy:
         if result.decision == "STOP":
             self._m3_stop_emitted += 1
             return self.stop_action()
-        if result.decision == "RESCAN":
-            return self._rotate_recovery_action()
-        return None
+        self._m3_semantic_rejections += 1
+        if self._m3_semantic_rejections >= max(
+            1, int(self.config.module3_semantic_rejection_limit)
+        ):
+            return self._fail_objectgoal_m3_standoff("m3_view_rejected")
+        # RESCAN and CONTINUE are both non-terminal verifier outcomes. Keep M3
+        # as the sole controller at the arrived standoff and scan persistently
+        # in one direction; never fall through to an opposite move_base /cmd_vel.
+        return self._m3_directed_turn_action(self._m3_scan_direction)
+
+    def _bbox_center_planar_distance_m(
+        self,
+        measurement: dict[str, float],
+        observations: dict[str, Any] | None = None,
+    ) -> float:
+        """Estimate robot-to-box-centre planar range from public RGB-D only."""
+
+        depth_m = float(measurement.get("depth_m", float("nan")))
+        # Prefer a small centre patch over the full-box median used for target
+        # tracking. Background pixels at the edge of a large box must not make
+        # M3 believe the robot is closer to the object centre than it is.
+        if observations is not None and observations.get("depth") is not None:
+            try:
+                depth = self._depth_meters(observations)
+                height, width = depth.shape
+                x1 = float(measurement.get("x1", measurement.get("center_x", 0.5)))
+                x2 = float(measurement.get("x2", measurement.get("center_x", 0.5)))
+                y1 = float(measurement.get("y1", measurement.get("center_y", 0.5)))
+                y2 = float(measurement.get("y2", measurement.get("center_y", 0.5)))
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                half_w = max(1, int(round(max(0.01, x2 - x1) * width * 0.10)))
+                half_h = max(1, int(round(max(0.01, y2 - y1) * height * 0.10)))
+                px = int(np.clip(round(cx * width), 0, width - 1))
+                py = int(np.clip(round(cy * height), 0, height - 1))
+                patch = depth[
+                    max(0, py - half_h):min(height, py + half_h + 1),
+                    max(0, px - half_w):min(width, px + half_w + 1),
+                ]
+                valid = patch[
+                    np.isfinite(patch)
+                    & (patch >= self.config.vision_min_depth_m)
+                    & (patch <= self.config.max_depth_m)
+                ]
+                if valid.size:
+                    depth_m = float(np.median(valid))
+            except (KeyError, TypeError, ValueError):
+                pass
+        center_x = float(measurement.get("center_x", float("nan")))
+        if not math.isfinite(depth_m) or depth_m <= 0.0 or not math.isfinite(center_x):
+            return float("inf")
+        focal_scale = 2.0 * math.tan(math.radians(self.config.hfov_degrees) * 0.5)
+        lateral_m = (center_x - 0.5) * focal_scale * depth_m
+        return float(math.hypot(depth_m, lateral_m))
+
+    def _m3_directed_turn_action(self, direction: float) -> dict[str, Any]:
+        return {
+            "action": "velocity_control",
+            "action_args": {
+                "linear_velocity": -1.0,
+                "angular_velocity": 1.0 if direction >= 0.0 else -1.0,
+                "camera_pitch_angular_velocity": 0.0,
+            },
+        }
+
+    def _m3_search_turn_action(
+        self,
+        pose_xy: np.ndarray,
+        heading: float,
+        active: _ActiveGoal,
+    ) -> dict[str, Any]:
+        """Face the public target estimate before a bounded symmetric scan."""
+
+        track = self._target_track
+        if track is not None and track.promoted:
+            delta = np.asarray(track.surface_xy, dtype=np.float32) - pose_xy
+            center_heading = math.atan2(-float(delta[1]), float(delta[0]))
+        else:
+            center_heading = float(active.goal_yaw)
+        center_error = self._wrap_angle(center_heading - float(heading))
+        heading_tolerance = 0.08
+        scan_half_angle = 0.30
+        if self._m3_scan_target_heading is None:
+            if abs(center_error) > heading_tolerance:
+                desired = center_heading
+            else:
+                desired = self._wrap_angle(
+                    center_heading + self._m3_scan_direction * scan_half_angle
+                )
+            self._m3_scan_target_heading = desired
+        error = self._wrap_angle(self._m3_scan_target_heading - float(heading))
+        if abs(error) <= heading_tolerance:
+            # Once the expected bearing has been checked, sweep around it rather
+            # than continuing a one-way spin that can miss the opposite side.
+            self._m3_scan_direction *= -1.0
+            self._m3_scan_target_heading = self._wrap_angle(
+                center_heading + self._m3_scan_direction * scan_half_angle
+            )
+            error = self._wrap_angle(self._m3_scan_target_heading - float(heading))
+        self._trace_public_event(
+            "objectgoal_m3_search_heading",
+            target_center_heading=float(center_heading),
+            scan_target_heading=float(self._m3_scan_target_heading),
+            heading_error=float(error),
+        )
+        return self._m3_directed_turn_action(1.0 if error >= 0.0 else -1.0)
+
+    def _fail_objectgoal_m3_standoff(self, reason: str) -> dict[str, Any]:
+        active = self._active_goal
+        if active is not None:
+            self._record_failed_target_standoff(active, -3, reason=reason)
+        self._trace_public_event(
+            "objectgoal_m3_standoff_rejected",
+            reason=reason,
+            candidate_id=(active.candidate_id if active is not None else None),
+        )
+        self._active_goal = None
+        self._last_replan_reason = reason
+        self._m3_verify_candidate_id = None
+        self._m3_verify_steps = 0
+        self._m3_missing_target_steps = 0
+        self._m3_semantic_rejections = 0
+        self._m3_detector_streak = 0
+        self._m3_navigation_terminal_candidate_id = None
+        self._m3_scan_target_heading = None
+        return self._hold_action()
 
     def _ros_plan_rows(
         self,
@@ -1314,12 +1766,305 @@ class HabitatInteractiveNavM2Policy:
                     value[1] = -float(value[1])
         return converted
 
+    @staticmethod
+    def _target_candidate_root(candidate_id: str) -> str:
+        """Return the stable object candidate ID shared by retry viewpoints."""
+
+        return str(candidate_id).split(":retry:", 1)[0]
+
+    def _record_failed_target_standoff(
+        self,
+        goal: _ActiveGoal,
+        status: int,
+        *,
+        reason: str = "move_base_terminal",
+    ) -> None:
+        """Remember one public target approach that move_base could not execute."""
+
+        root = self._target_candidate_root(goal.candidate_id)
+        xy = np.asarray(goal.xy, dtype=np.float32).copy()
+        radius = max(0.0, float(self.config.target_standoff_failure_radius_m))
+        for row in self._failed_target_standoffs:
+            if row["root"] == root and float(np.linalg.norm(row["xy"] - xy)) <= radius:
+                row["step"] = self._step
+                row["status"] = int(status)
+                row["reason"] = str(reason)
+                return
+        self._failed_target_standoffs.append(
+            {
+                "root": root,
+                "xy": xy,
+                "step": self._step,
+                "status": int(status),
+                "reason": str(reason),
+            }
+        )
+        self._trace_public_event(
+            "target_standoff_failed",
+            candidate_id=goal.candidate_id,
+            candidate_root=root,
+            goal_xy=[float(xy[0]), float(xy[1])],
+            move_base_status=int(status),
+            failure_reason=str(reason),
+        )
+
+    def _active_failed_target_standoffs(self, root: str) -> list[dict[str, Any]]:
+        cooldown = max(1, int(self.config.target_standoff_failure_cooldown_steps))
+        self._failed_target_standoffs = [
+            row for row in self._failed_target_standoffs
+            if self._step - int(row["step"]) < cooldown
+        ]
+        return [row for row in self._failed_target_standoffs if row["root"] == root]
+
+    def _target_standoff_failed(self, root: str, xy: np.ndarray) -> bool:
+        radius = max(0.0, float(self.config.target_standoff_failure_radius_m))
+        return any(
+            float(np.linalg.norm(row["xy"] - xy)) <= radius
+            for row in self._active_failed_target_standoffs(root)
+        )
+
+    def _snap_subgoal_to_reachable_free(
+        self,
+        requested: np.ndarray,
+        pose_xy: np.ndarray,
+        surface_xy: np.ndarray | None,
+        planner: tuple[np.ndarray, np.ndarray, tuple[int, int]] | None = None,
+    ) -> tuple[np.ndarray, tuple[tuple[int, int], ...]] | None:
+        """Snap a subgoal onto reachable, collision-free public-map space."""
+
+        costs, parents, start_xy = planner or self._reachable_tree(pose_xy)
+        ys, xs = np.nonzero((self._grid == FREE) & np.isfinite(costs))
+        if not len(xs):
+            return None
+        cells = np.stack([xs, ys], axis=1).astype(np.int32)
+        world = self._grid_to_world(cells)
+        requested_error = np.linalg.norm(world - requested[None, :], axis=1)
+        snap_radius_m = max(
+            float(self.config.target_standoff_failure_radius_m),
+            2.0 * float(self.config.map_resolution_m),
+        )
+        eligible = requested_error <= snap_radius_m
+        if surface_xy is not None:
+            surface_distance = np.linalg.norm(world - surface_xy[None, :], axis=1)
+            eligible &= (
+                np.abs(surface_distance - float(self.config.target_track_standoff_m))
+                <= float(self.config.target_track_standoff_tolerance_m)
+            )
+        indices = np.flatnonzero(eligible)
+        if not len(indices):
+            return None
+        selected = min(
+            indices.tolist(),
+            key=lambda index: (
+                float(requested_error[index]),
+                float(costs[ys[index], xs[index]]),
+                int(ys[index]),
+                int(xs[index]),
+            ),
+        )
+        goal_cell = (int(cells[selected, 0]), int(cells[selected, 1]))
+        route = self._reconstruct_route(parents, start_xy, goal_cell)
+        if not route:
+            return None
+        return world[selected].astype(np.float32), route
+
+    def _target_retry_records(
+        self,
+        base_record: dict[str, Any],
+        pose_xy: np.ndarray,
+        heading: float,
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Generate front-side alternatives around a detector-backed target.
+
+        The surface estimate comes only from public RGB-D tracking.  Offsets stay
+        within the visible half-plane around the failed view; no simulator goal,
+        semantic mesh, pathfinder, or ObjectNav metric is consulted.
+        """
+
+        track = self._target_track
+        if track is None or not track.promoted:
+            return []
+        candidate_id = str(base_record.get("candidate_id") or "")
+        root = self._target_candidate_root(candidate_id)
+        failures = self._active_failed_target_standoffs(root)
+        if not failures and not force:
+            return []
+        goal = np.asarray(base_record["goal_xyyaw"][:2], dtype=np.float32)
+        surface = np.asarray(track.surface_xy, dtype=np.float32)
+        radial = goal - surface
+        # Retry poses must obey the Habitat-specific target standoff instead of
+        # inheriting an older/farther ROS candidate radius.
+        standoff = max(0.40, float(self.config.target_track_standoff_m))
+        base_angle = math.atan2(float(radial[1]), float(radial[0]))
+        records: list[dict[str, Any]] = []
+        planner = self._reachable_tree(pose_xy)
+        for index, offset_deg in enumerate(self.config.target_standoff_retry_angles_deg):
+            angle = base_angle + math.radians(float(offset_deg))
+            requested = surface + standoff * np.asarray(
+                [math.cos(angle), math.sin(angle)], dtype=np.float32
+            )
+            snapped = self._snap_subgoal_to_reachable_free(
+                requested,
+                pose_xy,
+                surface,
+                planner,
+            )
+            if snapped is None:
+                continue
+            requested, route = snapped
+            if self._target_standoff_failed(root, requested):
+                continue
+            record = copy.deepcopy(base_record)
+            retry_id = f"{root}:retry:{index}"
+            ros_yaw = math.atan2(
+                -float(surface[1] - requested[1]),
+                float(surface[0] - requested[0]),
+            )
+            features = dict(record.get("features") or {})
+            features["distance_m"] = float(np.linalg.norm(requested - pose_xy))
+            metadata = dict(record.get("metadata") or {})
+            metadata.update(
+                target_goal=True,
+                target_standoff_retry=True,
+                target_standoff_retry_index=index,
+                failed_target_candidate_root=root,
+            )
+            relative = requested - pose_xy
+            metadata["relative_bearing_rad"] = self._wrap_angle(
+                math.atan2(-float(relative[1]), float(relative[0]))
+                - float(heading)
+            )
+            record.update(
+                candidate_id=retry_id,
+                goal_xyyaw=[float(requested[0]), float(requested[1]), float(ros_yaw)],
+                features=features,
+                metadata=metadata,
+                interaction_command=None,
+            )
+            self._candidate_routes[retry_id] = route
+            records.append(record)
+        return records
+
     def _full_ros_records(self, pose_xy: np.ndarray, heading: float) -> list[dict[str, Any]]:
         """Route original ROS candidates on the public Habitat occupancy map."""
 
         rows = self._full_ros_candidate_payload.get("candidates") or []
         if not isinstance(rows, list):
             rows = []
+        if self.config.original_ros_navigation_enabled:
+            records: list[dict[str, Any]] = []
+            self._candidate_routes = {}
+            planner = self._reachable_tree(pose_xy)
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                behavior_type = str(raw.get("behavior_type") or "").upper()
+                goal = raw.get("goal_xyyaw")
+                candidate_id = str(raw.get("candidate_id") or "")
+                if (
+                    behavior_type not in set(self.config.allowed_behavior_types)
+                    or raw.get("interaction_command") is not None
+                    or not candidate_id
+                    or not isinstance(goal, (list, tuple))
+                    or len(goal) < 2
+                ):
+                    continue
+                requested = np.asarray([float(goal[0]), -float(goal[1])], dtype=np.float32)
+                record = dict(raw)
+                metadata = dict(raw.get("metadata") or {})
+                is_target = bool(metadata.get("target_goal")) or candidate_id.startswith("target:")
+                route: tuple[tuple[int, int], ...] = ()
+                surface = (
+                    np.asarray(self._target_track.surface_xy, dtype=np.float32)
+                    if is_target
+                    and self._target_track is not None
+                    and self._target_track.promoted
+                    else None
+                )
+                if is_target:
+                    snapped = self._snap_subgoal_to_reachable_free(
+                        requested,
+                        pose_xy,
+                        surface,
+                        planner,
+                    )
+                    if snapped is None:
+                        # A geometric target approach that lies in OCCUPIED,
+                        # UNKNOWN, or disconnected space is not publishable.
+                        # Generate other views around the same public target;
+                        # if none exist, ordinary exploration remains active.
+                        preliminary = dict(record)
+                        preliminary["candidate_id"] = candidate_id
+                        preliminary["goal_xyyaw"] = [
+                            float(requested[0]),
+                            float(requested[1]),
+                            float(goal[2]) if len(goal) > 2 else 0.0,
+                        ]
+                        preliminary["metadata"] = metadata
+                        records.extend(
+                            self._target_retry_records(
+                                preliminary,
+                                pose_xy,
+                                heading,
+                                force=True,
+                            )
+                        )
+                        continue
+                    requested, route = snapped
+                    self._candidate_routes[candidate_id] = route
+                else:
+                    snapped = self._snap_subgoal_to_reachable_free(
+                        requested,
+                        pose_xy,
+                        None,
+                        planner,
+                    )
+                    if snapped is None:
+                        continue
+                    requested, route = snapped
+                    self._candidate_routes[candidate_id] = route
+                features = dict(raw.get("features") or {})
+                features["distance_m"] = float(np.linalg.norm(requested - pose_xy))
+                features.setdefault("exploration_gain", 0.0)
+                features.setdefault("visibility_gain", 0.0)
+                features.setdefault("interaction_cost", 0.0)
+                relative = requested - pose_xy
+                metadata["relative_bearing_rad"] = self._wrap_angle(
+                    math.atan2(-float(relative[1]), float(relative[0])) - heading
+                )
+                metadata["original_ros_navigation_candidate"] = True
+                metadata["collision_free_reachable_subgoal"] = True
+                if is_target:
+                    metadata["collision_free_reachable_standoff"] = True
+                    metadata["route_cells"] = len(route)
+                goal_yaw = float(goal[2]) if len(goal) > 2 else 0.0
+                if surface is not None:
+                    goal_yaw = math.atan2(
+                        -float(surface[1] - requested[1]),
+                        float(surface[0] - requested[0]),
+                    )
+                record.update(
+                    candidate_id=candidate_id,
+                    behavior_type=behavior_type,
+                    goal_xyyaw=[float(requested[0]), float(requested[1]), float(goal_yaw)],
+                    features=features,
+                    metadata=metadata,
+                    interaction_command=None,
+                )
+                root = self._target_candidate_root(candidate_id)
+                if not (is_target and self._target_standoff_failed(root, requested)):
+                    records.append(record)
+                if is_target:
+                    records.extend(self._target_retry_records(record, pose_xy, heading))
+            self._last_candidate_pool_stats = {
+                "source_candidates": len(rows),
+                "routeable_records": len(records),
+                "graph_nodes": len(self._full_ros_graph.get("nodes") or []),
+                "graph_edges": len(self._full_ros_graph.get("edges") or []),
+            }
+            return records
         costs, parents, start_xy = self._reachable_tree(pose_xy)
         ys, xs = np.nonzero((self._grid == FREE) & np.isfinite(costs))
         self._candidate_routes = {}
@@ -1459,6 +2204,10 @@ class HabitatInteractiveNavM2Policy:
                 "full_ros_target_detection",
                 goal_category=goal,
                 raw_detection_count=len(rows),
+                raw_detection_labels=[
+                    str(row.get("semantic_class") or row.get("class") or row.get("label") or "")
+                    for row in rows if isinstance(row, dict)
+                ],
                 target_candidate_count=0,
                 selected_target=None,
             )
@@ -1472,6 +2221,10 @@ class HabitatInteractiveNavM2Policy:
             "full_ros_target_detection",
             goal_category=goal,
             raw_detection_count=len(rows),
+            raw_detection_labels=[
+                str(row.get("semantic_class") or row.get("class") or row.get("label") or "")
+                for row in rows if isinstance(row, dict)
+            ],
             target_candidate_count=len(candidates),
             selected_target={
                 "label": str(source.get("semantic_class") or ""),
@@ -2233,10 +2986,38 @@ class HabitatInteractiveNavM2Policy:
 
     def _expire_public_target_track(self) -> None:
         track = self._target_track
-        if (
-            track is not None
-            and self._step - track.last_seen_step > self.config.target_track_expire_steps
-        ):
+        if track is None:
+            return
+        age = self._step - track.last_seen_step
+        # Promotion means that two spatially separated public observations
+        # already agreed on a stable world position.  A temporary detector gap
+        # must not revoke that target or force an unrelated exploration goal.
+        if track.promoted and self.config.persistent_target_tracking:
+            if age > self.config.target_track_stale_lease_steps:
+                self._target_track = None
+                if self._active_goal is not None and self._active_goal.candidate_id == "public_target_track":
+                    self._active_goal = None
+                self._target_track_expired += 1
+                self._trace_public_event(
+                    "target_track_expired",
+                    surface_xy=track.surface_xy.tolist(),
+                    last_seen_step=int(track.last_seen_step),
+                    observations=int(track.observations),
+                    promoted=True,
+                    stale_lease_steps=int(self.config.target_track_stale_lease_steps),
+                )
+            elif age > self.config.target_track_expire_steps and not self._target_track_stale_reported:
+                self._target_track_stale_reported = True
+                self._trace_public_event(
+                    "target_track_stale",
+                    surface_xy=track.surface_xy.tolist(),
+                    last_seen_step=int(track.last_seen_step),
+                    age_steps=int(age),
+                    stale_lease_steps=int(self.config.target_track_stale_lease_steps),
+                    promoted=True,
+                )
+            return
+        if age > self.config.target_track_expire_steps:
             self._target_track = None
             if self._active_goal is not None and self._active_goal.candidate_id == "public_target_track":
                 self._active_goal = None
@@ -2262,7 +3043,10 @@ class HabitatInteractiveNavM2Policy:
         surface_xy = self._public_target_surface_xy(pose_xy, heading, detection)
         track = self._target_track
         if track is None:
-            self._target_track = _PublicTargetTrack(surface_xy, pose_xy.copy(), self._step)
+            self._target_track = _PublicTargetTrack(
+                surface_xy, pose_xy.copy(), self._step,
+                confidence=float(detection.get("confidence", 0.0)),
+            )
             self._target_track_seeded += 1
             self._trace_public_event(
                 "target_track_seeded",
@@ -2287,7 +3071,10 @@ class HabitatInteractiveNavM2Policy:
             # for the entire expiry window.
             self._target_track_rejected += 1
             if not track.promoted:
-                self._target_track = _PublicTargetTrack(surface_xy, pose_xy.copy(), self._step)
+                self._target_track = _PublicTargetTrack(
+                    surface_xy, pose_xy.copy(), self._step,
+                    confidence=float(detection.get("confidence", 0.0)),
+                )
                 self._target_track_seeded += 1
             self._trace_public_event(
                 "target_track_rejected",
@@ -2302,6 +3089,8 @@ class HabitatInteractiveNavM2Policy:
             )
             return False
         track.last_seen_step = self._step
+        self._target_track_stale_reported = False
+        track.confidence = max(track.confidence, float(detection.get("confidence", 0.0)))
         if not track.promoted:
             if baseline + self.config.target_track_baseline_tolerance_m < self.config.target_track_min_baseline_m:
                 self._trace_public_event(
@@ -2921,6 +3710,26 @@ class HabitatInteractiveNavM2Policy:
             "decision_history": self._decision_history[-8:],
             "candidate_history": candidate_history,
         }
+        if self.config.target_goal_lock_enabled:
+            target_ids = [
+                candidate.candidate_id
+                for candidate in candidates
+                if candidate.candidate_id == "public_target_track"
+                or candidate.candidate_id.startswith("target:")
+                or bool(candidate.metadata.get("target_goal"))
+            ]
+            if target_ids:
+                score = float(np.clip(self.config.target_goal_pre_score, 0.0, 1.0))
+                robot_context["candidate_pre_scores"] = {
+                    candidate_id: score for candidate_id in target_ids
+                }
+                robot_context["candidate_pre_score_terms"] = {
+                    candidate_id: {"promoted_public_target": score}
+                    for candidate_id in target_ids
+                }
+                robot_context["candidate_decision_hints"] = {
+                    candidate_id: "TARGET_GOAL" for candidate_id in target_ids
+                }
         selected = self._model.select(
             candidates,
             target_context={
@@ -3022,6 +3831,11 @@ class HabitatInteractiveNavM2Policy:
             self._step,
             self._candidate_routes.get(selected.candidate_id, ()),
             candidate_history_key=history_key,
+            goal_yaw=(
+                float(selected.goal_xyyaw[2])
+                if selected.goal_xyyaw and len(selected.goal_xyyaw) > 2
+                else 0.0
+            ),
         )
 
     def _candidate_history_for_model(self, candidates: list[Any], graph: dict[str, Any]) -> dict[str, dict[str, Any]]:

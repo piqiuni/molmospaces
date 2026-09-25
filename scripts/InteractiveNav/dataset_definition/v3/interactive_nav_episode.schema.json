@@ -276,6 +276,36 @@
       },
       "additionalProperties": true
     },
+    "identityContract": {
+      "type": "object",
+      "required": [
+        "mode",
+        "instruction_consistent_candidates",
+        "contract_candidates",
+        "cross_contract_distractors"
+      ],
+      "properties": {
+        "mode": {"const": "interaction_contract_any"},
+        "instruction_consistent_candidates": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "contract_candidates": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "cross_contract_distractors": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
     "objectTarget": {
       "type": "object",
       "required": [
@@ -299,7 +329,8 @@
         },
         "container_name": {"type": ["string", "null"]},
         "container_category": {"type": ["string", "null"]},
-        "grounding": {"$ref": "#/$defs/targetGrounding"}
+        "grounding": {"$ref": "#/$defs/targetGrounding"},
+        "identity_contract": {"$ref": "#/$defs/identityContract"}
       },
       "additionalProperties": true
     },
@@ -605,6 +636,12 @@
         "required_interaction_ids": {
           "type": "array",
           "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "terminal_target_instances": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
           "uniqueItems": true
         },
         "steps": {

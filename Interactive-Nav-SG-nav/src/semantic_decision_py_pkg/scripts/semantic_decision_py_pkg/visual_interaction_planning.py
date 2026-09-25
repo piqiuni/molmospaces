@@ -242,8 +242,11 @@ def candidate_with_visual_drawer_scan(
 
     ``drawer_bbox_2d`` and ``capture_step`` are public detector evidence paired
     with the M1 image.  ``action_regions`` are crop-relative points the model
-    actually saw.  Returning ``None`` on any missing part is intentional: no
-    caller may turn a side/occluded/empty visual observation into a bridge call.
+    actually saw.  Low camera views can legitimately expose the front and target
+    box while exposing no reliable drawer-level region.  In that case the sealed
+    ``drawer_scan`` contract intentionally carries an empty region list: the
+    trusted bridge interprets it as "scan all slide joints".  This fallback is
+    *not* used by ``drawer_open``, which must remain grounded to explicit regions.
     """
 
     if not isinstance(drawer_bbox_2d, (list, tuple)) or len(drawer_bbox_2d) < 4:
@@ -260,8 +263,6 @@ def candidate_with_visual_drawer_scan(
     if public_capture_step < 0 or right - left < 1.0 or bottom - top < 1.0:
         return None
     regions = _normalized_visible_drawer_regions(action_regions)
-    if not regions:
-        return None
     plan = {
         "target_type": "drawer_container",
         "action": "scan",
@@ -286,6 +287,11 @@ def candidate_with_visual_drawer_scan(
     interaction = dict(planned.get("interaction_command") or {})
     interaction["drawer_container_bbox_2d"] = [left, top, right, bottom]
     interaction["drawer_container_capture_step"] = public_capture_step
+    # Make the low-view fallback explicit for diagnostics.  The bridge already
+    # treats an empty region list on ``drawer_scan`` as a request to scan every
+    # simulator slide joint; keeping this marker prevents callers from confusing
+    # it with an ungrounded drawer_open command.
+    interaction["drawer_scan_fallback_to_all"] = not bool(regions)
     interaction["visual_operation_plan"] = plan
     planned["interaction_command"] = interaction
     return planned

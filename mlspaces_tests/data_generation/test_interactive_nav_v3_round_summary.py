@@ -275,6 +275,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
             # NavToObj success and the two saved planar path lengths.
             "spl": 0.0,
             "required_interaction_success": True,
+            "required_interaction_completion_fraction": 1.0,
             "interaction_precision_episode": 0.5,
             "episode_total_cost": 1.0,
             "interaction_action_count": 9,
@@ -291,6 +292,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
             "navigation_path_length_m": 2.0,
             "spl": 0.0,
             "required_interaction_success": False,
+            "required_interaction_completion_fraction": 0.5,
             "interaction_precision_episode": 0.0,
             "episode_total_cost": 4.0,
             "interaction_action_count": 1,
@@ -325,7 +327,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
                     "status": "complete",
                     "scoring_eligible": True,
                     "paper_metric_schema_version": (
-                        "interactive_nav_v3_paper_metrics_v1"
+                        "interactive_nav_v3_paper_metrics_v3"
                     ),
                     "paper_metric_config": metric_config,
                 }
@@ -337,7 +339,8 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
 
     assert overall["sr"] == pytest.approx(2 / 3)
     assert overall["spl"] == pytest.approx(1.3 / 3)
-    assert overall["isr"] == pytest.approx(0.5)
+    assert overall["isr"] == pytest.approx(0.75)
+    assert overall["full_required_interaction_success_rate"] == pytest.approx(0.5)
     assert overall["ip"] == pytest.approx(0.5)
     assert overall["total_cost"] == pytest.approx(4.0)
     assert overall["success_rate"] == overall["sr"]
@@ -399,6 +402,8 @@ def test_round_summary_refuses_incomplete_or_mixed_paper_metric_records(
     overall = summary["paper_metrics"]["groups"]["overall"]
 
     assert overall["sr"] == 1.0
+    assert overall["isr"] is None  # v1 persisted only the binary full-plan flag
+    assert overall["isr_missing_count"] == 2
     assert overall["ip"] is None
     assert overall["ip_missing_count"] == 1
     assert overall["total_cost"] is None
@@ -570,6 +575,10 @@ def test_round_summary_merges_batch_manifest_latest_attempt_and_runtime_diagnost
     assert completed_row["outcomes"] == {
         "task_success": True,
         "nav_success": True,
+        "exact_instance_success": True,
+        "category_goal_success": True,
+        "interaction_contract_goal_success": True,
+        "interactive_episode_success": True,
         "required_interaction_success": True,
         "sequence_success": True,
     }

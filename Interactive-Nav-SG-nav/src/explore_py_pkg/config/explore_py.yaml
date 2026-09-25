@@ -100,7 +100,7 @@ exploration:
   external_navigation_plan_grace_sec: 16.0
   global_plan_goal_tolerance_m: 0.6
   make_plan_preflight_enabled: true
-  make_plan_service: "/move_base/make_plan"
+  make_plan_service: "/move_base/GlobalPlanner/make_plan"
   make_plan_service_wait_sec: 2.0
   make_plan_tolerance_m: 0.20
   make_plan_endpoint_tolerance_m: 0.60
@@ -108,6 +108,7 @@ exploration:
   initial_local_goal_count: 3
 
 frontier:
+  frontier_center_fallback_enabled: true
   free_max: 20
   occupied_min: 50
   hard_min_cluster_cells: 3

@@ -211,6 +211,7 @@ class RosGoalStatusObserver(GoalStatusObserver):
         self._rospy = rospy_module
         self._string_type = string_type
         self._subscriber: Any | None = None
+        self._verification_publisher: Any | None = None
 
     def _ensure_ros(self) -> bool:
         if self._rospy is not None and self._string_type is not None:
@@ -229,6 +230,9 @@ class RosGoalStatusObserver(GoalStatusObserver):
         if self._subscriber is not None or not self._ensure_ros():
             return
         try:
+            self._verification_publisher = self._rospy.Publisher(
+                self.topic + "_verification", self._string_type, queue_size=16, latch=True,
+            )
             self._subscriber = self._rospy.Subscriber(
                 self.topic,
                 self._string_type,
@@ -241,8 +245,24 @@ class RosGoalStatusObserver(GoalStatusObserver):
     def _callback(self, message: Any) -> None:
         self.ingest(getattr(message, "data", message))
 
+    def publish_verification(self, payload: Mapping[str, Any], accepted: bool) -> None:
+        if self._verification_publisher is None:
+            return
+        self._verification_publisher.publish(self._string_type(data=json.dumps({
+            "episode_id": self.expected_episode_id,
+            "claim_id": (payload.get("detail") or {}).get("claim_id"),
+            "accepted": bool(accepted),
+            "timestamp": time.time(),
+        })))
+
     def close(self) -> None:
         subscriber = self._subscriber
+        if self._verification_publisher is not None:
+            try:
+                self._verification_publisher.unregister()
+            except Exception:
+                pass
+            self._verification_publisher = None
         self._subscriber = None
         if subscriber is not None:
             unregister = getattr(subscriber, "unregister", None)
@@ -284,6 +304,7 @@ class PublicGoalEvidenceLedger:
             str(value).strip() for value in target_instance_ids if str(value).strip()
         )
         self._frames: deque[PublicGoalEvidence] = deque(maxlen=max(1, int(max_frames)))
+        self._latest_capture_step: int | None = None
 
     def record_frame(
         self,
@@ -297,6 +318,10 @@ class PublicGoalEvidenceLedger:
         observations = payload.get("observations")
         if not isinstance(observations, Iterable) or isinstance(observations, (str, bytes, Mapping)):
             return ()
+        self._latest_capture_step = max(
+            int(capture_step),
+            self._latest_capture_step if self._latest_capture_step is not None else int(capture_step),
+        )
         observed: list[str] = []
         timestamp = float(time.time() if received_at_wall_time is None else received_at_wall_time)
         for raw in observations:
@@ -321,6 +346,11 @@ class PublicGoalEvidenceLedger:
     @property
     def frames(self) -> tuple[PublicGoalEvidence, ...]:
         return tuple(self._frames)
+
+    @property
+    def latest_capture_step(self) -> int | None:
+        """Latest published frame step, including frames without target observations."""
+        return self._latest_capture_step
 
     def has_reliable_target_evidence(self) -> bool:
         return bool(self._frames)
@@ -351,6 +381,10 @@ def verify_target_goal_claim(
     evidence: PublicGoalEvidenceLedger,
     private_distances_m: Mapping[str, float],
     distance_threshold_m: float,
+    allow_open_container_anchor: bool = False,
+    candidate_selection: str = "nearest",
+    require_current_evidence: bool = False,
+    max_evidence_age_steps: int = 2,
 ) -> GoalClaimVerification:
     """Verify one policy declaration against public evidence and private range.
 
@@ -369,10 +403,14 @@ def verify_target_goal_claim(
     threshold = float(distance_threshold_m)
     if not math.isfinite(threshold) or threshold <= 0.0:
         return GoalClaimVerification(False, "invalid_distance_threshold")
-    # Match the native NavToObj endpoint: select the currently nearest target
-    # candidate first, then require public evidence for that *same* opaque
-    # instance.  Accepting any historically visible candidate would silently
-    # change ``any_candidate`` episodes into a different success definition.
+    if candidate_selection not in {"nearest", "nearest_published"}:
+        return GoalClaimVerification(False, "invalid_candidate_selection")
+    # The strict endpoint matches native NavToObj: select the currently nearest
+    # target first, then require evidence for that same opaque instance.  A
+    # category endpoint has different semantics: it may select the nearest
+    # *published* same-category candidate.  Otherwise an unobserved object that
+    # happens to be a few centimetres nearer can block a valid public claim for
+    # the object the policy actually found.
     finite_distances: list[tuple[float, str]] = []
     for instance_id, raw_distance in private_distances_m.items():
         try:
@@ -383,13 +421,20 @@ def verify_target_goal_claim(
             finite_distances.append((distance, str(instance_id)))
     if not finite_distances:
         return GoalClaimVerification(False, "private_distance_unavailable")
+    if candidate_selection == "nearest_published":
+        published_ids = evidence.observed_instance_ids
+        finite_distances = [
+            item for item in finite_distances if item[1] in published_ids
+        ]
+        if not finite_distances:
+            return GoalClaimVerification(False, "no_published_target_evidence")
     # ``min(..., key=distance)`` deliberately preserves the candidate mapping's
     # insertion order on an exact distance tie, matching ``target_metrics``.
     distance, nearest_instance_id = min(
         finite_distances,
         key=lambda item: item[0],
     )
-    if distance >= threshold:
+    if distance >= threshold and not allow_open_container_anchor:
         return GoalClaimVerification(False, "private_distance_failed")
     matching_frame = next(
         (
@@ -401,9 +446,14 @@ def verify_target_goal_claim(
     )
     if matching_frame is None:
         return GoalClaimVerification(False, "nearest_target_not_published")
+    if require_current_evidence:
+        latest_step = evidence.latest_capture_step
+        max_age = max(0, int(max_evidence_age_steps))
+        if latest_step is None or latest_step - matching_frame.capture_step > max_age:
+            return GoalClaimVerification(False, "target_perception_stale")
     return GoalClaimVerification(
         True,
-        "verified",
+        "verified_open_container_anchor" if allow_open_container_anchor else "verified",
         target_instance_id=nearest_instance_id,
         distance_m=distance,
         evidence_capture_step=matching_frame.capture_step,

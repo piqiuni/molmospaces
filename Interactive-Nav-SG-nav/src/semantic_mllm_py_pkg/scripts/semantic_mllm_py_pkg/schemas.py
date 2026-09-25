@@ -154,7 +154,6 @@ def build_attribute_patch_response_schema(
             "attribute response schema expected_node_type must be container or portal"
         )
     container_only = normalized_expected_type == "container"
-
     confidence = {"type": "number", "minimum": 0.0, "maximum": 1.0}
     nullable_portal_morphology = {
         "type": ["object", "null"],
@@ -316,6 +315,9 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     if not str(result.get("object_id") or ""):
         raise ValueError("attribute patch requires object_id")
+    result["selected_view_id"] = str(
+        result.get("selected_view_id") or "view_1"
+    ).strip() or "view_1"
     result["interactable"] = bool(result.get("interactable", False))
     observed_name = str(
         result.get("observed_object_name")

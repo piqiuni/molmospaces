@@ -1,0 +1,43 @@
+TaskName: "interactive_nav_v3_qwen_20w30s_dynamic2000_recording"
+Description: "One two-GPU instance: two Qwen replicas plus 20-worker, 30-scene, dynamic-step (max 2000) recorded V3 ROS evaluation"
+Entrypoint: "BENCHMARK_LAUNCHER_CONFIG=scripts/InteractiveNav/configs/evaluation/benchmark_batch_custom_task_20w30s_dynamic2000_recording.json EXPECTED_EPISODES=30 bash /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_v3_custom_task_smoke.sh"
+Tags: [InteractiveNav, benchmark, recording, dynamic]
+UserCodePath:
+RemoteMountCodePath:
+Envs: []
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:2.7.1-cu12.8.1-py3.12-ubuntu22.04"
+ImageCredential: {}
+ResourceQueueName: "c20250503"
+Framework: "PyTorchDDP"
+TaskRoleSpecs:
+  - RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.7xlarge"
+ActiveDeadlineSeconds: 21600
+DelayExitTimeSeconds: 0
+AccessType: "Public"
+AccessUsers: []
+Preemptible: false
+Priority: 6
+RetryOptions:
+  EnableRetry: false
+  EnableReserveResourceOnRetry: false
+  MaxRetryTimes: 0
+  IntervalSeconds: 120
+  PolicySets:
+    - "Failed"
+EnableTensorBoard: false
+TensorBoardStorage: {}
+Storages:
+  - Type: "TosFuse"
+    MountPath: "/tos"
+    Bucket: "c20250503"
+    Prefix: /
+  - Type: "Vepfs"
+    MountPath: "/home/ldl"
+    SubPath: "/c20250503/250404017"
+    ReadOnly: false
+  - Type: "Vepfs"
+    MountPath: "/vepfs-wxy"
+    SubPath: "/c20250503/240401046"
+    ReadOnly: false

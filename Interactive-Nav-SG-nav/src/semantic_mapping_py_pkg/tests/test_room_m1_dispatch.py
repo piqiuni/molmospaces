@@ -49,6 +49,9 @@ def runtime(monkeypatch):
     node.room_max_output_tokens = 96
     node.room_pending = {}
     node.room_completed = {}
+    node.room_failures = {}
+    node.room_failure_refresh_interval_s = 30.0
+    node.room_fallback_enabled = False
     node.room_generations = {}
     node.room_last_request = {}
     node.room_request_sequence = 0
@@ -81,6 +84,7 @@ def reserve(node, clock, room_id=1, signature="stove"):
     return dict(
         room_key=room_key, room_id=room_id, room_node_id=room_key,
         objects=[{"object_id": "stove", "name": signature}], episode_id="e1",
+        room_box={"center_xy": [0.0, 0.0], "size_xy": [3.0, 4.0]},
         capture_step=12, stamp=123.0, signature=signature,
         enqueued_at=clock.now, deadline_monotonic=clock.now + 8.0,
         **reservation,
@@ -98,7 +102,7 @@ def test_different_rooms_share_dispatch_budget_and_remain_text_only(runtime):
     assert node.calls[-1][1]["timeout_s"] == pytest.approx(7.0)
     for _, call in node.calls:
         assert call["role"] == "room_attribute_inference"
-        assert set(call["context"]) == {"room_id", "capture_step", "objects", "episode_id"}
+        assert set(call["context"]) == {"room_id", "room_box", "capture_step", "objects", "episode_id"}
         assert not any("image" in key for key in call)
 
 

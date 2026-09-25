@@ -46,11 +46,21 @@ def expected_video_frames_from_step_count(
 def count_jsonl_records(path: Path) -> int:
     """Count complete JSONL rows without accepting a partial final write."""
 
+    import gzip
+    compressed = path.with_name(path.name + ".gz")
+    if not path.exists() and compressed.exists():
+        path = compressed
+    count = 0
     try:
-        with path.open("rb") as handle:
-            return sum(bool(line.strip()) and line.endswith(b"\n") for line in handle)
+        with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as handle:
+            for line in handle:
+                count += bool(line.strip()) and line.endswith(b"\n")
     except FileNotFoundError:
         return 0
+    except EOFError:
+        # A running gzip writer has flushed rows but has not written its footer.
+        pass
+    return count
 
 
 def expected_frames_from_sim_manifest(path: Path) -> int:

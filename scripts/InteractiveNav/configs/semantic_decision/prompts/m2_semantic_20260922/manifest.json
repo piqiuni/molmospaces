@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "experiment": "m2_semantic_20260922",
+  "status": "not_evaluated",
+  "purpose": "Controlled prompt-only comparisons on the same frozen public full_context requests; no performance improvement is claimed.",
+  "baseline": {
+    "id": "b",
+    "reference_file": "../m2_rank_public_evidence_v2.txt",
+    "file_sha256": "6890f735cb5e019b7d63c406c9e8b108727c26e3a85d7f53d4ddbcc961c140c0",
+    "normalized_text_sha256": "079bf750847806abbc0693495d2023c08e7343be5a273b7dee2edcdbdf557c95",
+    "runner_source": "Use the instruction from the frozen baseline request; this directory does not replace or copy the baseline."
+  },
+  "common_constraints": {
+    "unchanged_baseline_sections": ["opening", "context_evidence_rules", "A", "B", "E", "JSON_format"],
+    "output_keys": ["ranked_ids", "reason", "confidence"],
+    "reason_enum": ["TARGET_VISIBLE", "REVEAL_TARGET_CONTAINER", "UNLOCK_ROUTE", "EXPLORE_TARGET_ROOM", "INFORMATION_GAIN", "INTERACTION_COVERAGE", "RECOVERY_DIVERSIFICATION", "DISTANCE_TIEBREAK", "NO_SEMANTIC_PREFERENCE"],
+    "confidence_enum": ["low", "medium", "high"],
+    "output_policy": "Only the existing JSON response, exact current candidate IDs, at most three distinct IDs, no reasoning-chain text or additional fields.",
+    "client_suffix": "No /no_think suffix is included in these files; the runner owns the common client suffix.",
+    "normalization": "normalized_text_sha256 is SHA-256 of UTF-8 text after strip(); file_sha256 hashes exact file bytes."
+  },
+  "public_input_limits": [
+    "Current candidates have no goal_xy; distance_m is current-position distance, not initial-position distance or guaranteed path distance.",
+    "Initial-position preference uses same-frame room-center geometry only as an approximate straight-line proxy; missing data is not a large distance.",
+    "Room anchors provide object names and room association, not observed target-support or containment relations.",
+    "Container centers, types and states do not establish interior dimensions, capacity, inspected contents or target containment.",
+    "Target size, material and surface associations may be absent; semantic hypotheses must remain uncertain rather than fabricated.",
+    "STARTED or PENDING is unfinished; missing history and gain are unknown; partial frontier totals cannot certify a fully searched room."
+  ],
+  "prompts": {
+    "p1": {
+      "file": "p1_target_semantic_chain.txt",
+      "parent": "b",
+      "changed_sections": ["B-SEMANTICS (inserted)"],
+      "intervention": "Add tentative target-category/attribute to container or support type to observed-room reasoning; distinguish portable, surface-supported and fixed targets without inventing relations or dimensions.",
+      "file_sha256": "3edf3f57d482db928f2ca70158e63a98db544145e06260412f1608b6f1b15b16",
+      "normalized_text_sha256": "89b6dc1f12be9ba74e1ec91151a3a3d7f9b455f8861d524fb27080d18712cf33",
+      "words": 507
+    },
+    "p2": {
+      "file": "p2_initial_room_proximity.txt",
+      "parent": "p1",
+      "changed_sections": ["D (replaced)"],
+      "intervention": "When semantic relevance and novelty are comparable, prefer approximately nearer-to-initial-position rooms before frontier-area tie-breaks, using available same-frame room geometry only.",
+      "file_sha256": "5b04834cd65a67a569564ae404b2491ee5a34f5ce7a8b3948bc3752263487295",
+      "normalized_text_sha256": "d7260c4d8f2c331d917596f7049cd97b7ba6b041c8d2061519118751b8e46697",
+      "words": 614
+    },
+    "p3": {
+      "file": "p3_search_novelty_history.txt",
+      "parent": "p1",
+      "changed_sections": ["C-HISTORY (inserted)"],
+      "intervention": "Interpret search novelty through ordered room history, target/action outcomes and changed state; entered is not searched, unfinished is not failure, and missing or partial evidence is not zero gain.",
+      "file_sha256": "aa3bf4cf4f33342f847681eb546d73a9e70a78d992aeb03a913e75cb3500baca",
+      "normalized_text_sha256": "f8a97c2fa1272bc9caa79a930f1f7b420fc873473e9309b7cf0253577f32e989",
+      "words": 658
+    },
+    "p4": {
+      "file": "p4_relevant_container_priority.txt",
+      "parent": "p1",
+      "changed_sections": ["C-CONTAINER (inserted)"],
+      "intervention": "Prioritize strongly target-specific unresolved container-search opportunities over generic exploration without prioritizing every cabinet; successful opening does not mean the interior was observed or inspected. Avoid duplicate opening unless a later observed closure or explicit new requirement makes a supplied executable re-opening action necessary again.",
+      "file_sha256": "930a95e311e61bffc3dffca6a5eb22b4ebf5c4e677871bac859dc5f6deb5554e",
+      "normalized_text_sha256": "b64150f172a9e3867d9475fdda40b0048e0e98dc38ea15e80f30f3454eee7138",
+      "words": 705
+    },
+    "p5": {
+      "file": "p5_support_directed_exploration.txt",
+      "parent": "p1",
+      "changed_sections": ["C-SUPPORT (inserted)"],
+      "intervention": "Use already supplied room-anchor and nearby-object cues to prefer relevant support-directed exploration; do not create support relations, sightlines, coordinates or actions.",
+      "file_sha256": "969b4b621ee9e0ddc8add30d552b3ace3cfcc7cc5c109579654f22bafd654642",
+      "normalized_text_sha256": "13b5153187131c80ff46c0ff0f6d90c90916cac96ee0976ff2101713ef99ce4a",
+      "words": 635
+    },
+    "p6": {
+      "file": "p6_integrated_priority.txt",
+      "parent": "p1",
+      "changed_sections": ["C (replaced)", "D (replaced with P2 D)"],
+      "intervention": "Combine container relevance, history-aware novelty, support-directed exploration and approximate initial-room proximity with explicit conflict priority: observed target or proven unfinished prerequisite, relevant unresolved container, semantically relevant new information, initial-room proximity, frontier information, current distance. Apply the same state-aware duplicate-opening rule as P4: opening is not interior observation, and later observed closure or an explicit new requirement can justify a supplied executable re-opening action.",
+      "file_sha256": "0fe65e9f7c516dfe42ac864bb2b594683ff3b64dce8725f6430979a8bfcc7696",
+      "normalized_text_sha256": "33e378f1585814b8e5e7c0753a7cd3a1233f70384fab85417ec3a934abe49d1f",
+      "words": 824
+    }
+  },
+  "additional_context_arms": "S1/S2 robot.stage_facts and robot.region_history_facts are not introduced by these prompt-only files; any separately authorized additions and explanations must be frozen and recorded by the runner."
+}

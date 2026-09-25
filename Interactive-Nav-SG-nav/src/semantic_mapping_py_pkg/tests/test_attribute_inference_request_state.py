@@ -1,5 +1,7 @@
 import json
 import threading
+import time
+from collections import defaultdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +11,11 @@ pytest.importorskip("rospy")
 
 import interaction_attribute_inference_node as attribute_module
 from interaction_attribute_inference_node import InteractionAttributeInferenceNode
+from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
+from semantic_mapping_py_pkg.room_inference_backends import (
+    WeightedRoomAttributeInferencer,
+    room_evidence_signature,
+)
 
 
 class RecordingQueue:
@@ -85,8 +92,8 @@ def test_unreliable_reply_fails_without_consuming_success_or_recheck_cache(monke
         signature="fresh", generation=0, request_sequence=1, enqueued_at=10.0,
         targeted_refresh={},
     )
-    assert len(published) == 1 and published[0]["attribute_status"] == "failed"
-    assert published[0]["error"] in {"low_model_confidence", "invalid_model_confidence"}
+    assert [patch["attribute_status"] for patch in published] == ["in_flight", "failed"]
+    assert published[-1]["error"] in {"low_model_confidence", "invalid_model_confidence"}
     assert not node.pending and not node.completed
     assert node.filter_counts["failed"] == 1 and node.filter_counts["completed"] == 0
     assert node._try_reserve("object_1", "next-view") is None  # No busy retry loop.
@@ -105,6 +112,183 @@ def test_unreliable_reply_fails_without_consuming_success_or_recheck_cache(monke
     assert published[-1]["attribute_status"] == "ready"
     assert node.completed["object_1"]["m1_recheck_attempts"] == 1
     assert node.filter_counts["completed"] == 1
+def test_room_request_signature_and_failure_refresh_cooldown(monkeypatch) -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.room_pending = {}
+    node.room_completed = {}
+    node.room_failures = {
+        "room_1": {"signature": "same", "failed_at": 100.0}
+    }
+    node.room_last_request = {}
+    node.room_min_interval_s = 2.0
+    node.room_failure_refresh_interval_s = 30.0
+    node.room_success_refresh_interval_s = 120.0
+    node.room_request_sequence = 0
+    node.room_generations = {}
+    node.current_episode_id = "episode"
+
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 129.0)
+    assert node._try_reserve_room("room_1", "same") is None
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 130.0)
+    assert node._try_reserve_room("room_1", "same") is not None
+    node.room_pending.clear()
+    node.room_failures.clear()
+    node.room_completed["room_1"] = {
+        "signature": "same", "completed_at": 130.0
+    }
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 249.0)
+    assert node._try_reserve_room("room_1", "same") is None
+    assert node._try_reserve_room("room_1", "new_box") is not None
+    node.room_pending.clear()
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 250.0)
+    assert node._try_reserve_room("room_1", "same") is not None
+
+    objects = [{"object_id": "stove_1", "name": "stove", "category": "appliance", "type": "object"}]
+    box = {"center_xy": [0.0, 1.0], "size_xy": [3.0, 4.0]}
+    assert node._room_signature(1, objects, box) == room_evidence_signature(1, box, objects)
+
+
+def test_failed_room_call_uses_rule_fallback_and_waits_for_refresh():
+    from collections import defaultdict
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.shutdown_event = threading.Event()
+    node.current_episode_id = "episode"
+    node.room_counts = defaultdict(int)
+    node.room_generations = {"room_1": 0}
+    node.room_pending = {"room_1": {
+        "episode_id": "episode", "signature": "box-and-members",
+        "generation": 0, "request_sequence": 1,
+    }}
+    node.room_last_request = {}
+    node.room_completed = {}
+    node.room_failures = {}
+    node.room_min_interval_s = 2.0
+    node.room_failure_refresh_interval_s = 30.0
+    node.room_success_refresh_interval_s = 120.0
+    node.room_request_timeout_s = 15.0
+    node.room_next_dispatch_at = 0.0
+    node.room_dispatch_interval_s = 0.0
+    node.room_max_output_tokens = 96
+    node.room_request_sequence = 1
+    node.room_fallback_enabled = True
+    node.room_fallback_inferencer = WeightedRoomAttributeInferencer(
+        {"kitchen": {"stove": 1.0}}
+    )
+    node.client = SimpleNamespace(
+        config=SimpleNamespace(model="qwen"),
+        request_json=lambda **_kwargs: SimpleNamespace(error="timeout", payload=None),
+    )
+    patches = []
+    node._publish_room_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    node._publish_status = lambda: None
+    started = time.monotonic()
+
+    node._infer_room(
+        room_key="room_1", room_id=1, room_node_id="room_1",
+        room_box={"center_xy": [0.0, 0.0], "size_xy": [4.0, 4.0]},
+        objects=[{"object_id": "stove_1", "name": "stove", "confidence": 1.0}],
+        episode_id="episode", capture_step=7, stamp=10.0,
+        signature="box-and-members", generation=0, request_sequence=1,
+        enqueued_at=started, deadline_monotonic=started + 15.0,
+    )
+
+    assert patches[0]["room_attribute"] == "kitchen"
+    assert patches[0]["fallback"] is True
+    assert patches[0]["room_attribute_status"] == "ready"
+    assert node.room_failures["room_1"]["error"] == "timeout"
+    assert node._try_reserve_room("room_1", "box-and-members") is None
+    node.room_failures["room_1"]["failed_at"] -= 31.0
+    node.room_last_request["room_1"] -= 3.0
+    assert node._try_reserve_room("room_1", "box-and-members") is not None
+
+
+def test_targeted_m1_survives_bbox_bucket_change_until_explicit_cancel():
+    from collections import defaultdict
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode"
+    node.pending = {"drawer": {"signature": "area_log2=11", "episode_id": "episode",
+        "generation": 0, "request_sequence": 36,
+        "targeted_refresh": {"request_id": "decision:m1:001"}}}
+    node.generations = {"drawer": 0}
+    node.last_request = {"drawer": 1.0}
+    node.targeted_refresh_requests = {}
+    node.request_queue = RecordingQueue()
+    node.filter_counts = defaultdict(int)
+    discarded = []
+    node._publish_discarded_attribute_requests = lambda *args, **kw: discarded.append(kw)
+    node._invalidate_if_state_changed("drawer", "area_log2=12", "episode")
+    assert node._is_current_request("drawer", "episode", 0, 36)
+    assert not discarded
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "action": "cancel", "request_id": "decision:m1:001", "episode_id": "old"})))
+    assert node._is_current_request("drawer", "episode", 0, 36)
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "action": "cancel", "request_id": "decision:m1:001", "episode_id": "episode"})))
+    assert not node._is_current_request("drawer", "episode", 0, 36)
+    assert discarded == [{"error": "targeted_refresh_cancelled"}]
+
+
+def test_detection_reaches_request_queue_despite_ros_sequence_offset(monkeypatch):
+    from collections import defaultdict, deque
+    from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    rgb = np.zeros((32, 48, 3), dtype=np.uint8)
+    node.latest_stamp = 1789304037.594208
+    node.latest_image = rgb
+    node.image_history = deque([
+        {"image": rgb, "stamp": node.latest_stamp, "stamp_key": (1789304037, 594208001),
+         "header_seq": 925, "image_sequence": 925},
+    ])
+    node.pending_detection_payload = {
+        "capture_step": 923, "stamp_sec": 1789304037, "stamp_nsec": 594208001,
+        "image_size": [48, 32],
+        "detections": [{"id": "fridge", "name": "refrigerator", "bbox_2d": [10, 5, 35, 28]}],
+    }
+    node.filter_counts = defaultdict(int)
+    node.request_queue = LatestPriorityRequestQueue(4)
+    node.crop_margin_ratio = 0.1
+    node.request_timeout_s = 8.0
+    node._register_aliases = lambda *args: None
+    node._targeted_refresh_for_detection = lambda *args, **kwargs: None
+    node._passes_observation_filter = lambda *args: True
+    node._is_portal_detection = lambda *args: False
+    node._target_bbox_containment = lambda *args: {"valid": True}
+    node._invalidate_if_state_changed = lambda *args: None
+    node._try_reserve = lambda *args, **kwargs: {"generation": 0, "request_sequence": 1}
+    node._priority = lambda *args: 1.0
+    node._publish_status = lambda: None
+    patches = []
+    node._publish_updates = lambda *args: patches.extend(args[-1])
+    monkeypatch.setattr(attribute_module.rospy, "loginfo_throttle", lambda *args: None)
+    node._process_pending_detections()
+    assert node.pending_detection_payload is None
+    assert node.filter_counts["enqueued"] == 1
+    assert len(node.request_queue) == 1
+    assert patches[0]["attribute_status"] == "pending"
+    assert patches[0]["observation_capture_step"] == 923
+    assert node.last_image_pairing_result["stage"] == "paired"
+
+
+def test_portal_confirmation_bypasses_completed_attribute_cache_not_pending() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.pending = {}
+    node.completed = {"door": {"signature": "same", "refresh_interval_s": 0.0}}
+    node.last_request = {}
+    node.min_interval_s = 0.0
+    node.success_refresh_interval_s = 120.0
+    node.request_sequence = 0
+    node.generations = {}
+    node.current_episode_id = "episode"
+    assert node._try_reserve("door", "same") is None
+    assert node._try_reserve("door", "same", portal_confirmation=True) is not None
+    assert node._try_reserve("door", "same", portal_confirmation=True) is None
 
 
 def test_initial_generation_zero_request_is_current() -> None:
@@ -132,6 +316,7 @@ def test_interaction_result_object_id_invalidates_cached_attribute() -> None:
     node.last_request = {"canonical_object": 1.0}
     node.pending = {"canonical_object": {"request_sequence": 4}}
     node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
 
     node._interaction_result_callback(
         SimpleNamespace(data=json.dumps({"object_id": "canonical_object", "success": True}))
@@ -142,6 +327,121 @@ def test_interaction_result_object_id_invalidates_cached_attribute() -> None:
     assert "canonical_object" not in node.last_request
     assert "canonical_object" not in node.pending
     assert node.request_queue.discarded == [("canonical_object", None)]
+
+
+def test_portal_interaction_result_latches_state_and_cooldown() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.aliases = {"door_0001": "door_0001"}
+    node.generations = {"door_0001": 0}
+    node.completed = {}
+    node.last_request = {}
+    node.pending = {}
+    node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
+
+    node._interaction_result_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "object_id": "door_0001",
+                    "candidate_id": "interaction:door_0001:open",
+                    "post_state": "open",
+                    "result_published_step": 120,
+                    "success": True,
+                }
+            )
+        )
+    )
+
+    assert node.portal_state_consensus.can_request(
+        "door_0001",
+        capture_step=419,
+        observation_pose_xyyaw=[0.0, 0.0, 0.0],
+    ) == (False, "stable_state_cooldown")
+
+
+def test_unavailable_portal_result_preserves_visual_state_cooldown() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.aliases = {"door_0002": "door_0002"}
+    node.generations = {"door_0002": 0}
+    node.completed = {}
+    node.last_request = {}
+    node.pending = {}
+    node.request_queue = RecordingQueue()
+    node.portal_state_consensus = PortalStateConsensus(
+        confirmation_count=1, cooldown_steps=300
+    )
+    node.portal_state_consensus.observe(
+        "door_0002",
+        "closed",
+        capture_step=100,
+        observation_pose_xyyaw=[0.0, 0.0, 0.0],
+    )
+
+    node._interaction_result_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "object_id": "door_0002",
+                    "candidate_id": "interaction:door_0002:open",
+                    "post_state": "unavailable",
+                    "result_published_step": 150,
+                    "success": False,
+                }
+            )
+        )
+    )
+
+    assert node.portal_state_consensus.can_request(
+        "door_0002",
+        capture_step=399,
+        observation_pose_xyyaw=[1.0, 0.0, 0.0],
+    ) == (False, "stable_state_cooldown")
+
+
+def test_targeted_portal_refresh_uses_cached_consensus_instead_of_failing() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.targeted_refresh_requests = {
+        "door_0003": {"refresh_sequence": 7}
+    }
+    published = []
+    node._publish_updates = (
+        lambda episode_id, stamp, patches: published.append(
+            (episode_id, stamp, patches)
+        )
+    )
+    targeted = {
+        "request_key": "door_0003",
+        "refresh_sequence": 7,
+        "request_id": "refresh-7",
+        "minimum_capture_step": 300,
+        "reason": "portal_unknown_refresh",
+    }
+
+    node._publish_cached_portal_targeted_refresh(
+        object_id="door_0003",
+        episode_id="episode_1",
+        observation_stamp=123.0,
+        frame_id="331",
+        image_sequence=44,
+        signature="door|closed",
+        targeted_refresh=targeted,
+        consensus={
+            "accepted": True,
+            "stable_state": "closed",
+            "reason": "cached_stable_state_cooldown",
+        },
+    )
+
+    assert "door_0003" not in node.targeted_refresh_requests
+    patch = published[0][2][0]
+    assert patch["attribute_status"] == "ready"
+    assert patch["coarse_state"] == "closed"
+    assert patch["portal_state_consensus_accepted"] is True
+    assert patch["error"] == ""
 
 
 def test_rle_only_minimal_gt_detection_passes_attribute_visibility_filter() -> None:
@@ -189,6 +489,90 @@ def test_public_detector_border_flag_marks_only_clipped_boxes() -> None:
     assert InteractionAttributeInferenceNode._detection_bbox_border_edges(
         image, {"bbox_2d": [40, 70, 160, 100]}
     ) == ["bottom"]
+
+
+def test_portal_m1_tracks_complete_views_during_camera_rotation() -> None:
+    node = InteractionAttributeInferenceNode.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 3
+    node.portal_observation_streaks = {}
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    boxes = [[188, 164, 312, 428], [240, 182, 334, 382], [273, 189, 359, 367]]
+    results = [node._portal_m1_visual_readiness("door", image, {"bbox_2d": box},
+        capture_step=step, image_sequence=step * 2, targeted_refresh=False)
+        for step, box in enumerate(boxes, 8)]
+    assert [result["ready"] for result in results] == [False, False, True]
+    duplicate = node._portal_m1_visual_readiness("door", image, {"bbox_2d": boxes[-1]},
+        capture_step=10, image_sequence=20, targeted_refresh=False)
+    assert not duplicate["ready"]
+    gap = node._portal_m1_visual_readiness("door", image, {"bbox_2d": boxes[-1]},
+        capture_step=20, image_sequence=40, targeted_refresh=False)
+    assert not gap["ready"]
+
+
+def test_portal_m1_waits_for_complete_stable_view() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 2
+    node.portal_observation_streaks = {}
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    clipped = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [0, 20, 80, 80]},
+        capture_step=10,
+        image_sequence=10,
+        targeted_refresh=False,
+    )
+    assert clipped["ready"] is False
+    assert clipped["reason"] == "portal_visual_evidence_truncated:left"
+
+    first_complete = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [40, 20, 160, 80]},
+        capture_step=11,
+        image_sequence=11,
+        targeted_refresh=False,
+    )
+    assert first_complete["ready"] is False
+    assert first_complete["reason"] == "portal_observation_not_stable"
+
+    second_complete = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [42, 21, 162, 81]},
+        capture_step=12,
+        image_sequence=12,
+        targeted_refresh=False,
+    )
+    assert second_complete["ready"] is True
+
+
+def test_targeted_portal_refresh_rejects_border_clipped_view_without_m1() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = True
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 2
+    node.portal_observation_streaks = {}
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    readiness = node._portal_m1_visual_readiness(
+        "door_1",
+        image,
+        {"name": "door", "bbox_2d": [0, 20, 80, 80]},
+        capture_step=10,
+        image_sequence=10,
+        targeted_refresh=True,
+    )
+    assert readiness["ready"] is False
+    assert "truncated" in readiness["reason"]
 
 
 def test_uncertain_portal_result_retries_after_short_refresh_interval(
@@ -432,6 +816,28 @@ def test_attribute_visual_evidence_is_full_image_with_target_outline_and_inset()
     assert np.any(np.all(evidence == np.array([0, 255, 255]), axis=2))
 
 
+def test_attribute_visual_outline_expands_detector_box_by_requested_margin() -> None:
+    image = np.zeros((120, 200, 3), dtype=np.uint8)
+    detection = {"bbox_2d": [80, 40, 120, 80]}
+
+    expanded = InteractionAttributeInferenceNode._expanded_visual_bbox_pixels(
+        image, detection
+    )
+    evidence = InteractionAttributeInferenceNode._compose_attribute_visual_evidence(
+        image,
+        detection,
+        margin_ratio=0.0,
+        include_crop_inset=False,
+    )
+
+    # 30%/20% would be 12/8 px, so the 24 px per-edge minimum wins.
+    assert expanded == (56, 16, 144, 104)
+    assert evidence is not None
+    assert np.array_equal(evidence[16, 56], np.array([0, 255, 255]))
+    # The old detector edge is no longer painted across the target.
+    assert np.array_equal(evidence[40, 80], image[40, 80])
+
+
 def test_portal_visual_evidence_keeps_full_frame_without_crop_inset() -> None:
     image = np.full((100, 160, 3), 17, dtype=np.uint8)
     image[25:85, 60:110] = (30, 100, 200)
@@ -560,7 +966,7 @@ def test_target_multiview_history_requires_step_and_pose_separation() -> None:
         min_yaw_gap_rad=0.25,
     )
 
-    assert [item["capture_step"] for item in selected] == [20, 34, 50]
+    assert [item["capture_step"] for item in selected] == [34, 50]
     assert selected[-1] is history[-1]
     assert not any(item["capture_step"] == 10 for item in selected)
 
@@ -575,7 +981,66 @@ def test_target_multiview_history_requires_step_and_pose_separation() -> None:
         reordered, max_images=3, min_step_gap=8,
         min_position_gap_m=0.25, min_yaw_gap_rad=0.25,
     )
-    assert [item["capture_step"] for item in selected] == [20, 34, 50]
+    assert [item["capture_step"] for item in selected] == [34, 50]
+
+
+def test_container_multiview_admission_rejects_duplicate_and_third_view() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.targeted_multiview_min_step_gap = 8
+    node.targeted_multiview_min_position_gap_m = 0.25
+    node.targeted_multiview_min_yaw_gap_rad = 0.25
+    evidence = np.zeros((8, 8, 3), dtype=np.uint8)
+    node.target_visual_history = {
+        "fridge_1": [
+            {
+                "capture_step": 10,
+                "observation_pose_xyyaw": [0.0, 0.0, 0.0],
+                "bbox_containment": {"valid": True},
+                "visual_evidence": evidence,
+            }
+        ]
+    }
+
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=20,
+        observation_pose_xyyaw=[0.02, 0.01, 0.02],
+    ) == "m1_duplicate_view_rejected"
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=20,
+        observation_pose_xyyaw=[0.35, 0.0, 0.0],
+    ) == ""
+
+    node.target_visual_history["fridge_1"].append(
+        {
+            "capture_step": 20,
+            "observation_pose_xyyaw": [0.35, 0.0, 0.0],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        }
+    )
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=30,
+        observation_pose_xyyaw=[0.7, 0.0, 0.0],
+    ) == "m1_two_view_budget_exhausted"
+
+
+def test_multiview_montage_keeps_two_chronological_panels_in_one_image() -> None:
+    first = np.full((20, 30, 3), (1, 2, 3), dtype=np.uint8)
+    second = np.full((20, 30, 3), (4, 5, 6), dtype=np.uint8)
+
+    montage = InteractionAttributeInferenceNode._compose_multiview_montage(
+        [first, second]
+    )
+
+    assert montage is not None
+    assert montage.shape[0] == 20
+    assert np.array_equal(montage[10, 10], first[10, 10])
+    assert np.array_equal(montage[10, -10], second[10, -10])
+    assert np.any(np.all(montage == 255, axis=2))
 
 
 @pytest.mark.parametrize("include_hypothesis", [False, True])
@@ -654,8 +1119,8 @@ def test_m1_inference_only_exposes_opted_in_detector_hypothesis(include_hypothes
     if include_hypothesis:
         assert "name-disambiguation recheck" in request["instruction"]
         assert "MUST replace it" in request["instruction"]
-        assert published[0][0]["observed_object_name"] == "water_dispenser"
-        assert published[0][0]["interaction_class"] == "none"
+        assert published[-1][0]["observed_object_name"] == "water_dispenser"
+        assert published[-1][0]["interaction_class"] == "none"
     else:
         assert "detector_class" not in request["instruction"]
     assert len(request["images"]) == 1
@@ -663,7 +1128,7 @@ def test_m1_inference_only_exposes_opted_in_detector_hypothesis(include_hypothes
         "target"
     ]
     assert published[0][0]["object_id"] == "object_1"
-    assert published[0][0]["approach_ready"] is (not include_hypothesis)
+    assert published[-1][0]["approach_ready"] is (not include_hypothesis)
     if include_hypothesis:
         from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 
@@ -675,11 +1140,176 @@ def test_m1_inference_only_exposes_opted_in_detector_hypothesis(include_hypothes
         }
         for stamp in (1.0, 2.0):
             store.update_observations([observation], stamp=stamp, source_mode="detector_online")
-        assert store.apply_attribute_patch(published[0][0], stamp=14.0)
+        assert store.apply_attribute_patch(published[-1][0], stamp=14.0)
         store.update_observations([observation], stamp=15.0, source_mode="detector_online")
         corrected = store.nodes["object_1"]
         assert corrected.label == "water_dispenser"
         assert corrected.type == "object"
+
+
+def test_superseded_portal_response_does_not_advance_consensus() -> None:
+    class ConsensusSpy:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def observe(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {"accepted": False, "reason": "confirmation_pending"}
+
+    class SupersedingPortalClient(RecordingClient):
+        def __init__(self, owner) -> None:
+            super().__init__()
+            self.owner = owner
+
+        def request_json(self, **kwargs):
+            response = super().request_json(**kwargs)
+            response.payload.update(
+                {
+                    "interaction_class": "portal",
+                    "coarse_state": "closed",
+                    "portal_morphology": {
+                        "door_leaf": "present",
+                        "confidence": 0.9,
+                    },
+                    "portal_aperture_evidence": {
+                        "open_aperture": "not_visible",
+                        "confidence": 0.9,
+                    },
+                }
+            )
+            self.owner.generations["door_1"] = 1
+            return response
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "door_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"door_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.uncertain_portal_refresh_interval_s = 5.0
+    node.uncertain_portal_confidence = 0.6
+    node.portal_state_consensus = ConsensusSpy()
+    node.client = SupersedingPortalClient(node)
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="door_1",
+        detection={"name": "door"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1",
+        frame_id="20",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={},
+        evidence_capture_steps=[20],
+        evidence_observation_pose_xyyaw=[[1.0, 2.0, 0.1]],
+    )
+
+    assert node.portal_state_consensus.calls == []
+    assert [patch["attribute_status"] for patch in published] == ["in_flight"]
+
+
+def test_m1_multiview_sends_one_montage_and_binds_authoritative_latest_view() -> None:
+    class SelectFirstViewClient(RecordingClient):
+        def request_json(self, **kwargs):
+            response = super().request_json(**kwargs)
+            response.payload["selected_view_id"] = "view_1"
+            return response
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "fridge_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"fridge_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.client = SelectFirstViewClient()
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="fridge_1",
+        detection={"name": "fridge"},
+        visual_evidence=np.full((40, 60, 3), 20, dtype=np.uint8),
+        visual_evidence_history=[np.full((40, 60, 3), 10, dtype=np.uint8)],
+        episode_id="episode_1",
+        frame_id="20",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={"expected_node_type": "container"},
+        evidence_frame_ids=["10", "20"],
+        evidence_capture_steps=[10, 20],
+        evidence_observation_pose_xyyaw=[[1.0, 2.0, 0.1], [3.0, 4.0, 0.2]],
+        evidence_view_metadata=[
+            {
+                "view_id": "view_1",
+                "frame_id": "10",
+                "capture_step": 10,
+                "observation_pose_xyyaw": [1.0, 2.0, 0.1],
+                "anchor_face_id": "aabb_face_pos_x",
+                "anchor_face_index": 0,
+                "anchor_face_axis_xy": [1.0, 0.0],
+            },
+            {
+                "view_id": "view_2",
+                "frame_id": "20",
+                "capture_step": 20,
+                "observation_pose_xyyaw": [3.0, 4.0, 0.2],
+                "anchor_face_id": "aabb_face_pos_y",
+                "anchor_face_index": 1,
+                "anchor_face_axis_xy": [0.0, 1.0],
+            },
+        ],
+    )
+
+    request = node.client.calls[0]
+    assert len(request["images"]) == 1
+    assert "exactly 2 panel(s)" in request["instruction"]
+    assert request["metrics_context"]["m1_transport_image_count"] == 1
+    assert request["metrics_context"]["m1_montage_panel_count"] == 2
+    patch = next(p for p in published if p["attribute_status"] == "ready")
+    # Historical panels are comparison context only.  Even if the model emits
+    # an older selected_view_id, action authorization must stay bound to the
+    # latest/rightmost panel and its actual robot pose/AABB face.
+    assert patch["selected_view_id"] == "view_2"
+    assert patch["selected_evidence_capture_step"] == 20
+    assert patch["selected_evidence_observation_pose_xyyaw"] == [3.0, 4.0, 0.2]
+    assert patch["selected_evidence_anchor_face_id"] == "aabb_face_pos_y"
+    assert patch["selected_evidence_anchor_face_axis_xy"] == [0.0, 1.0]
 
 
 def test_targeted_container_refresh_allows_m1_to_correct_planner_class() -> None:
@@ -729,6 +1359,7 @@ def test_targeted_container_refresh_allows_m1_to_correct_planner_class() -> None
     node.max_output_tokens = 256
     node.success_refresh_interval_s = 120.0
     node.client = PortalFallbackClient()
+    node.include_detector_class_hypothesis = True
     published = []
     node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
     node._publish_status = lambda: None
@@ -758,6 +1389,7 @@ def test_targeted_container_refresh_allows_m1_to_correct_planner_class() -> None
     assert request["context"] == {
         "object_id": "target",
         "expected_node_type": "container",
+        "detector_class": "fridge",
     }
     instruction = request["instruction"]
     assert "Judge frontality primarily from the target's horizontal perspective" in instruction
@@ -768,7 +1400,7 @@ def test_targeted_container_refresh_allows_m1_to_correct_planner_class() -> None
     properties = request["response_schema"]["schema"]["properties"]
     assert "portal" in properties["interaction_class"]["enum"]
     assert "container" in properties["interaction_class"]["enum"]
-    patch = published[0]
+    patch = published[-1]
     assert patch["interaction_class"] == "portal"
     assert patch["coarse_state"] == "static_open"
     assert patch["m1_expected_node_type"] == "container"
@@ -838,5 +1470,264 @@ def test_m1_request_expired_in_local_queue_is_not_sent() -> None:
     assert node.filter_counts["expired"] == 1
     assert node.filter_counts["failed"] == 0
     assert node.last_request == {}
+    assert node.m1_failure_streaks == {"object_1": 1}
     assert published[-1]["attribute_status"] == "failed"
     assert published[-1]["error"] == "queue_deadline_expired_before_send"
+
+
+def _budget_test_node() -> InteractionAttributeInferenceNode:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.request_sequence = 0
+    node.generations = {}
+    node.pending = {}
+    node.completed = {}
+    node.last_request = {}
+    node.min_interval_s = 0.0
+    node.success_refresh_interval_s = 0.0
+    node.max_calls_per_object = 10
+    node.targeted_call_reserve = 2
+    node.max_failure_retries_per_object = 2
+    node.m1_call_counts = {}
+    node.m1_failure_streaks = {}
+    node.filter_counts = defaultdict(int)
+    node.request_queue = RecordingQueue()
+    node.visual_evidence_max_side_px = 0
+    node.max_output_tokens = 256
+    node.request_timeout_s = 1.0
+    node.client = RecordingClient()
+    node._publish_updates = lambda *args: None
+    node._publish_status = lambda: None
+    return node
+
+
+def test_sixty_distinct_m1_views_respect_the_total_cap_and_targeted_reserve() -> None:
+    node = _budget_test_node()
+    object_id = "obj_000090"
+    for frame in range(60):
+        reservation = node._try_reserve(object_id, f"view-{frame}")
+        if frame < 8:
+            assert reservation is not None
+            index, error = node._claim_m1_call(
+                object_id, "episode_1", reservation["generation"],
+                reservation["request_sequence"], targeted=False,
+            )
+            assert (index, error) == (frame + 1, "")
+            node._release(object_id, reservation["request_sequence"])
+        else:
+            assert reservation is None
+    assert node.m1_call_counts[object_id] == 8
+
+    for index in (9, 10):
+        reservation = node._force_reserve_targeted_refresh(
+            object_id, f"target-view-{index}", "episode_1",
+            {"request_id": f"refresh-{index}"},
+        )
+        assert reservation is not None
+        call_index, error = node._claim_m1_call(
+            object_id, "episode_1", reservation["generation"],
+            reservation["request_sequence"], targeted=True,
+        )
+        assert (call_index, error) == (index, "")
+        node._release(object_id, reservation["request_sequence"])
+    assert node.m1_call_counts[object_id] == 10
+    assert node._force_reserve_targeted_refresh(
+        object_id, "eleventh-view", "episode_1", {"request_id": "too-many"},
+    ) is None
+    assert node._try_reserve("different_object", "first-view") is not None
+
+
+def test_failed_m1_calls_stop_after_two_retries_even_with_new_views() -> None:
+    node = _budget_test_node()
+    calls = []
+
+    def failed_call(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(error="timed out", payload=None)
+
+    node.client.request_json = failed_call
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._infer(
+            object_id="fridge", detection={"name": "fridge"},
+            visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+            episode_id="episode_1", frame_id=str(index),
+            image_sequence=index + 1, stamp=10.0,
+            signature=f"view-{index}", enqueued_at=time.monotonic(),
+            targeted_refresh={}, **reservation,
+        )
+    assert len(calls) == 3
+    assert node.m1_call_counts["fridge"] == 3
+    assert node.m1_failure_streaks["fridge"] == 3
+    assert node._try_reserve("fridge", "fourth-view") is None
+    assert node._force_reserve_targeted_refresh(
+        "fridge", "targeted-fourth", "episode_1", {"request_id": "retry"},
+    ) is None
+
+    # The final guard also protects the model endpoint if a stale reservation
+    # was admitted before another worker used the last available slot.
+    node.request_sequence += 1
+    node.pending["fridge"] = {
+        "request_sequence": node.request_sequence,
+        "generation": node.generations.get("fridge", 0),
+        "episode_id": "episode_1",
+    }
+    node._infer(
+        object_id="fridge", detection={"name": "fridge"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1", frame_id="4", image_sequence=5,
+        stamp=10.0, signature="fourth-view", enqueued_at=time.monotonic(),
+        targeted_refresh={}, generation=node.generations.get("fridge", 0),
+        request_sequence=node.request_sequence,
+    )
+    assert len(calls) == 3
+    assert patches[-1]["error"] == "m1_failure_retry_exhausted"
+
+
+def test_success_resets_failed_m1_streak_but_not_call_count() -> None:
+    node = _budget_test_node()
+    original_call = node.client.request_json
+    attempts = 0
+
+    def retry_then_succeed(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts in (1, 2):
+            return SimpleNamespace(error="timed out", payload=None)
+        return original_call(**kwargs)
+
+    node.client.request_json = retry_then_succeed
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._infer(
+            object_id="fridge", detection={"name": "fridge"},
+            visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+            episode_id="episode_1", frame_id=str(index),
+            image_sequence=index + 1, stamp=10.0,
+            signature=f"view-{index}", enqueued_at=time.monotonic(),
+            targeted_refresh={}, **reservation,
+        )
+    assert attempts == 3
+    assert node.m1_call_counts["fridge"] == 3
+    assert node.m1_failure_streaks.get("fridge", 0) == 0
+    # Success stays cached; only an explicit confirmation may bypass it.
+    assert node._try_reserve("fridge", "new-view") is None
+    assert node._try_reserve("fridge", "new-view", portal_confirmation=True) is not None
+
+
+def test_targeted_refresh_reports_exhausted_budget_without_waiting_for_rgb() -> None:
+    node = _budget_test_node()
+    node.aliases = {"fridge": "fridge"}
+    node.m1_call_counts["fridge"] = 10
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.portal_state_consensus = PortalStateConsensus()
+    node._seen_interaction_result_ids = set()
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "fridge", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "container",
+        "request_id": "decision:m1:001",
+    })))
+    assert node.targeted_refresh_requests == {}
+    assert patches[-1]["attribute_status"] == "failed"
+    assert patches[-1]["error"] == "m1_call_budget_exhausted"
+    assert patches[-1]["targeted_refresh_request_id"] == "decision:m1:001"
+
+
+def test_targeted_refresh_reports_exhausted_failure_retries() -> None:
+    node = _budget_test_node()
+    node.aliases = {"fridge": "fridge"}
+    node.m1_call_counts["fridge"] = 3
+    node.m1_failure_streaks["fridge"] = 3
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.portal_state_consensus = PortalStateConsensus()
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "fridge", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "container",
+        "request_id": "decision:m1:retry",
+    })))
+
+    assert node.targeted_refresh_requests == {}
+    assert patches[-1]["attribute_status"] == "failed"
+    assert patches[-1]["error"] == "m1_failure_retry_exhausted"
+
+
+def test_capped_portal_can_still_use_cached_authoritative_state() -> None:
+    node = _budget_test_node()
+    node.aliases = {"door": "door"}
+    node.m1_call_counts["door"] = 10
+    node.targeted_refresh_sequence = 0
+    node.targeted_refresh_requests = {}
+    node.latest_image_sequence = 14
+    node.portal_state_consensus = PortalStateConsensus(cooldown_steps=300)
+    assert node.portal_state_consensus.record_authoritative(
+        "door", "open", capture_step=10
+    )
+    patches = []
+    node._publish_updates = lambda _episode, _stamp, updates: patches.extend(updates)
+
+    node._targeted_refresh_callback(SimpleNamespace(data=json.dumps({
+        "object_id": "door", "episode_id": "episode_1",
+        "minimum_capture_step": 12, "expected_node_type": "portal",
+        "request_id": "decision:m1:portal",
+    })))
+
+    assert "door" in node.targeted_refresh_requests
+    assert patches[-1]["attribute_status"] == "waiting_for_view"
+    assert node.m1_call_counts["door"] == 10
+
+
+def test_queue_deadline_expiry_counts_toward_retry_limit_not_call_limit() -> None:
+    node = _budget_test_node()
+    updates = []
+    node._publish_updates = lambda _episode, _stamp, patches: updates.extend(patches)
+    for index in range(3):
+        reservation = node._try_reserve("fridge", f"view-{index}")
+        assert reservation is not None
+        node._expire_attribute_request({
+            "object_id": "fridge", "episode_id": "episode_1",
+            "frame_id": str(index), "stamp": 10.0,
+            "signature": f"view-{index}", "targeted_refresh": {},
+            "enqueued_at": time.monotonic() - 2.0,
+            **reservation,
+        })
+    assert node.m1_call_counts == {}
+    assert node.m1_failure_streaks["fridge"] == 3
+    assert node._try_reserve("fridge", "new-view") is None
+    assert updates[-1]["error"] == "queue_deadline_expired_before_send"
+
+
+def test_m1_call_and_retry_budgets_reset_on_episode_change() -> None:
+    node = _budget_test_node()
+    node._seen_interaction_result_ids = set()
+    node._seen_interaction_result_order = []
+    node.m1_call_counts["fridge"] = 10
+    node.m1_failure_streaks["fridge"] = 3
+    node.room_request_queue = RecordingQueue()
+    node.room_last_request = {}
+    node.room_pending = {}
+    node.room_completed = {}
+    node.room_failures = {}
+    node.room_generations = {}
+    node.aliases = {}
+    node.targeted_refresh_requests = {}
+    node.target_visual_history = {}
+    node.portal_observation_streaks = {}
+    node.portal_state_consensus = PortalStateConsensus()
+
+    node._set_episode("episode_2")
+
+    assert node.m1_call_counts == {}
+    assert node.m1_failure_streaks == {}
+    assert node._try_reserve("fridge", "fresh-view") is not None

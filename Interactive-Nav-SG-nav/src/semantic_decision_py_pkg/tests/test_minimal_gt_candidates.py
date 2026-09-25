@@ -64,7 +64,7 @@ def test_minimal_gt_unknown_portal_defaults_to_rule_interaction_only() -> None:
     command = interaction.interaction_command or {}
     assert command["object_id"] == public_id
     assert command["action"] == "open"
-    assert interaction.target_name == public_id
+    assert interaction.target_name == "door"  # Label and instance identity are distinct.
     assert command["node_id"] == public_id
     assert command["object_id"].startswith("door_")
 
@@ -101,7 +101,7 @@ def test_minimal_gt_unknown_portal_defaults_to_rule_interaction_only() -> None:
     command = interaction.interaction_command or {}
     assert command["object_id"] == public_id
     assert command["action"] == "open"
-    assert set(command) == {
+    assert {
         "node_id",
         "object_id",
         "action",
@@ -115,12 +115,19 @@ def test_minimal_gt_unknown_portal_defaults_to_rule_interaction_only() -> None:
         "navigation_goal_position_tolerance_m",
         "navigation_goal_yaw_tolerance_rad",
         "navigation_goal_tolerance_contract_explicit",
+    }.issubset(command)
+    assert command["interaction_front_axis_validation_required"] is True
+    assert command["interaction_front_axis_source"] in {
+        "portal_aabb_normal",
+        "portal_cardinal_fallback",
     }
+    assert command["interaction_front_position_tolerance_rad"] <= 0.15
+    assert command["interaction_front_yaw_tolerance_rad"] <= 0.15
 
     assert "joint_names" not in command
     assert "close_other_joint_names" not in command
     assert "close_other_joints" not in command
-    assert interaction.target_name == public_id
+    assert interaction.target_name == "door"
 
 
 def test_rule_portal_state_changes_only_after_public_executor_feedback() -> None:

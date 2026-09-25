@@ -155,7 +155,7 @@ class ExplorePyNode:
             exploration_cfg.get("make_plan_preflight_enabled", True)
         )
         self.make_plan_service = str(
-            exploration_cfg.get("make_plan_service", "/move_base/make_plan")
+            exploration_cfg.get("make_plan_service", "/move_base/GlobalPlanner/make_plan")
         )
         self.make_plan_service_wait_sec = float(
             exploration_cfg.get("make_plan_service_wait_sec", 2.0)
@@ -217,6 +217,7 @@ class ExplorePyNode:
         self.rotation_replan_last_metrics = {}
 
         core_config = FrontierConfig(
+            frontier_center_fallback_enabled=bool(frontier_cfg.get("frontier_center_fallback_enabled", True)),
             free_max=int(frontier_cfg.get("free_max", 20)),
             occupied_min=int(frontier_cfg.get("occupied_min", 50)),
             hard_min_cluster_cells=int(frontier_cfg.get("hard_min_cluster_cells", 3)),
@@ -349,6 +350,8 @@ class ExplorePyNode:
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
+        self.frontier_computed_ts = None
+        self.frontier_computed_frame_id = None
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
@@ -485,6 +488,8 @@ class ExplorePyNode:
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
+        self.frontier_computed_ts = None
+        self.frontier_computed_frame_id = None
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
@@ -916,10 +921,13 @@ class ExplorePyNode:
         global_fresh = now - self.latest_global_plan_time <= self.plan_freshness_sec
         local_fresh = now - self.latest_local_plan_time <= self.plan_freshness_sec
         global_available = global_fresh and self.latest_global_plan_pose_count >= self.global_plan_min_poses
+        min_local_plan_length_m = self.local_plan_min_length_m
+        if rospy.get_param_cached("/move_base/base_local_planner", "") == "nav_pkg/PathFollower":
+            min_local_plan_length_m = min(min_local_plan_length_m, 0.08)
         local_available = (
             local_fresh
             and self.latest_local_plan_pose_count >= self.local_plan_min_poses
-            and self.latest_local_plan_length_m >= self.local_plan_min_length_m
+            and self.latest_local_plan_length_m >= min_local_plan_length_m
         )
         if not global_available or local_available:
             self.local_plan_bad_since = 0.0
@@ -1022,6 +1030,8 @@ class ExplorePyNode:
         )
         self.state.update_seen_clusters(clusters)
         self.latest_clusters = clusters
+        self.frontier_computed_ts = time.time()
+        self.frontier_computed_frame_id = self.latest_grid.spec.frame_id
         if not clusters:
             if publish_selection:
                 self.last_selected_cluster = None
@@ -1037,6 +1047,9 @@ class ExplorePyNode:
 
     def build_status_payload(self):
         payload = {
+            "timestamp": time.time(),
+            "frame_id": getattr(self, "frontier_computed_frame_id", None),
+            "frontier_computed_ts": getattr(self, "frontier_computed_ts", None),
             "ready": self.latest_grid is not None and self.robot_xy is not None,
             "external_behavior_control": self.external_behavior_control,
             "initial_scan_complete": self.initial_spin_done,
@@ -1249,6 +1262,7 @@ class ExplorePyNode:
         self.subgoal_pub.publish(point_msg)
         detail = {
             "cluster_id": cluster.cluster_id,
+            "frontier_center_fallback": bool(getattr(cluster, "frontier_center_fallback", False)),
             "goal_xyyaw": [
                 float(cluster.subgoal_world[0]),
                 float(cluster.subgoal_world[1]),
@@ -1346,7 +1360,9 @@ class ExplorePyNode:
         cluster = self.external_reserved_cluster
         success = bool(command.get("success"))
         detail = dict(command.get("detail") or {})
-        canceled = str(detail.get("reason") or "") == "preempted_by_target"
+        canceled = str(detail.get("reason") or "") in {
+            "preempted_by_target", "frontier_resolved_by_observation"
+        }
         if cluster is not None and self.robot_xy is not None:
             if self.state.active_goal is None:
                 self.state.start_goal(
@@ -1358,7 +1374,7 @@ class ExplorePyNode:
             if canceled:
                 self.state.clear_active_goal(
                     "subgoal_canceled",
-                    event="preempted_by_target",
+                    event=str(detail.get("reason") or ""),
                 )
             elif success:
                 # The executor has already validated the navigation goal as

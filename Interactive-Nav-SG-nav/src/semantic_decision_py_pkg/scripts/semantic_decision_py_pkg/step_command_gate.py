@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 import time
 
 
@@ -50,6 +51,8 @@ class StepCommandGate:
     def reset(self) -> None:
         self._rgb_at: dict[int, float] = {}
         self._gate_at: dict[int, float] = {}
+        self._rgb_stamps: dict[float, float] = {}
+        self._gate_stamps: dict[float, int] = {}
         self._last_sent_step: int | None = None
         self._awaiting_ack_step: int | None = None
         self._last_sync_step: int | None = None
@@ -66,8 +69,29 @@ class StepCommandGate:
     def record_rgb(self, step_index: int, *, now: float | None = None) -> None:
         self._record(self._rgb_at, step_index, self._now(now))
 
-    def record_fresh_gate(self, step_index: int, *, now: float | None = None) -> None:
+    def record_rgb_stamp(self, stamp_sec: float, *, now: float | None = None) -> int | None:
+        """Resolve a source image to a task step; ROS header.seq is transport-only."""
+        stamp = float(stamp_sec)
+        if not math.isfinite(stamp):
+            return None
+        received = self._now(now)
+        self._rgb_stamps[stamp] = received
+        self._trim(self._rgb_stamps)
+        step = self._gate_stamps.pop(stamp, None)
+        if step is not None:
+            self.record_rgb(step, now=received)
+        return step
+
+    def record_fresh_gate(self, step_index: int, *, now: float | None = None, stamp_sec: float | None = None) -> bool:
         self._record(self._gate_at, step_index, self._now(now))
+        if stamp_sec is not None and math.isfinite(float(stamp_sec)):
+            stamp = float(stamp_sec)
+            if stamp in self._rgb_stamps:
+                self.record_rgb(step_index, now=self._rgb_stamps[stamp])
+                return True
+            self._gate_stamps[stamp] = int(step_index)
+            self._trim(self._gate_stamps)
+        return False
 
     def record_step_sync(
         self,

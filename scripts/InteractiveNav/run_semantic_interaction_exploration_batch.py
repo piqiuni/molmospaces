@@ -22,6 +22,7 @@ DEFAULT_RUNNER = (
     / "InteractiveNav"
     / "run_house7_semantic_exploration_ros_test.zsh"
 )
+NATIVE_THREAD_VARIABLES = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--house-inds", nargs="+", type=int, required=True)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--native-threads-per-worker", type=int, default=1,
+        help="Default BLAS/OpenMP threads in each worker; preserve explicit environment values. 0 keeps library defaults.",
+    )
     parser.add_argument("--base-master-port", type=int, default=12420)
     parser.add_argument("--task-horizon", type=int, default=1000)
     parser.add_argument(
@@ -340,6 +345,13 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             return result
     scene_dir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    native_threads = getattr(args, "native_threads_per_worker", 1)
+    if native_threads > 0:
+        # Each scene has several numerical ROS processes; avoid multiplying
+        # a machine-wide thread pool by the number of parallel workers.
+        for name in NATIVE_THREAD_VARIABLES:
+            environment.setdefault(name, str(native_threads))
+    native_thread_environment = {name: environment.get(name) for name in NATIVE_THREAD_VARIABLES}
     environment.update(
         {
             "METHOD": args.method,
@@ -383,6 +395,7 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "mujoco_egl_device": mujoco_egl_device,
             "semantic_model_env_file": environment.get("SEMANTIC_MODEL_ENV_FILE"),
             "dry_run": True,
+            "native_thread_environment": native_thread_environment,
         }
     started = time.monotonic()
     with (scene_dir / "batch_task.log").open("w", encoding="utf-8") as log_handle:
@@ -431,6 +444,7 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "exit_code": exit_code,
             "elapsed_sec": time.monotonic() - started,
             "resumed": False,
+            "native_thread_environment": native_thread_environment,
             "step_timing_loop_ms_avg": step_timing.get("loop_ms_avg"),
             "step_timing_policy_ms_avg": step_timing.get("policy_ms_avg"),
             "step_timing_task_ms_avg": step_timing.get("task_ms_avg"),
@@ -619,6 +633,8 @@ def main() -> int:
             )
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if args.native_threads_per_worker < 0:
+        raise ValueError("--native-threads-per-worker must be non-negative")
     if not args.runner.exists():
         raise FileNotFoundError(args.runner)
     args.output_dir.mkdir(parents=True, exist_ok=True)

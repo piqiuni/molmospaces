@@ -54,7 +54,7 @@ class ProjectedPlanarScan:
 
 
 class OrganizedDepthScanProjector:
-    """Project one depth image without retaining state between frames."""
+    """Project fresh depth frames, reusing only immutable camera calibration."""
 
     def __init__(self, config: OrganizedDepthScanConfig | None = None) -> None:
         self.config = config or OrganizedDepthScanConfig()
@@ -68,6 +68,21 @@ class OrganizedDepthScanProjector:
             raise ValueError("min_no_return_samples_per_beam must be positive")
         if self.config.vertical_window < 1 or self.config.horizontal_window < 1:
             raise ValueError("continuity windows must be positive")
+        self._ray_factor_cache = None
+
+    def _ray_factors(self, shape, intrinsics):
+        key = (*shape, *intrinsics)
+        cached = self._ray_factor_cache
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        height, width = shape
+        fx, fy, cx, cy = intrinsics
+        columns = -((np.arange(width, dtype=np.float64) - cx) / fx)
+        rows = -((np.arange(height, dtype=np.float64) - cy) / fy)
+        columns.flags.writeable = rows.flags.writeable = False
+        # One assignment keeps concurrent readers on a complete calibration.
+        self._ray_factor_cache = (key, columns, rows)
+        return columns, rows
 
     @staticmethod
     def _continuity_support(
@@ -87,13 +102,22 @@ class OrganizedDepthScanProjector:
         if length < window:
             return support.astype(bool)
 
-        windows = np.lib.stride_tricks.sliding_window_view(depth, window, axis=axis)
-        valid_windows = np.lib.stride_tricks.sliding_window_view(valid, window, axis=axis)
-        # ``sliding_window_view(..., axis)`` places the window dimension last.
-        adjacent = np.abs(np.diff(windows, axis=-1))
-        local_scale = np.minimum(windows[..., :-1], windows[..., 1:])
-        gap = np.maximum(gap_abs_m, gap_rel * local_scale)
-        good = np.all(valid_windows, axis=-1) & np.all(adjacent <= gap, axis=-1)
+        def section(start, stop):
+            slices = [slice(None)] * depth.ndim
+            slices[axis] = slice(start, stop)
+            return tuple(slices)
+
+        count = length - window + 1
+        good = valid[section(0, count)].copy()
+        # Compute each adjacent-pixel comparison once instead of materializing
+        # overlapping HxWx(window-1) difference/scale/gap arrays.
+        if window > 1:
+            left, right = depth[section(0, -1)], depth[section(1, None)]
+            gap = np.maximum(gap_abs_m, gap_rel * np.minimum(left, right))
+            adjacent = (valid[section(0, -1)] & valid[section(1, None)]
+                        & (np.abs(right - left) <= gap))
+            for offset in range(window - 1):
+                good &= adjacent[section(offset, offset + count)]
 
         for offset in range(window):
             if axis == 0:
@@ -116,8 +140,13 @@ class OrganizedDepthScanProjector:
         support = np.zeros(mask.shape, dtype=np.int16)
         if length < window:
             return support.astype(bool)
-        windows = np.lib.stride_tricks.sliding_window_view(mask, window, axis=axis)
-        good = np.all(windows, axis=-1)
+        count = length - window + 1
+        slices = [slice(None)] * mask.ndim
+        slices[axis] = slice(0, count)
+        good = mask[tuple(slices)].copy()
+        for offset in range(1, window):
+            slices[axis] = slice(offset, offset + count)
+            good &= mask[tuple(slices)]
         for offset in range(window):
             if axis == 0:
                 support[offset : offset + good.shape[0], :] += good
@@ -155,7 +184,8 @@ class OrganizedDepthScanProjector:
             raise ValueError("base_from_lidar must be a finite 4x4 transform")
 
         cfg = self.config
-        valid_depth = np.isfinite(depth) & (depth >= 0.1) & (depth <= 30.0)
+        finite_depth = np.isfinite(depth)
+        valid_depth = finite_depth & (depth >= 0.1) & (depth <= 30.0)
         vertical_support = self._continuity_support(
             depth,
             valid_depth,
@@ -175,7 +205,7 @@ class OrganizedDepthScanProjector:
             gap_rel=cfg.continuity_gap_rel,
         )
         supported_pixels = valid_depth & vertical_support & horizontal_support
-        no_hit_depth = ~np.isfinite(depth)
+        no_hit_depth = ~finite_depth
         no_hit_supported = (
             no_hit_depth
             & self._mask_support(
@@ -196,17 +226,18 @@ class OrganizedDepthScanProjector:
         # accepted scan.  These counters are diagnostics only: the masks below
         # are intentionally unchanged so invalid/unsupported samples remain
         # unknown in the projected scan.
-        nonfinite_depth_pixels = ~np.isfinite(depth)
-        out_of_range_depth_pixels = np.isfinite(depth) & ~valid_depth
+        nonfinite_depth_pixels = no_hit_depth
+        out_of_range_depth_pixels = finite_depth & ~valid_depth
         unsupported_valid_pixels = valid_depth & ~supported_pixels
         unsupported_no_hit_pixels = no_hit_depth & ~no_hit_supported
 
+        column_factors, row_factors = self._ray_factors(depth.shape, (fx, fy, cx, cy))
         rows, cols = np.nonzero(supported_pixels)
         if rows.size:
             ranges_depth = depth[rows, cols].astype(np.float64, copy=False)
             x_lidar = ranges_depth
-            y_lidar = -((cols.astype(np.float64) - cx) / fx) * ranges_depth
-            z_lidar = -((rows.astype(np.float64) - cy) / fy) * ranges_depth
+            y_lidar = column_factors[cols] * ranges_depth
+            z_lidar = row_factors[rows] * ranges_depth
             points_lidar = np.stack((x_lidar, y_lidar, z_lidar), axis=1)
             rotation = transform[:3, :3]
             translation = transform[:3, 3]
@@ -270,11 +301,9 @@ class OrganizedDepthScanProjector:
                     geometry_ranges[geometry_hits].astype(np.float32),
                 )
             if np.any(geometry_no_returns):
-                np.add.at(
-                    no_return_counts,
-                    beams[geometry_no_returns],
-                    1,
-                )
+                no_return_counts += np.bincount(
+                    beams[geometry_no_returns], minlength=beam_count,
+                ).astype(np.int32, copy=False)
 
         # A continuous non-finite patch is the simulator's explicit no-hit
         # observation.  Project its camera rays to the planar mapping horizon,
@@ -290,8 +319,8 @@ class OrganizedDepthScanProjector:
             ray_lidar = np.stack(
                 (
                     np.ones(no_hit_rows.size, dtype=np.float64),
-                    -((no_hit_cols.astype(np.float64) - cx) / fx),
-                    -((no_hit_rows.astype(np.float64) - cy) / fy),
+                    column_factors[no_hit_cols],
+                    row_factors[no_hit_rows],
                 ),
                 axis=1,
             )
@@ -322,7 +351,7 @@ class OrganizedDepthScanProjector:
                     (no_hit_angles + np.pi) / angle_increment
                 ).astype(np.int64)
                 no_hit_beams = np.clip(no_hit_beams, 0, beam_count - 1)
-                np.add.at(no_return_counts, no_hit_beams, 1)
+                no_return_counts += np.bincount(no_hit_beams, minlength=beam_count).astype(np.int32, copy=False)
                 invalid_no_return_pixels = int(ray_valid.sum())
 
         hit_candidates = np.isfinite(best_hit_ranges)

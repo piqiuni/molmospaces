@@ -214,7 +214,6 @@ def prepare_episode_for_saving(
     episode_idx: int = 0,
     save_file_suffix: str = "",
     remove_sensors_if_save_dir: bool = True,
-    remove_camera_sensors: bool | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """
     Transform raw episode history into batched format ready for save_trajectories().
@@ -235,8 +234,6 @@ def prepare_episode_for_saving(
         episode_idx: Episode index for video filenames
         save_file_suffix: Optional suffix for video filenames
         remove_sensors_if_save_dir: remove camera-related sensors if video saved
-        remove_camera_sensors: Explicitly remove camera sensors even when videos are not saved.
-            When omitted, preserves the historical remove_sensors_if_save_dir behavior.
 
     Returns:
         Dict[str, Tensor] with all data batched along time dimension, or None if no data
@@ -292,30 +289,34 @@ def prepare_episode_for_saving(
             sensor_suite=sensor_suite,
         )
 
-    if remove_camera_sensors is None:
-        remove_camera_sensors = save_dir is not None and remove_sensors_if_save_dir
+        if remove_sensors_if_save_dir:
+            # CRITICAL: Delete camera data (RGB and depth) from observations to avoid batching it
+            # This is where the massive memory savings come from
+            removed_sensors = set()
+            for obs in flattened_obs:
+                sensors_to_remove = []
+                for sensor_name in obs:
+                    # Check if this is a camera sensor (RGB or depth)
+                    # Skip segmentation sensors as they're not videos
+                    if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith(
+                        "_seg"
+                    ):
+                        sensors_to_remove.append(sensor_name)
 
-    if remove_camera_sensors:
-        # CRITICAL: Delete camera data (RGB and depth) from observations to avoid batching it.
-        removed_sensors = set()
-        for obs in flattened_obs:
-            sensors_to_remove = []
-            for sensor_name in obs:
-                # Skip segmentation sensors because they are not encoded as videos.
-                if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith("_seg"):
-                    sensors_to_remove.append(sensor_name)
+                # Remove camera data
+                for sensor_name in sensors_to_remove:
+                    obs.pop(sensor_name, None)
+                    removed_sensors.add(sensor_name)
 
-            for sensor_name in sensors_to_remove:
-                obs.pop(sensor_name, None)
-                removed_sensors.add(sensor_name)
+            if removed_sensors:
+                log.debug(
+                    f"Removed camera sensors from observations before batching: {removed_sensors}"
+                )
 
-        if removed_sensors:
-            log.debug(f"Removed camera sensors from observations before batching: {removed_sensors}")
-
-    gc.collect()
+        gc.collect()
 
     # Batch observations: List[Dict] -> Dict[str, Tensor(T, ...)]
-    # Note: Camera images are removed when requested, so this is much smaller.
+    # Note: Camera images already removed if save_dir was provided, so this is much smaller
     batched_data = batch_observations(flattened_obs, sensor_suite)
 
     # Delete flattened_obs after batching to free memory
@@ -727,42 +728,40 @@ def _save_agent_data_from_batched(obs_group, episode_data) -> None:
         log.warning("No qvel found in episode_data, cannot save qvel!")
 
 
+EXTRA_DATA_BLACKLIST = {
+    # Agent data, saved by _save_agent_data_from_batched
+    "qpos",
+    "qvel",
+    # Actions, saved by _save_actions_from_batched (episode_group["actions"])
+    "actions",
+    # Environment states, saved by _save_env_states_from_batched
+    "env_states",
+    # Episode-level metadata, saved directly in save_trajectories_from_batched
+    "terminals",
+    "truncateds",
+    "rewards",
+    "successes",
+    "obs_scene",
+}
+
+
+def _is_reserved_extra_key(sensor_name: str) -> bool:
+    """Check whether a key is already saved elsewhere and should be skipped in obs/extra."""
+    if sensor_name in EXTRA_DATA_BLACKLIST:
+        return True
+    # Action sensors (e.g. "actions/joint_pos"), saved by _save_actions_from_batched
+    if sensor_name.startswith("actions/"):
+        return True
+    # Camera parameters, saved by _save_sensor_params_from_batched
+    if sensor_name.startswith("sensor_param_"):
+        return True
+    # Camera frame data (rgb/depth/segmentation), saved by _save_sensor_data_from_batched
+    return sensor_name.endswith("_depth") or sensor_name.endswith("_seg") or "camera" in sensor_name
+
+
 def _save_extra_data_from_batched(obs_group, episode_data) -> None:
     """Save extra task data (pose sensors) from batched observations."""
     extra_group = obs_group.create_group("extra")
-
-    # TODO(max): why do we have this???
-    extra_sensor_mapping = {
-        # Standard object pose sensors
-        "obj_start_pose": "obj_start",
-        "obj_end_pose": "obj_end",
-        "grasp_state_pickup_obj": "grasp_state_pickup_obj",
-        "grasp_state_place_receptacle": "grasp_state_place_receptacle",
-        # Task info sensor
-        "task_info": "task_info",
-        # RBY1 door opening pose sensors
-        "door_start_pose": "obj_start",
-        "door_end_pose": "obj_end",
-        # RBY1 door state sensors
-        "door_state": "door_state",
-        "door_state_dict": "door_state_dict",
-        # Single arm TCP sensors
-        "tcp_pose": "tcp_pose",
-        "grasp_pose": "grasp_pose",
-        # RBY1 dual-arm TCP sensors
-        "left_tcp_pose": "left_tcp_pose",
-        "right_tcp_pose": "right_tcp_pose",
-        # RBY1 grasp state sensors
-        "rby1_left_grasp_state": "rby1_left_grasp_state",
-        "rby1_right_grasp_state": "rby1_right_grasp_state",
-        # Base pose sensor
-        "robot_base_pose": "robot_base_pose",
-        # Policy sensors
-        "policy_phase": "policy_phase",
-        "policy_num_retries": "policy_num_retries",
-        # Object tracking sensors
-        "object_image_points": "object_image_points",
-    }
 
     def _save_nested_data(data, group, name_prefix=""):
         """Recursively save nested dictionary data until hitting tensors."""
@@ -789,11 +788,12 @@ def _save_extra_data_from_batched(obs_group, episode_data) -> None:
                 except Exception as e:
                     log.warning(f"Could not save data for {name_prefix}: {type(data)}, error: {e}")
 
-    for sensor_name, target_name in extra_sensor_mapping.items():
-        if sensor_name in episode_data:
-            # Use recursive loop for all sensors - handles both simple tensors and nested dicts
-            sensor_data = episode_data[sensor_name]
-            _save_nested_data(sensor_data, extra_group, target_name)
+    for sensor_name in episode_data:
+        if _is_reserved_extra_key(sensor_name):
+            continue
+        # Use recursive loop for all sensors - handles both simple tensors and nested dicts
+        sensor_data = episode_data[sensor_name]
+        _save_nested_data(sensor_data, extra_group, sensor_name)
 
 
 def _save_sensor_params_from_batched(obs_group, episode_data) -> None:

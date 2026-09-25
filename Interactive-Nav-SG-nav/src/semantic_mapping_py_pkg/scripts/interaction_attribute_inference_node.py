@@ -35,8 +35,22 @@ from semantic_mapping_py_pkg.attribute_filter import (
 )
 from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
 from semantic_mapping_py_pkg.graph_rules import bbox_area, segmentation_pixel_count
+from semantic_mapping_py_pkg.image_frame_pairing import (
+    payload_capture_step,
+    payload_image_size,
+    select_image_record,
+    stamp_key_from_payload,
+    stamp_key_from_ros,
+)
+from semantic_mapping_py_pkg.messages import observation_stamp_seconds
+from semantic_mapping_py_pkg.portal_state_consensus import PortalStateConsensus
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_nested_param
+from semantic_mapping_py_pkg.room_inference_backends import (
+    WeightedRoomAttributeInferencer,
+    normalized_room_box,
+    room_evidence_signature,
+)
 
 
 class InteractionAttributeInferenceNode:
@@ -110,6 +124,16 @@ class InteractionAttributeInferenceNode:
         self.max_queue_size = max(
             self.worker_count, int(rospy.get_param("~max_queue_size", 8))
         )
+        self.max_calls_per_object = max(
+            1, int(attribute_config.get("max_calls_per_object", 10))
+        )
+        self.targeted_call_reserve = min(
+            self.max_calls_per_object - 1,
+            max(0, int(attribute_config.get("targeted_call_reserve", 2))),
+        )
+        self.max_failure_retries_per_object = max(
+            0, int(attribute_config.get("max_failure_retries_per_object", 2)),
+        )
         self.min_visible_fraction = max(
             0.0, float(rospy.get_param("~min_visible_fraction", 0.20))
         )
@@ -124,6 +148,22 @@ class InteractionAttributeInferenceNode:
         )
         self.required_consecutive_observations = max(
             1, int(rospy.get_param("~required_consecutive_observations", 2))
+        )
+        self.portal_m1_require_full_frame = bool(
+            attribute_config.get("portal_m1_require_full_frame", True)
+        )
+        self.portal_m1_border_margin_px = max(
+            0,
+            int(attribute_config.get("portal_m1_border_margin_px", 2)),
+        )
+        self.portal_m1_required_consecutive_observations = max(
+            1,
+            int(
+                attribute_config.get(
+                    "portal_m1_required_consecutive_observations",
+                    self.required_consecutive_observations,
+                )
+            ),
         )
         self.include_keywords = tuple(
             str(value).casefold()
@@ -150,6 +190,15 @@ class InteractionAttributeInferenceNode:
         self.client = MLLMClient(client_config_from_env(model=self.model_name or None))
         self.request_timeout_s = max(
             0.1, float(rospy.get_param("~request_timeout_s", 8.0))
+        )
+        self.targeted_refresh_timeout_s = max(
+            self.request_timeout_s,
+            float(
+                attribute_config.get(
+                    "targeted_refresh_timeout_s",
+                    max(self.request_timeout_s, 20.0),
+                )
+            ),
         )
         self.max_output_tokens = max(
             32,
@@ -181,8 +230,12 @@ class InteractionAttributeInferenceNode:
                 )
             ),
         )
-        self.targeted_multiview_max_images = max(
-            1, int(attribute_config.get("targeted_multiview_max_images", 3))
+        # One clear view is sufficient.  A second, materially different view is
+        # allowed only to resolve an inconclusive first observation.  Keeping
+        # this cap in the node prevents stale configs from rebuilding the old
+        # three-or-more-image request pattern.
+        self.targeted_multiview_max_images = min(
+            2, max(1, int(attribute_config.get("targeted_multiview_max_images", 2)))
         )
         self.targeted_multiview_min_step_gap = max(
             1, int(attribute_config.get("targeted_multiview_min_step_gap", 8))
@@ -195,8 +248,32 @@ class InteractionAttributeInferenceNode:
             0.0,
             float(attribute_config.get("targeted_multiview_min_yaw_gap_rad", 0.25)),
         )
+        self.targeted_front_confirmation_min_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    attribute_config.get(
+                        "targeted_front_confirmation_min_confidence", 0.80
+                    )
+                ),
+            ),
+        )
         self.target_bbox_mask_containment_required = bool(
             attribute_config.get("target_bbox_mask_containment_required", True)
+        )
+        self.portal_state_consensus = PortalStateConsensus(
+            confirmation_count=attribute_config.get(
+                "portal_state_confirmation_count", 3
+            ),
+            cooldown_steps=attribute_config.get("portal_state_cooldown_steps", 300),
+            cooldown_s=attribute_config.get("portal_state_cooldown_s"),
+            min_position_gap_m=attribute_config.get(
+                "portal_state_min_position_gap_m", 0.25
+            ),
+            min_yaw_gap_rad=attribute_config.get(
+                "portal_state_min_yaw_gap_rad", 0.25
+            ),
         )
         self.room_enabled = bool(room_mllm_config.get("enabled", True))
         self.room_worker_count = max(
@@ -220,6 +297,23 @@ class InteractionAttributeInferenceNode:
                     "success_refresh_interval_s", self.success_refresh_interval_s
                 )
             ),
+        )
+        # Failed room calls are refreshed by the same room lane, but with a
+        # cooldown so a timed-out backend cannot create a tight retry loop.
+        # The mapper keeps the room dirty and republishes it; this node is the
+        # single authority for admission/cooldown and therefore remains safe
+        # when multiple mapping publishers are present.
+        self.room_failure_refresh_interval_s = max(
+            0.0,
+            float(room_mllm_config.get("failure_refresh_interval_s", 30.0)),
+        )
+        self.room_fallback_enabled = bool(
+            room_mllm_config.get("fallback_enabled", True)
+        )
+        room_inference_config = get_nested_param(rospy, "room_inference", {}) or {}
+        self.room_fallback_inferencer = WeightedRoomAttributeInferencer(
+            get_nested_param(rospy, "object_room_priors", {}) or {},
+            min_confidence=float(room_inference_config.get("min_confidence", 0.2)),
         )
         self.room_request_timeout_s = max(
             0.1, float(room_mllm_config.get("request_timeout_s", self.request_timeout_s))
@@ -256,7 +350,13 @@ class InteractionAttributeInferenceNode:
         self._image_history: deque[tuple[float, int, np.ndarray]] = deque(
             maxlen=self.image_history_size
         )
+        self.latest_image_header_seq = 0
+        self.image_arrival_sequence = 0
+        self.image_history = deque(
+            maxlen=max(4, int(attribute_config.get("image_history_size", 32)))
+        )
         self.pending_detection_payload: dict | None = None
+        self.last_image_pairing_result: dict = {}
         self.filter_counts = {
             "messages_received": 0,
             "received": 0,
@@ -268,6 +368,7 @@ class InteractionAttributeInferenceNode:
             "stale": 0,
             "expired": 0,
             "failed": 0,
+            "budget_suppressed": 0,
             "filtered": 0,
             "missing_image": 0,
             "targeted_refresh_received": 0,
@@ -279,6 +380,10 @@ class InteractionAttributeInferenceNode:
             "targeted_refresh_multiview": 0,
             "image_sync_waiting": 0,
             "image_sync_dropped": 0,
+            "portal_consensus_suppressed": 0,
+            "portal_visual_not_ready": 0,
+            "image_frame_mismatch": 0,
+            "image_frame_identity_missing": 0,
         }
         self.room_counts = {
             "messages_received": 0,
@@ -301,15 +406,19 @@ class InteractionAttributeInferenceNode:
         self.pending: dict[str, dict] = {}
         self.completed: dict[str, dict] = {}
         self.generations: dict[str, int] = {}
+        self.m1_call_counts: dict[str, int] = {}
+        self.m1_failure_streaks: dict[str, int] = {}
         self.aliases: dict[str, str] = {}
         self.targeted_refresh_sequence = 0
         self.targeted_refresh_requests: dict[str, dict] = {}
         self.target_visual_history: dict[str, list[dict]] = {}
+        self.portal_observation_streaks: dict[str, dict] = {}
         self.request_queue = LatestPriorityRequestQueue(self.max_queue_size)
         self.room_request_sequence = 0
         self.room_last_request: dict[str, float] = {}
         self.room_pending: dict[str, dict] = {}
         self.room_completed: dict[str, dict] = {}
+        self.room_failures: dict[str, dict] = {}
         self.room_generations: dict[str, int] = {}
         self.room_request_queue = LatestPriorityRequestQueue(self.room_max_queue_size)
         self.shutdown_event = threading.Event()
@@ -367,6 +476,12 @@ class InteractionAttributeInferenceNode:
             self.worker_count,
             self.room_worker_count,
         )
+        rospy.loginfo(
+            "[interaction_attribute_inference] per_object_m1_calls=%d targeted_reserve=%d failure_retries=%d",
+            self.max_calls_per_object,
+            self.targeted_call_reserve,
+            self.max_failure_retries_per_object,
+        )
         self._publish_status()
 
     def _image_callback(self, message: Image) -> None:
@@ -375,13 +490,28 @@ class InteractionAttributeInferenceNode:
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "attribute image conversion failed: %s", exc)
             return
+        stamp = message.header.stamp.to_sec() or time.time()
+        header_seq = int(getattr(message.header, "seq", 0) or 0)
         with self.lock:
+            self.image_arrival_sequence += 1
+            image_sequence = header_seq if header_seq > 0 else self.image_arrival_sequence
             stored_image = image.copy()
             self.latest_image = stored_image
-            self.latest_stamp = message.header.stamp.to_sec() or time.time()
-            self.latest_image_sequence += 1
-            self._image_history.append(
-                (float(self.latest_stamp), int(self.latest_image_sequence), stored_image)
+            self._image_history.append((float(stamp), int(image_sequence), stored_image))
+            self.latest_stamp = stamp
+            self.latest_image_sequence = image_sequence
+            self.latest_image_header_seq = header_seq
+            self.image_history.append(
+                {
+                    "image": stored_image,
+                    "stamp": stamp,
+                    "stamp_key": stamp_key_from_ros(message.header.stamp),
+                    "header_seq": header_seq,
+                    "image_sequence": image_sequence,
+                    "arrival_sequence": self.image_arrival_sequence,
+                    "width": int(image.shape[1]),
+                    "height": int(image.shape[0]),
+                }
             )
         self._process_pending_detections()
 
@@ -458,50 +588,89 @@ class InteractionAttributeInferenceNode:
     def _process_pending_detections(self) -> None:
         with self.lock:
             payload = self.pending_detection_payload
-            image = None
-            image_stamp = float(self.latest_stamp or 0.0)
-            image_sequence = int(self.latest_image_sequence)
-            if isinstance(payload, dict):
-                # Prefer the detector envelope's capture stamp.  If the
-                # matching RGB packet has not arrived yet, leave the payload
-                # pending; the next image callback will retry it.  Once the
-                # requested stamp falls behind the bounded history, drop it
-                # explicitly instead of silently pairing a wrong frame.
-                requested_stamp = self._payload_stamp(payload)
-                selected = self._select_image_locked(requested_stamp)
-                if selected is not None:
-                    image_stamp, image_sequence, selected_image = selected
-                    image = selected_image.copy()
+            records = list(self.image_history)
+            if not records and self.latest_image is not None:
+                records = [
+                    {
+                        "image": self.latest_image.copy(),
+                        "stamp": self.latest_stamp,
+                        "stamp_key": None,
+                        "header_seq": int(self.latest_image_header_seq),
+                        "image_sequence": int(self.latest_image_sequence),
+                        "arrival_sequence": int(self.image_arrival_sequence),
+                        "width": int(self.latest_image.shape[1]),
+                        "height": int(self.latest_image.shape[0]),
+                    }
+                ]
+        if not isinstance(payload, dict):
+            return
+        matched_record, match_reason = select_image_record(payload, records)
+        with self.lock:
+            self.last_image_pairing_result = {
+                "stage": "paired" if matched_record is not None else "waiting_for_source_rgb",
+                "reason": match_reason,
+                "capture_step": payload_capture_step(payload),
+                "image_header_seq": (
+                    matched_record.get("header_seq") if matched_record is not None else None
+                ),
+                "history_size": len(records),
+            }
+        if matched_record is None:
+            with self.lock:
+                if match_reason == "detection_frame_identity_missing":
+                    self.filter_counts["image_frame_identity_missing"] += 1
                     self.pending_detection_payload = None
-                elif self.latest_image is None:
+                elif match_reason != "no_image_available":
+                    self.filter_counts["image_frame_mismatch"] += 1
+            if match_reason == "no_image_available":
+                with self.lock:
                     self.filter_counts["missing_image"] += 1
-                elif requested_stamp > 0.0:
-                    history = getattr(self, "_image_history", ())
-                    oldest_stamp = float(history[0][0]) if history else 0.0
-                    # A future capture is still expected; wait for a later
-                    # RGB callback.  An old capture no longer representable in
-                    # the history is terminally stale and must not be mixed.
-                    tolerance = max(
-                        0.0, float(getattr(self, "image_sync_tolerance_s", 0.25))
-                    )
-                    if oldest_stamp > 0.0 and requested_stamp < oldest_stamp - tolerance:
-                        self.pending_detection_payload = None
-                        self.filter_counts["image_sync_dropped"] += 1
-                    else:
-                        self.filter_counts["image_sync_waiting"] += 1
-                else:
-                    image = self.latest_image.copy()
-                    self.pending_detection_payload = None
-        if not isinstance(payload, dict) or image is None:
-            if isinstance(payload, dict):
-                self._publish_status()
+            elif match_reason == "detection_frame_identity_missing":
+                rospy.logwarn_throttle(
+                    5.0,
+                    "[interaction_attribute_inference] dropped detection without frame identity",
+                )
+            else:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "[interaction_attribute_inference] waiting for exact RGB frame: %s",
+                    match_reason,
+                )
+            self._publish_status()
+            return
+        with self.lock:
+            if self.pending_detection_payload is not payload:
+                return
+            self.pending_detection_payload = None
+        image = np.asarray(matched_record["image"]).copy()
+        image_stamp = float(matched_record.get("stamp", self.latest_stamp) or self.latest_stamp)
+        image_sequence = int(matched_record.get("image_sequence", 0) or 0)
+        image_header_seq = int(matched_record.get("header_seq", 0) or 0)
+        declared_image_size = payload_image_size(payload)
+        actual_image_size = (int(image.shape[1]), int(image.shape[0]))
+        if declared_image_size is not None and declared_image_size != actual_image_size:
+            with self.lock:
+                self.filter_counts["image_frame_mismatch"] += 1
+                self.last_image_pairing_result.update(
+                    stage="rejected", reason="image_size_mismatch",
+                    declared_image_size=list(declared_image_size),
+                    actual_image_size=list(actual_image_size),
+                )
+            rospy.logwarn_throttle(
+                5.0,
+                "[interaction_attribute_inference] image size mismatch declared=%s actual=%s",
+                declared_image_size,
+                actual_image_size,
+            )
+            self._publish_status()
             return
         detections = payload.get("detections") or payload.get("observations")
         if not isinstance(detections, list):
             return
         episode_id = str(payload.get("episode_id") or "") if isinstance(payload, dict) else ""
-        capture_step = self._capture_step(payload)
-        frame_id = "" if capture_step is None else str(capture_step)
+        capture_step = payload_capture_step(payload)
+        frame_id = str(capture_step) if capture_step is not None else f"rgb:{image_sequence}"
+        observation_pose_xyyaw = self._observation_pose_xyyaw(payload)
         observation_stamp = self._observation_stamp(payload, image_stamp)
         if episode_id:
             self._set_episode(episode_id)
@@ -536,7 +705,106 @@ class InteractionAttributeInferenceNode:
             if not self._passes_observation_filter(detection):
                 with self.lock:
                     self.filter_counts["filtered"] += 1
+                if targeted_refresh is not None:
+                    self._reject_targeted_refresh_evidence(
+                        object_id=object_id, episode_id=episode_id,
+                        observation_stamp=observation_stamp, frame_id=frame_id,
+                        image_sequence=image_sequence,
+                        signature=self._state_signature(detection),
+                        targeted_refresh=targeted_refresh,
+                        error="target_observation_filter_rejected",
+                    )
                 continue
+            portal_detection = self._is_portal_detection(detection)
+            if portal_detection:
+                visual_readiness = self._portal_m1_visual_readiness(
+                    object_id,
+                    image,
+                    detection,
+                    capture_step=capture_step,
+                    image_sequence=image_sequence,
+                    targeted_refresh=targeted_refresh is not None,
+                )
+                if not bool(visual_readiness.get("ready")):
+                    with self.lock:
+                        self.filter_counts["portal_visual_not_ready"] = (
+                            self.filter_counts.get("portal_visual_not_ready", 0)
+                            + 1
+                        )
+                        self.filter_counts["filtered"] += 1
+                    if targeted_refresh is not None:
+                        self._reject_targeted_refresh_evidence(
+                            object_id=object_id,
+                            episode_id=episode_id,
+                            observation_stamp=observation_stamp,
+                            frame_id=frame_id,
+                            image_sequence=image_sequence,
+                            signature=self._state_signature(detection),
+                            targeted_refresh=targeted_refresh,
+                            error=str(
+                                visual_readiness.get("reason")
+                                or "portal_m1_visual_not_ready"
+                            ),
+                        )
+                    continue
+                portal_pose = (
+                    targeted_refresh.get("observation_pose_xyyaw")
+                    if targeted_refresh is not None
+                    else observation_pose_xyyaw
+                )
+                portal_request_allowed, portal_request_reason = (
+                    self.portal_state_consensus.can_request(
+                        object_id,
+                        capture_step=capture_step,
+                        observation_pose_xyyaw=portal_pose,
+                    )
+                )
+                if not portal_request_allowed:
+                    with self.lock:
+                        self.filter_counts["portal_consensus_suppressed"] = (
+                            self.filter_counts.get("portal_consensus_suppressed", 0)
+                            + 1
+                        )
+                        self.filter_counts["filtered"] += 1
+                    if targeted_refresh is not None:
+                        cached_consensus = (
+                            self.portal_state_consensus.cached_stable_result(
+                                object_id,
+                                capture_step=capture_step,
+                            )
+                            if portal_request_reason == "stable_state_cooldown"
+                            else None
+                        )
+                        if cached_consensus is not None:
+                            self._publish_cached_portal_targeted_refresh(
+                                object_id=object_id,
+                                episode_id=episode_id,
+                                observation_stamp=observation_stamp,
+                                frame_id=frame_id,
+                                image_sequence=image_sequence,
+                                signature=self._state_signature(detection),
+                                targeted_refresh=targeted_refresh,
+                                consensus=cached_consensus,
+                            )
+                        else:
+                            self._reject_targeted_refresh_evidence(
+                                object_id=object_id,
+                                episode_id=episode_id,
+                                observation_stamp=observation_stamp,
+                                frame_id=frame_id,
+                                image_sequence=image_sequence,
+                                signature=self._state_signature(detection),
+                                targeted_refresh=targeted_refresh,
+                                error=f"portal_state_consensus:{portal_request_reason}",
+                            )
+                    continue
+            if targeted_refresh is None:
+                with self.lock:
+                    if self._m1_budget_error_locked(object_id, targeted=False):
+                        self.filter_counts["budget_suppressed"] = (
+                            self.filter_counts.get("budget_suppressed", 0) + 1
+                        )
+                        continue
             with self.lock:
                 self.filter_counts["eligible"] += 1
             signature = self._state_signature(detection)
@@ -548,15 +816,18 @@ class InteractionAttributeInferenceNode:
             # and containment checks before the force-reservation path below.
             reservation = None
             if targeted_refresh is None:
-                self._invalidate_if_state_changed(object_id, signature, episode_id)
-                reservation = self._try_reserve(object_id, signature)
+                if not portal_detection:
+                    self._invalidate_if_state_changed(object_id, signature, episode_id)
+                reservation = self._try_reserve(
+                    object_id, signature, portal_confirmation=portal_detection
+                )
                 if reservation is None:
                     continue
             visual_evidence = self._compose_attribute_visual_evidence(
                 image,
                 detection,
                 margin_ratio=self.crop_margin_ratio,
-                include_crop_inset=not self._is_portal_detection(detection),
+                include_crop_inset=not portal_detection,
             )
             if visual_evidence is None:
                 if reservation is not None:
@@ -567,7 +838,24 @@ class InteractionAttributeInferenceNode:
             evidence_capture_steps = (
                 [int(capture_step)] if capture_step is not None else []
             )
-            evidence_observation_poses: list[list[float]] = []
+            evidence_observation_poses: list[list[float]] = (
+                [list(observation_pose_xyyaw)] if observation_pose_xyyaw else []
+            )
+            evidence_view_metadata: list[dict] = (
+                [
+                    {
+                        "view_id": "view_1",
+                        "frame_id": frame_id,
+                        "capture_step": capture_step,
+                        "observation_pose_xyyaw": list(observation_pose_xyyaw),
+                        "anchor_face_id": "",
+                        "anchor_face_index": None,
+                        "anchor_face_axis_xy": [],
+                    }
+                ]
+                if observation_pose_xyyaw
+                else []
+            )
             bbox_containment = self._target_bbox_containment(
                 image, detection
             )
@@ -587,6 +875,26 @@ class InteractionAttributeInferenceNode:
                         bbox_containment=bbox_containment,
                     )
                     continue
+                if str(targeted_refresh.get("expected_node_type") or "") == "container":
+                    evidence_rejection = self._target_visual_history_rejection_reason(
+                        object_id,
+                        capture_step=capture_step,
+                        observation_pose_xyyaw=targeted_refresh.get(
+                            "observation_pose_xyyaw"
+                        ),
+                    )
+                    if evidence_rejection:
+                        self._reject_targeted_refresh_evidence(
+                            object_id=object_id,
+                            episode_id=episode_id,
+                            observation_stamp=observation_stamp,
+                            frame_id=frame_id,
+                            image_sequence=image_sequence,
+                            signature=signature,
+                            targeted_refresh=targeted_refresh,
+                            error=evidence_rejection,
+                        )
+                        continue
                 selected_evidence = self._record_and_select_target_visual_history(
                     object_id,
                     visual_evidence,
@@ -596,6 +904,9 @@ class InteractionAttributeInferenceNode:
                         "observation_pose_xyyaw"
                     ),
                     bbox_containment=bbox_containment,
+                    anchor_face_id=targeted_refresh.get("anchor_face_id"),
+                    anchor_face_index=targeted_refresh.get("anchor_face_index"),
+                    anchor_face_axis_xy=targeted_refresh.get("anchor_face_axis_xy"),
                 )
                 if selected_evidence:
                     visual_evidence_history = [
@@ -618,6 +929,10 @@ class InteractionAttributeInferenceNode:
                         if isinstance(item.get("observation_pose_xyyaw"), list)
                         and len(item["observation_pose_xyyaw"]) >= 3
                     ]
+                    evidence_view_metadata = [
+                        self._target_evidence_public_metadata(item, view_index=index)
+                        for index, item in enumerate(selected_evidence)
+                    ]
                     if len(selected_evidence) > 1:
                         with self.lock:
                             self.filter_counts["targeted_refresh_multiview"] += 1
@@ -629,8 +944,29 @@ class InteractionAttributeInferenceNode:
                     targeted_refresh,
                 )
             if reservation is None:
+                if targeted_refresh is not None:
+                    with self.lock:
+                        budget_error = self._m1_budget_error_locked(
+                            object_id, targeted=True
+                        )
+                    if budget_error:
+                        self._reject_targeted_refresh_evidence(
+                            object_id=object_id,
+                            episode_id=episode_id,
+                            observation_stamp=observation_stamp,
+                            frame_id=frame_id,
+                            image_sequence=image_sequence,
+                            signature=signature,
+                            targeted_refresh=targeted_refresh,
+                            error=budget_error,
+                        )
                 continue
             enqueued_at = time.monotonic()
+            request_timeout_s = (
+                getattr(self, "targeted_refresh_timeout_s", self.request_timeout_s)
+                if targeted_refresh is not None
+                else self.request_timeout_s
+            )
             requests.append(
                 {
                     "priority": (
@@ -650,16 +986,24 @@ class InteractionAttributeInferenceNode:
                     "evidence_frame_ids": evidence_frame_ids,
                     "evidence_capture_steps": evidence_capture_steps,
                     "evidence_observation_pose_xyyaw": evidence_observation_poses,
+                    "evidence_view_metadata": evidence_view_metadata,
                     "target_bbox_containment": bbox_containment,
                     "episode_id": episode_id,
                     "frame_id": frame_id,
                     "image_sequence": image_sequence,
+                    "image_header_seq": image_header_seq,
+                    "image_size": [actual_image_size[0], actual_image_size[1]],
+                    "image_stamp_key": list(
+                        matched_record.get("stamp_key")
+                        or stamp_key_from_payload(payload)
+                        or []
+                    ),
                     "stamp": observation_stamp,
                     "signature": signature,
                     "generation": reservation["generation"],
                     "request_sequence": reservation["request_sequence"],
                     "enqueued_at": enqueued_at,
-                    "deadline_monotonic": enqueued_at + self.request_timeout_s,
+                    "deadline_monotonic": enqueued_at + request_timeout_s,
                     "targeted_refresh": dict(targeted_refresh or {}),
                 }
             )
@@ -669,7 +1013,16 @@ class InteractionAttributeInferenceNode:
             requests, key=lambda item: (-float(item["priority"]), item["object_id"])
         ):
             if self._remaining_request_timeout(
-                request_payload.get("deadline_monotonic"), self.request_timeout_s
+                request_payload.get("deadline_monotonic"),
+                (
+                    getattr(
+                        self,
+                        "targeted_refresh_timeout_s",
+                        self.request_timeout_s,
+                    )
+                    if request_payload.get("targeted_refresh")
+                    else self.request_timeout_s
+                ),
             ) <= 0.0:
                 self._expire_attribute_request(request_payload)
                 continue
@@ -722,7 +1075,16 @@ class InteractionAttributeInferenceNode:
                 # before the queue lock is acquired.  Preserve the terminal
                 # expiry status instead of silently releasing the reservation.
                 if self._remaining_request_timeout(
-                    request_payload.get("deadline_monotonic"), self.request_timeout_s
+                    request_payload.get("deadline_monotonic"),
+                    (
+                        getattr(
+                            self,
+                            "targeted_refresh_timeout_s",
+                            self.request_timeout_s,
+                        )
+                        if request_payload.get("targeted_refresh")
+                        else self.request_timeout_s
+                    ),
                 ) <= 0.0:
                     self._expire_attribute_request(request_payload)
                 else:
@@ -832,12 +1194,18 @@ class InteractionAttributeInferenceNode:
                 continue
             room_node_id = str(room.get("room_node_id") or f"room_{room_id}")
             objects = self._room_objects(room.get("objects"))
+            box = room.get("room_box")
+            if not isinstance(box, dict):
+                box = {}
+            room_box = normalized_room_box(
+                box.get("center_xy"), box.get("size_xy")
+            )
             if not objects:
                 with self.lock:
                     self.room_counts["filtered"] += 1
                 continue
             room_key = room_node_id or f"room_{room_id}"
-            signature = self._room_signature(room_id, objects)
+            signature = self._room_signature(room_id, objects, room_box)
             self._invalidate_room_if_state_changed(room_key, signature, episode_id)
             reservation = self._try_reserve_room(room_key, signature)
             if reservation is None:
@@ -855,6 +1223,7 @@ class InteractionAttributeInferenceNode:
                     "priority": self._room_priority(objects),
                     "room_id": room_id,
                     "room_node_id": room_node_id,
+                    "room_box": room_box,
                     "objects": objects,
                     "episode_id": episode_id,
                     "capture_step": capture_step,
@@ -950,24 +1319,8 @@ class InteractionAttributeInferenceNode:
         return sorted(normalized, key=lambda item: (item["object_id"], item["name"]))
 
     @staticmethod
-    def _room_signature(room_id: int, objects: list[dict]) -> str:
-        return json.dumps(
-            {
-                "room_id": int(room_id),
-                "objects": [
-                    {
-                        "object_id": item["object_id"],
-                        "name": item["name"].casefold(),
-                        "category": item["category"].casefold(),
-                        "type": item["type"].casefold(),
-                    }
-                    for item in objects
-                ],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
+    def _room_signature(room_id: int, objects: list[dict], room_box=None) -> str:
+        return room_evidence_signature(room_id, room_box, objects)
 
     @staticmethod
     def _room_priority(objects: list[dict]) -> float:
@@ -1009,6 +1362,14 @@ class InteractionAttributeInferenceNode:
                     < self.room_success_refresh_interval_s
                 ):
                     return None
+            failed = self.room_failures.get(room_key)
+            if failed is not None and failed.get("signature") == signature:
+                if (
+                    self.room_failure_refresh_interval_s > 0.0
+                    and now - float(failed.get("failed_at", 0.0))
+                    < self.room_failure_refresh_interval_s
+                ):
+                    return None
             if now - self.room_last_request.get(room_key, 0.0) < self.room_min_interval_s:
                 return None
             self.room_request_sequence += 1
@@ -1047,6 +1408,68 @@ class InteractionAttributeInferenceNode:
             "error": str(error)[:240],
         }
 
+    def _room_fallback_patch(
+        self,
+        request_payload: dict,
+        objects: list[dict],
+        *,
+        error: str,
+        queue_lag_sec: float,
+        request_started: float,
+        enqueued_at: float,
+    ) -> dict | None:
+        """Create an immediately usable rule-based room result after failure."""
+
+        if not self.room_fallback_enabled:
+            return None
+        detections = []
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            category = str(item.get("category") or "")
+            detections.append(
+                {
+                    "node_id": str(
+                        item.get("object_id") or item.get("node_id") or ""
+                    ),
+                    "semantic_name": (
+                        category
+                        if name.casefold() in {"", "object", "unknown"} and category
+                        else name
+                    ),
+                    "category": category,
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                }
+            )
+        result = self.room_fallback_inferencer.infer(detections)
+        evidence_ids = [
+            str(item.get("node_id") or "")
+            for item in result.get("evidence") or []
+            if str(item.get("node_id") or "")
+        ][:2]
+        return {
+            "room_id": int(request_payload["room_id"]),
+            "room_node_id": str(request_payload["room_node_id"]),
+            "episode_id": str(request_payload.get("episode_id") or ""),
+            "stamp_sec": float(request_payload["stamp"]),
+            "observation_stamp_sec": float(request_payload["stamp"]),
+            "observation_capture_step": request_payload.get("capture_step"),
+            "observation_signature": str(request_payload["signature"]),
+            "room_attribute": str(result.get("room_attribute") or "unknown"),
+            "confidence": float(result.get("confidence", 0.0) or 0.0),
+            "evidence_object_ids": evidence_ids,
+            "source": "weighted_object_types_fallback",
+            "model_name": "",
+            "request_sequence": int(request_payload["request_sequence"]),
+            "room_attribute_status": "ready",
+            "fallback": True,
+            "error": str(error)[:240],
+            "queue_lag_sec": float(queue_lag_sec),
+            "response_lag_sec": max(0.0, time.monotonic() - request_started),
+            "total_lag_sec": max(0.0, time.monotonic() - float(enqueued_at)),
+        }
+
     def _publish_discarded_room_requests(
         self,
         requests: list[dict] | None,
@@ -1076,12 +1499,27 @@ class InteractionAttributeInferenceNode:
                 "filter_counts": dict(self.filter_counts),
                 "queue_size": len(self.request_queue),
                 "pending_requests": len(self.pending),
+                "image_pairing": dict(getattr(self, "last_image_pairing_result", {})),
                 "room_enabled": self.room_enabled,
                 "room_counts": dict(self.room_counts),
                 "room_queue_size": len(self.room_request_queue),
                 "room_pending_requests": len(self.room_pending),
+                "room_failed_signatures": len(self.room_failures),
+                "m1_total_calls": sum(getattr(self, "m1_call_counts", {}).values()),
+                "m1_objects_at_call_limit": sum(
+                    count >= getattr(self, "max_calls_per_object", 10)
+                    for count in getattr(self, "m1_call_counts", {}).values()
+                ),
+                "m1_objects_retry_exhausted": sum(
+                    count > getattr(self, "max_failure_retries_per_object", 2)
+                    for count in getattr(self, "m1_failure_streaks", {}).values()
+                ),
                 "has_latest_image": self.latest_image is not None,
                 "latest_image_sequence": int(self.latest_image_sequence),
+                "latest_image_header_seq": int(
+                    getattr(self, "latest_image_header_seq", 0)
+                ),
+                "image_history_size": len(getattr(self, "image_history", ())),
                 "has_pending_detection": self.pending_detection_payload is not None,
                 "targeted_refresh_topic": self.targeted_refresh_topic,
                 "targeted_refresh_pending": len(self.targeted_refresh_requests),
@@ -1111,13 +1549,18 @@ class InteractionAttributeInferenceNode:
             self.pending.clear()
             self.completed.clear()
             self.generations.clear()
+            getattr(self, "m1_call_counts", {}).clear()
+            getattr(self, "m1_failure_streaks", {}).clear()
             self.aliases.clear()
             self.room_last_request.clear()
             self.room_pending.clear()
             self.room_completed.clear()
+            self.room_failures.clear()
             self.room_generations.clear()
             self.targeted_refresh_requests.clear()
             self.target_visual_history.clear()
+            self.portal_observation_streaks.clear()
+        self.portal_state_consensus.reset()
         for object_id, request_sequence in stale_request_ids:
             self.request_queue.discard(object_id, request_sequence)
         for room_key, request_sequence in stale_room_request_ids:
@@ -1185,8 +1628,36 @@ class InteractionAttributeInferenceNode:
                 self.completed.pop(object_id, None)
                 self.last_request.pop(object_id, None)
                 self.pending.pop(object_id, None)
+                getattr(self, "target_visual_history", {}).pop(object_id, None)
+                getattr(self, "portal_observation_streaks", {}).pop(object_id, None)
         for object_id in object_ids:
             self.request_queue.discard(object_id)
+            consensus = getattr(self, "portal_state_consensus", None)
+            if consensus is not None:
+                is_portal_result = bool(
+                    str(payload.get("node_type") or "").casefold() == "portal"
+                    or str(payload.get("expected_node_type") or "").casefold()
+                    == "portal"
+                    or str(object_id).casefold().startswith("door_")
+                    or "door_" in str(payload.get("candidate_id") or "").casefold()
+                )
+                result_step = payload.get("result_published_step")
+                if result_step is None:
+                    result_step = payload.get("step")
+                result_state = payload.get("post_state") or payload.get("state")
+                if is_portal_result:
+                    # Capability=unavailable is orthogonal to visual aperture
+                    # state. If the backend cannot provide open/closed, retain
+                    # the existing proposal/stable state and its cooldown;
+                    # never erase visual consensus merely because the asset is
+                    # non-articulated.
+                    consensus.record_authoritative(
+                        object_id,
+                        result_state,
+                        capture_step=result_step,
+                    )
+                else:
+                    consensus.clear(object_id)
 
     @staticmethod
     def _parse_targeted_refresh_payload(payload: object) -> dict | None:
@@ -1221,6 +1692,21 @@ class InteractionAttributeInferenceNode:
                 observation_pose = []
             if not all(math.isfinite(value) for value in observation_pose):
                 observation_pose = []
+        anchor_face_id = str(payload.get("anchor_face_id") or "").strip()[:96]
+        try:
+            anchor_face_index = int(payload.get("anchor_face_index"))
+        except (TypeError, ValueError):
+            anchor_face_index = None
+        raw_face_axis = payload.get("anchor_face_axis_xy")
+        anchor_face_axis_xy: list[float] = []
+        if isinstance(raw_face_axis, (list, tuple)) and len(raw_face_axis) >= 2:
+            try:
+                axis_x, axis_y = float(raw_face_axis[0]), float(raw_face_axis[1])
+            except (TypeError, ValueError):
+                axis_x = axis_y = float("nan")
+            norm = math.hypot(axis_x, axis_y)
+            if math.isfinite(norm) and norm > 1e-6:
+                anchor_face_axis_xy = [axis_x / norm, axis_y / norm]
         return {
             "object_id": object_id,
             "episode_id": str(payload.get("episode_id") or "").strip(),
@@ -1233,6 +1719,12 @@ class InteractionAttributeInferenceNode:
                 payload.get("expected_object_kind") or ""
             ).strip().casefold(),
             "observation_pose_xyyaw": observation_pose,
+            # These fields are response-routing metadata only.  They are never
+            # placed in the M1 prompt, but let the selected visual panel retain
+            # the exact AABB face and capture pose that generated it.
+            "anchor_face_id": anchor_face_id,
+            "anchor_face_index": anchor_face_index,
+            "anchor_face_axis_xy": anchor_face_axis_xy,
         }
 
     def _targeted_refresh_callback(self, message: String) -> None:
@@ -1244,6 +1736,28 @@ class InteractionAttributeInferenceNode:
             with self.lock:
                 self.filter_counts["targeted_refresh_rejected"] += 1
             self._publish_status()
+            return
+        if isinstance(payload, dict) and payload.get("action") == "cancel":
+            request_id = str(payload.get("request_id") or "")
+            episode_id = str(payload.get("episode_id") or "")
+            cancelled = []
+            with self.lock:
+                for key, armed in list(self.targeted_refresh_requests.items()):
+                    if (request_id and armed.get("request_id") == request_id
+                            and (not episode_id or armed.get("episode_id") == episode_id)):
+                        self.targeted_refresh_requests.pop(key, None)
+                for key, pending in list(self.pending.items()):
+                    targeted = pending.get("targeted_refresh") or {}
+                    if (request_id and targeted.get("request_id") == request_id
+                            and (not episode_id or pending.get("episode_id") == episode_id)):
+                        self.generations[key] = self.generations.get(key, 0) + 1
+                        self.pending.pop(key, None)
+                        self.last_request.pop(key, None)
+                        cancelled.append({**pending, "object_id": key})
+            for pending in cancelled:
+                discarded = self.request_queue.discard(pending["object_id"], int(pending.get("request_sequence", 0)))
+                self._publish_discarded_attribute_requests(
+                    discarded or [pending], error="targeted_refresh_cancelled")
             return
         request = self._parse_targeted_refresh_payload(payload)
         if request is None:
@@ -1272,18 +1786,63 @@ class InteractionAttributeInferenceNode:
             canonical_object_id = self.aliases.get(
                 request["object_id"], request["object_id"]
             )
-            self.targeted_refresh_sequence += 1
-            refresh_sequence = self.targeted_refresh_sequence
-            self.targeted_refresh_requests[canonical_object_id] = {
-                **request,
-                "request_key": canonical_object_id,
-                "refresh_sequence": refresh_sequence,
-                # Require an RGB image that arrived after this request, even
-                # if an old detection packet is still waiting to be consumed.
-                "minimum_image_sequence": int(self.latest_image_sequence),
-                "armed_at_monotonic": time.monotonic(),
-            }
-            self.filter_counts["targeted_refresh_armed"] += 1
+            budget_error = self._m1_budget_error_locked(
+                canonical_object_id, targeted=True
+            )
+            # A stable portal vote can still satisfy a later view without a
+            # model call; keep its existing cached-consensus path available.
+            consensus = getattr(self, "portal_state_consensus", None)
+            if budget_error and request["expected_node_type"] == "portal" and consensus:
+                if consensus.cached_stable_result(
+                    canonical_object_id,
+                    capture_step=request["minimum_capture_step"],
+                ) is not None:
+                    budget_error = ""
+            if budget_error and canonical_object_id not in self.pending:
+                self.request_sequence += 1
+                rejected_sequence = self.request_sequence
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                self.filter_counts["targeted_refresh_rejected"] += 1
+            else:
+                budget_error = ""
+            if not budget_error:
+                self.targeted_refresh_sequence += 1
+                refresh_sequence = self.targeted_refresh_sequence
+                self.targeted_refresh_requests[canonical_object_id] = {
+                    **request,
+                    "request_key": canonical_object_id,
+                    "refresh_sequence": refresh_sequence,
+                    # Require an RGB image that arrived after this request, even
+                    # if an old detection packet is still waiting to be consumed.
+                    "minimum_image_sequence": int(self.latest_image_sequence),
+                    "armed_at_monotonic": time.monotonic(),
+                }
+                self.filter_counts["targeted_refresh_armed"] += 1
+        if budget_error:
+            self._publish_updates(
+                requested_episode or current_episode,
+                time.time(),
+                [self._attribute_status_patch(
+                    {
+                        "object_id": canonical_object_id,
+                        "request_sequence": rejected_sequence,
+                        "targeted_refresh": request,
+                    },
+                    "failed",
+                    error=budget_error,
+                )],
+            )
+            self._publish_status()
+            return
+        self._publish_updates(
+            requested_episode, time.time(),
+            [self._attribute_status_patch(
+                {"object_id": request["object_id"], "targeted_refresh": request},
+                "waiting_for_view",
+            )],
+        )
         rospy.loginfo(
             "[interaction_attribute_inference] armed targeted refresh object=%s "
             "minimum_capture_step=%d reason=%s",
@@ -1511,9 +2070,10 @@ class InteractionAttributeInferenceNode:
         valid.sort(key=lambda item: int(item["capture_step"]))
         if not valid:
             return []
+        max_images = min(2, max(1, int(max_images)))
         selected = [valid[-1]]
         for candidate in reversed(valid[:-1]):
-            if len(selected) >= max(1, int(max_images)):
+            if len(selected) >= max_images:
                 break
             candidate_pose = [float(value) for value in candidate["observation_pose_xyyaw"][:3]]
             candidate_step = int(candidate["capture_step"])
@@ -1541,6 +2101,51 @@ class InteractionAttributeInferenceNode:
                 selected.append(candidate)
         return list(reversed(selected))
 
+    def _target_visual_history_rejection_reason(
+        self,
+        object_id: str,
+        *,
+        capture_step: int | None,
+        observation_pose_xyyaw: object,
+    ) -> str:
+        """Reject duplicate or third container views before contacting M1."""
+
+        pose = list(observation_pose_xyyaw or [])
+        if capture_step is None or len(pose) < 3:
+            return ""
+        with self.lock:
+            history = list(self.target_visual_history.get(str(object_id)) or [])
+        prior = self._select_diverse_target_visual_history(
+            history,
+            max_images=2,
+            min_step_gap=self.targeted_multiview_min_step_gap,
+            min_position_gap_m=self.targeted_multiview_min_position_gap_m,
+            min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
+        )
+        if not prior:
+            return ""
+        current = {
+            "capture_step": int(capture_step),
+            "observation_pose_xyyaw": [float(value) for value in pose[:3]],
+            "bbox_containment": {"valid": True},
+        }
+        combined = self._select_diverse_target_visual_history(
+            [*prior, current],
+            max_images=2,
+            min_step_gap=self.targeted_multiview_min_step_gap,
+            min_position_gap_m=self.targeted_multiview_min_position_gap_m,
+            min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
+        )
+        current_selected = any(
+            int(item.get("capture_step", -1)) == int(capture_step)
+            for item in combined
+        )
+        if not current_selected or len(combined) == 1:
+            return "m1_duplicate_view_rejected"
+        if len(prior) >= 2:
+            return "m1_two_view_budget_exhausted"
+        return ""
+
     def _record_and_select_target_visual_history(
         self,
         object_id: str,
@@ -1550,6 +2155,9 @@ class InteractionAttributeInferenceNode:
         frame_id: str,
         observation_pose_xyyaw: object,
         bbox_containment: dict,
+        anchor_face_id: object = "",
+        anchor_face_index: object = None,
+        anchor_face_axis_xy: object = None,
     ) -> list[dict]:
         pose = list(observation_pose_xyyaw or [])
         if capture_step is None or len(pose) < 3:
@@ -1560,6 +2168,9 @@ class InteractionAttributeInferenceNode:
             "observation_pose_xyyaw": [float(value) for value in pose[:3]],
             "bbox_containment": dict(bbox_containment),
             "visual_evidence": visual_evidence.copy(),
+            "anchor_face_id": str(anchor_face_id or "")[:96],
+            "anchor_face_index": anchor_face_index,
+            "anchor_face_axis_xy": list(anchor_face_axis_xy or [])[:2],
         }
         with self.lock:
             history = list(self.target_visual_history.get(str(object_id)) or [])
@@ -1579,6 +2190,21 @@ class InteractionAttributeInferenceNode:
             min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
         )
 
+    @staticmethod
+    def _target_evidence_public_metadata(item: dict, *, view_index: int) -> dict:
+        """Return prompt-external routing metadata for one montage panel."""
+
+        metadata = {
+            "view_id": f"view_{int(view_index) + 1}",
+            "frame_id": str(item.get("frame_id") or ""),
+            "capture_step": item.get("capture_step"),
+            "observation_pose_xyyaw": list(item.get("observation_pose_xyyaw") or [])[:3],
+            "anchor_face_id": str(item.get("anchor_face_id") or ""),
+            "anchor_face_index": item.get("anchor_face_index"),
+            "anchor_face_axis_xy": list(item.get("anchor_face_axis_xy") or [])[:2],
+        }
+        return metadata
+
     def _force_reserve_targeted_refresh(
         self,
         object_id: str,
@@ -1592,6 +2218,11 @@ class InteractionAttributeInferenceNode:
         previous_snapshot: dict | None = None
         with self.lock:
             if episode_id and self.current_episode_id and episode_id != self.current_episode_id:
+                return None
+            if self._m1_budget_error_locked(object_id, targeted=True):
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
                 return None
             previous = self.pending.get(object_id)
             if previous is not None:
@@ -1689,6 +2320,83 @@ class InteractionAttributeInferenceNode:
             ],
         )
 
+    def _reject_targeted_refresh_evidence(
+        self,
+        *,
+        object_id: str,
+        episode_id: str,
+        observation_stamp: float,
+        frame_id: str,
+        image_sequence: int,
+        signature: str,
+        targeted_refresh: dict,
+        error: str,
+    ) -> None:
+        """Finish a duplicate/third container view without a model request."""
+
+        with self.lock:
+            self.filter_counts["targeted_refresh_rejected"] += 1
+            self.filter_counts["failed"] += 1
+        self._consume_targeted_refresh(targeted_refresh)
+        self._publish_updates(
+            episode_id,
+            observation_stamp,
+            [
+                self._attribute_status_patch(
+                    {
+                        "object_id": object_id,
+                        "frame_id": frame_id,
+                        "image_sequence": image_sequence,
+                        "signature": signature,
+                        "targeted_refresh": targeted_refresh,
+                    },
+                    "failed",
+                    error=str(error),
+                )
+            ],
+        )
+
+    def _publish_cached_portal_targeted_refresh(
+        self,
+        *,
+        object_id: str,
+        episode_id: str,
+        observation_stamp: float,
+        frame_id: str,
+        image_sequence: int,
+        signature: str,
+        targeted_refresh: dict,
+        consensus: dict,
+    ) -> None:
+        """Satisfy a stale unknown-state refresh from stable consensus."""
+
+        self._consume_targeted_refresh(targeted_refresh)
+        stable_state = str(consensus.get("stable_state") or "unknown")
+        patch = self._attribute_status_patch(
+            {
+                "object_id": object_id,
+                "frame_id": frame_id,
+                "image_sequence": image_sequence,
+                "signature": signature,
+                "targeted_refresh": targeted_refresh,
+            },
+            "ready",
+        )
+        patch.update(
+            {
+                "coarse_state": stable_state,
+                "portal_state_consensus": dict(consensus),
+                "portal_state_consensus_accepted": True,
+                "is_currently_visible": True,
+                "attribute_resolution_source": "cached_portal_state_consensus",
+            }
+        )
+        self._publish_updates(
+            episode_id,
+            observation_stamp,
+            [patch],
+        )
+
     @classmethod
     def _attribute_status_patch(
         cls, request_payload: dict, status: str, error: str = ""
@@ -1724,6 +2432,18 @@ class InteractionAttributeInferenceNode:
                     ),
                 }
             )
+        if "image_header_seq" in request_payload:
+            patch["observation_image_header_seq"] = int(
+                request_payload.get("image_header_seq", 0) or 0
+            )
+        if "image_size" in request_payload:
+            patch["observation_image_size"] = list(
+                request_payload.get("image_size") or []
+            )
+        if "image_stamp_key" in request_payload:
+            patch["observation_image_stamp_key"] = list(
+                request_payload.get("image_stamp_key") or []
+            )
         return patch
 
     def _publish_discarded_attribute_requests(
@@ -1750,27 +2470,26 @@ class InteractionAttributeInferenceNode:
 
     @staticmethod
     def _observation_stamp(payload: object, fallback: float) -> float:
-        if isinstance(payload, dict):
-            try:
-                return float(payload.get("stamp_sec", fallback) or fallback)
-            except (TypeError, ValueError):
-                pass
-        return float(fallback)
+        return observation_stamp_seconds(payload, fallback)
 
     @staticmethod
     def _capture_step(payload: object) -> int | None:
         """Prefer the evaluator capture step over legacy frame-index aliases."""
 
+        return payload_capture_step(payload) if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _observation_pose_xyyaw(payload: object) -> list[float]:
         if not isinstance(payload, dict):
-            return None
-        value = payload.get("capture_step")
-        if value is None:
-            value = payload.get("frame_index")
+            return []
+        value = payload.get("observation_pose_xyyaw")
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return []
         try:
-            capture_step = int(value)
+            pose = [float(item) for item in value[:3]]
         except (TypeError, ValueError):
-            return None
-        return capture_step if capture_step >= 0 else None
+            return []
+        return pose if all(math.isfinite(item) for item in pose) else []
 
     def _invalidate_if_state_changed(
         self, object_id: str, signature: str, episode_id: str
@@ -1784,6 +2503,10 @@ class InteractionAttributeInferenceNode:
             if pending is None or str(pending.get("signature") or "") == signature:
                 return
             if episode_id and str(pending.get("episode_id") or "") not in {"", episode_id}:
+                return
+            # A decision-bound view owns its result until completion or explicit
+            # cancellation. Background bbox bucket changes are not cancellation.
+            if pending.get("targeted_refresh"):
                 return
             pending_snapshot = dict(pending)
             request_sequence = int(pending.get("request_sequence", 0) or 0)
@@ -1812,6 +2535,132 @@ class InteractionAttributeInferenceNode:
             error="queue_replaced_by_newer_object_evidence",
         )
 
+    @staticmethod
+    def _bbox_iou(
+        left: tuple[int, int, int, int] | None,
+        right: tuple[int, int, int, int] | None,
+    ) -> float:
+        if left is None or right is None:
+            return 0.0
+        left_x0, left_y0, left_x1, left_y1 = left
+        right_x0, right_y0, right_x1, right_y1 = right
+        intersection_x0 = max(left_x0, right_x0)
+        intersection_y0 = max(left_y0, right_y0)
+        intersection_x1 = min(left_x1, right_x1)
+        intersection_y1 = min(left_y1, right_y1)
+        intersection = max(0, intersection_x1 - intersection_x0) * max(
+            0, intersection_y1 - intersection_y0
+        )
+        if intersection <= 0:
+            return 0.0
+        left_area = max(0, left_x1 - left_x0) * max(0, left_y1 - left_y0)
+        right_area = max(0, right_x1 - right_x0) * max(
+            0, right_y1 - right_y0
+        )
+        union = left_area + right_area - intersection
+        return float(intersection / union) if union > 0 else 0.0
+
+    def _portal_m1_visual_readiness(
+        self,
+        object_id: str,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        capture_step: int | None,
+        image_sequence: int,
+        targeted_refresh: bool,
+    ) -> dict:
+        """Gate portal M1 on complete and temporally stable detector evidence."""
+
+        bbox = self._bbox_pixels(image, detection)
+        if bbox is None:
+            return {"ready": False, "reason": "portal_bbox_unavailable"}
+        edges = self._detection_bbox_border_edges(
+            image,
+            detection,
+            margin_px=self.portal_m1_border_margin_px,
+        )
+        sample_index = image_sequence if capture_step is None else capture_step
+        if edges and self.portal_m1_require_full_frame:
+            with self.lock:
+                self.portal_observation_streaks[object_id] = {
+                    "sample_index": int(sample_index),
+                    "bbox": bbox,
+                    "streak": 0,
+                }
+            return {
+                "ready": False,
+                "reason": "portal_visual_evidence_truncated:" + ",".join(edges),
+                "truncated_edges": edges,
+            }
+        # A targeted refresh has already paid for a fresh post-arrival pose.
+        # Requiring a second detector frame here would recreate the timeout
+        # race seen in H7; completeness is the only additional portal gate.
+        if targeted_refresh:
+            return {
+                "ready": True,
+                "reason": "targeted_complete_portal_view",
+                "truncated_edges": edges,
+            }
+        try:
+            explicit_consecutive = int(
+                detection.get("consecutive_observations", 0) or 0
+            )
+        except (TypeError, ValueError):
+            explicit_consecutive = 0
+        if explicit_consecutive > 0:
+            ready = (
+                explicit_consecutive
+                >= self.portal_m1_required_consecutive_observations
+            )
+            if not ready:
+                return {
+                    "ready": False,
+                    "reason": "portal_observation_not_stable",
+                    "consecutive_observations": explicit_consecutive,
+                    "required_consecutive_observations": (
+                        self.portal_m1_required_consecutive_observations
+                    ),
+                }
+            return {
+                "ready": True,
+                "reason": "detector_consecutive_observations",
+                "consecutive_observations": explicit_consecutive,
+            }
+        with self.lock:
+            previous = dict(self.portal_observation_streaks.get(object_id) or {})
+            previous_sample = previous.get("sample_index")
+            previous_streak = int(previous.get("streak", 0) or 0)
+            # Exact RGB pairing already protects frame identity. During a scan,
+            # camera motion shifts a consistently tracked door's box; overlap
+            # is not a measure of whether that door was observed consecutively.
+            same_observation = (
+                previous_sample is not None
+                and 0 < int(sample_index) - int(previous_sample) <= 2
+            )
+            if previous_sample is not None and int(sample_index) == int(previous_sample):
+                return {"ready": False, "reason": "duplicate_portal_observation"}
+            streak = previous_streak + 1 if same_observation else 1
+            self.portal_observation_streaks[object_id] = {
+                "sample_index": int(sample_index),
+                "bbox": bbox,
+                "streak": streak,
+            }
+        if streak < self.portal_m1_required_consecutive_observations:
+            return {
+                "ready": False,
+                "reason": "portal_observation_not_stable",
+                "consecutive_observations": streak,
+                "required_consecutive_observations": (
+                    self.portal_m1_required_consecutive_observations
+                ),
+            }
+        return {
+            "ready": True,
+            "reason": "local_consecutive_observations",
+            "consecutive_observations": streak,
+        }
+
     def _passes_observation_filter(self, detection: dict) -> bool:
         if not is_interaction_attribute_candidate(
             detection, self.include_keywords, self.exclude_keywords
@@ -1834,7 +2683,14 @@ class InteractionAttributeInferenceNode:
             area = bbox_area(box)
             visible_fraction = min(1.0, visible_pixels / area) if area > 0.0 else 0.0
         visible_fraction = float(visible_fraction or 0.0)
-        if visible_fraction < self.min_visible_fraction:
+        # A resolved doorway frame need not fill the area of its aperture.
+        portal_frame = (
+            self._is_portal_detection(detection)
+            and isinstance(box, (list, tuple)) and len(box) >= 4
+            and min(abs(float(box[2]) - float(box[0])), abs(float(box[3]) - float(box[1]))) >= 8
+            and visible_pixels >= 8 * max(abs(float(box[2]) - float(box[0])), abs(float(box[3]) - float(box[1])))
+        )
+        if visible_fraction < self.min_visible_fraction and not portal_frame:
             return False
         if visible_pixels < self.min_visible_pixels:
             return False
@@ -2013,15 +2869,68 @@ class InteractionAttributeInferenceNode:
         score += max(0.0, self.max_distance_m - distance_m)
         return score
 
-    def _try_reserve(self, object_id: str, signature: str) -> dict | None:
+    def _m1_budget_error_locked(self, object_id: str, *, targeted: bool) -> str:
+        """Check the per-episode call cap and consecutive failure retry cap."""
+
+        max_calls = max(1, int(getattr(self, "max_calls_per_object", 10)))
+        reserve = min(
+            max_calls - 1, max(0, int(getattr(self, "targeted_call_reserve", 2)))
+        )
+        calls = getattr(self, "m1_call_counts", {}).get(object_id, 0)
+        failures = getattr(self, "m1_failure_streaks", {}).get(object_id, 0)
+        if calls >= max_calls:
+            return "m1_call_budget_exhausted"
+        if failures > max(0, int(getattr(self, "max_failure_retries_per_object", 2))):
+            return "m1_failure_retry_exhausted"
+        if not targeted and calls >= max_calls - reserve:
+            return "m1_discovery_budget_exhausted"
+        return ""
+
+    def _claim_m1_call(
+        self,
+        object_id: str,
+        episode_id: str,
+        generation: int,
+        request_sequence: int,
+        *,
+        targeted: bool,
+    ) -> tuple[int, str]:
+        """Charge only a real model submission, atomically across M1 workers."""
+
+        with self.lock:
+            if not self._is_current_request_locked(
+                object_id, episode_id, generation, request_sequence
+            ):
+                return 0, "stale"
+            error = self._m1_budget_error_locked(object_id, targeted=targeted)
+            if error:
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                return 0, error
+            counts = getattr(self, "m1_call_counts", None)
+            if counts is None:
+                counts = self.m1_call_counts = {}
+            call_index = counts.get(object_id, 0) + 1
+            counts[object_id] = call_index
+            return call_index, ""
+
+    def _try_reserve(
+        self, object_id: str, signature: str, *, portal_confirmation: bool = False
+    ) -> dict | None:
         if not object_id:
             return None
         now = time.monotonic()
         with self.lock:
+            if self._m1_budget_error_locked(object_id, targeted=False):
+                self.filter_counts["budget_suppressed"] = (
+                    self.filter_counts.get("budget_suppressed", 0) + 1
+                )
+                return None
             if object_id in self.pending:
                 return None
             completed = self.completed.get(object_id)
-            if completed is not None:
+            if not portal_confirmation and completed is not None:
                 # A small detector-box jitter must not invalidate a successful
                 # semantic answer.  Previously the refresh interval was only
                 # applied when the raw/coarse view signature was identical;
@@ -2041,9 +2950,8 @@ class InteractionAttributeInferenceNode:
                     or 0.0
                 )
                 if (
-                    refresh_interval_s > 0.0
-                    and now - float(completed.get("completed_at", 0.0))
-                    < refresh_interval_s
+                    refresh_interval_s <= 0.0
+                    or now - float(completed.get("completed_at", 0.0)) < refresh_interval_s
                 ):
                     return None
             if now - self.last_request.get(object_id, 0.0) < self.min_interval_s:
@@ -2097,6 +3005,10 @@ class InteractionAttributeInferenceNode:
             )
             if current:
                 self.pending.pop(object_id, None)
+                streaks = getattr(self, "m1_failure_streaks", None)
+                if streaks is None:
+                    streaks = self.m1_failure_streaks = {}
+                streaks[object_id] = streaks.get(object_id, 0) + 1
             self.filter_counts["expired"] = self.filter_counts.get("expired", 0) + 1
         if current:
             failure_payload = {
@@ -2146,27 +3058,52 @@ class InteractionAttributeInferenceNode:
             )
             if current:
                 self.room_pending.pop(room_key, None)
+                previous = self.room_failures.get(room_key) or {}
+                self.room_failures[room_key] = {
+                    "signature": str(request_payload.get("signature") or ""),
+                    "failed_at": now,
+                    "attempts": int(previous.get("attempts", 0) or 0) + 1,
+                    "error": "queue_deadline_expired_before_send",
+                    "request_sequence": request_sequence,
+                }
             self.room_counts["expired"] = self.room_counts.get("expired", 0) + 1
         if current:
             request_payload = dict(request_payload)
             enqueued_at = float(request_payload.get("enqueued_at", now) or now)
             stamp = float(request_payload.get("stamp", time.time()) or time.time())
-            self._publish_room_updates(
-                episode_id,
-                stamp,
-                [
-                    self._room_status_patch(
-                        request_payload,
-                        "failed",
-                        error="queue_deadline_expired_before_send",
-                    )
-                    | {
-                        "queue_lag_sec": max(0.0, now - enqueued_at),
-                        "response_lag_sec": 0.0,
-                        "total_lag_sec": max(0.0, now - enqueued_at),
-                    }
-                ],
-            )
+            try:
+                fallback_patch = self._room_fallback_patch(
+                    request_payload,
+                    request_payload.get("objects") or [],
+                    error="queue_deadline_expired_before_send",
+                    queue_lag_sec=max(0.0, now - enqueued_at),
+                    request_started=now,
+                    enqueued_at=enqueued_at,
+                )
+            except Exception as fallback_error:
+                rospy.logwarn_throttle(
+                    5.0, "room fallback inference failed: %s", fallback_error
+                )
+                fallback_patch = None
+            if fallback_patch is not None:
+                self._publish_room_updates(episode_id, stamp, [fallback_patch])
+            else:
+                self._publish_room_updates(
+                    episode_id,
+                    stamp,
+                    [
+                        self._room_status_patch(
+                            request_payload,
+                            "failed",
+                            error="queue_deadline_expired_before_send",
+                        )
+                        | {
+                            "queue_lag_sec": max(0.0, now - enqueued_at),
+                            "response_lag_sec": 0.0,
+                            "total_lag_sec": max(0.0, now - enqueued_at),
+                        }
+                    ],
+                )
         self._publish_status()
 
     def _worker_loop(self) -> None:
@@ -2176,7 +3113,16 @@ class InteractionAttributeInferenceNode:
                 continue
             request_payload.pop("priority", None)
             if self._remaining_request_timeout(
-                request_payload.get("deadline_monotonic"), self.request_timeout_s
+                request_payload.get("deadline_monotonic"),
+                (
+                    getattr(
+                        self,
+                        "targeted_refresh_timeout_s",
+                        self.request_timeout_s,
+                    )
+                    if request_payload.get("targeted_refresh")
+                    else self.request_timeout_s
+                ),
             ) <= 0.0:
                 self._expire_attribute_request(request_payload)
                 continue
@@ -2282,10 +3228,14 @@ class InteractionAttributeInferenceNode:
         targeted_refresh: dict,
         deadline_monotonic: float | None = None,
         raw_image: np.ndarray | None = None,
+        image_header_seq: int = 0,
+        image_size: list[int] | None = None,
+        image_stamp_key: list[int] | None = None,
         visual_evidence_history: list[np.ndarray] | None = None,
         evidence_frame_ids: list[str] | None = None,
         evidence_capture_steps: list[int] | None = None,
         evidence_observation_pose_xyyaw: list[list[float]] | None = None,
+        evidence_view_metadata: list[dict] | None = None,
         target_bbox_containment: dict | None = None,
     ) -> None:
         request_started = time.monotonic()
@@ -2305,19 +3255,66 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
-            image_data_sequence: list[str] = []
-            for evidence_image in [*list(visual_evidence_history or []), visual_evidence]:
-                encoded = self._encode_jpeg(
-                    self._resize_visual_evidence(
-                        evidence_image, self.visual_evidence_max_side_px
+            self._publish_updates(episode_id, stamp, [self._attribute_status_patch(
+                {"object_id": object_id, "frame_id": frame_id,
+                 "request_sequence": request_sequence, "targeted_refresh": targeted_refresh},
+                "in_flight",
+            )])
+            evidence_images = [
+                *list(visual_evidence_history or []),
+                visual_evidence,
+            ][-2:]
+            montage = self._compose_multiview_montage(evidence_images)
+            if montage is None:
+                return
+            encoded = self._encode_jpeg(
+                self._resize_visual_evidence(
+                    montage, self.visual_evidence_max_side_px
+                )
+            )
+            if not encoded:
+                return
+            # OpenAI-compatible local endpoints commonly accept at most one
+            # image per prompt.  Multi-view evidence is therefore transported
+            # as one chronological left-to-right montage.
+            image_data_sequence = [
+                "data:image/jpeg;base64,"
+                + __import__("base64").b64encode(encoded).decode("ascii")
+            ]
+            panel_count = len(evidence_images)
+            normalized_view_metadata = [
+                dict(item)
+                for item in list(evidence_view_metadata or [])[-panel_count:]
+                if isinstance(item, dict)
+            ]
+            if len(normalized_view_metadata) != panel_count:
+                normalized_view_metadata = []
+                poses = list(evidence_observation_pose_xyyaw or [])[-panel_count:]
+                steps = list(evidence_capture_steps or [])[-panel_count:]
+                frames = list(evidence_frame_ids or [])[-panel_count:]
+                for index in range(panel_count):
+                    normalized_view_metadata.append(
+                        {
+                            "view_id": f"view_{index + 1}",
+                            "frame_id": frames[index] if index < len(frames) else "",
+                            "capture_step": steps[index] if index < len(steps) else None,
+                            "observation_pose_xyyaw": (
+                                poses[index] if index < len(poses) else []
+                            ),
+                            "anchor_face_id": "",
+                            "anchor_face_index": None,
+                            "anchor_face_axis_xy": [],
+                        }
                     )
-                )
-                if not encoded:
-                    return
-                image_data_sequence.append(
-                    "data:image/jpeg;base64,"
-                    + __import__("base64").b64encode(encoded).decode("ascii")
-                )
+            view_ids = [str(item["view_id"]) for item in normalized_view_metadata]
+            # The newest/rightmost panel is the only action-authorizing view.
+            # Older panels provide comparison context, but asking the model to
+            # choose a dynamic view enum caused the local structured decoder to
+            # emit whitespace until its token budget was exhausted.  Keeping
+            # selection deterministic also guarantees that visual frontality
+            # is bound to the pose and AABB face currently occupied by the
+            # robot, never to a stale historical observation.
+            authoritative_view_id = view_ids[-1]
             raw_input_encoded = self._encode_jpeg(
                 self._resize_visual_evidence(
                     raw_image if isinstance(raw_image, np.ndarray) else visual_evidence,
@@ -2356,7 +3353,14 @@ class InteractionAttributeInferenceNode:
                 getattr(self, "include_detector_class_hypothesis", False)
             )
             remaining_timeout_s = self._remaining_request_timeout(
-                deadline_monotonic, self.request_timeout_s
+                deadline_monotonic,
+                getattr(
+                    self,
+                    "targeted_refresh_timeout_s",
+                    self.request_timeout_s,
+                )
+                if targeted_refresh
+                else self.request_timeout_s,
             )
             if remaining_timeout_s <= 0.0:
                 deadline_expired = True
@@ -2421,12 +3425,12 @@ class InteractionAttributeInferenceNode:
             )
             portal_full_frame = self._is_portal_detection(detection)
             visual_layout_instruction = (
-                "Each image is the complete head-camera image with only a target outline; "
+                "Each panel is the complete head-camera image with only an expanded target outline; "
                 "there is no crop inset. Judge the whole door leaf, frame, aperture, and "
                 "surrounding wall context together. "
                 if portal_full_frame
                 else (
-                    "Each composite shows the complete head-camera image, a target outline, "
+                    "Each panel shows the complete head-camera image, an expanded target outline, "
                     "and a padded target crop inset. "
                 )
             )
@@ -2443,11 +3447,14 @@ class InteractionAttributeInferenceNode:
                 (
                     expected_type_instruction,
                     hypothesis_instruction,
-                    "Infer the outlined target's pre-interaction visual attributes using "
-                    "only pixels in the supplied composite image sequence. Images are ordered "
-                    "from older to newest and come only from materially separated robot views; "
-                    "the newest image is authoritative for approach_ready and action_regions, "
-                    "while older images only corroborate which physical surface is the front. "
+                    "Infer the outlined target's pre-interaction visual attributes using only "
+                    f"pixels in the single supplied montage. It contains exactly {panel_count} "
+                    f"panel(s), ordered left-to-right as {', '.join(view_ids)} from older to "
+                    "newest. The panels come only from materially separated robot views. "
+                    f"The newest/rightmost panel, {authoritative_view_id}, is the evaluated "
+                    "candidate view. Older panels are comparison context only and must never "
+                    "authorize an action. view_state, approach_ready, and action_regions describe "
+                    f"only {authoritative_view_id}. "
                     "Every image passed a target-mask-inside-outline check. ",
                     visual_layout_instruction,
                     "Do not use generic names such as object or thing when "
@@ -2460,9 +3467,9 @@ class InteractionAttributeInferenceNode:
                     "needs_reobserve, action_regions, interaction_parts, and confidence. ",
                     class_instruction,
                     portal_instruction,
-                    "view_state is front, oblique, side_or_back, occluded, or unknown and "
-                    "describes only the newest camera view of the outlined target. A historical "
-                    "front view must never make a side/oblique newest view approach_ready. Judge "
+                    "view_state is front, oblique, side_or_back, occluded, or unknown and describes "
+                    f"only {authoritative_view_id}. Never mix the appearance of one panel with another "
+                    "panel's pose or face. Judge "
                     "frontality primarily from the target's horizontal perspective: use front "
                     "for a nearly head-on, broad usable face whose left/right extent and visible "
                     "drawer or door fronts/handles face the camera without a dominant receding "
@@ -2480,7 +3487,8 @@ class InteractionAttributeInferenceNode:
                     "direct front view; an oblique, side_or_back, occluded, or unknown view "
                     "must set approach_ready false and needs_reobserve true. "
                     "action_regions is an ordered list of visible actionable centers, in "
-                    "normalized coordinates of the padded target-crop inset (x=0 left, y=0 top). "
+                    f"normalized coordinates of {authoritative_view_id}'s padded target-crop inset "
+                    "(x=0 left, y=0 top). "
                     "For a visibly front-facing drawer-like container, include each visible "
                     "drawer front or handle from top to bottom. A vertically clipped lower "
                     "drawer does not invalidate frontality, but include only action regions "
@@ -2493,6 +3501,19 @@ class InteractionAttributeInferenceNode:
                     "markdown, explanations, geometry, axes, ranges, trajectories, or extra keys.",
                 )
             )
+            call_index, budget_error = self._claim_m1_call(
+                object_id,
+                episode_id,
+                generation,
+                request_sequence,
+                targeted=bool(targeted_refresh),
+            )
+            if budget_error:
+                if budget_error == "stale":
+                    outcome_status = "stale"
+                else:
+                    outcome_error = budget_error
+                return
             model_call_started = True
             response = self.client.request_json(
                 role="attribute_inference",
@@ -2511,7 +3532,7 @@ class InteractionAttributeInferenceNode:
                 },
                 images=image_data_sequence,
                 response_schema=build_attribute_patch_response_schema(
-                    "target", expected_node_type=None
+                    "target", expected_node_type=(None if include_detector_hypothesis else expected_node_type or None)
                 ),
                 timeout_s=remaining_timeout_s,
                 max_tokens=self.max_output_tokens,
@@ -2521,10 +3542,18 @@ class InteractionAttributeInferenceNode:
                     "observation_frame_index": self._frame_index(frame_id),
                     "observation_capture_step": self._frame_index(frame_id),
                     "observation_image_sequence": int(image_sequence),
+                    "observation_image_header_seq": int(image_header_seq or 0),
+                    "observation_image_size": list(image_size or []),
+                    "observation_image_stamp_key": list(image_stamp_key or []),
                     "request_sequence": request_sequence,
+                    "m1_object_call_index": call_index,
+                    "m1_object_call_limit": getattr(self, "max_calls_per_object", 10),
                     "queue_lag_sec": queue_lag_sec,
                     "targeted_refresh": bool(targeted_refresh),
-                    "m1_evidence_image_count": len(image_data_sequence),
+                    "m1_evidence_image_count": panel_count,
+                    "m1_transport_image_count": len(image_data_sequence),
+                    "m1_montage_panel_count": panel_count,
+                    "m1_evidence_views": normalized_view_metadata,
                     "m1_evidence_capture_steps": list(evidence_capture_steps or []),
                     "m1_evidence_observation_pose_xyyaw": list(
                         evidence_observation_pose_xyyaw or []
@@ -2567,6 +3596,47 @@ class InteractionAttributeInferenceNode:
                 # Keep the planner hypothesis for diagnostics, but never
                 # overwrite M1's visual class decision.
                 patch["m1_expected_node_type"] = "container"
+            selected_view = normalized_view_metadata[-1]
+            patch["selected_view_id"] = authoritative_view_id
+            if container_refresh:
+                front_confidence = min(
+                    float(patch.get("view_state_confidence", 0.0) or 0.0),
+                    float(patch.get("front_surface_confidence", 0.0) or 0.0),
+                )
+                front_confirmed = bool(
+                    patch.get("view_state") == "front"
+                    and patch.get("front_surface_visible")
+                    and front_confidence
+                    >= float(
+                        getattr(
+                            self,
+                            "targeted_front_confirmation_min_confidence",
+                            0.80,
+                        )
+                    )
+                )
+                patch["m1_front_confirmed"] = front_confirmed
+                patch["m1_front_confirmation_confidence"] = front_confidence
+                # A low-confidence apparent front is precisely the case for
+                # which a second materially different panel is useful.  It may
+                # not authorize the physical approach on its own.
+                if not front_confirmed:
+                    patch["approach_ready"] = False
+                    patch["needs_reobserve"] = True
+                    patch["action_regions"] = []
+            if container_refresh and not include_detector_hypothesis and patch.get("interaction_class") != "container":
+                # A compatible endpoint should enforce the strict schema.  Keep
+                # this response-side guard for older/command backends: preserve
+                # its image-derived state/frontality, but never let a targeted
+                # container refresh turn into a portal update.
+                patch["m1_reported_interaction_class"] = str(
+                    patch.get("interaction_class") or "unknown"
+                )
+                patch["interaction_class"] = "container"
+                if str(patch.get("coarse_state") or "").casefold() == "static_open":
+                    patch["coarse_state"] = "unknown"
+                patch.pop("portal_morphology", None)
+                patch.pop("portal_aperture_evidence", None)
             refresh_interval_s = self._attribute_refresh_interval(detection, patch)
             m1_recheck_required = bool(patch.get("m1_recheck_required", False))
             with self.lock:
@@ -2589,6 +3659,9 @@ class InteractionAttributeInferenceNode:
                     "observation_frame_index": self._frame_index(frame_id),
                     "observation_capture_step": self._frame_index(frame_id),
                     "observation_image_sequence": int(image_sequence),
+                    "observation_image_header_seq": int(image_header_seq or 0),
+                    "observation_image_size": list(image_size or []),
+                    "observation_image_stamp_key": list(image_stamp_key or []),
                     "observation_signature": signature,
                     "source": "mllm_attribute_inference",
                     "model_name": self.client.config.model,
@@ -2597,7 +3670,24 @@ class InteractionAttributeInferenceNode:
                     "evidence_observation_pose_xyyaw": list(
                         evidence_observation_pose_xyyaw or []
                     ),
-                    "m1_evidence_image_count": len(image_data_sequence),
+                    "m1_evidence_image_count": panel_count,
+                    "m1_transport_image_count": len(image_data_sequence),
+                    "m1_montage_panel_count": panel_count,
+                    "m1_evidence_views": normalized_view_metadata,
+                    "selected_evidence_capture_step": selected_view.get("capture_step"),
+                    "selected_evidence_frame_id": str(selected_view.get("frame_id") or ""),
+                    "selected_evidence_observation_pose_xyyaw": list(
+                        selected_view.get("observation_pose_xyyaw") or []
+                    )[:3],
+                    "selected_evidence_anchor_face_id": str(
+                        selected_view.get("anchor_face_id") or ""
+                    ),
+                    "selected_evidence_anchor_face_index": selected_view.get(
+                        "anchor_face_index"
+                    ),
+                    "selected_evidence_anchor_face_axis_xy": list(
+                        selected_view.get("anchor_face_axis_xy") or []
+                    )[:2],
                     "target_bbox_containment": dict(target_bbox_containment or {}),
                     "m1_detector_class_hypothesis": semantic_label,
                     "request_sequence": request_sequence,
@@ -2639,7 +3729,32 @@ class InteractionAttributeInferenceNode:
                     "ready",
                 )
             )
-            self._publish_updates(episode_id, stamp, [patch])
+            # Re-check under the request-state lock and publish the consensus
+            # vote atomically with respect to detection-driven invalidation.
+            # Otherwise a superseded response can consume the third vote and
+            # start cooldown even though graph freshness rejects its patch.
+            with self.lock:
+                if not self._is_current_request_locked(
+                    object_id, episode_id, generation, request_sequence
+                ):
+                    outcome_status = "stale"
+                    return
+                if self._is_portal_detection(detection):
+                    consensus = self.portal_state_consensus.observe(
+                        object_id,
+                        patch.get("coarse_state"),
+                        capture_step=selected_view.get("capture_step"),
+                        observation_pose_xyyaw=selected_view.get(
+                            "observation_pose_xyyaw"
+                        ),
+                    )
+                    patch["portal_state_consensus"] = consensus
+                    patch["portal_state_consensus_accepted"] = bool(
+                        consensus.get("accepted")
+                    )
+                    if consensus.get("accepted") and consensus.get("stable_state"):
+                        patch["coarse_state"] = str(consensus["stable_state"])
+                self._publish_updates(episode_id, stamp, [patch])
             succeeded = True
         except Exception as exc:
             outcome_error = str(exc)
@@ -2660,6 +3775,7 @@ class InteractionAttributeInferenceNode:
                         m1_recheck_required
                         or previous_completed.get("m1_recheck_required")
                     )
+                    getattr(self, "m1_failure_streaks", {}).pop(object_id, None)
                     self.completed[object_id] = {
                         "signature": signature,
                         "completed_at": time.monotonic(),
@@ -2675,6 +3791,11 @@ class InteractionAttributeInferenceNode:
                 elif (
                     current_request
                 ):
+                    if model_call_started or deadline_expired:
+                        streaks = getattr(self, "m1_failure_streaks", None)
+                        if streaks is None:
+                            streaks = self.m1_failure_streaks = {}
+                        streaks[object_id] = streaks.get(object_id, 0) + 1
                     publish_status = True
             if publish_status:
                 failure_payload = {
@@ -2721,6 +3842,7 @@ class InteractionAttributeInferenceNode:
         room_key: str,
         room_id: int,
         room_node_id: str,
+        room_box: dict,
         objects: list[dict],
         episode_id: str,
         capture_step: int | None,
@@ -2775,8 +3897,9 @@ class InteractionAttributeInferenceNode:
             response = self.client.request_json(
                 role="room_attribute_inference",
                 instruction=(
-                    "Infer the likely room attribute using only the supplied room ID and "
-                    "its currently known in-room object labels. Return exactly one compact, "
+                    "Infer the likely room attribute primarily from its in-room object labels; "
+                    "use the XY room box only as coarse size context, not as proof of room type. "
+                    "Return exactly one compact, "
                     "single-line JSON object with only room_id, room_attribute, confidence, "
                     "and evidence_object_ids. Include at most two strongest evidence_object_ids. "
                     "Do not assume an image was provided. Do not "
@@ -2786,6 +3909,7 @@ class InteractionAttributeInferenceNode:
                 ),
                 context={
                     "room_id": int(room_id),
+                    "room_box": room_box,
                     "capture_step": capture_step,
                     "objects": objects,
                     "episode_id": episode_id,
@@ -2842,6 +3966,7 @@ class InteractionAttributeInferenceNode:
             rospy.logwarn_throttle(5.0, "room attribute inference failed: %s", exc)
         finally:
             publish_status = False
+            fallback_patch = None
             with self.lock:
                 current_request = self._is_current_room_request_locked(
                     room_key, episode_id, generation, request_sequence
@@ -2856,9 +3981,43 @@ class InteractionAttributeInferenceNode:
                         "completed_at": time.monotonic(),
                         "request_sequence": request_sequence,
                     }
+                    self.room_failures.pop(room_key, None)
                 elif current_request:
+                    previous = self.room_failures.get(room_key) or {}
+                    self.room_failures[room_key] = {
+                        "signature": signature,
+                        "failed_at": time.monotonic(),
+                        "attempts": int(previous.get("attempts", 0) or 0) + 1,
+                        "error": str(outcome_error)[:240],
+                        "request_sequence": request_sequence,
+                    }
                     publish_status = True
-            if publish_status:
+                    if outcome_status != "stale":
+                        try:
+                            fallback_patch = self._room_fallback_patch(
+                                request_payload,
+                                objects,
+                                error=outcome_error or outcome_status,
+                                queue_lag_sec=queue_lag_sec,
+                                request_started=request_started,
+                                enqueued_at=enqueued_at,
+                            )
+                        except Exception as fallback_error:
+                            rospy.logwarn_throttle(
+                                5.0,
+                                "room fallback inference failed: %s",
+                                fallback_error,
+                            )
+            if fallback_patch is not None:
+                # Publish the fallback as a ready room patch.  The mapper
+                # records it as a fallback (and keeps the room dirty), while
+                # the failure cooldown admits a later MLLM refresh.
+                self._publish_room_updates(
+                    episode_id,
+                    float(stamp),
+                    [fallback_patch],
+                )
+            elif publish_status:
                 self._publish_room_updates(
                     episode_id,
                     float(stamp),
@@ -3022,6 +4181,74 @@ class InteractionAttributeInferenceNode:
             return None
         return image[y0:y1, x0:x1]
 
+    @classmethod
+    def _expanded_visual_bbox_pixels(
+        cls,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        horizontal_ratio: float = 0.30,
+        vertical_ratio: float = 0.20,
+        minimum_margin_px: int = 24,
+    ) -> tuple[int, int, int, int] | None:
+        """Expand the detector box for M1 without changing detector geometry."""
+
+        bbox = cls._bbox_pixels(image, detection)
+        if bbox is None:
+            return None
+        height, width = image.shape[:2]
+        left, top, right, bottom = bbox
+        margin_x = max(
+            int(minimum_margin_px),
+            int(round((right - left) * max(0.0, float(horizontal_ratio)))),
+        )
+        margin_y = max(
+            int(minimum_margin_px),
+            int(round((bottom - top) * max(0.0, float(vertical_ratio)))),
+        )
+        left = max(0, left - margin_x)
+        right = min(width, right + margin_x)
+        top = max(0, top - margin_y)
+        bottom = min(height, bottom + margin_y)
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
+    @classmethod
+    def _compose_multiview_montage(
+        cls, evidence_images: list[np.ndarray]
+    ) -> np.ndarray | None:
+        """Place at most two full-frame observations in one transport image.
+
+        Panels are chronological and read left-to-right as VIEW_1, VIEW_2.  The
+        prompt carries that mapping explicitly, so the image needs no text that
+        could cover scene pixels.  A narrow white separator makes the boundary
+        unambiguous without obscuring either panel.
+        """
+
+        panels = [
+            image
+            for image in list(evidence_images or [])[-2:]
+            if isinstance(image, np.ndarray) and image.ndim == 3 and image.size
+        ]
+        if not panels:
+            return None
+        if len(panels) == 1:
+            return panels[0].copy()
+        target_height = max(int(panel.shape[0]) for panel in panels)
+        resized: list[np.ndarray] = []
+        for panel in panels:
+            panel_height, panel_width = panel.shape[:2]
+            width = max(1, int(round(panel_width * target_height / panel_height)))
+            resized.append(cls._resize_nearest(panel, width, target_height))
+        separator_width = max(4, target_height // 120)
+        separator = np.full(
+            (target_height, separator_width, resized[0].shape[2]),
+            255,
+            dtype=resized[0].dtype,
+        )
+        return np.concatenate((resized[0], separator, resized[1]), axis=1)
+
     @staticmethod
     def _resize_nearest(image: np.ndarray, width: int, height: int) -> np.ndarray:
         """Resize without making M1 depend on an OpenCV-enabled ROS build."""
@@ -3107,8 +4334,8 @@ class InteractionAttributeInferenceNode:
 
         if not isinstance(image, np.ndarray) or image.ndim != 3:
             return None
-        bbox = cls._bbox_pixels(image, detection)
-        crop = cls._crop(image, detection, margin_ratio=margin_ratio)
+        bbox = cls._expanded_visual_bbox_pixels(image, detection)
+        crop = None if bbox is None else image[bbox[1] : bbox[3], bbox[0] : bbox[2]]
         if bbox is None or (include_crop_inset and (crop is None or crop.size == 0)):
             return None
         composite = image.copy()

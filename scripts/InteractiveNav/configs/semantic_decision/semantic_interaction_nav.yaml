@@ -1,6 +1,11 @@
+# LatchedStopRotateController reads the move_base private namespace, not DWA's.
+latch_xy_goal_tolerance: true
+
 GlobalPlanner:
   allow_unknown: false
-  orientation_mode: 3
+  # OrientedGlobalPlanner owns tangent/terminal yaw. Noetic mode 3 indexes n-3
+  # without guarding two-point paths and can corrupt memory on same-XY plans.
+  orientation_mode: 0
   orientation_window_size: 8
 
 DWAPlannerROS:

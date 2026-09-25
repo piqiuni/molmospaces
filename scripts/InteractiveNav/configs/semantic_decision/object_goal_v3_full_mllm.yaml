@@ -13,8 +13,13 @@ target:
   completion_requires_visibility: true
 
 candidate:
+  frontier_center_fallback_enabled: true
+  navigation_clearance_enabled: true
   # V3 object-goal constraints.
-  target_require_current_visibility: false
+  # A target claim must be backed by the current perception frame.  Historical
+  # graph evidence is still useful for planning, but cannot terminate an
+  # episode after the robot has moved away from the target.
+  target_require_current_visibility: true
   target_require_same_room: false
   target_allow_connected_room: true
   target_min_visible_pixels: 128
@@ -34,19 +39,22 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   container_action_standoff_m: 0.50
-  drawer_action_standoff_m: 0.50
+  # The drawer can travel about 0.35 m toward the robot.  Keep the action and
+  # M1 capture poses 0.70 m outside the closed AABB surface, leaving room for
+  # the 0.25 m base radius and a small residual margin after opening.
+  drawer_action_standoff_m: 0.70
   fridge_action_standoff_m: 1.15
   container_m1_face_selection_enabled: true
   fridge_multiview_angular_scale: 1.0
   container_m1_capture_standoff_m: 0.50
-  drawer_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.70
   fridge_m1_capture_standoff_m: 1.15
   container_navigation_anchor_outer_offset_m: 0.35
   container_navigation_anchor_ring_count: 3
   container_navigation_anchor_tangent_offset_m: 0.20
   container_anchor_shared_pose_enabled: true
   drawer_navigation_anchor_aabb_fan_enabled: true
-  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_clearances_m: [0.70, 0.85, 1.00]
   drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
   fridge_navigation_anchor_aabb_fan_enabled: true
   fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
@@ -59,11 +67,9 @@ candidate:
   container_safe_staging_arrival_tolerance_m: 0.15
   container_interaction_ready_distance_m: 0.15
   container_action_lateral_offset_m: 0.22
-  # Do not turn the graph's initial unknown/default portal state into an
-  # OPEN action.  The asynchronous Module 1 object lane must first classify
-  # the visible door; a ready-but-unknown classification is also non-actionable.
-  portal_require_attribute_ready: true
-  portal_allow_unknown_state: false
+  # Match the native portal candidate/observation flow.
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
   remembered_portal_reobservation_enabled: true
   # Keep the channel interaction pose contract identical to the ordinary
   # full-MLLM navigation profile.  ``portal_standoff_m`` is measured from the
@@ -71,6 +77,8 @@ candidate:
   # while ``interaction_ready_distance_m`` is only arrival error around that
   # stance.
   portal_standoff_m: 0.85
+  portal_allow_opposite_side_interaction: false
+  portal_interaction_front_angle_tolerance_rad: 0.15
   interaction_safety_margin_m: 0.10
   interaction_ready_distance_m: 0.25
   interaction_ready_yaw_tolerance_rad: 0.20
@@ -107,8 +115,16 @@ model:
   # Empty makes the executor use SEMANTIC_MODEL_NAME from the secure env file
   # instead of overriding it with the default config's local model name.
   model: ""
+  # M2 is text-only and may use a stronger/slower OpenAI-compatible model than
+  # visual M1/M3 through SEMANTIC_M2_*.  Keep its wall-clock budget independent
+  # and retry only one explicit timeout with a short exponential backoff.
   timeout_s: 12.0
-  max_tokens: 384
+  timeout_retry_count: 1
+  timeout_retry_backoff_s: 1.0
+  # M2 reasons internally through evidence/dependencies/compatibility; only the
+  # final compact ranking JSON enters the executor. Tokens include reasoning.
+  selection_reasoning_effort: "low"
+  max_tokens: 1536
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   # Curate with observation-derived semantic/topological priors before asking
@@ -118,10 +134,11 @@ model:
   force_unentered_room_exploration: true
   skill_timeout_s: 12.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 12.0
+  verification_timeout_s: 10.0
   verification_max_output_tokens: 256
 
 completion:
+  require_goal_verification: true
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
 
@@ -136,6 +153,7 @@ topics:
   global_costmap_updates: "/move_base/global_costmap/costmap_updates"
 
 executor:
+  container_anchor_blocked_confirmation_task_steps: 3
   container_m1_same_pose_flip_retry_count: 0
   # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
   # opaque and is expanded privately into low-view open-observe-close steps.
@@ -148,16 +166,17 @@ executor:
   # Container observation/navigation remains the ordinary implementation.  V3
   # changes only the opaque force boundary and its result wait below.
   interaction_observation_timeout_s: 12.0
+  interaction_fallback_on_m1_failure: true
   interaction_observation_same_pose_samples_per_view: 1
   interaction_observation_max_viewpoints: 3
   interaction_observation_max_total_requests: 3
   container_m1_capture_yaw_tolerance_rad: 0.5235987756
-  container_m1_distinct_view_arrival_tolerance_m: 0.05
-  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.08
+  container_m1_distinct_view_arrival_tolerance_m: 0.15
+  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.20
   container_m1_capture_dwa_profile_enabled: true
   container_m1_capture_dwa_reconfigure_server: "/move_base/DWAPlannerROS"
   container_m1_capture_dwa_reconfigure_timeout_s: 1.0
-  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 100
   container_m1_capture_successor_quiescence_timeout_s: 1.0
   move_base_successor_quiescence_timeout_s: 1.0
   container_outer_staging_abort_replan_global_costmap_wait_s: 1.0
@@ -185,6 +204,7 @@ executor:
   rear_goal_prerotate_step_sync_enabled: true
   rear_goal_prerotate_control_dt_s: 0.2
   rear_goal_prerotate_max_control_steps: 28
+  rear_goal_prerotate_control_step_margin_steps: 4
   rear_goal_prerotate_post_budget_settle_steps: 3
   rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
   rear_goal_local_costmap_max_age_s: 0.75
@@ -208,14 +228,14 @@ executor:
   semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
-  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_step_sync_stall_timeout_s: 30.0
   navigation_stagnation_post_rotation_grace_s: 15.0
   interaction_final_align_enabled: true
   interaction_final_align_max_distance_m: 0.35
   interaction_final_align_yaw_tolerance_rad: 0.15
   interaction_final_align_rotate_speed_rad_s: 0.30
   interaction_final_align_timeout_s: 15.0
-  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 100
   interaction_final_align_step_sync_enabled: true
   interaction_final_align_control_dt_s: 0.2
   interaction_final_align_max_control_steps: 56

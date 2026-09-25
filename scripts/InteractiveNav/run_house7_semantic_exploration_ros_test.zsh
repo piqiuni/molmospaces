@@ -15,9 +15,16 @@ REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 ROUTE_CONFIG=${ROUTE_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_routes.yaml}
 VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
 RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
+RAW_TOPDOWN_RENDERER=${RAW_TOPDOWN_RENDERER:-${SCRIPT_DIR}/render_raw_interactive_nav_topdown.py}
 ROUTE_ID=${2:-${ROUTE_ID:-house7_force_route_01}}
 HOUSE_IND=${HOUSE_IND:-7}
+export HOUSE_IND
 USE_FIXED_ROUTE=${USE_FIXED_ROUTE:-true}
+# Keep the scene, coverage evaluator, and post-run GT sidecar on one split.
+# Direct legacy runs remain train by default; the batch wrapper may override to
+# val when its benchmark episodes come from the validation split.
+RAW_DATA_SPLIT=${RAW_DATA_SPLIT:-train}
+export RAW_DATA_SPLIT
 SCENE_SEED=${SCENE_SEED:-${HOUSE_IND}}
 METHOD=${METHOD:-interactive_rule}
 OUTPUT_DIR=${1:-${REPO_ROOT}/outputs/house7_${METHOD}_${ROUTE_ID}_$(date +%Y%m%d_%H%M%S)}
@@ -105,10 +112,6 @@ STEP_READY_WARMUP_SKIP_FRAMES=${STEP_READY_WARMUP_SKIP_FRAMES:-0}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-# Keep the launch-time override consistent with the checked-in global/local
-# costmap configs.  A stale 0.30 default here silently defeated the requested
-# 0.40 m local inflation in every house-run smoke.
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.45}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -120,6 +123,7 @@ INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
+INTERACTIVE_NAV_RENDER_TOPDOWN=${INTERACTIVE_NAV_RENDER_TOPDOWN:-true}
 ENABLE_EXTERNAL_VIDEO=${ENABLE_EXTERNAL_VIDEO:-false}
 EXTERNAL_IMAGE_TOPIC=${EXTERNAL_IMAGE_TOPIC:-/molmo_spaces/debug_front_camera/image}
 DEBUG_FOLLOW_CAMERA_OFFSET=${DEBUG_FOLLOW_CAMERA_OFFSET:--1.45,1.30,1.90}
@@ -232,7 +236,7 @@ case "${METHOD}" in
     ENABLE_ATTRIBUTE_INFERENCE=true
     BYPASS_UNSAFE_OPEN_SWEEP=${BYPASS_UNSAFE_OPEN_SWEEP:-false}
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
-    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-15.0}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_interactive_exploration.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
@@ -246,7 +250,7 @@ case "${METHOD}" in
     ENABLE_ATTRIBUTE_INFERENCE=true
     BYPASS_UNSAFE_OPEN_SWEEP=${BYPASS_UNSAFE_OPEN_SWEEP:-false}
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
-    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-15.0}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_runtime.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
@@ -260,7 +264,7 @@ case "${METHOD}" in
     ENABLE_ATTRIBUTE_INFERENCE=true
     BYPASS_UNSAFE_OPEN_SWEEP=${BYPASS_UNSAFE_OPEN_SWEEP:-false}
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
-    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-15.0}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_apple.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
@@ -273,8 +277,20 @@ case "${METHOD}" in
     ;;
 esac
 
+# Module 2 (candidate/subgoal selection) has an independent wall-clock budget.
+# The shared SEMANTIC_MODEL_TIMEOUT_S below is intentionally kept for the
+# legacy/global client used by other modules; these M2-only defaults are
+# exported after method selection so an inherited SEMANTIC_M2_* value remains
+# an explicit user override.  The semantic node loads the selected dotenv with
+# override=True, so a deliberately configured value in that file wins too.
+if [[ "${START_SEMANTIC_DECISION:-false}" == true ]]; then
+  export SEMANTIC_M2_TIMEOUT_S="${SEMANTIC_M2_TIMEOUT_S:-12.0}"
+  export SEMANTIC_M2_TIMEOUT_RETRY_COUNT="${SEMANTIC_M2_TIMEOUT_RETRY_COUNT:-1}"
+  export SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S="${SEMANTIC_M2_TIMEOUT_RETRY_BACKOFF_S:-1.0}"
+fi
+
 BYPASS_UNSAFE_OPEN_SWEEP=${BYPASS_UNSAFE_OPEN_SWEEP:-false}
-SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
+SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-15.0}
 
 COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-0}
 
@@ -328,6 +344,7 @@ set -u
 # Keep each batch worker on its explicitly isolated ROS master after sourcing
 # the workspace setup, while loading OpenCV/MuJoCo from the MolmoSpaces env.
 export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
+ROS_PACKAGE_PATH=${ROS_PACKAGE_PATH:-}
 export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
 export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
 
@@ -340,8 +357,8 @@ if [[ -z "${GT_EMIT_INTERACTION_APPROACH_AXIS}" && -n "${SEMANTIC_DECISION_OVERR
   GT_EMIT_INTERACTION_APPROACH_AXIS=$(python -c 'import sys,yaml; data=yaml.safe_load(open(sys.argv[1])) or {}; value=(data.get("runtime") or {}).get("rule_oracle_gt_interaction_axis", False); print("true" if bool(value) else "false")' "${SEMANTIC_DECISION_OVERRIDE}")
 fi
 GT_EMIT_INTERACTION_APPROACH_AXIS=${GT_EMIT_INTERACTION_APPROACH_AXIS:-false}
-if [[ "${GT_EMIT_INTERACTION_APPROACH_AXIS}" == true && "${METHOD}" != interactive_rule ]]; then
-  print -u2 -- "GT_EMIT_INTERACTION_APPROACH_AXIS is restricted to METHOD=interactive_rule"
+if [[ "${GT_EMIT_INTERACTION_APPROACH_AXIS}" == true && "${METHOD}" != interactive_rule && "${METHOD}" != full_mllm_exploration ]]; then
+  print -u2 -- "GT_EMIT_INTERACTION_APPROACH_AXIS is restricted to interactive_rule or full_mllm_exploration"
   exit 2
 fi
 
@@ -584,13 +601,13 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
-  local_costmap_inflation_radius:="${LOCAL_COSTMAP_INFLATION_RADIUS}" \
+  base_local_planner:="${BASE_LOCAL_PLANNER:-dwa_local_planner/DWAPlannerROS}" \
   exploration_only:=true \
   randomize_camera:=false \
   publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \
   robot:=rby1 \
   scene_dataset:=procthor-10k \
-  data_split:=train \
+  data_split:="${RAW_DATA_SPLIT}" \
   house_ind:="${HOUSE_IND}" \
   house_inds:="${HOUSE_IND}" \
   task_horizon:="${TASK_HORIZON}" \
@@ -716,7 +733,7 @@ if [[ "${SKIP_COVERAGE}" != true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; t
     --run-dir "${OUTPUT_DIR}/debug" \
     --robot rby1 \
     --scene-dataset procthor-10k \
-    --data-split train \
+    --data-split "${RAW_DATA_SPLIT}" \
     --house-ind "${HOUSE_IND}" \
     --gt-agent-radius-m 0.10 \
     >"${OUTPUT_DIR}/coverage.log" 2>&1 || true
@@ -731,8 +748,45 @@ else
 fi
 print -r -- "${ANALYSIS_ELAPSED_SEC}" >"${OUTPUT_DIR}/analysis_elapsed_sec.txt"
 
-python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" "${POINTCLOUD_STRIDE}" "${MAPPING_SCAN_SOURCE}" <<'PY'
+# The legacy/raw runner has no formal V3 episode visualisation sidecar.  Build
+# the report from the recorder's final map, trajectory and force interaction
+# log after all ROS processes have stopped.  Rendering is post-run only: GT
+# route geometry is never made available to the policy.  Keep failures visible
+# in a dedicated log while preserving the semantic result/SR summary.
+RAW_TOPDOWN_STATUS=0
+RAW_TOPDOWN_OUTPUT="${OUTPUT_DIR}/topdown.png"
+RAW_TOPDOWN_METADATA="${OUTPUT_DIR}/topdown.json"
+if [[ "${INTERACTIVE_NAV_RENDER_TOPDOWN}" == true ]]; then
+  RAW_TOPDOWN_ARGS=(
+    --run-dir "${OUTPUT_DIR}"
+    --output "${RAW_TOPDOWN_OUTPUT}"
+    --metadata "${RAW_TOPDOWN_METADATA}"
+  )
+  # Route YAML coordinates are valid GT only for the fixed-route simulator
+  # mode.  In random/runtime-target mode, passing a coincident route_id would
+  # draw a plausible but unrelated train-scene path.
+  if [[ "${USE_FIXED_ROUTE}" == true ]]; then
+    RAW_TOPDOWN_ARGS+=(--route-config "${ROUTE_CONFIG}" --route-id "${ROUTE_ID}")
+  else
+    RAW_TOPDOWN_ARGS+=(--disable-route-config)
+  fi
+  if [[ -n "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK:-}" && -f "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK}" ]]; then
+    RAW_TOPDOWN_ARGS+=(--benchmark "${INTERACTIVE_NAV_TOPDOWN_BENCHMARK}")
+  fi
+  if [[ -n "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION:-}" && -f "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION}" ]]; then
+    RAW_TOPDOWN_ARGS+=(--target-selection "${INTERACTIVE_NAV_TOPDOWN_TARGET_SELECTION}")
+  elif [[ -f "${OUTPUT_DIR}/target_selection.json" ]]; then
+    RAW_TOPDOWN_ARGS+=(--target-selection "${OUTPUT_DIR}/target_selection.json")
+  fi
+  "${PYTHON_BIN}" "${RAW_TOPDOWN_RENDERER}" "${RAW_TOPDOWN_ARGS[@]}" \
+    >"${OUTPUT_DIR}/topdown.log" 2>&1 || RAW_TOPDOWN_STATUS=$?
+else
+  printf '%s\n' "disabled" >"${OUTPUT_DIR}/topdown.log"
+fi
+
+python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" "${POINTCLOUD_STRIDE}" "${MAPPING_SCAN_SOURCE}" "${RAW_TOPDOWN_OUTPUT}" "${RAW_TOPDOWN_METADATA}" "${RAW_TOPDOWN_STATUS}" <<'PY'
 import json
+import os
 import re
 from pathlib import Path
 import statistics
@@ -745,6 +799,9 @@ task_horizon = int(sys.argv[4])
 house_ind = int(sys.argv[5])
 pointcloud_stride = int(sys.argv[6])
 mapping_scan_source = sys.argv[7]
+topdown_path = Path(sys.argv[8])
+topdown_metadata_path = Path(sys.argv[9])
+topdown_status = int(sys.argv[10])
 def read_json(path):
     try:
         return json.loads(path.read_text())
@@ -914,6 +971,7 @@ result = {
     "recording_enabled": bool(video_path.exists()),
     "route_id": route_id,
     "house_ind": house_ind,
+    "raw_data_split": os.environ.get("RAW_DATA_SPLIT", "train"),
     "task_horizon": task_horizon,
     "pointcloud_stride": pointcloud_stride,
     "mapping_scan_source": mapping_scan_source,
@@ -1004,6 +1062,11 @@ result = {
     "mllm_metrics_path": str(mllm_path) if mllm_path.exists() else "",
     "mllm_request_count": len(mllm_rows),
     "mllm_by_role": mllm_by_role,
+    "topdown_path": str(topdown_path) if topdown_path.is_file() else "",
+    "topdown_metadata_path": str(topdown_metadata_path) if topdown_metadata_path.is_file() else "",
+    "topdown_exists": topdown_path.is_file() and topdown_path.stat().st_size > 0,
+    "topdown_artifact_valid": topdown_path.is_file() and topdown_path.stat().st_size > 0 and topdown_metadata_path.is_file(),
+    "topdown_status": topdown_status,
 }
 (output_dir / "semantic_exploration_result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
 print(json.dumps(result, ensure_ascii=False))

@@ -134,6 +134,40 @@ def test_transient_drawer_frame_is_evidence_but_never_terminates_without_claim()
     assert accepted.accepted is True
 
 
+def test_current_evidence_rejects_target_missing_from_later_published_frames() -> None:
+    ledger = PublicGoalEvidenceLedger(
+        episode_id=EPISODE_ID,
+        target_instance_ids={"obj_target"},
+    )
+    ledger.record_frame(_frame("obj_target"), capture_step=10)
+    ledger.record_frame(_frame(), capture_step=13)
+
+    stale = verify_target_goal_claim(
+        _status(),
+        episode_id=EPISODE_ID,
+        evidence=ledger,
+        private_distances_m={"obj_target": 1.0},
+        distance_threshold_m=1.5,
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
+    )
+    assert not stale.accepted
+    assert stale.reason == "target_perception_stale"
+
+    ledger.record_frame(_frame("obj_target"), capture_step=14)
+    fresh = verify_target_goal_claim(
+        _status(),
+        episode_id=EPISODE_ID,
+        evidence=ledger,
+        private_distances_m={"obj_target": 1.0},
+        distance_threshold_m=1.5,
+        require_current_evidence=True,
+        max_evidence_age_steps=2,
+    )
+    assert fresh.accepted
+    assert fresh.evidence_capture_step == 14
+
+
 def test_claim_requires_evidence_for_current_nearest_target_candidate() -> None:
     ledger = PublicGoalEvidenceLedger(
         episode_id=EPISODE_ID,
@@ -162,6 +196,45 @@ def test_claim_requires_evidence_for_current_nearest_target_candidate() -> None:
     assert accepted.accepted is True
     assert accepted.target_instance_id == "obj_nearest"
     assert accepted.evidence_capture_step == 22
+
+
+def test_category_claim_selects_nearest_published_candidate() -> None:
+    ledger = PublicGoalEvidenceLedger(
+        episode_id=EPISODE_ID,
+        target_instance_ids={"obj_unseen_nearest", "obj_found"},
+    )
+    ledger.record_frame(_frame("obj_found"), capture_step=18)
+
+    accepted = verify_target_goal_claim(
+        _status(),
+        episode_id=EPISODE_ID,
+        evidence=ledger,
+        private_distances_m={"obj_unseen_nearest": 0.8, "obj_found": 1.2},
+        distance_threshold_m=1.5,
+        candidate_selection="nearest_published",
+    )
+
+    assert accepted.accepted is True
+    assert accepted.target_instance_id == "obj_found"
+    assert accepted.evidence_capture_step == 18
+
+
+def test_bad_candidate_selection_fails_closed() -> None:
+    ledger = PublicGoalEvidenceLedger(
+        episode_id=EPISODE_ID,
+        target_instance_ids={"obj_target"},
+    )
+    ledger.record_frame(_frame("obj_target"), capture_step=18)
+    rejected = verify_target_goal_claim(
+        _status(),
+        episode_id=EPISODE_ID,
+        evidence=ledger,
+        private_distances_m={"obj_target": 0.8},
+        distance_threshold_m=1.5,
+        candidate_selection="unknown",
+    )
+    assert rejected.accepted is False
+    assert rejected.reason == "invalid_candidate_selection"
 
 
 def test_equal_distance_target_candidates_preserve_native_candidate_order() -> None:
