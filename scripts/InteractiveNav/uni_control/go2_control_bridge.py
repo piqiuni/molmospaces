@@ -208,6 +208,7 @@ class Go2Driver:
             print("warning: no rt/lowstate received; battery telemetry unavailable")
 
         self._client = None
+        self._motion_authorized = bool(enable_motion)
         self._velocity_control_enabled = False
         self._motion_lock = threading.RLock()
         self._last_enable_attempt = 0.0
@@ -240,6 +241,8 @@ class Go2Driver:
         if self._client is None:
             return
         with self._motion_lock:
+            if not getattr(self, "_motion_authorized", True):
+                return
             moving = abs(vx) > 1e-6 or abs(vy) > 1e-6 or abs(wz) > 1e-6
             if moving and self._min_locomotion_height_m > 0.0:
                 with self._pose_lock:
@@ -280,6 +283,37 @@ class Go2Driver:
                     return
             if code not in (None, 0):
                 print(f"motion command rejected with code {code}")
+
+    def set_motion_enabled(self, enabled: bool) -> None:
+        """Change the explicit output gate without rebuilding DDS or speech."""
+        with self._motion_lock:
+            self._motion_authorized = False
+            if self._client is not None:
+                self._client.Move(0.0, 0.0, 0.0)
+            if not enabled:
+                self._velocity_control_enabled = False
+                if self._client is not None:
+                    code = self._client.UseRemoteCommandFromApi(False)
+                    if code not in (None, 0):
+                        raise RuntimeError(f"motion lease release failed: {code}")
+                return
+            if self._client is None:
+                from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient
+                client = ObstaclesAvoidClient()
+                client.SetTimeout(3.0)
+                client.Init()
+                self._client = client
+            try:
+                self.enable_velocity_control(attempts=1)
+                code = self._client.Move(0.0, 0.0, 0.0)
+                if code not in (None, 0):
+                    raise RuntimeError(f"initial stop failed: {code}")
+            except Exception:
+                self._velocity_control_enabled = False
+                with contextlib.suppress(Exception):
+                    self._client.UseRemoteCommandFromApi(False)
+                raise
+            self._motion_authorized = True
 
     def enable_velocity_control(
         self,
@@ -391,7 +425,7 @@ class Go2Driver:
                         "BalanceStand did not return success; continuing with "
                         f"API lease recovery (code {balance_error})"
                     )
-                if self._client is not None:
+                if self._client is not None and self._motion_authorized:
                     # Wait for the posture transition and reacquire the lease.
                     # The move() fallback remains active if the SDK needs longer.
                     last_error: Optional[Exception] = None
@@ -501,6 +535,9 @@ class MotionController:
         self.driver = driver
         self.event_callback = event_callback
         self.lock = threading.Lock()
+        self.dispatch_lock = threading.RLock()
+        self.motion_enabled = bool(getattr(args, "enable_motion", False)) or getattr(args, "state_source", "simulated") == "simulated"
+        self.motion_enabled_at = 0.0
         self.stop_event = threading.Event()
         self.velocity = VelocityTarget()
         self.primitive: Optional[ActivePrimitive] = None
@@ -508,6 +545,19 @@ class MotionController:
         self.motion_suspended = False
 
     def submit(self, command: ControlCommand) -> bool:
+        received_at = time.monotonic()
+        # Consume and reject commands during SDK enable/disable rather than
+        # building a socket backlog that could replay after the gate opens.
+        if not self.dispatch_lock.acquire(blocking=False):
+            return False
+        try:
+            if not self.motion_enabled or received_at < self.motion_enabled_at:
+                return False
+            return self._submit(command)
+        finally:
+            self.dispatch_lock.release()
+
+    def _submit(self, command: ControlCommand) -> bool:
         cancelled: Optional[ActivePrimitive] = None
         with self.lock:
             self.motion_suspended = False
@@ -628,6 +678,7 @@ class MotionController:
                 "active_mode": self.active_mode,
                 "primitive": self.primitive.action.name if self.primitive else None,
                 "motion_suspended": self.motion_suspended,
+                "motion_enabled": self.motion_enabled,
             }
 
     def _finish_primitive(
@@ -753,21 +804,21 @@ class MotionController:
         last_applied: Optional[Tuple[float, float, float]] = None
         try:
             while not self.stop_event.wait(self.args.control_period):
-                if self.snapshot()["motion_suspended"]:
-                    continue
-                target = self.target(time.monotonic())
-                moving = any(abs(value) > 1e-6 for value in target)
-                was_moving = bool(
-                    last_applied
-                    and any(abs(value) > 1e-6 for value in last_applied)
-                )
-                # Continuous non-zero motion must be refreshed. An unchanged
-                # zero only needs to be sent once; calling Move(0,0,0) at
-                # 20 Hz while Go2 is prone can repeatedly trigger firmware
-                # warning tones without adding any safety.
-                if moving or was_moving or last_applied is None:
-                    self.driver.move(*target)
-                last_applied = target
+                with self.dispatch_lock:
+                    if not self.motion_enabled or self.snapshot()["motion_suspended"]:
+                        last_applied = None
+                        continue
+                    target = self.target(time.monotonic())
+                    moving = any(abs(value) > 1e-6 for value in target)
+                    was_moving = bool(
+                        last_applied
+                        and any(abs(value) > 1e-6 for value in last_applied)
+                    )
+                    # Keep target selection and SDK dispatch atomic with a
+                    # mode switch, so an old target cannot follow disable.
+                    if moving or was_moving or last_applied is None:
+                        self.driver.move(*target)
+                    last_applied = target
                 rounded = tuple(round(value, 3) for value in target)
                 if rounded != last_logged:
                     print(
@@ -1098,6 +1149,35 @@ class UnifiedBridge:
             args.speaker_backend = "go2" if args.state_source == "go2" else "simulated"
         self.speaker = SpeakerWorker(args, self.send_event)
 
+    def switch_motion(self, request: dict[str, Any]) -> dict[str, Any]:
+        controller = self.controller
+        with controller.dispatch_lock:
+            if controller.stop_event.is_set():
+                raise RuntimeError("control bridge is stopping")
+            if request:
+                enabled = request.get("enabled")
+                if type(enabled) is not bool:
+                    raise ValueError("enabled must be a boolean")
+                limits = {key: float(request.get(key, getattr(self.args, key)))
+                          for key in ("max_vx", "max_wz")}
+                if any(not math.isfinite(value) or value <= 0 for value in limits.values()):
+                    raise ValueError("motion limits must be finite and positive")
+                unchanged = enabled == controller.motion_enabled and all(
+                    value == getattr(self.args, key) for key, value in limits.items()
+                )
+                if not unchanged:
+                    controller.motion_enabled = False
+                    self.args.enable_motion = False
+                    controller.force_stop("motion_mode_changed")
+                    self.driver.set_motion_enabled(enabled)
+                    for key, value in limits.items():
+                        setattr(self.args, key, value)
+                    controller.motion_enabled_at = time.monotonic()
+                    controller.motion_enabled = enabled
+                    self.args.enable_motion = enabled
+            return {"mode": "enable_motion" if controller.motion_enabled else "speech_only",
+                    "max_vx": self.args.max_vx, "max_wz": self.args.max_wz}
+
     def apply_lidar_action(self, action: str) -> bool:
         with self.lidar_lock:
             if action == "toggle":
@@ -1290,8 +1370,9 @@ class UnifiedBridge:
                 if not self.controller.stop_event.wait(self.args.reconnect_delay):
                     print("Retrying WebSocket connection")
         finally:
-            self.controller.force_stop("bridge_shutdown")
-            self.controller.stop_event.set()
+            with self.controller.dispatch_lock:
+                self.controller.stop_event.set()
+                self.controller.force_stop("bridge_shutdown")
             control_thread.join(timeout=2.0)
             telemetry_thread.join(timeout=2.0)
             self.speaker.close()
@@ -1457,10 +1538,13 @@ def main() -> None:
     bridge: Optional[UnifiedBridge] = None
     ready_path = Path(args.ready_file).expanduser() if args.ready_file else None
     ready_pid = str(os.getpid())
+    motion_switch = None
     try:
         bridge = UnifiedBridge(args)
         if ready_path is not None:
+            from motion_switch import MotionSwitchServer
             ready_path.parent.mkdir(parents=True, exist_ok=True)
+            motion_switch = MotionSwitchServer(ready_path, bridge.switch_motion)
             temporary = ready_path.with_name(f".{ready_path.name}.{ready_pid}.tmp")
             temporary.write_text(ready_pid + "\n", encoding="utf-8")
             temporary.replace(ready_path)
@@ -1470,6 +1554,8 @@ def main() -> None:
         if bridge is not None:
             bridge.controller.stop_event.set()
     finally:
+        if motion_switch is not None:
+            motion_switch.close()
         if ready_path is not None:
             try:
                 if ready_path.read_text(encoding="utf-8").strip() == ready_pid:

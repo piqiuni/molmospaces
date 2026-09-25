@@ -2,6 +2,31 @@
 
 最后更新：2026-09-10
 
+## YOLO 统一启动入口回归（2026-09-15）
+
+单独前台启动：`bash scripts/InteractiveNav/physical_nav/run_yolo.sh --gpu 0`。
+整套服务选卡：`PHYSICAL_NAV_YOLO_GPU=2 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh restart`。
+默认 GPU 0；不再同时设置可见卡与进程内卡号。旧的两个 YOLO 选卡变量需移除。
+
+无硬件副作用的命令展开和回归：
+
+```bash
+bash scripts/InteractiveNav/physical_nav/run_yolo.sh --gpu 2 --dry-run
+/home/user/miniconda3/envs/mlspaces/bin/python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_run_yolo_launcher.py
+bash -n scripts/InteractiveNav/physical_nav/run_yolo.sh
+bash -n scripts/InteractiveNav/physical_nav/start_physical_nav.sh
+bash -n scripts/InteractiveNav/physical_nav/physical_nav_all.sh
+```
+
+YOLO 启动默认执行两帧合成图预热，成功标志为 `warmup OK`，不是 `model loaded`。
+预热失败直接退出；不发布合成图检测结果，也不自动启用运动或启动相机服务。
+预热逻辑离线回归（模拟模型和 CUDA，不访问 GPU）：
+
+```bash
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+  /home/user/miniconda3/envs/mlspaces/bin/python -m pytest -q scripts/InteractiveNav/physical_nav/tests/test_yolo_startup_warmup.py
+```
+
 ## 1. 文档定位
 
 本文件用于维护交互导航相关的：
@@ -32,6 +57,20 @@
 
 如果只是改动文档、配置或高层设计，不需要跑重型测试。  
 如果只是改动某个局部模块，优先使用最小相关命令，而不是整套系统全启动。
+
+### 实物运动热切换回归（2026-09-15）
+
+```bash
+conda run -n mlspaces python -m pytest -q \
+  scripts/InteractiveNav/uni_control/test_motion_switch.py \
+  scripts/InteractiveNav/uni_control/test_motion_enable_retry.py \
+  scripts/InteractiveNav/uni_control/test_speech_control.py
+```
+
+使用模拟 SDK 与本机 Unix socket，覆盖暂停后清除旧速度、切换中拒绝排队、
+SDK 失败保持关闭、在途输出与暂停的顺序以及进程身份；不会发送实机运动指令。
+图2新增地图范围不被首次视口裁掉的回归在下述环境运行
+`scripts/InteractiveNav/physical_nav/tests/test_orientation_display.py`。
 
 ### 实物网页与状态转发离线回归
 

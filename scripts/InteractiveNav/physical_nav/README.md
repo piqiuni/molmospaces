@@ -8,6 +8,47 @@ the local policy machine.
 
 ## Data path
 
+The full-stack camera default is RGB 1280×720 at 10 FPS and native depth
+848×480 at 10 FPS, published at 10 Hz with `align none`. Both native image
+grids and their calibration are retained; downstream RGB-mask lifting uses
+the depth-to-color transform, not equal pixel coordinates. Override alignment
+explicitly with `PHYSICAL_NAV_GO2_ALIGN_TO` when testing other modes.
+
+YOLO has one shared launch entry point for foreground debugging and the full
+navigation supervisor (run from the repository root):
+
+```bash
+bash scripts/InteractiveNav/physical_nav/run_yolo.sh --gpu 0
+# Preview only: no ROS connection, model loading or inference.
+bash scripts/InteractiveNav/physical_nav/run_yolo.sh --gpu 2 --dry-run
+# Full stack uses the same launcher; default GPU is 0.
+PHYSICAL_NAV_YOLO_GPU=2 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh restart
+```
+
+The launcher sets up ROS/Python paths, the model, camera extrinsics and the
+10 Hz rate. Select a CUDA GPU index with `--gpu N` (or `cpu` for explicit CPU
+debugging); additional bridge options such as `--rate 5` can follow. It clears
+inherited `CUDA_VISIBLE_DEVICES` and passes `--device cuda:N` to the detector;
+there is no second user-facing device selector. CUDA indices can change after
+hardware/driver changes. Old `PHYSICAL_NAV_YOLO_DEVICE` and
+`PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES` settings are rejected with a migration
+message. The full stack still supervises the worker and writes `yoloe.log`;
+standalone execution stays in the foreground. Do not start a second standalone
+worker while the full stack's detector is running. ROS master and the sensor
+publisher must be available for live inference; the web observer is optional
+(`PHYSICAL_NAV_START_WEB=0`). These commands do not repair a CUDA driver fault.
+
+Startup now runs two synthetic inference frames on the selected device before
+publishing or waiting for sensor input. Only `warmup OK` confirms that inference
+and device synchronization passed; `model loaded` alone does not. Warmup errors
+terminate startup with a nonzero exit code (no silent CPU fallback), and dummy
+detections are never published. Warmup logs show the actual predictor device,
+GPU name and allocated memory. Ultralytics may internally remap the selected
+GPU to logical `cuda:0`. Without usable RGB-D input the worker prints a waiting
+diagnostic every 10 seconds. Live input shapes may still trigger additional
+first-frame initialization. This entry point does not automatically start the
+sensor receiver or enable robot motion.
+
 ```text
 D435i + Unitree state subscribers (Go2)
   -> JSON WebSocket (RGB JPEG, depth PNG16, intrinsics, timestamps, pose)

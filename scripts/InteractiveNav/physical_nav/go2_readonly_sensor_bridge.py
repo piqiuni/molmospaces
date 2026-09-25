@@ -2720,7 +2720,7 @@ def main() -> None:
     parser.add_argument("--depth-width", type=int, default=848)
     parser.add_argument("--depth-height", type=int, default=480)
     parser.add_argument("--depth-fps", type=int, default=10)
-    parser.add_argument("--align-to", choices=("none", "color", "depth"), default="depth")
+    parser.add_argument("--align-to", choices=("none", "color", "depth"), default="none")
     parser.add_argument("--publish-fps", type=float, default=10.0)
     parser.add_argument("--depth-png-compression", type=int, default=4)
     parser.add_argument(

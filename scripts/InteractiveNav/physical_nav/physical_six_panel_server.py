@@ -325,9 +325,8 @@ class SixPanelRenderer:
         # JPEG encodes on every 5 Hz render tick.
         self.capture_panel_streams = False
         self.latest_panel_streams: dict[int, bytes] = {}
-        # OCC viewport is locked once at startup.  Its size is copied from
-        # the first room-panel world bounds, while its center is the initial
-        # robot pose, so later frontier/trajectory points cannot zoom panel 2.
+        # Fit the current known OCC extent; navigation overlays never enlarge
+        # it, and newly explored cells must not be clipped to the first frame.
         self._occ_view_bounds: tuple[float, float, float, float] | None = None
         # The web gateway may survive a navigation-stack restart.  New ROS
         # gateway processes attach a process-scoped map_session token to OCC
@@ -1242,22 +1241,8 @@ class SixPanelRenderer:
         # preallocated much larger than the explored area (often <2% known),
         # so using a multi-metre margin makes panel 2 mostly unknown space.
         world_bounds = known_world_bounds(planning, margin_m=2.5) if planning is not None else None
-        if self._occ_view_bounds is None and world_bounds is not None:
-            pose = step.get("pose") or []
-            try:
-                cx, cy = float(pose[0]), float(pose[1])
-            except (TypeError, ValueError, IndexError):
-                cx = (world_bounds[0] + world_bounds[2]) * 0.5
-                cy = (world_bounds[1] + world_bounds[3]) * 0.5
-            half_w = max(1.0, (world_bounds[2] - world_bounds[0]) * 0.5)
-            half_h = max(1.0, (world_bounds[3] - world_bounds[1]) * 0.5)
-            self._occ_view_bounds = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
-        # Keep panel 2 on the startup viewport.  ``known_world_bounds`` grows
-        # as SLAM explores more cells; using it directly here makes the image
-        # suddenly zoom out and fill with unknown grey space.  The locked
-        # bounds are expressed in map coordinates, so the canonical renderer
-        # still applies the current map<-odom transform and grid origin.
-        occ_view_bounds = self._occ_view_bounds or world_bounds
+        self._occ_view_bounds = world_bounds
+        occ_view_bounds = world_bounds
         width, height = self.panel_size
         if rgb is None:
             camera = np.full((height, width, 3), 235, dtype=np.uint8)
@@ -1274,9 +1259,8 @@ class SixPanelRenderer:
             draw_global_plan=True, draw_local_plan=False, draw_frontiers=True,
             draw_semantic_candidates=True, draw_route_plan=False,
             draw_interaction_target_links=True,
-            # Match panel 3's established framing and never let the historic
-            # trajectory enlarge the locked viewport.
-            view_scale=1.75,
+            # Fit every known cell without the former 1.75x central crop.
+            view_scale=1.0,
             expand_crop_for_trajectory=False,
         )
         draw_task_subgoal_header(occ, step, box_width_px=width // 2 - 10, background_alpha=.55)
@@ -1722,7 +1706,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             return {"accepted": True, "action": "stop", "control_only": True,
                     "message": "已中断控制，网页和导航栈保持运行", "pid": pid}
         script = Path(__file__).resolve().with_name("physical_nav_all.sh")
-        args = ["bash", str(script), "start_control", "enable_motion"] if action == "enable_motion" else ["bash", str(script), action]
+        if action == "enable_motion":
+            args = ["bash", str(script), "start_control", "enable_motion"]
+        elif action == "disable_motion":
+            args = ["bash", str(script), "stop_control"]
+        else:
+            args = ["bash", str(script), action]
         if action in {"start", "restart"}:
             args.append("enable_motion")
             if goal:
@@ -2501,8 +2490,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 action = str(payload.get("action", "")).strip().lower()
                 goal = str(payload.get("goal", "")).strip()
-                if action not in {"start", "stop", "restart", "enable_motion"}:
-                    self._json({"accepted": False, "error": "action 必须是 start、stop、restart 或 enable_motion"}, 400); return
+                if action not in {"start", "stop", "restart", "enable_motion", "disable_motion"}:
+                    self._json({"accepted": False, "error": "action 必须是 start、stop、restart、enable_motion 或 disable_motion"}, 400); return
                 if len(goal) > 80 or any(ch in goal for ch in "\r\n\x00"):
                     self._json({"accepted": False, "error": "goalname 无效"}, 400); return
                 self._json(self._run_control(action, goal), 202)
@@ -2594,12 +2583,12 @@ async function navControl(action, goal=''){
 q('#nav-start')?.addEventListener('click',()=>navControl('start'));
 q('#nav-restart')?.addEventListener('click',()=>navControl('restart',q('#nav-goal').value.trim()));
 q('#nav-stop')?.addEventListener('click',()=>navControl('stop'));
-q('#nav-enable')?.addEventListener('click',()=>navControl('enable_motion'));
+q('#nav-enable')?.addEventListener('click',()=>navControl(q('#nav-enable').dataset.enabled==='true'?'disable_motion':'enable_motion'));
 document.addEventListener('keydown',event=>{
   if(event.target instanceof HTMLInputElement||event.target instanceof HTMLTextAreaElement)return;
   if(event.key==='Escape'||event.key.toLowerCase()==='s'){event.preventDefault();navControl('stop')}
 });
-async function refreshControlStatus(){try{const r=await fetch('/api/control-status?ts='+Date.now(),{cache:'no-store'});const s=await r.json();if(s.running)q('#control-status').textContent=s.action+' 执行中 · pid '+s.pid; }catch(_){} }
+async function refreshControlStatus(){try{const r=await fetch('/api/control-status?ts='+Date.now(),{cache:'no-store'});const s=await r.json();const button=q('#nav-enable');button.dataset.enabled=String(s.mode==='enable_motion');button.textContent=s.mode==='enable_motion'?'暂停运动':'开启运动';button.disabled=!!s.request?.running;if(s.request?.running)q('#control-status').textContent=s.request.action+' 切换中';else q('#control-status').textContent=s.label||'控制器状态未知';}catch(_){} }
 setInterval(refreshControlStatus,2000);
 refreshControlStatus();
 function setupResizableLayout(){

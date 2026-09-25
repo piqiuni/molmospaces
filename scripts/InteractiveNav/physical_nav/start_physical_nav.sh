@@ -5,7 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f /opt/ros/noetic/setup.bash ]]; then
   # Keep ROS' generated Python/message paths when this script is run from a
   # clean shell. The Go2 process never sources ROS; this is policy-host only.
+  # Catkin profile scripts reference ROS_DISTRO; under set -u a clean
+  # non-interactive shell would abort before the stack starts.
+  export ROS_DISTRO="${ROS_DISTRO:-noetic}"
+  export ROS_VERSION="${ROS_VERSION:-1}"
+  export ROS_PYTHON_VERSION="${ROS_PYTHON_VERSION:-3}"
+  set +u
   source /opt/ros/noetic/setup.bash
+  set -u
 fi
 CATKIN_SETUP="${ROOT_DIR}/../../../Interactive-Nav-SG-nav/devel/setup.bash"
 if [[ -f "${CATKIN_SETUP}" ]]; then
@@ -23,6 +30,12 @@ export ROS_PACKAGE_PATH="${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src:${ROS_P
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
+# Single-machine ROS: bind XML-RPC/TCPROS to loopback only (avoid 0.0.0.0).
+# Override via environment if multi-machine ROS is required.
+export ROS_IP="${ROS_IP:-127.0.0.1}"
+export ROS_HOSTNAME="${ROS_HOSTNAME:-localhost}"
+export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11311}"
 
 WEB_HOST="${PHYSICAL_NAV_WEB_HOST:-0.0.0.0}"
 GATEWAY_PYTHON="${PHYSICAL_NAV_GATEWAY_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}"
@@ -278,12 +291,14 @@ if [[ "${START_YOLO}" == "1" ]]; then
   fi
   YOLO_MODEL_PATH="${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}"
   YOLO_CONFIG_PATH="${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}"
-  YOLO_DEVICE="${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}"
+  # Validate the shared launcher before replacing an existing worker.
+  bash "${ROOT_DIR}/run_yolo.sh" --dry-run >/dev/null
+  YOLO_GPU="${PHYSICAL_NAV_YOLO_GPU:-0}"
   YOLO_RATE="${PHYSICAL_NAV_YOLO_RATE:-10}"
   YOLO_EXPECTED_FINGERPRINT="$({
-    printf 'python=%s device=%s rate=%s cuda=%s camera=%s,%s,%s,%s,%s,%s\n' \
-      "${ALGORITHM_PYTHON}" "${YOLO_DEVICE}" "${YOLO_RATE}" \
-      "${PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES:-0}" "${CAMERA_X}" "${CAMERA_Y}" \
+    printf 'python=%s gpu=%s rate=%s camera=%s,%s,%s,%s,%s,%s\n' \
+      "${ALGORITHM_PYTHON}" "${YOLO_GPU}" "${YOLO_RATE}" \
+      "${CAMERA_X}" "${CAMERA_Y}" \
       "${CAMERA_Z}" "${CAMERA_ROLL}" "${CAMERA_PITCH}" "${CAMERA_YAW}"
     printf 'model=%s ' "${YOLO_MODEL_PATH}"
     if [[ -f "${YOLO_MODEL_PATH}" ]]; then
@@ -298,6 +313,7 @@ if [[ "${START_YOLO}" == "1" ]]; then
       printf 'missing-config\n'
     fi
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/physical_yoloe_bridge.py"; else shasum -a 256 "${ROOT_DIR}/physical_yoloe_bridge.py"; fi
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/run_yolo.sh"; else shasum -a 256 "${ROOT_DIR}/run_yolo.sh"; fi
   } | if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi)"
   # Reusing one detector is important: two workers would consume the same
   # latest-only ROS image stream and publish competing detections.  As with
@@ -327,18 +343,7 @@ if [[ "${START_YOLO}" == "1" ]]; then
     fi
   fi
   if (( YOLO_REUSED == 0 )); then
-    CUDA_VISIBLE_DEVICES="${PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES:-0}" \
-    OMP_NUM_THREADS="${PHYSICAL_NAV_YOLO_OMP_NUM_THREADS:-1}" \
-    OPENBLAS_NUM_THREADS="${PHYSICAL_NAV_YOLO_OPENBLAS_NUM_THREADS:-1}" \
-    MKL_NUM_THREADS="${PHYSICAL_NAV_YOLO_MKL_NUM_THREADS:-1}" \
-    NUMEXPR_NUM_THREADS="${PHYSICAL_NAV_YOLO_NUMEXPR_NUM_THREADS:-1}" \
-    "${ALGORITHM_PYTHON}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
-    --web-url "$([[ "${START_WEB}" == "1" ]] && echo "http://127.0.0.1:${WEB_PORT}" || echo "")" \
-    --model-path "${YOLO_MODEL_PATH}" \
-    --detector-config "${YOLO_CONFIG_PATH}" \
-    --device "${YOLO_DEVICE}" --rate "${YOLO_RATE}" \
-    --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" \
-    --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" \
+    bash "${ROOT_DIR}/run_yolo.sh" \
       >>"${LOG_DIR}/yoloe.log" 2>&1 &
     register_process yoloe "$!"
     printf '%s\n' "${YOLO_EXPECTED_FINGERPRINT}" >"${YOLO_FINGERPRINT_FILE}"

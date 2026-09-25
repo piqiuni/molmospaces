@@ -344,6 +344,41 @@ def test_persistent_renderer_releases_locked_occ_view_for_new_map_session():
     assert renderer._occ_view_bounds is None
 
 
+def test_occ_panel_fits_newly_explored_cells_without_startup_crop(monkeypatch):
+    import numpy as np
+
+    state = RuntimeState()
+    renderer = SixPanelRenderer(state)
+    captured = []
+    original = renderer._canonical.render_map_panel
+
+    def capture(*args, **kwargs):
+        if kwargs.get("title") == "OCC":
+            captured.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(renderer._canonical, "render_map_panel", capture)
+    def occupancy(end):
+        cells = np.full((80, 80), -1, dtype=np.int8)
+        cells[12:20, 12:end] = 0
+        return {"width": 80, "height": 80, "resolution": 1.0,
+                "frame_id": "tf_frame_map", "origin": {"x": -40, "y": -40},
+                "data": cells.ravel().tolist()}
+
+    state.occupancy = occupancy(20)
+    renderer.render()
+    first = captured[-1]["world_bounds"]
+    state.occupancy = occupancy(72)
+    state.map_revision += 1
+    renderer.render()
+    current = captured[-1]
+    assert current["world_bounds"][2] > first[2]
+    assert current["world_bounds"][0] <= -28
+    assert current["world_bounds"][2] >= 32
+    assert current["view_scale"] == 1.0
+    assert current["expand_crop_for_trajectory"] is False
+
+
 def test_ros_grid_payload_carries_map_session_token():
     from types import SimpleNamespace
 

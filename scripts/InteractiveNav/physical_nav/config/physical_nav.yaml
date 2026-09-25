@@ -12,7 +12,7 @@ camera:
   depth_width: 848
   depth_height: 480
   depth_fps: 10
-  align_to: "depth"
+  align_to: "none"
 
 topics:
   rgb_image: "/physical_nav/rgb/image_raw"

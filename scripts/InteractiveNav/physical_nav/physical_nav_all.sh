@@ -27,7 +27,7 @@ GO2_COLOR_FPS="${PHYSICAL_NAV_GO2_COLOR_FPS:-10}"
 GO2_DEPTH_WIDTH="${PHYSICAL_NAV_GO2_DEPTH_WIDTH:-848}"
 GO2_DEPTH_HEIGHT="${PHYSICAL_NAV_GO2_DEPTH_HEIGHT:-480}"
 GO2_DEPTH_FPS="${PHYSICAL_NAV_GO2_DEPTH_FPS:-10}"
-GO2_ALIGN_TO="${PHYSICAL_NAV_GO2_ALIGN_TO:-depth}"
+GO2_ALIGN_TO="${PHYSICAL_NAV_GO2_ALIGN_TO:-none}"
 GO2_CAMERA_IMU="${PHYSICAL_NAV_GO2_CAMERA_IMU:-0}"
 GO2_SENSOR_QUEUE_CAPACITY="${PHYSICAL_NAV_GO2_SENSOR_QUEUE_CAPACITY:-128}"
 GO2_TELEMETRY_PERIOD="${PHYSICAL_NAV_GO2_TELEMETRY_PERIOD:-0.05}"
@@ -55,7 +55,7 @@ MOTION_ENABLED=0
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") {start|start_control|stop|restart|status|logs} [enable_motion] [obj_goal]
+Usage: $(basename "$0") {start|start_control|stop_control|stop|restart|status|logs} [enable_motion] [obj_goal]
 
 Starts the Go2 read-only sensor bridge, Go2 SSH tunnel, Qwen SSH tunnel and
 the local physical navigation stack. Motion control is started only when the
@@ -120,7 +120,7 @@ start_qwen_tunnel() {
     return 0
   fi
   rm -f "${QWEN_PID_FILE}"
-  nohup python3 "${QWEN_TUNNEL_SCRIPT}" \
+  nohup setsid python3 "${QWEN_TUNNEL_SCRIPT}" \
     --ssh-port "${PHYSICAL_NAV_QWEN_SSH_PORT:-41051}" \
     --user "${PHYSICAL_NAV_QWEN_USER:-root}" \
     --host "${PHYSICAL_NAV_QWEN_HOST:-115.190.90.101}" \
@@ -225,7 +225,60 @@ REMOTE
   echo "Go2 sensor bridge pid=${bridge_pid}$( [[ "${bridge_owned}" == 1 ]] && echo ' (started)' || echo ' (reused)' )"
 }
 
+ensure_policy_control() {
+  if [[ -f "${POLICY_PID_FILE}" ]] && pid_alive "$(<"${POLICY_PID_FILE}")"; then
+    return 0
+  fi
+  nohup setsid env PYTHONPATH="${POLICY_CONTROL_PYTHONPATH}" "${POLICY_CONTROL_PYTHON}" "${POLICY_CONTROL_SCRIPT}" \
+    --control-mode continuous --source ros \
+    --continuous-ttl-ms "${PHYSICAL_NAV_MOTION_TTL_MS:-500}" \
+    --ros-command-refresh-hz "${PHYSICAL_NAV_MOTION_REFRESH_HZ:-20}" \
+    --ros-command-stale-after-s "${PHYSICAL_NAV_MOTION_STALE_AFTER_S:-0.50}" \
+    --cmd-vel-topic "${PHYSICAL_NAV_MOTION_CMD_VEL_TOPIC:-/physical_nav/actuated_cmd_vel}" \
+    --speech-request-topic "${PHYSICAL_NAV_SPEECH_REQUEST_TOPIC:-/physical_nav/speech_request}" \
+    --speech-status-topic "${PHYSICAL_NAV_SPEECH_STATUS_TOPIC:-/physical_nav/speech_status}" \
+    >>"${LOG_DIR}/policy_control.log" 2>&1 </dev/null &
+  echo $! >"${POLICY_PID_FILE}"
+  echo "policy control server started (pid=$(<"${POLICY_PID_FILE}"))"
+}
+
+switch_motion_live() {
+  local enabled="$1"
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" \
+    "test -f /home/unitree/uni_control/motion_switch.py || exit 3; \
+     python3 /home/unitree/uni_control/motion_switch.py \
+       --ready-file '${MOTION_REMOTE_READY_FILE}' \
+       ${enabled:+--enabled ${enabled} --max-vx ${MOTION_MAX_VX} --max-wz ${MOTION_MAX_WZ}}"
+}
+
 start_motion_control() {
+  local hot_result hot_status=0
+  hot_result="$(switch_motion_live '')" || hot_status=$?
+  if (( hot_status == 0 )); then
+    if (( ! MOTION_ENABLED )) && [[ "${hot_result}" == *'"mode": "enable_motion"'* ]]; then
+      echo "refusing read-only launch: live motion control is enabled" >&2
+      return 1
+    fi
+    ensure_policy_control
+    if ! wait_local_port "${PHYSICAL_NAV_MOTION_POLICY_PORT:-12333}" 50; then
+      echo "policy control server did not open port 12333" >&2
+      return 1
+    fi
+    if (( MOTION_ENABLED )); then
+      printf '%s\n' unknown >"${MOTION_STATUS_FILE}"
+      hot_result="$(switch_motion_live true)" || return $?
+    fi
+    if [[ "${hot_result}" == *'"mode": "enable_motion"'* ]]; then
+      printf '%s\n' enable_motion >"${MOTION_STATUS_FILE}"
+    else
+      printf '%s\n' speech_only >"${MOTION_STATUS_FILE}"
+    fi
+    echo "Go2 control switched without restart: ${hot_result}"
+    return 0
+  elif (( hot_status != 3 )); then
+    echo "Go2 live motion switch failed; bridge was not restarted" >&2
+    return "${hot_status}"
+  fi
   # Fail closed before opening the local policy server: an untracked legacy
   # bridge may still own port 12333. Never let the read-only/speech launch
   # connect to a process that was started with --enable-motion.
@@ -417,7 +470,7 @@ start_all() {
   PHYSICAL_NAV_START_ROSCORE="${PHYSICAL_NAV_START_ROSCORE:-1}" \
   PHYSICAL_NAV_START_YOLO_WORKER="${PHYSICAL_NAV_START_YOLO_WORKER:-1}" \
   PHYSICAL_NAV_ALGORITHM_PYTHON="${PHYSICAL_NAV_ALGORITHM_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}" \
-  PHYSICAL_NAV_YOLO_DEVICE="${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}" \
+  PHYSICAL_NAV_YOLO_GPU="${PHYSICAL_NAV_YOLO_GPU:-0}" \
   PHYSICAL_NAV_YOLO_RATE="${PHYSICAL_NAV_YOLO_RATE:-10}" \
   PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S="${PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S:-180}" \
     bash "${SERVICE}" start
@@ -425,7 +478,6 @@ start_all() {
   if [[ "${PHYSICAL_NAV_START_WEB:-1}" == "1" ]]; then
     wait_local_port "${PHYSICAL_NAV_WS_PORT:-12334}" 100
   fi
-  wait_ros_command_subscriber
   start_go2_components
   publish_object_goal
   start_motion_control
@@ -540,7 +592,10 @@ status_all() {
     echo "policy control server: stopped"
   fi
   ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" \
-    "if [ -f \"${MOTION_REMOTE_PID_FILE}\" ] && [ -f \"${MOTION_REMOTE_READY_FILE}\" ] && \
+    "if [ -f /home/unitree/uni_control/motion_switch.py ] && [ -f \"${MOTION_REMOTE_READY_FILE}\" ]; then \
+       python3 /home/unitree/uni_control/motion_switch.py --ready-file \"${MOTION_REMOTE_READY_FILE}\"; exit \$?; \
+     fi; \
+     if [ -f \"${MOTION_REMOTE_PID_FILE}\" ] && [ -f \"${MOTION_REMOTE_READY_FILE}\" ] && \
         kill -0 \"\$(cat \"${MOTION_REMOTE_PID_FILE}\")\" 2>/dev/null && \
         kill -0 \"\$(cat \"${MOTION_REMOTE_READY_FILE}\")\" 2>/dev/null; then \
        pid=\$(cat \"${MOTION_REMOTE_PID_FILE}\"); \
@@ -587,6 +642,10 @@ case "${ACTION}" in
   # speech/motion bridge. This leaves the running perception/navigation stack
   # untouched and is useful after either transport exits independently.
   start_control) start_motion_control ;;
+  stop_control)
+    switch_motion_live false
+    printf '%s\n' speech_only >"${MOTION_STATUS_FILE}"
+    ;;
   stop) stop_all ;;
   restart) stop_all; start_all ;;
   status) status_all ;;

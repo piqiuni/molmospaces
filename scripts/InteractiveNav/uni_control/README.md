@@ -61,6 +61,25 @@ ssh -N -T \
 launcher 同时监控 tunnel 和 bridge。任一进程退出时，它会先停止 bridge、归零速度并释放
 API 控制权，再关闭隧道，默认等待 2 秒后重新建立整条链路。
 
+## 常驻控制桥的运动切换
+
+实物导航已支持在同一个 Go2 控制桥进程内开启/暂停运动输出：
+
+```bash
+bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh start_control enable_motion
+bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh stop_control
+```
+
+六面板网页的“开启运动／暂停运动”按钮调用上述接口。切换保留相机、YOLO、OCC、
+语义图、WebSocket 和语音进程，不清空地图。首次部署新版桥需要重新加载一次控制桥；
+SDK 首次初始化或重新申请控制权限仍可能耗时，失败时输出门保持关闭。
+
+控制桥通过与 ready 文件同目录、权限为 `0600` 的 `go2-motion-<pid>.sock` 接收
+SSH 转发的本地请求。`motion_switch.py` 需与 `go2_control_bridge.py` 一起部署。
+暂停时清零并释放 API 运动权限；暂停/切换期间的速度消息直接丢弃，开启后等待新指令。
+启动参数 `--enable-motion` 仅表示初始状态；运行状态应查询此 socket 或总脚本的 `status`。
+原来的网页 `Stop` / Esc / S 仍可直接中断本机控制传输。
+
 ## 2. 文件与部署位置
 
 | 文件 | 运行位置 | 用途 |

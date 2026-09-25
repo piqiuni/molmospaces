@@ -1501,6 +1501,43 @@ class _ExactRgbdPairBuffer:
             del current[next(iter(current))]
 
 
+def _warmup_detector(model: Any, args: argparse.Namespace) -> None:
+    """Validate the actual inference path before accepting any sensor frames."""
+    import torch
+
+    started = time.perf_counter()
+    frame = np.zeros((int(args.imgsz), int(args.imgsz), 3), dtype=np.uint8)
+    print(f"YOLOE startup: warming up device={args.device} (2 synthetic frames)", flush=True)
+    try:
+        for _ in range(2):
+            model.predict(
+                source=frame, device=args.device, imgsz=args.imgsz,
+                conf=args.conf, iou=args.iou, max_det=args.max_det,
+                verbose=False, save=False,
+            )
+        actual_device = model.predictor.device
+        if str(args.device) != "cpu" and actual_device.type != "cuda":
+            raise RuntimeError(f"requested {args.device}, but predictor is on {actual_device}")
+        if actual_device.type == "cuda":
+            torch.cuda.synchronize(actual_device)
+            detail = (
+                f"name={torch.cuda.get_device_name(actual_device)} "
+                f"allocated_mib={torch.cuda.memory_allocated(actual_device) / 1024 ** 2:.1f}"
+            )
+        else:
+            detail = "explicit CPU mode"
+    except Exception as exc:
+        raise RuntimeError(
+            f"YOLOE startup warmup FAILED for {args.device}; detector is not ready: {exc}"
+        ) from exc
+    print(
+        f"YOLOE startup: warmup OK requested={args.device} actual={actual_device} "
+        f"{detail} elapsed_ms={(time.perf_counter() - started) * 1000:.1f}; "
+        "waiting for live ROS RGB-D",
+        flush=True,
+    )
+
+
 class YoloeWorker:
     def __init__(self, args: argparse.Namespace) -> None:
         # Register ROS subscriptions before loading the large GPU model.  This
@@ -1614,6 +1651,9 @@ class YoloeWorker:
             str(label).strip().casefold().replace(" ", "_"): max(0.001, min(1.0, float(value)))
             for label, value in class_thresholds.items()
         }
+        # Failure must escape startup, not enter the per-frame fallback loop.
+        # Synthetic warmup outputs are never published to the semantic graph.
+        _warmup_detector(self.model, self.args)
         self.report_pub = rospy.Publisher("/physical_nav/yolo_report", String, queue_size=1)
         # A report contains the overlay JPEG, sparse masks and compact point
         # samples. JSON encoding that payload on the inference thread can cost
@@ -2705,14 +2745,24 @@ class YoloeWorker:
         profile_started = time.monotonic()
         profile_count = 0
         profile_totals: dict[str, float] = {}
+        last_input_warning = time.monotonic()
         while True:
             cycle_started = time.monotonic()
             raw = None
             try:
                 raw = self._latest_raw_frame()
                 if raw is None:
+                    if time.monotonic() - last_input_warning >= 10.0:
+                        print(
+                            "YOLOE waiting: no usable new ROS RGB-D pair; "
+                            "check /physical_nav/rgb/image_raw, /physical_nav/depth/image_raw "
+                            "and capture_context (model warmup already passed)",
+                            flush=True,
+                        )
+                        last_input_warning = time.monotonic()
                     time.sleep(0.01)
                     continue
+                last_input_warning = time.monotonic()
                 if not self._claim_frame(raw): time.sleep(.02); continue
                 report = self.infer(raw)
                 cycle_ms = (time.monotonic() - cycle_started) * 1000.0
