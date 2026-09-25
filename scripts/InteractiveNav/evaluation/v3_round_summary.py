@@ -30,7 +30,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "interactive_nav_v3_round_summary_v5"
-PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v3"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v4"
 _WORKER_INDEX_RE = re.compile(r"^worker[_-]?(?P<index>\d+)")
 _PRE_SCORE_MARKERS = {
     "pre_score_guard",
@@ -183,11 +183,15 @@ def _paper_spl_from_saved_paths(
 
     if nav_success is None or reference_length_m is None or executed_length_m is None:
         return None
-    reference = max(0.0, float(reference_length_m))
-    executed = max(0.0, float(executed_length_m))
+    reference = float(reference_length_m)
+    executed = float(executed_length_m)
+    if not all(math.isfinite(value) and value >= 0.0 for value in (reference, executed)):
+        return None
     if not nav_success:
         return 0.0
-    return reference / max(reference, executed, 1e-9)
+    if reference == executed == 0.0:
+        return 1.0
+    return reference / max(reference, executed)
 
 
 def _worker_dir(round_root: Path, result_path: Path) -> Path:
@@ -1103,6 +1107,14 @@ def _strict_paper_mean(
 
     denominator = len(rows)
     values = [_finite_number(_paper_metric_value(row, key)) for row in rows]
+    if key in {"spl", "required_interaction_completion_fraction", "interaction_precision"}:
+        values = [value if value is not None and 0 <= value <= 1 else None for value in values]
+    if key == "total_cost":
+        values = [
+            None if _paper_metric_value(row, "schema_version") == PAPER_METRIC_SCHEMA_VERSION
+            and value is not None and not 0 <= value <= 1 else value
+            for row, value in zip(rows, values)
+        ]
     missing_count = sum(value is None for value in values)
     if denominator == 0 or missing_count:
         return None, denominator, missing_count
@@ -1178,20 +1190,33 @@ def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     # unless every episode records one explicit, shared metric schema.
     if not metric_schema["consistent"]:
         sr = spl = isr = ip = total_cost = None
+    current_schema = metric_schema["value"] == PAPER_METRIC_SCHEMA_VERSION
+    if not current_schema:
+        isr = ip = total_cost = None
+    if any(
+        (value := _finite_number(_paper_metric_value(row, "total_cost"))) is not None
+        and not 0 <= value <= 1
+        for row in rows
+    ):
+        total_cost = None
 
     # A Cost value without one frozen parameter vector is not comparable across
     # workers, so make it unavailable rather than averaging incompatible runs.
-    if not metric_config["consistent"]:
+    budget = _finite_number((metric_config["value"] or {}).get("cost_budget"))
+    cost_config_valid = budget is not None and budget > 0
+    if not metric_config["consistent"] or not cost_config_valid:
         total_cost = None
 
     return {
         "episode_count": len(rows),
         "paper_metric_schema_version": metric_schema["value"],
         "paper_metric_schema_consistent": metric_schema["consistent"],
+        "paper_metric_schema_current": current_schema,
         "paper_metric_schema_missing_count": metric_schema["missing_count"],
         "paper_metric_schema_distinct_count": metric_schema["distinct_count"],
         "paper_metric_config": metric_config["value"],
         "paper_metric_config_consistent": metric_config["consistent"],
+        "paper_cost_config_valid": cost_config_valid,
         "paper_metric_config_missing_count": metric_config["missing_count"],
         "paper_metric_config_distinct_count": metric_config["distinct_count"],
         # Canonical paper names.
@@ -1274,6 +1299,10 @@ def _paper_metric_warnings(paper_summary: dict[str, Any]) -> list[str]:
             "Total Cost is unavailable: episode results do not share one persisted "
             "paper_metric_config."
         )
+    if not overall.get("paper_metric_schema_current"):
+        warnings.append("ISR, IP and normalized Cost require metric schema v4; rescore older private traces rather than mixing legacy scalars.")
+    elif not overall.get("paper_cost_config_valid"):
+        warnings.append("Total Cost is unavailable: a finite positive cost_budget must be persisted.")
     for name, missing_key in (
         ("SR", "sr_missing_count"),
         ("SPL", "spl_missing_count"),

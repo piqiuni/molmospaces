@@ -96,6 +96,7 @@ def test_canonical_restricted_gt_adapter_derives_only_legacy_geometry_aliases() 
 
 def test_summary_separates_task_success_from_interaction_conditioned_success() -> None:
     common = {
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v4",
         "domains": ["container"],
         "interaction_requirement": "required",
         "recipe": "container_hidden",
@@ -188,19 +189,19 @@ def test_restricted_paper_metric_result_contract_is_scalar_and_redacted() -> Non
         "repeated_interaction_attempt_count": 0,
         "interaction_precision_episode": 0.5,
         "spl": 0.8,
-        "episode_total_cost": 5.2,
-        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v3",
+        "episode_total_cost": 5.2 / 30,
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v4",
         "paper_metric_config": {
-            "schema_version": "interactive_nav_v3_paper_metrics_v3",
+            "schema_version": "interactive_nav_v3_paper_metrics_v4",
             "interaction_attempt_cost": 0.4,
             "error_interaction_surcharge": 1.2,
-            "failure_penalty": 7.0,
+            "cost_budget": 30.0,
         },
         "episode_total_cost_breakdown": {
             "navigation_path_length_m": 3.2,
             "interaction_attempt_cost": 0.8,
             "error_interaction_surcharge": 1.2,
-            "failure_penalty": 0.0,
+            "operation_cost": 5.2, "cost_budget": 30.0,
         },
         "interaction_attempts": [
             {
@@ -222,7 +223,7 @@ def test_restricted_paper_metric_result_contract_is_scalar_and_redacted() -> Non
     assert group["success_rate"] == 1.0
     assert group["required_interaction_success_rate"] == 1.0
     assert group["interaction_precision"] == 0.5
-    assert group["mean_total_cost"] == 5.2
+    assert group["mean_total_cost"] == 5.2 / 30
 
     serialized = json.dumps(public_row, sort_keys=True)
     for private_value in (

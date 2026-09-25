@@ -314,6 +314,7 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
         episode={
             "interactive_nav": {
                 "target": {"selected_instance": "private_target"},
+                "success_criteria": {"distance": {"threshold_m": 1.0}},
                 "interactions": [
                     {"object_name": "private_fridge", "joint_index": 1}
                 ],
@@ -333,6 +334,7 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
         episode={
             "interactive_nav": {
                 "target": {"selected_instance": "private_target"},
+                "success_criteria": {"distance": {"threshold_m": 1.0}},
                 "interactions": [
                     {"object_name": "private_fridge", "joint_index": 2}
                 ],
@@ -942,6 +944,15 @@ def test_partial_object_skill_result_is_reported_failed_to_ros(
     assert consumed["private_attempt"]["classification"] == "required_valid"
     assert consumed["private_attempt"]["success"] is False
     assert consumed["private_attempt"]["resolved_interaction_ids"] == ["outer"]
+    assert consumed["private_attempt"]["metadata"]["physical_effect_achieved"] is True
+    from scripts.InteractiveNav.evaluation import benchmark_metrics
+    monkeypatch.setattr(
+        benchmark_metrics, "joint_open_fraction",
+        lambda _env, row: 0.9 if row["interaction_id"] == "outer" else 0.2,
+    )
+    score = benchmark_metrics.score_interactions(task.env, episode, [consumed["private_attempt"]])
+    assert score.required_interaction_completion_fraction == 0.5
+    assert not score.required_interaction_success
 
 
 def test_unsafe_refrigerator_sweep_matches_ordinary_retry_contract() -> None:

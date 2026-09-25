@@ -40,8 +40,8 @@ from scripts.InteractiveNav.force_interaction_runtime import ground_drawer_open_
 from scripts.InteractiveNav import interactive_nav_v3
 
 from .benchmark_metrics import (
+    DEFAULT_PAPER_COST_BUDGET,
     DEFAULT_PAPER_COST_ERROR_SURCHARGE,
-    DEFAULT_PAPER_COST_FAILURE_PENALTY,
     DEFAULT_PAPER_COST_INTERACTION_ATTEMPT,
     PAPER_METRIC_SCHEMA_VERSION,
     PaperMetricConfig,
@@ -213,7 +213,7 @@ class BenchmarkEvaluationConfig:
     runtime_base_yaw_tolerance_rad: float = 0.05
     paper_cost_interaction_attempt: float = DEFAULT_PAPER_COST_INTERACTION_ATTEMPT
     paper_cost_error_surcharge: float = DEFAULT_PAPER_COST_ERROR_SURCHARGE
-    paper_cost_failure_penalty: float = DEFAULT_PAPER_COST_FAILURE_PENALTY
+    paper_cost_budget: float = DEFAULT_PAPER_COST_BUDGET
     progress_every: int = 10
 
     def validate(self) -> None:
@@ -356,7 +356,7 @@ def _paper_metric_config(config: BenchmarkEvaluationConfig) -> PaperMetricConfig
     return PaperMetricConfig(
         interaction_attempt_cost=float(config.paper_cost_interaction_attempt),
         error_interaction_surcharge=float(config.paper_cost_error_surcharge),
-        failure_penalty=float(config.paper_cost_failure_penalty),
+        cost_budget=float(config.paper_cost_budget),
     )
 
 
@@ -3881,6 +3881,12 @@ def _consume_pending_ros_object_goal_interaction(
             # required effect is pending.  Preserve physical effects so the
             # paper's V/E accounting remains per attempted interaction.
             "effect_achieved_interaction_ids": successful_ids,
+            "physical_effect_achieved": any(
+                result.open_fraction_before is not None
+                and result.open_fraction_after is not None
+                and result.open_fraction_before < SUCCESS_OPEN_FRACTION <= result.open_fraction_after
+                for result in joint_results
+            ),
             "resolved_object_category": joints[0].object_category if joints else None,
             "resolved_object_domain": joints[0].domain if joints else None,
             "physical_state_changed": (
@@ -5900,10 +5906,10 @@ def parse_args() -> BenchmarkEvaluationConfig:
         help="Paper Total Cost mu: additional cost for an erroneous attempt (must exceed lambda).",
     )
     parser.add_argument(
-        "--paper-cost-failure-penalty",
+        "--paper-cost-budget",
         type=float,
-        default=DEFAULT_PAPER_COST_FAILURE_PENALTY,
-        help="Paper Total Cost kappa: fixed penalty for NavToObj terminal failure.",
+        default=DEFAULT_PAPER_COST_BUDGET,
+        help="Positive frozen normalization budget B; failure or over-budget success has Cost=1. Does not change the rollout step limit.",
     )
     parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
@@ -5991,7 +5997,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         runtime_base_yaw_tolerance_rad=args.runtime_base_yaw_tolerance_rad,
         paper_cost_interaction_attempt=args.paper_cost_interaction_attempt,
         paper_cost_error_surcharge=args.paper_cost_error_surcharge,
-        paper_cost_failure_penalty=args.paper_cost_failure_penalty,
+        paper_cost_budget=args.paper_cost_budget,
         progress_every=args.progress_every,
     )
 

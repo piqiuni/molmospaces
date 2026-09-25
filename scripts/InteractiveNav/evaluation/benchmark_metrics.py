@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+import json
 import math
 from typing import Any
 
@@ -18,14 +19,14 @@ DEFAULT_PATH_BINS_M = (0.0, 3.0, 5.0, 8.0, 12.0, 20.0)
 
 # These values are deliberately part of the evaluator protocol rather than a
 # post-hoc plotting choice.  ``lambda`` matches the deployed semantic policy's
-# interaction cost weight; the larger error surcharge and fixed failure penalty
-# make Eq. (1) in the paper reproducible from saved episode results.  All three
+# interaction cost weight; the error surcharge and normalization budget
+# make the paper cost reproducible from saved episode results. All three
 # can be overridden by the evaluator CLI and are frozen into every manifest and
 # episode result.
-PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v3"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v4"
 DEFAULT_PAPER_COST_INTERACTION_ATTEMPT = 0.30
 DEFAULT_PAPER_COST_ERROR_SURCHARGE = 1.00
-DEFAULT_PAPER_COST_FAILURE_PENALTY = 5.00
+DEFAULT_PAPER_COST_BUDGET = 30.00
 
 
 @dataclass(frozen=True)
@@ -34,17 +35,18 @@ class PaperMetricConfig:
 
     interaction_attempt_cost: float = DEFAULT_PAPER_COST_INTERACTION_ATTEMPT
     error_interaction_surcharge: float = DEFAULT_PAPER_COST_ERROR_SURCHARGE
-    failure_penalty: float = DEFAULT_PAPER_COST_FAILURE_PENALTY
+    cost_budget: float = DEFAULT_PAPER_COST_BUDGET
 
     def validate(self) -> None:
         values = {
             "interaction_attempt_cost": self.interaction_attempt_cost,
             "error_interaction_surcharge": self.error_interaction_surcharge,
-            "failure_penalty": self.failure_penalty,
         }
         for name, value in values.items():
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if not math.isfinite(float(self.cost_budget)) or float(self.cost_budget) <= 0.0:
+            raise ValueError("cost_budget must be finite and strictly positive")
         if float(self.error_interaction_surcharge) <= float(self.interaction_attempt_cost):
             raise ValueError(
                 "error_interaction_surcharge must be strictly greater than "
@@ -55,16 +57,17 @@ class PaperMetricConfig:
         self.validate()
         return {
             "schema_version": PAPER_METRIC_SCHEMA_VERSION,
-            "formula": "L_exec_m + lambda*A + mu*E + kappa*(1-S)",
-            "interaction_precision_definition": "new_successful_target_class_effect_attempts / all_interaction_attempts",
+            "formula": "min((L_exec_m + lambda*A + mu*E)/B, 1) if S else 1",
+            "interaction_precision_definition": "target_class_physical_effect_attempts / all_interaction_attempts",
             "interaction_success_definition": "episode_mean_of_best_required_plan_effect_completion_fraction",
             "error_definition": "failed_or_effect_free_repeated_attempts",
             "interaction_attempt_cost": float(self.interaction_attempt_cost),
             "error_interaction_surcharge": float(self.error_interaction_surcharge),
-            "failure_penalty": float(self.failure_penalty),
+            "cost_budget": float(self.cost_budget),
+            "cost_budget_mode": "scoring_ceiling_not_rollout_termination",
             "lambda_interaction_attempt_cost": float(self.interaction_attempt_cost),
             "mu_error_interaction_surcharge": float(self.error_interaction_surcharge),
-            "kappa_failure_penalty": float(self.failure_penalty),
+            "B_cost_budget": float(self.cost_budget),
         }
 
 
@@ -287,17 +290,15 @@ def score_interactions(
     successful_required: list[str] = []
     transient_satisfied: set[str] = set()
     for row in attempts:
-        if row.get("classification") != "required_valid" or not bool(row.get("success")):
+        if row.get("classification") != "required_valid":
             continue
         # An evaluator-owned object-level skill may execute a private set of
         # joints for one public ``open(opaque_id)`` request.  Keep the legacy
         # singular key for older traces while accepting the private plural form
         # needed to score the resulting V3 postconditions correctly.
-        resolved_ids = row.get("resolved_interaction_ids")
-        if isinstance(resolved_ids, (list, tuple)):
-            successful_required.extend(str(value) for value in resolved_ids if value is not None)
-        elif row.get("resolved_interaction_id") is not None:
-            successful_required.append(str(row["resolved_interaction_id"]))
+        # A failed multi-joint macro can still complete individual required
+        # effects. Requested IDs alone never constitute completion evidence.
+        successful_required.extend(_attempt_effect_interaction_ids(row, set(by_id)))
         metadata = row.get("metadata") or {}
         transient_ids = metadata.get("transient_satisfied_interaction_ids", [])
         if isinstance(transient_ids, (list, tuple, set)):
@@ -459,7 +460,7 @@ def paper_interaction_attempt_score(
     episode: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> PaperInteractionAttemptScore:
-    """Credit new successful effects in the target interaction class.
+    """Credit physical effects per attempt in the target interaction class.
 
     Other successful exploration is charged for the attempt but is not an
     error. ``E`` counts failed or effect-free repeated attempts only once.
@@ -477,8 +478,6 @@ def paper_interaction_attempt_score(
         str(row["interaction_id"]): row
         for row in nav.get("interactions", []) if row.get("interaction_id") is not None
     }
-    completed_ids: set[str] = set()
-    completed_objects: set[tuple[str, str, str]] = set()
     valid_count = 0
     error_count = 0
     irrelevant_count = 0
@@ -488,10 +487,8 @@ def paper_interaction_attempt_score(
     for attempt in attempts:
         targeted_ids = _attempt_targeted_interaction_ids(attempt)
         effect_ids = _attempt_effect_interaction_ids(attempt, required_ids)
-        has_new_effect = bool(set(effect_ids) - completed_ids)
         metadata = attempt.get("metadata") or {}
         metadata = metadata if isinstance(metadata, dict) else {}
-        object_name = str(attempt.get("resolved_object_name") or "")
         category = metadata.get("resolved_object_category")
         domain = str(metadata.get("resolved_object_domain") or "")
         if not category and targeted_ids:
@@ -500,23 +497,27 @@ def paper_interaction_attempt_score(
                 category = matched.get("object_category")
                 domain = str(matched.get("type") or "").split("_", 1)[0]
         interaction_class = _interaction_class(category, domain)
-        object_key = (domain, object_name, str(attempt.get("resolved_joint_name") or attempt.get("resolved_joint_index") or ""))
-        physical_state_changed = metadata.get("physical_state_changed")
+        # New ROS records verify threshold crossings inside a macro, including
+        # open-observe-close scans. Final macro state alone loses those effects.
+        physical_effect = metadata.get("physical_effect_achieved")
         before = _finite_float(attempt.get("joint_fraction_before"))
         after = _finite_float(attempt.get("joint_fraction_after"))
-        if before is not None and after is not None:
-            physical_state_changed = after > before + 1e-3
-        new_object_effect = bool(
-            attempt.get("success") and object_name
-            and physical_state_changed is not False
-            and (physical_state_changed is True or object_key not in completed_objects)
-        )
-        new_effect = has_new_effect or new_object_effect
-        repeated = bool(effect_ids or (attempt.get("success") and object_name)) and not new_effect
-        failed = bool(not effect_ids and not attempt.get("success"))
+        if physical_effect is not None:
+            has_effect = bool(physical_effect)
+        elif before is not None and after is not None:
+            has_effect = before < SUCCESS_OPEN_FRACTION <= after
+        else:
+            # Compatibility for private traces predating the per-macro flag:
+            # require both an observed change and a verified successful effect.
+            has_effect = bool(
+                metadata.get("physical_state_changed") is True
+                and (effect_ids or attempt.get("success"))
+            )
+        repeated = bool(attempt.get("success")) and not has_effect
+        failed = not bool(attempt.get("success")) and not has_effect
         irrelevant = interaction_class is not None and interaction_class not in target_classes
 
-        if new_effect and interaction_class in target_classes:
+        if has_effect and interaction_class in target_classes:
             valid_count += 1
         if irrelevant:
             irrelevant_count += 1
@@ -526,9 +527,6 @@ def paper_interaction_attempt_score(
             repeated_count += 1
         if failed or repeated:
             error_count += 1
-        completed_ids.update(effect_ids)
-        if new_effect and object_name:
-            completed_objects.add(object_key)
 
     attempt_count = len(attempts)
     if attempt_count:
@@ -557,20 +555,31 @@ def paper_episode_total_cost(
     """Evaluate and expose every term of the paper's Total Cost equation."""
 
     config.validate()
-    path_length = max(0.0, float(navigation_path_length_m))
+    path_length = float(navigation_path_length_m)
+    if not math.isfinite(path_length) or path_length < 0:
+        raise ValueError("navigation_path_length_m must be finite and non-negative")
+    if not (
+        0 <= interaction_score.error_interaction_attempt_count <= interaction_score.interaction_attempt_count
+        and 0 <= interaction_score.valid_interaction_attempt_count <= interaction_score.interaction_attempt_count
+    ):
+        raise ValueError("interaction counters must lie between zero and attempt count")
     attempt_cost = float(config.interaction_attempt_cost) * int(
         interaction_score.interaction_attempt_count
     )
     error_cost = float(config.error_interaction_surcharge) * int(
         interaction_score.error_interaction_attempt_count
     )
-    failure_cost = float(config.failure_penalty) * int(not bool(nav_success))
-    total = float(path_length + attempt_cost + error_cost + failure_cost)
+    operation_cost = float(path_length + attempt_cost + error_cost)
+    budget = float(config.cost_budget)
+    total = min(operation_cost / budget, 1.0) if nav_success else 1.0
     return total, {
         "navigation_path_length_m": path_length,
         "interaction_attempt_cost": attempt_cost,
         "error_interaction_surcharge": error_cost,
-        "failure_penalty": failure_cost,
+        "operation_cost": operation_cost,
+        "cost_budget": budget,
+        "cost_budget_exceeded": operation_cost > budget,
+        "success_within_cost_budget": bool(nav_success and operation_cost <= budget),
         "interaction_attempt_count": int(interaction_score.interaction_attempt_count),
         "error_interaction_attempt_count": int(interaction_score.error_interaction_attempt_count),
         "nav_success_indicator": int(bool(nav_success)),
@@ -624,11 +633,15 @@ def path_length_bin(length_m: float | None, bins: tuple[float, ...] = DEFAULT_PA
 def spl(success: bool, reference_length_m: float | None, actual_length_m: float) -> float | None:
     if reference_length_m is None:
         return None
-    reference = max(0.0, float(reference_length_m))
-    actual = max(0.0, float(actual_length_m))
+    reference = float(reference_length_m)
+    actual = float(actual_length_m)
+    if not all(math.isfinite(value) and value >= 0.0 for value in (reference, actual)):
+        return None
     if not success:
         return 0.0
-    return float(reference / max(reference, actual, 1e-9))
+    if reference == actual == 0.0:
+        return 1.0
+    return float(reference / max(reference, actual))
 
 
 def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -693,12 +706,15 @@ def _strict_rate(values: list[bool | None]) -> float | None:
     return float(sum(bool(value) for value in values if value is not None) / len(values))
 
 
+def _unit_float(value: Any) -> float | None:
+    value = _finite_float(value)
+    return value if value is not None and 0 <= value <= 1 else None
+
+
 def _paper_nav_success(row: dict[str, Any]) -> bool | None:
     """Return the terminal NavToObj predicate, never legacy V3 success."""
 
     value = row.get("nav_success")
-    if value is None:
-        value = row.get("task_success")
     return None if value is None else bool(value)
 
 
@@ -714,24 +730,17 @@ def _paper_spl(row: dict[str, Any]) -> float | None:
 
 
 def _paper_interaction_precision(row: dict[str, Any]) -> float | None:
-    value = _finite_float(row.get("interaction_precision_episode"))
-    if value is not None:
-        return value
-    valid_count = _finite_float(row.get("valid_interaction_attempt_count"))
-    attempt_count = _finite_float(row.get("interaction_action_count"))
-    requirement = row.get("interaction_requirement")
-    if valid_count is None or attempt_count is None or requirement is None:
-        return None
-    if attempt_count > 0.0:
-        return float(valid_count / attempt_count)
-    return 1.0 if str(requirement) == "unnecessary" else 0.0
+    # Match the round report: v4 writers must persist the per-episode scalar.
+    # Missing metrics must not be silently repaired from legacy counters.
+    return _unit_float(row.get("interaction_precision_episode"))
 
 
 def _paper_total_cost(row: dict[str, Any]) -> float | None:
     # Episode results store the evaluated equation and its full breakdown.  Do
     # not derive a cost from legacy correct-action counters: those cannot
     # distinguish effect-level credit from the paper's attempt-level V/E.
-    return _finite_float(row.get("episode_total_cost"))
+    value = _finite_float(row.get("episode_total_cost"))
+    return value if value is not None and 0 <= value <= 1 else None
 
 
 def _triggered_early_stops(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -752,7 +761,7 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row for row in rows if str(row.get("interaction_requirement") or "") == "required"
     ]
     paper_isr_values = [
-        _finite_float(row.get("required_interaction_completion_fraction"))
+        _unit_float(row.get("required_interaction_completion_fraction"))
         for row in required_rows
     ]
     paper_ip_values = [_paper_interaction_precision(row) for row in rows]
@@ -762,6 +771,21 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     paper_isr = _strict_mean(paper_isr_values)
     paper_ip = _strict_mean(paper_ip_values)
     paper_total_cost = _strict_mean(paper_cost_values)
+    schemas = {row.get("paper_metric_schema_version") for row in rows}
+    schema_consistent = bool(rows) and len(schemas) == 1 and None not in schemas and "" not in schemas
+    current_schema = schema_consistent and schemas == {PAPER_METRIC_SCHEMA_VERSION}
+    configs = [row.get("paper_metric_config") for row in rows]
+    config_consistent = bool(rows) and all(isinstance(config, dict) and config for config in configs)
+    if config_consistent:
+        config_consistent = len({json.dumps(config, sort_keys=True) for config in configs}) == 1
+    budget = _finite_float(configs[0].get("cost_budget")) if config_consistent else None
+    cost_config_valid = budget is not None and budget > 0
+    if not schema_consistent:
+        paper_sr = paper_spl = None
+    if not current_schema:
+        paper_isr = paper_ip = paper_total_cost = None
+    if not config_consistent or not cost_config_valid:
+        paper_total_cost = None
     early_stops = _triggered_early_stops(rows)
     early_stop_reasons = Counter(
         str(payload.get("reason") or "unknown") for payload in early_stops
@@ -773,6 +797,12 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "episode_count": len(rows),
+        "paper_metric_schema_version": next(iter(schemas)) if schema_consistent else None,
+        "paper_metric_schema_consistent": schema_consistent,
+        "paper_metric_schema_current": current_schema,
+        "paper_metric_config": configs[0] if config_consistent else None,
+        "paper_metric_config_consistent": config_consistent,
+        "paper_cost_config_valid": cost_config_valid,
         # The five primary fields below intentionally follow the paper rather
         # than the historical interaction-conditioned V3 `success` field.
         "success_rate": paper_sr,

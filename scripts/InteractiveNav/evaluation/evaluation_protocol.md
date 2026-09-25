@@ -136,22 +136,32 @@ For backward compatibility, result field `success` is the same as
 along with navigation success, required interaction success, sequence success,
 wrong interaction count, path length, and terminal reason.
 
-Paper metric schema `interactive_nav_v3_paper_metrics_v3` scores ISR as the
+Paper metric schema `interactive_nav_v3_paper_metrics_v4` scores ISR as the
 episode mean of the completed-required-effect fraction for the best valid
 required plan. A scene completing one of two required effects receives 0.5;
 the existing `required_interaction_success` flag still records full-plan
-completion for task logic. Schema v2 ISR was an all-or-nothing episode rate,
-so v2 and v3 ISR are not comparable without rescoring the underlying
-interactions. The v3 schema scores interaction
-precision per episode as the number of attempts producing a new successful
+completion for task logic. A failed macro does not discard verified partial
+effects; requested IDs alone are not completion evidence. The v4 schema scores interaction
+precision per episode as the number of attempts producing a successful
 effect on an object in the target interaction **category** divided by all
 interaction attempts. Categories use evaluator-private `object_category` and
 channel/container domain; they do not require the target instance or joint ID.
 An unrelated successful exploration interaction has no IP credit, but is not
-automatically an error. The cost is `L_exec + lambda*A + mu*E + kappa*(1-S)`,
-where `E` counts failed or effect-free repeated attempts, never mere
-non-target-category exploration. Old v1 IP and Total Cost are not comparable
-to v2/v3, whose IP and cost definitions are identical.
+automatically an error. An open effect must cross from below 0.8 to at least
+0.8 during that attempt. Reopening a closed object can earn credit again;
+opening an already-open object cannot. Private macro records preserve
+open-observe-close effects even when final state is closed or the macro fails.
+Cost is `min((L_exec + lambda*A + mu*E)/B, 1)` for NavToObj success and `1`
+otherwise, with `lambda=0.3`, `mu=1`, and default `B=30`. `E` counts attempts
+without any qualifying physical effect once. Verified partial macro effects
+and successful non-target-category exploration do not incur this surcharge.
+`--paper-cost-budget` (launcher: `PAPER_COST_BUDGET`) freezes B into the run
+signature, manifest and episode cost breakdown. This is a scoring ceiling,
+not a rollout step limit, and does not alter SR or SPL. The breakdown retains
+unnormalized operation cost and budget-exceeded/within-budget-success flags.
+The old failure-penalty option is removed. Do not pool old v1--v3 interaction
+scores/costs with v4, or mix different frozen budgets/weights. Missing scalars
+make a formal aggregate unavailable rather than shrinking its denominator.
 
 ### ROS step accounting and command liveness
 

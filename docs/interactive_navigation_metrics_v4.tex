@@ -1,0 +1,72 @@
+% Metric schema interactive_nav_v3_paper_metrics_v4. Requires amsmath.
+\paragraph{Evaluation metrics.}
+Let $S_i$ indicate verified navigation success, $L_i$ the executed planar
+base path length, and $L_i^{\mathrm{ref}}$ the frozen feasible reference
+length. We report episode means of SR and SPL:
+\begin{equation}
+\mathrm{SR}=\frac{1}{N}\sum_i S_i,\qquad
+\mathrm{SPL}=\frac{1}{N}\sum_i
+ S_i\frac{L_i^{\mathrm{ref}}}{\max(L_i^{\mathrm{ref}},L_i)}.
+\end{equation}
+A successful zero-reference, zero-motion episode has SPL one. Missing or
+invalid reference lengths are reported as unavailable, not silently omitted.
+For the restricted ROS policy, success requires an explicit completion claim
+verified using published target evidence and the benchmark distance criterion.
+
+\paragraph{Required-interaction recall (ISR).}
+Let $R_{ip}$ contain the required interaction IDs of valid plan $p$, and
+$G_i$ contain the IDs with verified required effects. A failed macro can
+contribute completed sub-effects; each ID contributes at most once per episode.
+\begin{equation}
+\mathrm{ISR}_i=\max_{p:\,R_{ip}\ne\emptyset}
+ \frac{|G_i\cap R_{ip}|}{|R_{ip}|}.
+\end{equation}
+\begin{equation}
+\mathrm{ISR}=\frac{1}{N_{\mathrm{req}}}
+ \sum_{i:\,\mathrm{required}}\mathrm{ISR}_i.
+\end{equation}
+Episodes without required interactions are excluded from ISR. Opening effects
+must satisfy the terminal opening threshold or a verified transient opening
+condition. The complete-plan success indicator is reported separately.
+
+\paragraph{Target-class interaction precision (IP).}
+Let $A_i$ be the number of interaction attempts and $V_i$ the number producing
+at least one verified physical effect in an annotated target class. Classes
+combine channel/container domain and object category. An attempt contributes
+at most once, including when a multi-joint macro is only partly successful.
+An open effect crosses from below $0.8$ to at least $0.8$ during the attempt;
+transient opening within a drawer scan also counts. Reopening after closure
+can earn credit again; an effect-free repeated request cannot. Let $U_i=1$
+only for episodes where interaction is unnecessary, and zero otherwise.
+\begin{equation}
+\mathrm{IP}_i=\begin{cases}V_i/A_i,&A_i>0,\\U_i,&A_i=0.\end{cases}
+\qquad \mathrm{IP}=\frac{1}{N}\sum_i\mathrm{IP}_i.
+\end{equation}
+The object need not be the reference instance. IP jointly reflects target-class
+selection and physical execution; successful exploration of other classes
+receives no IP credit but is not automatically an execution error.
+
+\paragraph{Normalized total cost.}
+Let $E_i$ count attempts without any qualifying physical effect, including
+failed and effect-free repeated requests. An attempt with a verified partial
+effect is not an error, regardless of its category or macro acknowledgement.
+Define the operation cost and normalized episode cost as
+\begin{equation}
+C_i^{\mathrm{op}}=L_i+\lambda A_i+\mu E_i,
+\end{equation}
+\begin{equation}
+\mathrm{Cost}_i=\begin{cases}
+\min(C_i^{\mathrm{op}}/B,1),&S_i=1,\\
+1,&S_i=0.
+\end{cases}
+\end{equation}
+\begin{equation}
+\mathrm{TotalCost}=\frac{1}{N}\sum_i\mathrm{Cost}_i.
+\end{equation}
+The default protocol freezes $\lambda=0.3$, $\mu=1$, and $B=30$ before
+evaluation. The budget is in weighted operation-cost units and is shared by
+the compared methods. It is a scoring ceiling, not a rollout stopping rule;
+SR and SPL retain their navigation-success definitions. Failures and successes
+exceeding the budget have Cost one. We retain the unnormalized operation cost
+and report SR alongside Cost. Metric versions and cost parameters are never
+pooled across incompatible runs.

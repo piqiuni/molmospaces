@@ -3358,3 +3358,37 @@ restricted-GT 对 refrigerator/cabinet/drawer/dresser/wardrobe 及中心位于�
 展示每组已完成 n 个的平均指标，同时保留计划分母30。ICS 取 episode `success`，
 NavSR 单列，不使用 aggregate `success_rate` 冒充正式成功。未完成分母下的成功率只是
 临时下界；infra、排队、heartbeat过期与正常算法失败分开显示。新增输出不纳入 Git。
+
+### 2026-09-26 论文指标 v4：归一化 Cost 与计算口径回归
+
+当前公式和可复制的论文片段见 `docs/interactive_navigation_metrics.md`、
+`docs/interactive_navigation_metrics_v4.tex`。Cost 使用预先冻结的
+`B=30`（可通过 `--paper-cost-budget` / `PAPER_COST_BUDGET` 修改），成功记
+`min((L_exec + 0.3*A + E)/B, 1)`，失败记 1；B 不改变仿真终止条件。
+
+从仓库根目录运行以下轻量测试，不启动仿真或 ROS master：
+
+```bash
+mkdir -p /home/ldl/tmp/interactive-nav-paper-dropin /home/ldl/.cache/interactive-nav-paper-dropin
+TMPDIR=/home/ldl/tmp/interactive-nav-paper-dropin \
+XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-paper-dropin \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD" \
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q --tb=short \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_metrics.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_benchmark_evaluation.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_benchmark_cli.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_round_summary.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_public_evaluator_contract.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_ros_object_goal_interaction.py
+```
+
+覆盖 SR 与交互条件化成功的区分、SPL 路径及零距离边界、ISR 部分完成和多方案、
+IP 本次开启阈值跨越与抽屉瞬时效果、Cost 失败/超预算封顶、逐场景宏平均、
+缺失值与混合版本拒绝、参数落盘及预算变更的 resume 拒绝。
+本次结果为 **131 passed, 1 failed**。唯一失败是已有静态测试
+`test_v3_runner_bounds_observation_turns_and_gives_m1_worker_pool_headroom`：
+断言 M1 超时默认值为 30 秒，而修改前的配置已是 15 秒；本次未调整该运行参数。
+修复了 ROS 路由测试样例缺少 `success_criteria.distance.threshold_m` 的问题。
+新版 LaTeX 指标片段通过独立 `article` + `amsmath` 编译；历史表 3 数值仍属于 v3，
+不能配上 v4 公式后直接复用，需基于完整私有物理记录重新评分。

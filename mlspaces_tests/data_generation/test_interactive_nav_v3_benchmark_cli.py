@@ -78,9 +78,14 @@ def test_public_v3_cli_routes_to_canonical_benchmark_runner() -> None:
     assert EvaluationConfig is benchmark_runner.BenchmarkEvaluationConfig
 
 
+@pytest.mark.parametrize(
+    ("resume_error_surcharge", "resume_cost_budget"), [(1.3, 7.0), (1.2, 8.0)]
+)
 def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    resume_error_surcharge: float,
+    resume_cost_budget: float,
 ) -> None:
     """Paper cost weights must be explicit, validated, and resume-locked."""
 
@@ -100,7 +105,7 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
             "0.4",
             "--paper-cost-error-surcharge",
             "1.2",
-            "--paper-cost-failure-penalty",
+            "--paper-cost-budget",
             "7.0",
         ],
     )
@@ -108,26 +113,26 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
     config = benchmark_runner.parse_args()
     assert config.paper_cost_interaction_attempt == pytest.approx(0.4)
     assert config.paper_cost_error_surcharge == pytest.approx(1.2)
-    assert config.paper_cost_failure_penalty == pytest.approx(7.0)
+    assert config.paper_cost_budget == pytest.approx(7.0)
 
     result = benchmark_runner.run_evaluation(config)
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["evaluation_config"]["paper_cost_interaction_attempt"] == pytest.approx(0.4)
     assert manifest["evaluation_config"]["paper_cost_error_surcharge"] == pytest.approx(1.2)
-    assert manifest["evaluation_config"]["paper_cost_failure_penalty"] == pytest.approx(7.0)
+    assert manifest["evaluation_config"]["paper_cost_budget"] == pytest.approx(7.0)
     paper_metric_config = result["summary"]["paper_metric_config"]
-    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v3"
+    assert paper_metric_config["schema_version"] == "interactive_nav_v3_paper_metrics_v4"
     assert paper_metric_config["interaction_success_definition"] == "episode_mean_of_best_required_plan_effect_completion_fraction"
-    assert paper_metric_config["formula"] == "L_exec_m + lambda*A + mu*E + kappa*(1-S)"
+    assert paper_metric_config["formula"] == "min((L_exec_m + lambda*A + mu*E)/B, 1) if S else 1"
     assert paper_metric_config["error_definition"] == "failed_or_effect_free_repeated_attempts"
     assert paper_metric_config["interaction_attempt_cost"] == pytest.approx(0.4)
     assert paper_metric_config["error_interaction_surcharge"] == pytest.approx(1.2)
-    assert paper_metric_config["failure_penalty"] == pytest.approx(7.0)
+    assert paper_metric_config["cost_budget"] == pytest.approx(7.0)
     # The direct names make saved JSON ergonomic; the aliases pin the exact
     # notation used in the paper's equation.
     assert paper_metric_config["lambda_interaction_attempt_cost"] == pytest.approx(0.4)
     assert paper_metric_config["mu_error_interaction_surcharge"] == pytest.approx(1.2)
-    assert paper_metric_config["kappa_failure_penalty"] == pytest.approx(7.0)
+    assert paper_metric_config["B_cost_budget"] == pytest.approx(7.0)
 
     with pytest.raises(ValueError, match="error_interaction_surcharge"):
         benchmark_runner.BenchmarkEvaluationConfig(
@@ -135,7 +140,7 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
             output_dir=tmp_path / "invalid",
             paper_cost_interaction_attempt=1.0,
             paper_cost_error_surcharge=1.0,
-            paper_cost_failure_penalty=7.0,
+            paper_cost_budget=7.0,
         ).validate()
 
     with pytest.raises(ValueError, match="different benchmark/evaluation signature"):
@@ -145,7 +150,7 @@ def test_paper_cost_cli_parameters_are_frozen_in_manifest_and_summary(
                 output_dir=output_dir,
                 resume=True,
                 paper_cost_interaction_attempt=0.4,
-                paper_cost_error_surcharge=1.3,
-                paper_cost_failure_penalty=7.0,
+                paper_cost_error_surcharge=resume_error_surcharge,
+                paper_cost_budget=resume_cost_budget,
             )
         )

@@ -307,12 +307,12 @@ def _result_row(**overrides: object) -> dict[str, object]:
         # These are the evaluator-owned, per-episode fields used by the paper
         # metrics.  They deliberately are not inferred from the legacy
         # ``correct_interaction_action_count`` aggregate.
-        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v3",
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v4",
         "paper_metric_config": {
-            "schema_version": "interactive_nav_v3_paper_metrics_v3",
+            "schema_version": "interactive_nav_v3_paper_metrics_v4",
             "interaction_attempt_cost": 0.3,
             "error_interaction_surcharge": 1.0,
-            "failure_penalty": 5.0,
+            "cost_budget": 30.0,
         },
         "valid_interaction_attempt_count": 2,
         "error_interaction_attempt_count": 1,
@@ -320,12 +320,12 @@ def _result_row(**overrides: object) -> dict[str, object]:
         "failed_interaction_attempt_count": 0,
         "repeated_interaction_attempt_count": 1,
         "interaction_precision_episode": 2 / 3,
-        "episode_total_cost": 5.9,
+        "episode_total_cost": 5.9 / 30,
         "episode_total_cost_breakdown": {
             "navigation_path_length_m": 4.0,
             "interaction_attempt_cost": 0.9,
             "error_interaction_surcharge": 1.0,
-            "failure_penalty": 0.0,
+            "operation_cost": 5.9, "cost_budget": 30.0,
         },
         "step_count": 5,
         "applied_action_step_count": 4,
@@ -1020,19 +1020,63 @@ def test_paper_ip_is_episode_macro_and_defines_both_zero_attempt_cases() -> None
 
 def test_paper_total_cost_is_macro_averaged_from_saved_episode_costs() -> None:
     rows = [
-        _result_row(episode_total_cost=1.25),
+        _result_row(episode_total_cost=0.25),
         _result_row(
             domains=["container"],
             recipe="container_hidden",
             interaction_types=["container_hinged_door"],
-            episode_total_cost=8.75,
+            episode_total_cost=0.75,
         ),
     ]
 
     groups = summarise_results(rows)["groups"]
-    assert groups["overall"]["mean_total_cost"] == pytest.approx(5.0)
-    assert groups["domain/channel"]["mean_total_cost"] == pytest.approx(1.25)
-    assert groups["domain/container"]["mean_total_cost"] == pytest.approx(8.75)
+    assert groups["overall"]["mean_total_cost"] == pytest.approx(0.5)
+    assert groups["domain/channel"]["mean_total_cost"] == pytest.approx(0.25)
+    assert groups["domain/container"]["mean_total_cost"] == pytest.approx(0.75)
+
+
+def test_paper_summary_refuses_mixed_versions_and_cost_budgets() -> None:
+    current = _result_row(episode_total_cost=0.25)
+    other_budget = _result_row(episode_total_cost=0.5)
+    other_budget["paper_metric_config"] = {**current["paper_metric_config"], "cost_budget": 60.0}
+    group = summarise_results([current, other_budget])["groups"]["overall"]
+    assert group["paper_sr"] == 1
+    assert group["mean_total_cost"] is None
+    assert not group["paper_metric_config_consistent"]
+    legacy = _result_row(paper_metric_schema_version="interactive_nav_v3_paper_metrics_v3", episode_total_cost=10.0)
+    group = summarise_results([current, legacy])["groups"]["overall"]
+    assert not group["paper_metric_schema_current"]
+    assert group["paper_isr"] is group["paper_ip"] is group["mean_total_cost"] is None
+
+
+@pytest.mark.parametrize("success,reference,actual,expected", [
+    (True, 0.0, 0.0, 1.0), (False, 0.0, 0.0, 0.0),
+    (True, 0.0, 1.0, 0.0), (True, -1.0, 1.0, None),
+    (True, float("nan"), 1.0, None), (True, 1.0, float("inf"), None),
+])
+def test_spl_boundary_cases_agree_with_round_summary(success, reference, actual, expected) -> None:
+    from scripts.InteractiveNav.evaluation.v3_round_summary import _paper_spl_from_saved_paths
+    assert spl(success, reference, actual) == expected
+    assert _paper_spl_from_saved_paths(success, reference, actual) == expected
+
+
+@pytest.mark.parametrize("value", [None, -0.1, 1.1, float("nan")])
+def test_paper_ip_missing_or_invalid_scalar_is_unavailable_in_both_reports(value) -> None:
+    from scripts.InteractiveNav.evaluation.v3_round_summary import _paper_group_summary
+
+    valid = _result_row(interaction_precision_episode=0.5)
+    invalid = _result_row(interaction_precision_episode=value)
+    regular = summarise_results([valid, invalid])["groups"]["overall"]
+    round_group = _paper_group_summary([
+        {"paper_metrics": {
+            "schema_version": row["paper_metric_schema_version"],
+            "metric_config": row["paper_metric_config"],
+            "interaction_precision": row["interaction_precision_episode"],
+        }} for row in (valid, invalid)
+    ])
+    assert regular["paper_ip"] is round_group["ip"] is None
+    assert regular["paper_metric_denominators"]["ip_missing_episode_count"] == 1
+    assert round_group["ip_missing_count"] == 1
 
 
 def test_summary_excludes_runtime_ineligible_rows_from_formal_metrics() -> None:

@@ -330,7 +330,7 @@ simulator observation (common step/stamp)
 | `SPL` | 成功加权路径效率，失败为 0，成功时按参考路径长度与实际路径长度的比值加权 |
 | `Interaction Success Rate` | 逐场景计算必要交互效果完成数 / 必要交互数，再对需要交互的场景平均；多方案取最佳完成比例 |
 | `Interaction Precision` | 全部交互尝试中，完成目标交互对象类别中新效果的比例；同类其他实例也计入 |
-| `Total Cost` | `L_exec + λ*A + μ*E + κ*(1-S)`；`E` 只包含失败或无新效果重复尝试 |
+| `Total Cost` | v4：成功为 `min((L_exec+λ*A+μ*E)/B,1)`，失败为 1；默认 `λ=0.3, μ=1, B=30`，预算预先冻结 |
 
 其中 `reachability`、`visibility` 和 `enablement` 是 benchmark 设计与论文叙事中的交互收益类型：
 

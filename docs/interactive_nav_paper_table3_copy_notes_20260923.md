@@ -1,5 +1,7 @@
 # 在 zgca_gpu 中合并到主稿
 
+2026-09-26 更新：以下表格是历史 v3 数值。当前 v4 的全部指标定义见 [`interactive_navigation_metrics_v4.tex`](interactive_navigation_metrics_v4.tex)，其中 Cost 已归一化，IP 按本次物理效果计分。不要将旧表数值与 v4 公式混用；新结果应来自 v4 evaluator 或有完整私有效果证据的重算。
+
 目标是 `/home/user/ldl/molmospaces/interactive-nav-paper/main.tex`。本机无法读取该主机上的原文件，所附 [`interactive_nav_paper_table3_20260923.tex`](interactive_nav_paper_table3_20260923.tex) 是**可复制的替换片段**，尚未修改远端 `main.tex`。
 
 合并时：

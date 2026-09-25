@@ -1,9 +1,9 @@
 # Interactive Navigation Evaluation Metrics
 
-最后更新：2026-09-23
+最后更新：2026-09-26，metric schema `interactive_nav_v3_paper_metrics_v4`
 
 本文档固定当前交互式导航 benchmark 的论文指标定义；实际计算入口为 `scripts/InteractiveNav/evaluation/benchmark_metrics.py`。
-可直接纳入论文主稿的 LaTeX 定义见 [`interactive_navigation_metrics_v2.tex`](interactive_navigation_metrics_v2.tex)。
+可直接纳入论文主稿的 LaTeX 定义见 [`interactive_navigation_metrics_v4.tex`](interactive_navigation_metrics_v4.tex)。
 
 当前主指标固定为 5 个：
 
@@ -12,8 +12,8 @@
 | `SR` | 越高越好 | 最终是否完成导航任务 |
 | `SPL` | 越高越好 | 成功前提下的路径效率 |
 | `Interaction Success Rate` | 越高越好 | 逐场景计算必要交互效果的完成比例，再对需要交互的场景平均 |
-| `Interaction Precision` | 越高越好 | 全部交互尝试中，完成目标交互对象**类别**中新效果的比例 |
-| `Total Cost` | 越低越好 | 路径、所有交互尝试、失败/无新效果重复及任务失败的总代价 |
+| `Interaction Precision` | 越高越好 | 全部交互尝试中，本次完成目标交互对象**类别**物理效果的比例 |
+| `Total Cost` | 越低越好 | 归一化的导航与交互代价；失败或超成本预算成功均记 1 |
 
 `reachability`、`visibility` 和 `enablement` 不作为论文主表中的独立指标。它们是 benchmark 构建、episode 分层和 `Interaction Success Rate` 判定时使用的交互收益语义。
 
@@ -57,7 +57,7 @@ S_i = 0, otherwise
 
 - `distance_passed_i`：机器人最终 base 到目标对象的平面距离满足 `success_criteria.distance.threshold_m`。
 - `visibility_passed_i`：目标对象在 `head_camera` 中满足 `success_criteria.visibility.threshold`。
-- 当前沿用 `NavToObj` 的成功逻辑，即距离条件和可见性条件都满足才算成功。
+- 非 ROS 模式沿用 `NavToObj`：先选最近的有效候选，再对同一对象检查严格距离 `< threshold` 和可见性 `> 0`。受限 ROS 模式还必须由算法声明目标完成，并由 evaluator 检查已发布的可见目标证据和距离。论文 SR 取 `nav_success`，不取交互条件化的旧 `success`，也不自动使用宽松类别成功字段。
 
 整体成功率为：
 
@@ -89,6 +89,8 @@ SPL = (1 / N) * sum_i SPL_i
 - `L_exec_i` 是 policy 实际走过的 robot base 平面路径长度。
 - `L_ref_i` 是该 episode 的参考可行路径长度。
 
+成功且参考与实际距离都为 0 时，SPL 约定为 1；失败为 0。参考路径缺失、非有限或负值时不伪造 SPL，正式平均值报告缺失；汇总使用 `nav_success` 和两条路径重算 SPL，不信任旧的交互条件化 SPL。
+
 这里的 `L_ref_i` 不能使用纯静态地图上的最短路作为统一基准。对于交互导航任务，参考路径应来自允许必要交互状态变化后的可行计划：
 
 - 无交互 episode：使用普通导航最短路或已有 `NavToObj` 参考路径。
@@ -102,7 +104,7 @@ SPL = (1 / N) * sum_i SPL_i
 
 `Interaction Success Rate` 表示需要交互的 episode 中，**必要交互效果完成的比例**，允许部分完成得分。
 
-默认只在 `interaction_requirement == "required"` 且 `oracle_plan.required_interaction_ids` 非空的 episode 上计算。对无交互样本，该指标记为 `N/A`，不进入该指标的分母。
+只在 `interaction_requirement == "required"` 的 episode 上计算，合法 required 样本必须有非空的必要交互计划。无交互样本不进入该指标的分母；required 样本缺失必要计划时记为缺失，正式 ISR 汇总不可用，不悄悄剔除该样本。
 
 单个 required episode 有一个或多个有效的必要交互计划。对计划 `p`，记其必要交互 ID 集合为 `R_{i,p}`，已成功产生预期物理效果的 ID 集合为 `G_i`。对有多个可行计划的 episode，取完成比例最高的一条：
 
@@ -118,7 +120,7 @@ Interaction Success Rate = (1 / N_required) * sum_i ISR_i
 
 例如 mixed 场景需要开门与打开容器两个效果，仅完成门时记 `ISR_i = 1/2`，而不是 0。`required_interaction_success` 仍是完整必要计划是否完成的二值诊断量，用于其他任务成功判定；它不能直接代替论文 ISR。对交互非必需或必要计划为空的场景，ISR 记为 `N/A`。多方案场景中的一个方案即便含更少的必要效果，也只和该方案自身的必要项比较，不把其他备选方案中的交互算作必须全部完成。
 
-当前 evaluator 按 GT `interaction_id` 统计：对应交互操作成功，并在终态达到 0.8 开启比例，或有操作过程中的已完成效果记录，才计入 `G_i`。`effect_types` 描述必要交互服务的场景目标；ISR 不另行对每种 effect type 作独立的通行、可见性或下游动作验收。最终导航目标是否达成由 SR 单独衡量。
+当前 evaluator 按 GT `interaction_id` 统计：有该效果已完成的私有证据，并在终态达到 0.8 开启比例，或有过程中的有效开启记录，才计入 `G_i`。宏整体 `success=False` 不会丢弃已证实的局部效果；仅有 requested ID 不计分。同一必要 ID 在整场只计一次。`effect_types` 描述场景目标；ISR 不另行对每种 effect type 作独立的通行、可见性或下游动作验收。最终导航目标是否达成由 SR 单独衡量。
 
 | effect type | 场景目标（不作为 ISR 的额外验收条件） |
 |-------------|----------|
@@ -152,7 +154,7 @@ Interaction Precision_i = 0, if A_i = 0 and interaction_requirement is not unnec
 - `A_i` 是 policy 实际执行的交互尝试次数。
 - `V_class_i` 是完成目标类别中新效果的交互尝试次数；一次多关节宏只计一次。
 
-一次交互尝试仅在目标类别匹配、物理操作成功（或已有私有记录证明某个目标关节效果已实现）、且该对象/关节此前未完成相同效果时计入分子。打开另一扇门或另一台冰箱可以得到类别交互信用；打开非目标类别的容器不会得到信用，但也不自动被定性为错误。失败尝试及对已完成对象的无新效果重复仍进入分母，不进入分子。IP 衡量目标类别交互的完成密度，不是部分可观测环境中的最优探索策略证明；应结合 SR 随预算变化及每类操作次数解读。
+一次尝试在目标类别匹配且本次至少产生一个合格物理效果时计入分子，宏整体失败也可凭已验证的局部效果计一次。开启效果要求从低于 0.8 跨到至少 0.8；轻微移动或对已经开启对象继续发开门请求不计分。按本次物理状态转移统计，不按整场首次效果去重：对象关上后成功重开可再次计分；打开其他同类实例也可计分。抽屉打开—观察—关闭以宏内部已验证的开启记录计分，不能仅比较宏开始和结束状态。缺少物理证据时不凭成功 ACK 猜测效果。其他类别的成功探索不计 IP 信用，但不自动判为错误。IP 联合反映类别选择与物理执行效果，重复探索的代价由 Cost 体现。
 
 结果字段 `non_target_class_interaction_attempt_count` 记录已识别类别但不属于目标类别的尝试。保留的旧字段 `task_irrelevant_interaction_attempt_count` 在 v2 中是同一计数的兼容别名，不代表该探索行为一定无用，也不自动计入成本中的错误数。
 
@@ -177,10 +179,12 @@ Attempt Precision = sum_i V_class_i / sum_i A_i
 
 ## 6. Total Cost
 
-`Total Cost` 与 evaluator v3 口径一致（其 IP 与成本公式承袭 v2，ISR 改为逐场景必要效果完成率），包含所有 episode：
+`Total Cost` 使用 metric schema v4，先计算操作代价，再归一化：
 
 ```text
-Cost_i = L_exec_i + lambda * A_i + mu * E_i + kappa * (1 - S_i)
+C_op_i = L_exec_i + lambda * A_i + mu * E_i
+Cost_i = min(C_op_i / B, 1), if S_i = 1
+Cost_i = 1, if S_i = 0
 ```
 
 其中：
@@ -188,8 +192,11 @@ Cost_i = L_exec_i + lambda * A_i + mu * E_i + kappa * (1 - S_i)
 - `L_exec_i` 是实际 robot base 平面路径长度。
 - `A_i` 是交互尝试次数，成功、失败、重复交互都计入。
 - `lambda` 是交互代价权重，用于把一次交互折算成等效路径长度。
-- `E_i` 是失败或已无新效果的重复尝试数，同一尝试即使同时满足两项也只计一次；打开其他探索对象不会仅因对象不属于目标类别而计入 `E_i`。
-- `S_i` 是严格 NavToObj 成功指示；`mu` 和 `kappa` 分别是错误尝试及任务失败的固定惩罚。当前默认 `lambda=0.3`、`mu=1`、`kappa=5`。
+- `E_i` 是本次未产生合格物理效果的尝试数，包含失败和无效重复请求，每次只计一次。宏整体失败但已完成至少一个合格效果时不计入 `E_i`；打开其他类别对象并产生合格效果也不计入 `E_i`。物理效果阈值与 IP 一致，E 不要求目标类别匹配。
+- `S_i` 与论文 SR 的 `nav_success` 相同。默认 `lambda=0.3`、`mu=1`、`B=30`；B 是加权操作代价单位，不是 step 数、秒数或本轮数据的最大成本。
+- 失败统一记 1；成功超过成本预算也记 1。B 只作为评分上限，不改变 rollout 的 step 上限、SR 判定或 SPL。
+- 使用 CLI `--paper-cost-budget` 或 ROS launcher 的 `PAPER_COST_BUDGET` 配置 B。必须在评测前冻结，并在相同场景的方法之间保持一致；预算、权重进入 manifest、episode 和 resume signature。
+- `episode_total_cost_breakdown` 保存 `operation_cost`、`cost_budget`、是否超预算及各项原始代价。旧 `--paper-cost-failure-penalty` 不适用于 v4。
 
 主表报告全部 episode 的平均总代价：
 
@@ -197,7 +204,7 @@ Cost_i = L_exec_i + lambda * A_i + mu * E_i + kappa * (1 - S_i)
 Total Cost = (1 / N) * sum_i Cost_i
 ```
 
-固定失败罚分并不能完全消除早停的低成本偏差，因此同时报告 SR、共同成功 episode 的成本与成功率随预算变化；不能单独用 Total Cost 判断规划能力。所有权重在评测前冻结：v1 与 v2 的 IP/Total Cost 不可直接比较，v2 与 v3 的 ISR 不可直接比较。
+Cost 位于 [0,1]，仍应结合 SR 解读；失败场景间的部分进度由 ISR 展示。普通汇总与 round summary 都拒绝将不同指标版本的 ISR/IP/Cost 混算，也不平均不同预算或权重的 Cost。旧 v1–v3 结果不能通过除以 30 直接变成 v4：失败必须记 1，且 ISR/IP 的物理效果口径也已修正。缺失值不能悄悄从正式指标分母中删除。
 
 当前交互尝试使用统一 `lambda`。后续如果需要更细，可以扩展为：
 

@@ -258,7 +258,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
     metric_config = {
         "interaction_attempt_cost": 0.3,
         "error_interaction_surcharge": 1.0,
-        "failure_penalty": 5.0,
+        "cost_budget": 30.0,
     }
     saved_rows = [
         {
@@ -294,7 +294,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
             "required_interaction_success": False,
             "required_interaction_completion_fraction": 0.5,
             "interaction_precision_episode": 0.0,
-            "episode_total_cost": 4.0,
+            "episode_total_cost": 0.4,
             "interaction_action_count": 1,
             "valid_interaction_attempt_count": 0,
             "error_interaction_attempt_count": 1,
@@ -312,7 +312,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
             "required_interaction_success": True,
             # IP is an episode macro, not 1 / (9 + 1 + 0).
             "interaction_precision_episode": 1.0,
-            "episode_total_cost": 7.0,
+            "episode_total_cost": 0.7,
             "interaction_action_count": 0,
             "valid_interaction_attempt_count": 0,
             "error_interaction_attempt_count": 0,
@@ -327,7 +327,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
                     "status": "complete",
                     "scoring_eligible": True,
                     "paper_metric_schema_version": (
-                        "interactive_nav_v3_paper_metrics_v3"
+                        "interactive_nav_v3_paper_metrics_v4"
                     ),
                     "paper_metric_config": metric_config,
                 }
@@ -342,7 +342,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
     assert overall["isr"] == pytest.approx(0.75)
     assert overall["full_required_interaction_success_rate"] == pytest.approx(0.5)
     assert overall["ip"] == pytest.approx(0.5)
-    assert overall["total_cost"] == pytest.approx(4.0)
+    assert overall["total_cost"] == pytest.approx(0.7)
     assert overall["success_rate"] == overall["sr"]
     assert overall["mean_spl"] == overall["spl"]
     assert overall["required_interaction_success_rate"] == overall["isr"]
@@ -352,7 +352,7 @@ def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> Non
     assert overall["isr_denominator"] == 2
     assert overall["ip_denominator"] == 3
     assert summary["paper_metrics"]["paper_metric_config"] == metric_config
-    assert summary["paper_metrics"]["groups"]["domain/mixed"]["total_cost"] == 7.0
+    assert summary["paper_metrics"]["groups"]["domain/mixed"]["total_cost"] == 0.7
     unnecessary = summary["paper_metrics"]["groups"]["requirement/unnecessary"]
     assert unnecessary["isr"] is None
     assert unnecessary["isr_denominator"] == 0

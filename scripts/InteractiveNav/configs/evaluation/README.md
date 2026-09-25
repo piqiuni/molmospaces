@@ -16,6 +16,7 @@ For example, a small override file can contain:
 ```bash
 FAST_EVAL=true
 ROS_MASTER_URI=http://127.0.0.1:15101
+PAPER_COST_BUDGET=30.0
 ```
 
 Pass its path as the third argument. Batch jobs can select it through
@@ -35,6 +36,7 @@ Default persistence:
 |---|---|---|
 | `STEP_BUDGET_MODE` | `dynamic` | GT path plus interaction budget |
 | `MAX_STEPS` | `2000` | Upper cap, also batch CLI default |
+| `PAPER_COST_BUDGET` | `30.0` | Frozen Cost normalization ceiling; independent of step limits |
 | `RECORDER_SAVE_EVENTS` | `false` | Do not create `debug/events.jsonl` |
 | `RECORDER_COMPACT_STEPS` | `true` | Remove candidate `graph_context`; retain only terminal/completion summaries from decision trace |
 | `RECORDER_COMPRESS_STEPS` | `true` | Flush gzip level 3 JSONL per step |
