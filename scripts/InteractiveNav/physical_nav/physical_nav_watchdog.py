@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Monitor whether the physical-navigation gateway keeps making progress."""
+"""Monitor ROS pipeline progress independently of the optional dashboard."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -90,7 +91,94 @@ def fetch_health(url: str, timeout_s: float) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+class PipelineProgress:
+    """Bounded progress receipts; duplicates cannot keep a stalled worker alive."""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._receipts = {}
+
+    def observe(self, stream, seq, stamp, *, ros_now=None):
+        stamp = _finite_float(stamp)
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if stream not in {"frame", "perception"} or seq < 0 or stamp is None or stamp <= 0:
+            return False
+        now = self._clock()
+        ros_now = _finite_float(ros_now)
+        # These stamps have already been mapped to the local ROS epoch by the
+        # sensor bridge. Include source age so old queued frames are not healthy.
+        source_age = max(0.0, ros_now - stamp) if ros_now is not None else 0.0
+        with self._lock:
+            previous = self._receipts.get(stream)
+            if previous is not None and stamp <= previous[1]:
+                return False
+            self._receipts[stream] = (seq, stamp, now, source_age)
+        return True
+
+    def snapshot(self):
+        now = self._clock()
+        result = {"generated_at": time.time(), "source": "ros"}
+        with self._lock:
+            for stream in ("frame", "perception"):
+                seq, stamp, received, source_age = self._receipts.get(
+                    stream, (-1, 0.0, now, float("inf"))
+                )
+                result.update({f"{stream}_seq": seq, f"{stream}_stamp": stamp,
+                               f"{stream}_age_s": max(0.0, now - received) + source_age})
+        # This is end-to-end data liveness, not a claim about TCP socket state.
+        result["link_connected"] = result["frame_seq"] >= 0
+        return result
+
+
+class RosHealthSource:
+    def __init__(self, args):
+        import rospy
+        from std_msgs.msg import Header, String
+
+        self.rospy = rospy
+        self.progress = PipelineProgress()
+        rospy.init_node("physical_nav_watchdog", anonymous=False, disable_signals=True)
+        self.subscribers = [
+            rospy.Subscriber(args.capture_context_topic, String, self._capture,
+                             queue_size=1, tcp_nodelay=True),
+            rospy.Subscriber(args.perception_heartbeat_topic, Header, self._perception,
+                             queue_size=1, tcp_nodelay=True),
+        ]
+
+    def _capture(self, message):
+        try:
+            data = json.loads(message.data)
+            self.progress.observe("frame", data.get("seq"), data.get("stamp"),
+                                  ros_now=self.rospy.Time.now().to_sec())
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    def _perception(self, message):
+        self.progress.observe("perception", message.seq, message.stamp.to_sec(),
+                              ros_now=self.rospy.Time.now().to_sec())
+
+    def snapshot(self):
+        return self.progress.snapshot()
+
+    def close(self):
+        for subscriber in self.subscribers:
+            subscriber.unregister()
+
+
 def monitor(args: argparse.Namespace) -> int:
+    source = RosHealthSource(args) if args.source == "ros" else None
+    try:
+        return _monitor(args, source)
+    finally:
+        if source is not None:
+            source.close()
+
+
+def _monitor(args: argparse.Namespace, source=None) -> int:
     limits = HealthLimits(
         frame_stale_s=args.frame_stale_s,
         perception_stale_s=args.perception_stale_s,
@@ -101,7 +189,7 @@ def monitor(args: argparse.Namespace) -> int:
     last_message = ""
     while True:
         try:
-            payload = fetch_health(args.url, args.timeout_s)
+            payload = source.snapshot() if source is not None else fetch_health(args.url, args.timeout_s)
             errors = health_errors(payload, limits)
         except Exception as exc:
             errors = [f"health request failed: {exc}"]
@@ -141,6 +229,9 @@ def monitor(args: argparse.Namespace) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", choices=("ros", "http"), default="ros")
+    parser.add_argument("--capture-context-topic", default="/physical_nav/capture_context")
+    parser.add_argument("--perception-heartbeat-topic", default="/physical_nav/yolo/heartbeat")
     parser.add_argument("--url", default="http://127.0.0.1:8765/api/health")
     parser.add_argument("--interval-s", type=float, default=2.0)
     parser.add_argument("--timeout-s", type=float, default=1.0)

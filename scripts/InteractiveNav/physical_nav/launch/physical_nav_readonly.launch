@@ -21,7 +21,7 @@
   <arg name="web_url" default="http://127.0.0.1:8765"/>
   <arg name="web_state_enabled" default="true"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
-  <arg name="system_ros_python" default="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/physical_ros_python.sh"/>
+  <arg name="system_ros_python" default="$(find physical_nav)/.runtime/physical_ros_python.sh"/>
   <arg name="start_mapping" default="true"/>
   <arg name="semantic_override_config" default="$(find physical_nav)/config/semantic_shadow_override.yaml"/>
   <arg name="explore_override_config" default="$(find physical_nav)/config/explore_physical_override.yaml"/>

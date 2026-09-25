@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""ROS1-side gateway for the read-only Go2 WebSocket service.
+"""ROS-side perception adapter and optional dashboard mirror.
 
-This node deliberately runs with the system ROS Python (normally
-``/usr/bin/python3``). It polls encoded frames from the algorithm/web process
-over localhost HTTP, publishes standard ROS messages, and sends detector/map
-JSON back to the web process. The Go2 link itself remains WebSocket-only.
+The physical launch consumes authoritative ROS sensor/YOLO messages. Legacy
+HTTP sensor/state readers are opt-in replay compatibility, not live inputs.
+Dashboard delivery is latest-only and never owns capture or algorithm state.
 """
 
 from __future__ import annotations

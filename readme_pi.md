@@ -506,6 +506,11 @@ simulator observation (common step/stamp)
 
 ## 10. 后续文档维护目标
 
+实物 Go2 作为公共 ROS 交互导航的同仓库附加部署层，代码边界、唯一配置来源和
+与 exp-setting 的后续合并规则见
+[`docs/physical_addon_architecture.md`](docs/physical_addon_architecture.md)。
+网页为可选观察/控制入口，不作为算法输入或健康监督的必需中间服务。
+
 后续文档维护的方向不是继续堆积新的“方案文档”，而是：
 
 1. 把历史讨论中的有效结论吸收到 4 个核心文档

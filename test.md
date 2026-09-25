@@ -3748,3 +3748,83 @@ cmake --build Interactive-Nav-SG-nav/build \
 
 此编译命令适用于当前仅编译实物依赖的工作空间；其他工作树已有包白名单时，
 应在其原有白名单中添加上述包，而不是覆盖。默认局部规划器仍是 DWA。
+
+### 2026-09-25 实物 addon 分离验收
+
+先运行上节的全量离线回归（会自动包含新增 `test_addon_architecture.py`）。新增测试
+覆盖配置单一来源、ROS 资源查找不重名、安装位置无关的入口、公共算法无实物反向
+依赖、共用几何、两帧语义持久化、门侧记忆、无网页监督、旧帧/重发检测、YOLO
+报告发布成功后才发送心跳。无需连接 Go2、加载 GPU 模型或启动 ROS master。
+
+已有包白名单中增加 `physical_nav` 后，构建并安装到临时目录（不覆盖运行部署）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source Interactive-Nav-SG-nav/devel/setup.bash
+cmake -S Interactive-Nav-SG-nav/src -B Interactive-Nav-SG-nav/build \
+  -DCATKIN_WHITELIST_PACKAGES="struct_mapping_pkg;nav_pkg;physical_nav"
+cmake --build Interactive-Nav-SG-nav/build \
+  --target slam_gmapping oriented_global_planner path_follower -j4
+ADDON_CHECK_DIR="$(mktemp -d /tmp/physical-addon-check-XXXXXX)"
+cmake --install Interactive-Nav-SG-nav/build/physical_nav --prefix "$ADDON_CHECK_DIR/install"
+
+# 仅解析 launch 参数，不启动任何节点。
+ROS_PACKAGE_PATH="$PWD/Interactive-Nav-SG-nav/src:${ROS_PACKAGE_PATH:-}" \
+  /usr/bin/python3 /opt/ros/noetic/bin/roslaunch --dump-params \
+  physical_nav physical_nav_readonly.launch web_state_enabled:=false
+
+# 不依赖源码 PYTHONPATH 的 devel 和临时 install 入口检查。
+PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages \
+ROS_PACKAGE_PATH="$PWD/Interactive-Nav-SG-nav/src" \
+  conda run -n mlspaces python \
+  Interactive-Nav-SG-nav/devel/lib/physical_nav/physical_sensor_ros_bridge.py --help
+PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages \
+ROS_PACKAGE_PATH="$ADDON_CHECK_DIR/install/share:/opt/ros/noetic/share" \
+  conda run -n mlspaces python \
+  "$ADDON_CHECK_DIR/install/lib/physical_nav/physical_sensor_ros_bridge.py" --help
+```
+
+真机重启/运行不是上述验收的一部分。安全现场后续可用
+`PHYSICAL_NAV_START_WEB=0 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh start`
+验证无网页主链，再比较打开网页时的 `/physical_nav/capture_context`、
+`/physical_nav/yolo/heartbeat`、OCC 和算法输出频率。该命令会实际启动服务，
+须另行确认现场条件，且不得借此默认启用运动。
+
+### 实物 addon 第二阶段：开门后策略拆分
+
+最小离线检查如下，完整验收继续运行上面的全量命令：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:." \
+conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_post_open_workflows.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_behavior_execution.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_semantic_behavior_executor_static.py \
+  scripts/InteractiveNav/physical_nav/tests/test_addon_architecture.py
+```
+
+`test_post_open_workflows.py` 使用显式时间推进，没有真实 sleep 或运动发布。
+执行器测试用假 publisher/clock/condition 复现 raw→planning→costmap、实物直连、
+新地图与取消同时到达，以及观察线程归属切换后的禁止发布（含禁止旧线程发送零速度）。
+这轮没有改 C++、相机/运动参数或 launch 接线；无需为测试启动机器人服务。
+
+### 实物 addon 第三阶段：容器策略与交互命令拆分
+
+保持上述环境前置条件，最小离线检查：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:." \
+conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_container_contracts.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_behavior_execution.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_semantic_behavior_executor_static.py \
+  scripts/InteractiveNav/physical_nav/tests/test_addon_architecture.py
+```
+
+`test_container_contracts.py` 覆盖无 ROS/传输依赖、旧导入兼容、视点索引不变、
+输入不被修改、M1 新鲜/正面/裁切门槛、正面证据到动作位姿的映射、抽屉合同拒绝
+与命令字段隔离。执行器测试同时检查发送前绑定结果 ID，以及无效抽屉命令既不
+分配序号也不发布。最小检查 388 项、全量 2041 项通过（2026-09-25）。
+本阶段不改 C++、运行配置或服务，不需要重启、连接机器人或加载 GPU 模型。

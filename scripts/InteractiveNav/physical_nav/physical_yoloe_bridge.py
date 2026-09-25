@@ -26,14 +26,10 @@ import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from std_msgs.msg import Header, String
 
-# Keep the detector's embedded fallback geometry on the exact same camera-IMU
-# convention as the direct ROS bridge.  The direct bridge is the authority for
-# ``tf_frame_base_link -> d435i_*_optical_frame``; importing its small pure
-# quaternion helpers avoids re-implementing the sensor-axis conjugation here.
-# (The module has no node-start side effects at import time.)
-from physical_sensor_ros_bridge import (  # noqa: E402
+# The sensor adapter and detector share pure capture geometry, not ROS nodes.
+from capture_geometry import (
     _camera_imu_parent_correction_quaternion,
     _coerce_bool as _sensor_coerce_bool,
     _quat_multiply as _sensor_quat_multiply,
@@ -1671,6 +1667,7 @@ class YoloeWorker:
         # Synthetic warmup outputs are never published to the semantic graph.
         _warmup_detector(self.model, self.args)
         self.report_pub = rospy.Publisher("/physical_nav/yolo_report", String, queue_size=1)
+        self.heartbeat_pub = rospy.Publisher("/physical_nav/yolo/heartbeat", Header, queue_size=1)
         # A report contains the overlay JPEG, sparse masks and compact point
         # samples. JSON encoding that payload on the inference thread can cost
         # several milliseconds and, more importantly, lets ROS serialization
@@ -1994,6 +1991,13 @@ class YoloeWorker:
                         )
                     )
                 )
+                # Emit only after an authoritative report was published. The
+                # watchdog need not deserialize masks, point clouds or JPEGs.
+                self.heartbeat_pub.publish(Header(
+                    seq=int(report["seq"]) & 0xFFFFFFFF,
+                    stamp=rospy.Time.from_sec(float(report["stamp"])),
+                    frame_id=str(report.get("camera_frame", "")),
+                ))
             except Exception as exc:
                 rospy.logwarn_throttle(5.0, "YOLO ROS report publish failed: %s", exc)
 

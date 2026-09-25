@@ -726,9 +726,7 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
     assert dispatched[0]["detail"]["verification_mode"] == "direct_static_portal_feedback"
 
 
-def test_physical_fast_path_does_not_wait_for_planning_occ(executor_module) -> None:
-    """Raw OCC plus a downstream global update must release make_plan directly."""
-
+def _map_wait_executor(executor_module):
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.lock = threading.RLock()
     executor._global_costmap_condition = threading.Condition(executor.lock)
@@ -771,6 +769,16 @@ def test_physical_fast_path_does_not_wait_for_planning_occ(executor_module) -> N
     executor._planning_occupancy_received_count = 40
     executor._latest_planning_occupancy_header_seq = 40
     executor._latest_planning_occupancy_header_stamp_sec = 100.0
+    executor._post_interaction_planning_map_barriers = {}
+    return executor
+
+
+@pytest.mark.parametrize("preempted", [False, True])
+def test_physical_fast_path_does_not_wait_for_planning_occ(executor_module, preempted) -> None:
+    """Raw OCC plus a downstream global update must release make_plan directly."""
+    executor = _map_wait_executor(executor_module)
+    if preempted:
+        executor.selection = {"decision_id": "new_decision"}
     executor._post_interaction_planning_map_barrier_locked = lambda *_args: pytest.fail(
         "physical fast path must not wait for planning OCC"
     )
@@ -786,9 +794,183 @@ def test_physical_fast_path_does_not_wait_for_planning_occ(executor_module) -> N
         },
     )
 
+    if preempted:
+        assert fresh is False
+        assert detail["reason"] == "post_open_costmap_wait_preempted"
+        assert not detail["costmap_fresh"]
+        return
     assert fresh is True
     assert detail["post_open_costmap_fast_path"] is True
     assert detail["fresh_source"] == "raw_occupancy_to_global_costmap_update"
+
+
+@pytest.mark.parametrize("preempted", [False, True])
+def test_strict_map_wait_requires_planning_then_a_later_costmap(executor_module, monkeypatch, preempted):
+    executor = _map_wait_executor(executor_module)
+    executor.post_interaction_costmap_fast_path_enabled = False
+    executor.post_interaction_costmap_fresh_timeout_s = 10.0
+    stages = []
+
+    def deliver_next_map(timeout):
+        assert len(stages) < 2
+        if not stages:
+            assert executor._post_interaction_planning_map_barriers == {}
+            stages.append("planning")
+            executor._planning_occupancy_received_count = 41
+            executor._latest_planning_occupancy_header_seq = 41
+            executor._latest_planning_occupancy_header_stamp_sec = 100.1
+        else:
+            admitted = executor._post_interaction_planning_map_barriers["portal:portal_fast"]
+            assert admitted.costmap_update_receipt_count == 21
+            stages.append("costmap")
+            executor._global_costmap_update_received_count = 22
+            if preempted:
+                executor.selection = None
+
+    monkeypatch.setattr(executor._global_costmap_condition, "wait", deliver_next_map)
+    fresh, detail = executor._wait_for_post_interaction_costmap_freshness(
+        "decision_fast", {"target_id": "portal_fast"})
+    assert stages == ["planning", "costmap"]
+    assert detail["baseline_global_costmap_seq"] == 21
+    assert detail["observed_global_costmap_seq"] == 22
+    assert fresh is not preempted
+    if preempted:
+        assert detail["reason"] == "post_open_costmap_wait_preempted"
+    else:
+        assert detail["fresh_source"] == "costmap_update"
+        assert "post_open_costmap_fast_path" not in detail
+
+
+@pytest.mark.parametrize("stage", ["raw", "planning", "costmap", "baseline"])
+def test_map_wait_keeps_stage_specific_failure_reasons(executor_module, monkeypatch, stage):
+    executor = _map_wait_executor(executor_module)
+    executor.post_interaction_costmap_fresh_timeout_s = 0.0
+    if stage == "raw":
+        executor._raw_occupancy_events = []
+        executor._latest_raw_occupancy_event = None
+    elif stage == "planning":
+        executor.post_interaction_costmap_fast_path_enabled = False
+    elif stage == "costmap":
+        executor._global_costmap_update_received_count = 20
+    else:
+        executor._post_interaction_costmap_baselines.clear()
+    monkeypatch.setattr(executor_module.rospy, "logwarn", lambda *args: None)
+    fresh, detail = executor._wait_for_post_interaction_costmap_freshness(
+        "decision_fast", {"target_id": "portal_fast"})
+    assert not fresh
+    assert detail["reason"] == {
+        "raw": "post_open_raw_occ_refresh_timeout",
+        "planning": "post_open_planning_occ_refresh_timeout",
+        "costmap": "post_open_costmap_refresh_timeout",
+        "baseline": "post_open_costmap_baseline_missing",
+    }[stage]
+
+
+def _exit_sweep_executor(module, monkeypatch):
+    executor = object.__new__(module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "sweep"}
+    executor.machine = SimpleNamespace(state=module.STATE_NAVIGATING)
+    executor._active_navigation_run_tokens = {"sweep": 7}
+    executor.map_frame = "map"
+    executor.post_interaction_exit_observation_enabled = True
+    executor.post_interaction_exit_observation_angle_rad = math.pi / 2
+    executor.post_interaction_exit_observation_speed_rad_s = .3
+    executor.post_interaction_exit_observation_tolerance_rad = .12
+    executor.post_interaction_exit_observation_settle_s = .1
+    executor.post_interaction_exit_observation_view_timeout_s = 1.0
+    executor.post_interaction_exit_observation_return_home = True
+    executor._post_interaction_exit_observation_decisions = set()
+    now = [0.0]
+    commands = []
+    executor._publish_rotation = commands.append
+    executor._current_pose = lambda frame: (0.0, 0.0, 0.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(module.rospy, "is_shutdown", lambda: False)
+    return executor, now, commands
+
+
+@pytest.mark.parametrize("mode", ["disabled", "already_done", "pose_unavailable", "stale_token"])
+def test_exit_sweep_skip_paths_publish_no_motion(executor_module, monkeypatch, mode):
+    executor, _, commands = _exit_sweep_executor(executor_module, monkeypatch)
+    if mode == "disabled":
+        executor.post_interaction_exit_observation_enabled = False
+    elif mode == "already_done":
+        executor._post_interaction_exit_observation_decisions.add("sweep")
+    elif mode == "pose_unavailable":
+        executor._current_pose = lambda frame: None
+    else:
+        executor._active_navigation_run_tokens["sweep"] = 8
+    result = executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+    assert result["status"] == {"pose_unavailable": "skipped", "stale_token": "canceled"}.get(mode, mode)
+    assert commands == []
+    if mode == "stale_token":
+        assert executor._post_interaction_exit_observation_decisions == set()
+
+
+@pytest.mark.parametrize("replacement", ["decision", "same_decision_new_worker"])
+def test_exit_sweep_old_worker_cannot_publish_rotation_or_stop(executor_module, monkeypatch, replacement):
+    executor, now, commands = _exit_sweep_executor(executor_module, monkeypatch)
+
+    def replace_owner(seconds):
+        now[0] += seconds
+        if replacement == "decision":
+            executor.selection = {"decision_id": "new"}
+        else:
+            executor._active_navigation_run_tokens["sweep"] = 8
+
+    monkeypatch.setattr(executor_module.time, "sleep", replace_owner)
+    result = executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+    assert result["status"] == "canceled"
+    assert commands == [-.3]  # No old-owner zero may clobber the successor.
+
+
+def test_exit_sweep_cancel_during_settle_is_bounded(executor_module, monkeypatch):
+    executor, now, commands = _exit_sweep_executor(executor_module, monkeypatch)
+    poses = iter([(0, 0, 0), (0, 0, -math.pi / 2)])
+    executor._current_pose = lambda frame: next(poses, (0, 0, -math.pi / 2))
+    executor.post_interaction_exit_observation_settle_s = 20.0
+    waits = []
+
+    def cancel(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+        executor.selection = None
+
+    monkeypatch.setattr(executor_module.time, "sleep", cancel)
+    result = executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+    assert result["status"] == "canceled" and len(result["views"]) == 1
+    assert waits == [.05]
+    assert commands == [0.0]
+
+
+def test_exit_sweep_success_stops_and_is_once_per_decision(executor_module, monkeypatch):
+    executor, now, commands = _exit_sweep_executor(executor_module, monkeypatch)
+    executor.post_interaction_exit_observation_settle_s = 0.0
+    poses = iter([(0, 0, 0), (0, 0, -math.pi / 2), (0, 0, math.pi / 2), (0, 0, 0)])
+    executor._current_pose = lambda frame: next(poses, (0, 0, 0))
+    result = executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+    assert result["status"] == "completed" and len(result["views"]) == 3
+    assert all(value == 0.0 for value in commands)
+    before = len(commands)
+    assert executor._run_post_interaction_exit_observation("sweep", {})["status"] == "already_done"
+    assert len(commands) == before
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_exit_sweep_timeout_or_exception_stops_owned_rotation(executor_module, monkeypatch, raises):
+    executor, _, commands = _exit_sweep_executor(executor_module, monkeypatch)
+    if raises:
+        def fail_sleep(seconds):
+            raise RuntimeError("test failure")
+        monkeypatch.setattr(executor_module.time, "sleep", fail_sleep)
+        with pytest.raises(RuntimeError, match="test failure"):
+            executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+    else:
+        result = executor._run_post_interaction_exit_observation("sweep", {}, navigation_run_token=7)
+        assert result["status"] == "timeout" and result["failed_view_index"] == 0
+    assert commands[0] < 0 and commands[-1] == 0.0
 
 
 def test_failed_interaction_navigation_is_marked_for_bounded_reachability(
@@ -969,6 +1151,52 @@ def test_physical_retries_publish_unique_command_ids(executor_module) -> None:
         "decision:candidate:interaction:002",
     ]
     assert published[0]["candidate_id"] == published[1]["candidate_id"]
+
+
+def test_command_serializer_leaves_result_ownership_in_executor(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.evaluator_opaque_open_only = False
+    executor.interaction_command_sequence = 4
+    executor.latest_image_sequence = 12
+    executor.latest_graph = {"episode_id": "episode-current"}
+    executor._command_id = lambda candidate: "decision:candidate"
+    executor._interaction_execution_progress = {"old": True}
+    executor._interaction_execution_terminal = {"old": True}
+    published = []
+
+    def publish(message):
+        payload = json.loads(message.data)
+        assert executor._active_interaction_command_id == payload["command_id"]
+        assert executor._active_interaction_event_id == payload["event_id"]
+        assert executor._active_interaction_episode_id == "episode-current"
+        assert executor._interaction_command_sent_id == payload["command_id"]
+        assert executor.pre_interaction_image_sequence == 12
+        assert executor._interaction_execution_progress == {}
+        assert executor._interaction_execution_terminal == {}
+        published.append(payload)
+
+    executor.interaction_command_pub = SimpleNamespace(publish=publish)
+    executor._publish_interaction_command(_portal_selection())
+    assert len(published) == 1
+    assert executor.interaction_command_sequence == 5
+    assert published[0]["command_id"] == "decision:candidate:interaction:005"
+
+
+def test_invalid_drawer_contract_never_allocates_or_publishes_command(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.interaction_command_sequence = 4
+    published, rejected = [], []
+    executor.interaction_command_pub = SimpleNamespace(publish=published.append)
+    executor._reject_drawer_command_without_visual_contract = (
+        lambda candidate, reason: rejected.append(reason)
+    )
+    candidate = _portal_selection()
+    candidate["interaction_command"].update(sequence_type="drawer_open", open_regions=[])
+    executor._publish_interaction_command(candidate)
+    assert published == []
+    assert executor.interaction_command_sequence == 4
+    assert rejected == ["drawer_visual_contract_missing_before_bridge"]
 
 
 def test_unknown_portal_waits_for_its_matching_fresh_m1_update(

@@ -8,6 +8,14 @@ the local policy machine.
 
 ## Data path
 
+The addon boundary, single-source configuration, catkin installation and
+future exp-setting merge rules are documented in
+[physical_addon_architecture.md](../../../docs/physical_addon_architecture.md).
+The ROS package is a thin deployment adapter; its source config/launch paths
+alias this directory. The supervisor uses the ROS package entry point.
+The watchdog consumes ROS capture progress and a lightweight YOLO heartbeat,
+including when `PHYSICAL_NAV_START_WEB=0`; no dashboard health request is needed.
+
 The full-stack camera default is RGB 1280×720 at 10 FPS and native depth
 848×480 at 10 FPS, published at 10 Hz with `align none`. Both native image
 grids and their calibration are retained; downstream RGB-mask lifting uses

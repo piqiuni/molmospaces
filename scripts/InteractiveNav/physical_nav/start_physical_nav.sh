@@ -59,7 +59,11 @@ export SEMANTIC_MODEL_ENDPOINT="${SEMANTIC_MODEL_ENDPOINT:-http://127.0.0.1:1808
 export SEMANTIC_MODEL_NAME="${SEMANTIC_MODEL_NAME:-${QWEN_MODEL}}"
 export SEMANTIC_MODEL_PROTOCOL="${SEMANTIC_MODEL_PROTOCOL:-openai_chat}"
 export SEMANTIC_MODEL_METRICS_PATH="${SEMANTIC_MODEL_METRICS_PATH:-/tmp/physical_nav_mllm.jsonl}"
-export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-http://127.0.0.1:${WEB_PORT}/api/mllm-event}"
+if [[ "${START_WEB}" == "1" ]]; then
+  export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-http://127.0.0.1:${WEB_PORT}/api/mllm-event}"
+else
+  export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-}"
+fi
 # Measured Go2 standing-pose calibration: camera is about 3 cm forward of
 # the base centre (38 cm from a 70 cm rear-to-front body) and 0.62 m above
 # the base. The base-to-ground offset is therefore about 0.43 m (1.05 m
@@ -250,31 +254,12 @@ start_or_reuse_gateway() {
   log_supervisor "started persistent gateway pid=${GATEWAY_PID}"
 }
 
-# Start/reuse the gateway first so downstream workers never enter a long retry
-# loop before their only input endpoint exists. It is intentionally persistent.
+# The dashboard is optional. Its HTTP readiness must not gate ROS/YOLO startup.
 if [[ "${START_WEB}" == "1" ]]; then
-  start_or_reuse_gateway
+  start_or_reuse_gateway || log_supervisor "optional dashboard startup failed; continuing ROS pipeline"
 else
   log_supervisor "web dashboard disabled; ROS sensor path remains active"
   GATEWAY_PID=""
-fi
-
-GATEWAY_READY=0
-if [[ "${START_WEB}" != "1" ]]; then GATEWAY_READY=1; fi
-if [[ "${START_WEB}" == "1" ]]; then
-for _ in {1..100}; do
-  if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then break; fi
-  if (exec 3<>/dev/tcp/127.0.0.1/"${WEB_PORT}") 2>/dev/null; then
-    exec 3>&- 3<&-
-    GATEWAY_READY=1
-    break
-  fi
-  sleep .1
-done
-fi
-if (( GATEWAY_READY == 0 )); then
-  EXIT_REASON="gateway failed to become ready; see ${LOG_DIR}/gateway.log"
-  exit 1
 fi
 
 START_YOLO="${PHYSICAL_NAV_START_YOLO_WORKER:-1}"
@@ -314,6 +299,7 @@ if [[ "${START_YOLO}" == "1" ]]; then
     fi
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/physical_yoloe_bridge.py"; else shasum -a 256 "${ROOT_DIR}/physical_yoloe_bridge.py"; fi
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/run_yolo.sh"; else shasum -a 256 "${ROOT_DIR}/run_yolo.sh"; fi
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "${ROOT_DIR}/capture_geometry.py"; else shasum -a 256 "${ROOT_DIR}/capture_geometry.py"; fi
   } | if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi)"
   # Reusing one detector is important: two workers would consume the same
   # latest-only ROS image stream and publish competing detections.  As with
@@ -350,10 +336,11 @@ if [[ "${START_YOLO}" == "1" ]]; then
   fi
 fi
 
+ROS_STARTED=0
 if [[ "${PHYSICAL_NAV_SKIP_ROS:-0}" == "1" ]]; then
   log_supervisor "ROS launch disabled"
 elif command -v roscore >/dev/null 2>&1 && command -v roslaunch >/dev/null 2>&1; then
-  roslaunch "${ROOT_DIR}/launch/physical_nav_readonly.launch" \
+  roslaunch physical_nav physical_nav_readonly.launch \
     config_file:="${ROOT_DIR}/config/physical_nav.yaml" \
     semantic_override_config:="${SEMANTIC_OVERRIDE_CONFIG}" \
     move_base_override_config:="${ROOT_DIR}/config/physical_move_base_override.yaml" \
@@ -368,13 +355,14 @@ elif command -v roscore >/dev/null 2>&1 && command -v roslaunch >/dev/null 2>&1;
     system_ros_python:="${PHYSICAL_NAV_SYSTEM_ROS_PYTHON:-${ROOT_DIR}/physical_ros_python.sh}" \
     >"${PHYSICAL_NAV_ROSLAUNCH_STDOUT:-${LOG_DIR}/roslaunch.log}" 2>&1 &
   register_process roslaunch "$!"
+  ROS_STARTED=1
 else
   log_supervisor "ROS1 tools not found; running gateway and detector only"
 fi
 
-if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" && "${START_WEB}" == "1" ]]; then
+if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" && "${ROS_STARTED}" == "1" ]]; then
   WATCHDOG_ARGS=(
-    --url "http://127.0.0.1:${WEB_PORT}/api/health"
+    --source ros
     --interval-s "${PHYSICAL_NAV_WATCHDOG_INTERVAL_S:-2}"
     --timeout-s "${PHYSICAL_NAV_WATCHDOG_TIMEOUT_S:-1}"
     --startup-grace-s "${PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S:-60}"
@@ -388,7 +376,7 @@ if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" && "${START_WEB}" == "1" ]]; 
     >>"${LOG_DIR}/watchdog.log" 2>&1 &
   register_process watchdog "$!"
 elif [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" ]]; then
-  log_supervisor "web health watchdog disabled in headless mode"
+  log_supervisor "ROS health watchdog disabled because ROS was not started"
 fi
 
 if [[ "${START_WEB}" == "1" ]]; then

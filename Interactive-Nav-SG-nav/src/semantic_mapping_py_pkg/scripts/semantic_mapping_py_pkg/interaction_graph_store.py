@@ -25,6 +25,13 @@ from .graph_rules import (
 )
 from .graph_schema import NavigationHint, SceneGraphBundle, SceneGraphEdge, SceneGraphNode
 from .room_inference_backends import WeightedRoomAttributeInferencer
+from .semantic_evidence import (
+    _portal_geometry_plausible,
+    _portal_attrs_geometry_plausible,
+    _accepted_semantic_evidence,
+    _has_m1_portal_confirmation,
+    persistence_action,
+)
 
 
 _SEMANTIC_POSTCONDITION_BY_ACTION = {
@@ -80,76 +87,10 @@ def _cached_label_marker_match(label, marker):
     return result
 
 
-def _portal_geometry_plausible(size):
-    """Reject degenerate RGB-D portal boxes before they become topology."""
-
-    try:
-        values = [abs(float(value)) for value in list(size or [])[:3]]
-    except (TypeError, ValueError):
-        return False
-    if len(values) < 3 or not all(math.isfinite(value) for value in values):
-        return False
-    horizontal = max(values[0], values[1])
-    return bool(
-        horizontal >= 0.25
-        and values[2] >= 0.90
-        and horizontal * values[2] >= 0.35
-    )
-
-
-def _portal_attrs_geometry_plausible(attrs):
-    attrs = attrs or {}
-    for key in (
-        "viz_aabb_size",
-        "interaction_reference_aabb_size",
-        "interaction_reference_obb_size",
-    ):
-        if key in attrs and attrs.get(key):
-            return _portal_geometry_plausible(attrs.get(key))
-    return True
-
-
 _SEMANTIC_CONFIRMATION_FIELDS = (
     "attribute_status", "attribute_confidence", "mllm_interaction_class",
     "m1_observed_object_name", "m1_refrigerator_pending_confirmation", "attribute_updated_at",
 )
-
-
-def _accepted_semantic_evidence(attrs):
-    """Transport progress is not a revocation of the last semantic result."""
-    if str(attrs.get("attribute_status") or "").casefold() in {"pending", "failed", "stale"}:
-        accepted = attrs.get("attribute_last_ready")
-        if isinstance(accepted, dict):
-            return accepted
-    return attrs
-
-
-def _has_m1_portal_confirmation(attrs):
-    """Return whether M1 positively identified a detector portal as a door."""
-
-    # A detector portal is not necessarily a door.  M1 can correctly reject
-    # a wall panel, cabinet face, or other flat structure while the detector
-    # keeps its provisional ``portal`` label.  Such a result must never create
-    # a synthetic room behind it.
-    evidence = _accepted_semantic_evidence(attrs)
-    if str(evidence.get("attribute_status") or "").casefold() != "ready":
-        return False
-    try:
-        confidence = float(evidence.get("attribute_confidence", 0.0))
-    except (TypeError, ValueError, OverflowError):
-        return False
-    if not math.isfinite(confidence) or not 0.5 <= confidence <= 1.0:
-        return False
-    if str(evidence.get("mllm_interaction_class") or "").casefold() != "portal":
-        return False
-    if not _portal_attrs_geometry_plausible(attrs):
-        return False
-    observed_name = normalize_label(evidence.get("m1_observed_object_name"))
-    # A portal class with a contradictory concrete name (for example
-    # ``thermostat``) is not a confirmed door, even if the detector proposed
-    # portal and the crop contains a flat, door-like shape.  M1's concrete
-    # identity is the final semantic check for topology.
-    return observed_name in PORTAL_LABELS
 
 
 def _has_persistent_semantic_evidence(node):
@@ -3248,31 +3189,8 @@ class InteractionGraphStore:
 
         if node.type not in {"portal", "container"}:
             return
-        # ``tracking_confirmed`` is a tracker-level streak flag and can be
-        # true even when this graph node has only received one observation
-        # (for example after a startup race or a track hand-off).  It must not
-        # promote a one-frame RGB-D box to a persistent interaction object.
-        # Use graph receipts as the admission evidence instead.
-        two_frames = node.observation_count >= 2
-        evidence = _accepted_semantic_evidence(node.attributes)
-        m1_status = str(evidence.get("attribute_status") or "").casefold()
-        m1_confidence = float(evidence.get("attribute_confidence", 0.0) or 0.0)
-        m1_name = normalize_label(evidence.get("m1_observed_object_name"))
-        # A locker/safe refrigerator recheck is intentionally not persistent
-        # after its first ambiguous answer; the graph store only latches it
-        # once the existing two-independent-M1-evidence rule is satisfied.
-        m1_recheck_pending = bool(
-            evidence.get("m1_refrigerator_pending_confirmation", False)
-        )
-        m1_confirmed = bool(
-            m1_status == "ready"
-            and m1_confidence >= 0.5
-            and (m1_name or evidence.get("mllm_interaction_class"))
-            and not m1_recheck_pending
-        )
-        if node.type == "portal":
-            m1_confirmed = _has_m1_portal_confirmation(node.attributes)
-        if two_frames and m1_confirmed:
+        action = persistence_action(node.type, node.observation_count, node.attributes)
+        if action == "latch":
             node.attributes.update(
                 {
                     "persistent_semantic_node": True,
@@ -3281,7 +3199,7 @@ class InteractionGraphStore:
                     or node.last_seen,
                 }
             )
-        elif node.type == "portal":
+        elif action == "clear":
             # M1 may later reject a detector portal as a wall panel or other
             # non-door surface.  Clear the latch immediately so any synthetic
             # child room can be removed on the same callback.

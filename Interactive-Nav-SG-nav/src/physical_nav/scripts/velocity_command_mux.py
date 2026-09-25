@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""Package-local launcher for the physical velocity command mux."""
+"""Compatibility entry point for the physical deployment addon."""
 
-from pathlib import Path
-import os
-import sys
-
-IMPLEMENTATION = (
-    Path(__file__).resolve().parents[4]
-    / "scripts" / "InteractiveNav" / "physical_nav" / "velocity_command_mux.py"
-)
-sys.path.insert(0, str(IMPLEMENTATION.parent))
+from physical_nav_runtime import run
 
 if __name__ == "__main__":
-    os.execv(sys.executable, [sys.executable, str(IMPLEMENTATION), *sys.argv[1:]])
+    run("velocity_command_mux.py")

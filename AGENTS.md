@@ -77,6 +77,12 @@
 
 ## 工作原则
 
+实物 Go2 与公共算法的依赖边界见 `docs/physical_addon_architecture.md`：
+实物配置/launch 的唯一来源为 `scripts/InteractiveNav/physical_nav`；ROS 包中的
+兼容路径是链接，不要重新写成独立副本。公共 `semantic_*` 算法不得导入实物节点
+或网页；时钟、几何、证据等通用逻辑通过纯函数接口复用。网页不是数据或健康监督
+的必需服务。改动应运行 `test_addon_architecture.py` 及对应功能回归。
+
 - 优先遵循仓库已有代码风格、目录结构和工具链。
 - 修改范围应尽量贴近用户请求，避免无关重构。
 - 不随意修改大规模数据、下载资产、生成结果或 benchmark 文件。

@@ -17,6 +17,7 @@ from semantic_decision_py_pkg.behavior_candidates import (
 from semantic_decision_py_pkg.model_policy import public_decision_graph_context
 from semantic_decision_py_pkg.frontier_context import observed_room_frontier_summary
 from semantic_decision_py_pkg.public_robot_context import graph_robot_pose_context
+from semantic_decision_py_pkg.progress_clock import ProgressClock
 from semantic_decision_py_pkg.navigation_clearance import ArrivalClearanceGrid
 from semantic_decision_py_pkg.frontier_terminal_contract import (
     summarize_frontier_filtering,
@@ -1583,15 +1584,10 @@ class SemanticCandidateNode:
         return best, pushed
 
     def _progress_clock_context(self) -> dict:
-        capture_step = self.graph.get("capture_step")
-        mode = getattr(self, "progress_clock", "capture_step")
-        period = getattr(self, "progress_clock_period_s", 0.2)
-        return {
-            "observation_step": int(time.monotonic() / period) if mode == "monotonic" else capture_step,
-            "observation_step_clock": mode,
-            "progress_clock_period_s": period if mode == "monotonic" else None,
-            "source_capture_step": capture_step,
-        }
+        return ProgressClock(
+            mode=getattr(self, "progress_clock", "capture_step"),
+            period_s=getattr(self, "progress_clock_period_s", 0.2),
+        ).context(self.graph.get("capture_step"))
 
     def _model_robot_pose_context(self, graph: dict) -> dict:
         source_frame = str(getattr(self, "robot_position_frame_id", "") or "")

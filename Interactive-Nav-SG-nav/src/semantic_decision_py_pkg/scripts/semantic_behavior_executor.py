@@ -20,9 +20,6 @@ from semantic_decision_py_pkg.behavior_execution import (
     ExecutionConfig,
     NavigationProgressWatchdog,
     SemanticNavigationProgressSupervisor,
-    PostInteractionCostmapBaseline,
-    PostInteractionPlanningMapBarrier,
-    PostInteractionRawMapBarrier,
     STATE_APPROACH_INTERACTION,
     STATE_IDLE,
     STATE_INTERACTING,
@@ -35,14 +32,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
-    container_two_stage_action_goal_options_for_staging,
-    container_two_stage_face_indices,
-    container_two_stage_m1_anchor_priority,
-    container_two_stage_m1_preflight_batch_indices,
-    container_two_stage_next_m1_viewpoint_index,
     interaction_pose_validation,
-    is_container_two_stage_m1_capture,
-    is_container_two_stage_physical_action,
     is_post_interaction_traversal_navigation,
     is_interaction_pose_precondition_failure,
     navigation_goal_options,
@@ -54,18 +44,41 @@ from semantic_decision_py_pkg.behavior_execution import (
     path_lookahead_point,
     post_open_path_is_confirmed,
     post_open_path_retryable_preflight_reason,
-    post_interaction_costmap_baseline_keys,
-    post_interaction_costmap_receipts_fresh_source,
-    post_interaction_global_costmap_fresh_source,
-    post_interaction_planning_occupancy_fresh_source,
-    post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
     requires_graph_verification,
     is_static_portal_interaction_feedback,
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
+from semantic_decision_py_pkg.container_approach import (
+    container_two_stage_action_goal_options_for_staging,
+    container_two_stage_face_indices,
+    container_two_stage_m1_anchor_priority,
+    container_two_stage_m1_preflight_batch_indices,
+    container_two_stage_next_m1_viewpoint_index,
+    is_container_two_stage_m1_capture,
+    is_container_two_stage_physical_action,
+)
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+from semantic_decision_py_pkg.container_evidence import (
+    container_m1_front_axis_from_capture_pose,
+    container_m1_pre_action_ready,
+    container_visual_truncation_reason,
+    finite_public_bbox,
+    public_step_or_none,
+)
+from semantic_decision_py_pkg.interaction_commands import (
+    build_interaction_command,
+    has_valid_drawer_visual_contract,
+)
+from semantic_decision_py_pkg.post_open_maps import (
+    MapReceipt, MapReceiptSnapshot, PostOpenMapPolicy, post_open_map_detail,
+    PostInteractionCostmapBaseline, PostInteractionPlanningMapBarrier,
+    PostInteractionRawMapBarrier, post_interaction_costmap_baseline_keys,
+    post_interaction_planning_occupancy_fresh_source,
+    post_interaction_raw_occupancy_fresh_source,
+)
+from semantic_decision_py_pkg.exit_observation import ExitObservationConfig, ExitObservationSweep
 from semantic_decision_py_pkg.step_command_gate import StepCommandGate
 from semantic_decision_py_pkg.navigation_arrival import PositionToleranceLatch, path_deviation_m
 from semantic_decision_py_pkg.navigation_clearance import ArrivalClearanceGrid
@@ -78,7 +91,6 @@ from semantic_decision_py_pkg.startup_scan_timing import (
     startup_scan_timeout_reason,
 )
 from semantic_decision_py_pkg.visual_interaction_planning import (
-    action_for_opaque_open_contract,
     candidate_with_direct_drawer_scan,
     candidate_with_visual_drawer_scan,
     candidate_with_visual_operation_plan,
@@ -2073,21 +2085,7 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _finite_public_bbox(value: object) -> list[float] | None:
-        """Normalize one detector box carried by a targeted M1 update."""
-
-        if not isinstance(value, (list, tuple)) or len(value) < 4:
-            return None
-        try:
-            x0, y0, x1, y1 = (float(item) for item in value[:4])
-        except (TypeError, ValueError):
-            return None
-        if not all(math.isfinite(item) for item in (x0, y0, x1, y1)):
-            return None
-        left, right = sorted((x0, x1))
-        top, bottom = sorted((y0, y1))
-        if right - left < 1.0 or bottom - top < 1.0:
-            return None
-        return [left, top, right, bottom]
+        return finite_public_bbox(value)
 
     @staticmethod
     def _is_drawer_pre_action_candidate(candidate: dict | None) -> bool:
@@ -2107,78 +2105,15 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _container_visual_truncation_reason(update: dict) -> str:
-        """Reject only missing lateral contact evidence for a container.
+        return container_visual_truncation_reason(update)
 
-        A low camera can clip the bottom of a tall drawer/fridge box while the
-        front plane and all model-provided action regions remain visible.  That
-        is different from clipping the left/right boundary, which prevents a
-        reliable frontality judgement.  Older messages without the public edge
-        list remain fail-closed.
-        """
-
-        if not bool(update.get("visual_evidence_truncated", False)):
-            return ""
-        raw_edges = update.get("visual_evidence_truncated_edges")
-        if not isinstance(raw_edges, (list, tuple, set)):
-            return "m1_visual_evidence_truncated"
-        edges = {str(edge).strip().casefold() for edge in raw_edges}
-        if not edges:
-            return "m1_visual_evidence_truncated"
-        if edges.intersection({"left", "right", "unknown"}):
-            return "m1_visual_evidence_laterally_truncated"
-        return ""
-
-    def _container_m1_pre_action_ready_locked(
-        self,
-        update: dict,
-        request: dict,
-    ) -> str:
-        """Validate the public fresh-M1 contract before opening a container.
-
-        The state machine makes the final transition.  This helper only turns
-        malformed/stale updates into an ordinary bounded re-observation rather
-        than allowing a ring pose or stale detector frame to reach the bridge.
-        """
-
-        status = str(update.get("attribute_status") or "").strip().casefold()
-        if status != "ready":
-            return f"m1_attribute_status_{status or 'missing'}"
-        if update.get("is_currently_visible") is not True:
-            return "m1_target_not_currently_visible"
-        truncation_reason = self._container_visual_truncation_reason(update)
-        if truncation_reason:
-            return truncation_reason
-        if self._finite_public_bbox(update.get("observed_bbox_2d")) is None:
-            return "m1_public_bbox_unavailable"
-        capture_step = self._public_step_or_none(
-            update.get("observation_capture_step")
-            or update.get("attribute_capture_step")
+    def _container_m1_pre_action_ready_locked(self, update: dict, request: dict) -> str:
+        return container_m1_pre_action_ready(
+            update, request,
+            require_direct_front=bool(getattr(
+                self, "container_pre_action_require_direct_front", True
+            )),
         )
-        if capture_step is None:
-            return "m1_capture_step_unavailable"
-        minimum_capture_step = self._public_step_or_none(
-            request.get("minimum_capture_step")
-        )
-        if (
-            minimum_capture_step is not None
-            and capture_step <= minimum_capture_step
-        ):
-            return "m1_capture_not_fresh"
-        view_state = str(update.get("view_state") or "unknown").strip().casefold()
-        allowed_views = (
-            {"front"}
-            if bool(getattr(self, "container_pre_action_require_direct_front", True))
-            else {"front", "oblique"}
-        )
-        if view_state not in allowed_views:
-            return f"m1_view_state_{view_state}"
-        if update.get("front_surface_visible") is not True:
-            return "m1_front_surface_not_visible"
-        if update.get("approach_ready") is not True:
-            return "m1_approach_not_ready"
-        if bool(update.get("needs_reobserve", False)):
-            return "m1_needs_reobserve"
-        return "ready"
 
     def _container_m1_staging_pose_tolerance_m(self, candidate: dict) -> float:
         """Return the pose envelope for a model-only outer staging observation.
@@ -2554,93 +2489,12 @@ class SemanticBehaviorExecutor:
         selected_face_index: object = None,
         selected_face_id: object = "",
     ) -> dict | None:
-        """Freeze a world-space face only after M1 confirms the current image.
-
-        M1 intentionally supplies a categorical visual claim, not a map-space
-        normal.  The calibrated capture pose supplies the metric half: the
-        target-to-camera ray is meaningful only because the accepted M1 image
-        established that it sees the target's usable front.  Never substitute a
-        graph ``interaction_approach_axis_xy`` here: it may be oracle geometry.
-        """
-
-        metadata = candidate.get("metadata") or {}
-        if not bool(metadata.get("container_m1_front_axis_from_capture", False)):
-            return {}
-        if bool(metadata.get("container_m1_face_selection_enabled", False)):
-            selected_axis = list(selected_face_axis_xy or [])
-            if len(selected_axis) >= 2:
-                try:
-                    axis_x = float(selected_axis[0])
-                    axis_y = float(selected_axis[1])
-                except (TypeError, ValueError):
-                    return None
-                norm = math.hypot(axis_x, axis_y)
-                if not math.isfinite(norm) or norm <= 1e-6:
-                    return None
-                axis_x /= norm
-                axis_y /= norm
-                try:
-                    staging_index = int(selected_face_index)
-                except (TypeError, ValueError):
-                    staging_index = -1
-                return {
-                    "m1_front_axis_xy": [axis_x, axis_y],
-                    "m1_front_yaw": math.atan2(-axis_y, -axis_x),
-                    "m1_front_axis_source": "m1_selected_montage_view_aabb_cardinal_face",
-                    "m1_front_staging_index": staging_index,
-                    "m1_front_face_id": str(selected_face_id or ""),
-                }
-            try:
-                staging_index = int(
-                    metadata.get(
-                        "container_two_stage_staging_goal_option_index",
-                        metadata.get("interaction_approach_goal_option_index", 0),
-                    )
-                )
-            except (TypeError, ValueError):
-                return None
-            axes = list(metadata.get("container_face_axis_xy_by_staging_index") or [])
-            axis_values = (
-                list(axes[staging_index] or [])
-                if 0 <= staging_index < len(axes)
-                else []
-            )
-            if len(axis_values) < 2:
-                return None
-            try:
-                axis_x = float(axis_values[0])
-                axis_y = float(axis_values[1])
-            except (TypeError, ValueError):
-                return None
-            norm = math.hypot(axis_x, axis_y)
-            if not math.isfinite(norm) or norm <= 1e-6:
-                return None
-            axis_x /= norm
-            axis_y /= norm
-            return {
-                "m1_front_axis_xy": [axis_x, axis_y],
-                "m1_front_yaw": math.atan2(-axis_y, -axis_x),
-                "m1_front_axis_source": "m1_confirmed_obb_face_normal",
-                "m1_front_staging_index": staging_index,
-            }
-        anchor = list(metadata.get("container_geometry_anchor_xy") or [])
-        if len(anchor) < 2 or len(capture_pose_xyyaw) < 2:
-            return None
-        try:
-            axis_x = float(capture_pose_xyyaw[0]) - float(anchor[0])
-            axis_y = float(capture_pose_xyyaw[1]) - float(anchor[1])
-        except (TypeError, ValueError):
-            return None
-        norm = math.hypot(axis_x, axis_y)
-        if not math.isfinite(norm) or norm <= 1e-6:
-            return None
-        axis_x /= norm
-        axis_y /= norm
-        return {
-            "m1_front_axis_xy": [axis_x, axis_y],
-            "m1_front_yaw": math.atan2(-axis_y, -axis_x),
-            "m1_front_axis_source": "m1_confirmed_capture_pose",
-        }
+        return container_m1_front_axis_from_capture_pose(
+            candidate, capture_pose_xyyaw,
+            selected_face_axis_xy=selected_face_axis_xy,
+            selected_face_index=selected_face_index,
+            selected_face_id=selected_face_id,
+        )
 
     def _container_m1_evidence_still_at_capture_pose_locked(
         self, candidate: dict, evidence: dict
@@ -4652,385 +4506,94 @@ class SemanticBehaviorExecutor:
         )
         return barrier
 
+    def _map_receipt_snapshot_locked(self) -> MapReceiptSnapshot:
+        """Read compact counters while the existing map condition is held."""
+        return MapReceiptSnapshot(
+            raw=MapReceipt(self._raw_occupancy_received_count,
+                           self._latest_raw_occupancy_header_seq,
+                           self._latest_raw_occupancy_header_stamp_sec),
+            planning=MapReceipt(self._planning_occupancy_received_count,
+                                self._latest_planning_occupancy_header_seq,
+                                self._latest_planning_occupancy_header_stamp_sec),
+            full=MapReceipt(self._global_costmap_received_count,
+                            self._latest_global_costmap_header_seq,
+                            getattr(self, "_latest_global_costmap_header_stamp_sec", None)),
+            update=MapReceipt(self._global_costmap_update_received_count,
+                              self._latest_global_costmap_update_header_seq,
+                              getattr(self, "_latest_global_costmap_update_header_stamp_sec", None)),
+        )
+
     def _wait_for_post_interaction_costmap_freshness(
         self, decision_id: str, candidate: dict
     ) -> tuple[bool, dict]:
-        """Wait for a causally fresh post-open global costmap.
-
-        The normal chain is raw OCC -> planning OCC -> global costmap.  The
-        physical fast path may skip waiting for planning OCC, because the
-        global costmap consumes raw OCC directly through StaticLayer.  In both
-        cases, raw OCC must be newer than the interaction result and the
-        accepted global-costmap full/update must be a callback received after
-        that raw OCC.  A trusted source-map publisher may opt into accepting a
-        cross-topic callback reorder when its header stamp proves the source
-        relationship; the physical publisher uses a local ``now`` stamp and
-        therefore does not opt in.  An unproven old map is never admitted to
-        ``make_plan``.
-        """
-
+        """Own waiting/cancellation; delegate source-map policy and diagnostics."""
+        policy = PostOpenMapPolicy(
+            direct_raw_costmap=self.post_interaction_costmap_fast_path_enabled,
+        )
         started_at = time.monotonic()
         deadline = started_at + self.post_interaction_costmap_fresh_timeout_s
         with self._global_costmap_condition:
-            baseline, baseline_key = self._post_interaction_costmap_baseline_locked(
-                candidate
-            )
+            baseline, baseline_key = self._post_interaction_costmap_baseline_locked(candidate)
             while True:
-                current_full_count = self._global_costmap_received_count
-                current_full_header_seq = self._latest_global_costmap_header_seq
-                current_full_header_stamp_sec = getattr(
-                    self, "_latest_global_costmap_header_stamp_sec", None
-                )
-                current_update_count = self._global_costmap_update_received_count
-                current_update_header_seq = (
-                    self._latest_global_costmap_update_header_seq
-                )
-                current_update_header_stamp_sec = getattr(
-                    self, "_latest_global_costmap_update_header_stamp_sec", None
-                )
-                current_raw_count = self._raw_occupancy_received_count
-                current_raw_header_seq = self._latest_raw_occupancy_header_seq
-                current_raw_header_stamp_sec = (
-                    self._latest_raw_occupancy_header_stamp_sec
-                )
-                current_planning_count = self._planning_occupancy_received_count
-                current_planning_header_seq = (
-                    self._latest_planning_occupancy_header_seq
-                )
-                current_planning_header_stamp_sec = (
-                    self._latest_planning_occupancy_header_stamp_sec
-                )
-                raw_barrier: PostInteractionRawMapBarrier | None = None
-                raw_fresh_source = ""
-                planning_barrier: PostInteractionPlanningMapBarrier | None = None
+                snapshot = self._map_receipt_snapshot_locked()
+                raw_barrier, raw_source = None, ""
+                planning_barrier = None
                 if baseline is not None:
-                    raw_barrier, raw_fresh_source = (
-                        self._post_interaction_raw_map_barrier_locked(
-                            baseline, baseline_key
-                        )
+                    raw_barrier, raw_source = self._post_interaction_raw_map_barrier_locked(
+                        baseline, baseline_key,
                     )
-                    # The physical lane deliberately bypasses the semantic
-                    # planning-OCC relay.  Its global costmap StaticLayer reads
-                    # the raw OCC topic directly, so waiting for
-                    # ``planning_occ_map`` here would recreate the very delay
-                    # this fast path is meant to remove.  The strict/sim lane
-                    # below keeps the original raw -> planning -> costmap
-                    # barrier.
-                if (
-                    raw_barrier is not None
-                    and not self.post_interaction_costmap_fast_path_enabled
-                ):
-                    planning_barrier = (
-                        self._post_interaction_planning_map_barrier_locked(
-                            baseline_key,
-                            raw_barrier,
-                            raw_fresh_source,
-                            )
-                        )
-                if raw_barrier is None:
-                    causal_stage = "waiting_raw_occupancy"
-                elif (
-                    not self.post_interaction_costmap_fast_path_enabled
-                    and planning_barrier is None
-                ):
-                    causal_stage = "waiting_planning_occupancy"
-                else:
-                    causal_stage = "waiting_global_costmap"
-                costmap_baseline_full_count = (
-                    None
-                    if baseline is None
-                    else (
-                        planning_barrier.costmap_receipt_count
-                        if planning_barrier is not None
-                        else baseline.receipt_count
+                if raw_barrier is not None and policy.requires_planning_occupancy:
+                    planning_barrier = self._post_interaction_planning_map_barrier_locked(
+                        baseline_key, raw_barrier, raw_source,
                     )
-                )
-                costmap_baseline_full_header_seq = (
-                    None
-                    if baseline is None
-                    else (
-                        planning_barrier.costmap_header_seq
-                        if planning_barrier is not None
-                        else baseline.header_seq
-                    )
-                )
-                costmap_baseline_update_count = (
-                    None
-                    if baseline is None
-                    else (
-                        planning_barrier.costmap_update_receipt_count
-                        if planning_barrier is not None
-                        else baseline.update_receipt_count
-                    )
-                )
-                costmap_baseline_update_header_seq = (
-                    None
-                    if baseline is None
-                    else (
-                        planning_barrier.costmap_update_header_seq
-                        if planning_barrier is not None
-                        else baseline.update_header_seq
-                    )
-                )
+                freshness = policy.evaluate(baseline, raw_barrier, planning_barrier, snapshot)
                 elapsed_s = max(0.0, time.monotonic() - started_at)
-                detail = {
-                    "opened_portal_id": str(
-                        (candidate.get("metadata") or {}).get("opened_portal_id")
-                        or candidate.get("target_id")
-                        or ""
-                    ),
-                    "post_open_costmap_baseline_key": baseline_key,
-                    "post_open_costmap_baseline_receipt_count": (
-                        costmap_baseline_full_count
-                    ),
-                    "post_open_costmap_baseline_header_seq": (
-                        costmap_baseline_full_header_seq
-                    ),
-                    "post_open_costmap_latest_receipt_count": current_full_count,
-                    "post_open_costmap_latest_header_seq": current_full_header_seq,
-                    "post_open_costmap_latest_header_stamp_sec": (
-                        current_full_header_stamp_sec
-                    ),
-                    "post_open_costmap_baseline_update_receipt_count": (
-                        costmap_baseline_update_count
-                    ),
-                    "post_open_costmap_baseline_update_header_seq": (
-                        costmap_baseline_update_header_seq
-                    ),
-                    "post_open_costmap_latest_update_receipt_count": (
-                        current_update_count
-                    ),
-                    "post_open_costmap_latest_update_header_seq": (
-                        current_update_header_seq
-                    ),
-                    "post_open_costmap_latest_update_header_stamp_sec": (
-                        current_update_header_stamp_sec
-                    ),
-                    "post_open_costmap_wait_elapsed_s": elapsed_s,
-                    "post_open_costmap_wait_timeout_s": (
-                        self.post_interaction_costmap_fresh_timeout_s
-                    ),
-                    "post_open_causal_map_stage": causal_stage,
-                    "post_open_result_stamp_sec": (
-                        None
-                        if baseline is None
-                        else baseline.interaction_result_stamp_sec
-                    ),
-                    "post_open_raw_occ_baseline_receipt_count": (
-                        None
-                        if baseline is None
-                        else baseline.raw_occupancy_receipt_count
-                    ),
-                    "post_open_raw_occ_baseline_header_seq": (
-                        None
-                        if baseline is None
-                        else baseline.raw_occupancy_header_seq
-                    ),
-                    "post_open_raw_occ_baseline_header_stamp_sec": (
-                        None
-                        if baseline is None
-                        else baseline.raw_occupancy_header_stamp_sec
-                    ),
-                    "post_open_raw_occ_latest_receipt_count": current_raw_count,
-                    "post_open_raw_occ_latest_header_seq": current_raw_header_seq,
-                    "post_open_raw_occ_latest_header_stamp_sec": (
-                        current_raw_header_stamp_sec
-                    ),
-                    "post_open_raw_occ_admitted_receipt_count": (
-                        None if raw_barrier is None else raw_barrier.receipt_count
-                    ),
-                    "post_open_raw_occ_admitted_header_seq": (
-                        None if raw_barrier is None else raw_barrier.header_seq
-                    ),
-                    "post_open_raw_occ_admitted_header_stamp_sec": (
-                        None
-                        if raw_barrier is None
-                        else raw_barrier.header_stamp_sec
-                    ),
-                    "post_open_raw_occ_fresh_source": raw_fresh_source,
-                    "post_open_planning_occ_baseline_receipt_count": (
-                        None
-                        if baseline is None
-                        else baseline.planning_occupancy_receipt_count
-                    ),
-                    "post_open_planning_occ_baseline_header_seq": (
-                        None
-                        if baseline is None
-                        else baseline.planning_occupancy_header_seq
-                    ),
-                    "post_open_planning_occ_baseline_header_stamp_sec": (
-                        None
-                        if baseline is None
-                        else baseline.planning_occupancy_header_stamp_sec
-                    ),
-                    "post_open_planning_occ_latest_receipt_count": (
-                        current_planning_count
-                    ),
-                    "post_open_planning_occ_latest_header_seq": (
-                        current_planning_header_seq
-                    ),
-                    "post_open_planning_occ_latest_header_stamp_sec": (
-                        current_planning_header_stamp_sec
-                    ),
-                    "post_open_planning_occ_admitted_receipt_count": (
-                        None
-                        if planning_barrier is None
-                        else planning_barrier.receipt_count
-                    ),
-                    "post_open_planning_occ_admitted_header_seq": (
-                        None
-                        if planning_barrier is None
-                        else planning_barrier.header_seq
-                    ),
-                    "post_open_planning_occ_admitted_header_stamp_sec": (
-                        None
-                        if planning_barrier is None
-                        else planning_barrier.header_stamp_sec
-                    ),
-                    "post_open_planning_occ_fresh_source": (
-                        ""
-                        if planning_barrier is None
-                        else planning_barrier.planning_fresh_source
-                    ),
-                    "post_open_causal_costmap_baseline_receipt_count": (
-                        costmap_baseline_full_count
-                    ),
-                    "post_open_causal_costmap_baseline_update_receipt_count": (
-                        costmap_baseline_update_count
-                    ),
-                    # Stable primary trace keys are local incremental-update
-                    # receipt sequences; after planning OCC they are sampled
-                    # at that causal barrier instead of at action result.
-                    "baseline_global_costmap_seq": (
-                        costmap_baseline_update_count
-                    ),
-                    "observed_global_costmap_seq": current_update_count,
-                    "baseline_global_costmap_header_seq": (
-                        costmap_baseline_update_header_seq
-                    ),
-                    "observed_global_costmap_header_seq": current_update_header_seq,
-                    "baseline_global_costmap_full_seq": (
-                        costmap_baseline_full_count
-                    ),
-                    "observed_global_costmap_full_seq": current_full_count,
-                    "baseline_global_costmap_full_header_seq": (
-                        costmap_baseline_full_header_seq
-                    ),
-                    "observed_global_costmap_full_header_seq": (
-                        current_full_header_seq
-                    ),
-                    "costmap_wait_elapsed": elapsed_s,
-                    "costmap_fresh": False,
-                    "fresh_source": "",
-                }
+                detail = post_open_map_detail(
+                    candidate, baseline_key, baseline, raw_barrier, raw_source,
+                    planning_barrier, snapshot, freshness, elapsed_s=elapsed_s,
+                    timeout_s=self.post_interaction_costmap_fresh_timeout_s,
+                )
                 if baseline is None:
                     detail["reason"] = "post_open_costmap_baseline_missing"
                     rospy.logwarn(
                         "[semantic_behavior_executor] post-open traversal has "
-                        "no global-costmap baseline: portal=%s",
-                        detail["opened_portal_id"],
+                        "no global-costmap baseline: portal=%s", detail["opened_portal_id"],
                     )
                     return False, detail
-                fast_source = ""
-                if (
-                    self.post_interaction_costmap_fast_path_enabled
-                    and raw_barrier is not None
-                ):
-                    fast_source = post_interaction_global_costmap_fresh_source(
-                        raw_barrier,
-                        current_full_count,
-                        current_update_count,
-                        current_full_header_stamp_sec,
-                        current_update_header_stamp_sec,
-                        # The physical costmap publisher stamps with local
-                        # receipt time, so a header-only callback reorder is
-                        # not causal evidence.  Require an actual callback
-                        # after the admitted raw OCC.
-                        allow_callback_reorder=False,
-                    )
-                if fast_source:
-                    detail["post_open_costmap_fresh"] = True
-                    detail["costmap_fresh"] = True
-                    detail["fresh_source"] = fast_source
-                    detail["post_open_causal_map_stage"] = "ready"
-                    detail["post_open_costmap_fast_path"] = True
-                    rospy.loginfo(
-                        "[semantic_behavior_executor] fast post-open map "
-                        "chain admits preflight: portal=%s source=%s raw=%d "
-                        "update=%d full=%d wait=%.3fs",
-                        baseline.portal_id,
-                        fast_source,
-                        raw_barrier.receipt_count,
-                        current_update_count,
-                        current_full_count,
-                        elapsed_s,
-                    )
-                    return True, detail
-                fresh_source = ""
-                if planning_barrier is not None:
-                    fresh_source = post_interaction_costmap_receipts_fresh_source(
-                        planning_barrier.costmap_receipt_count,
-                        planning_barrier.costmap_update_receipt_count,
-                        current_full_count,
-                        current_update_count,
-                    )
-                if fresh_source:
-                    detail["post_open_costmap_fresh"] = True
-                    detail["costmap_fresh"] = True
-                    detail["fresh_source"] = fresh_source
-                    detail["post_open_causal_map_stage"] = "ready"
-                    rospy.loginfo(
-                        "[semantic_behavior_executor] causal post-open map "
-                        "chain admits preflight: portal=%s source=%s raw=%d "
-                        "planning=%d update=%d->%d full=%d->%d wait=%.3fs",
-                        baseline.portal_id,
-                        fresh_source,
-                        raw_barrier.receipt_count if raw_barrier is not None else -1,
-                        planning_barrier.receipt_count,
-                        planning_barrier.costmap_update_receipt_count,
-                        current_update_count,
-                        planning_barrier.costmap_receipt_count,
-                        current_full_count,
-                        elapsed_s,
-                    )
-                    return True, detail
+                # A map update and preemption can wake the same waiter. Fresh
+                # data never authorizes a worker whose decision no longer owns it.
                 if not (
                     self.selection is not None
                     and str(self.selection.get("decision_id") or "") == decision_id
-                    and self.machine.state
-                    in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
+                    and self.machine.state in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
                 ):
-                    detail["reason"] = "post_open_costmap_wait_preempted"
+                    detail.update(reason="post_open_costmap_wait_preempted",
+                                  costmap_fresh=False, post_open_costmap_fresh=False)
                     return False, detail
+                if freshness.fresh:
+                    rospy.loginfo(
+                        "[semantic_behavior_executor] post-open map chain admits "
+                        "preflight: portal=%s source=%s raw=%d planning=%d "
+                        "update=%d full=%d wait=%.3fs",
+                        baseline.portal_id, freshness.source,
+                        raw_barrier.receipt_count,
+                        planning_barrier.receipt_count if planning_barrier is not None else -1,
+                        snapshot.update.count, snapshot.full.count, elapsed_s,
+                    )
+                    return True, detail
                 remaining_s = deadline - time.monotonic()
                 if remaining_s <= 0.0:
-                    detail["reason"] = {
-                        "waiting_raw_occupancy": "post_open_raw_occ_refresh_timeout",
-                        "waiting_planning_occupancy": (
-                            "post_open_planning_occ_refresh_timeout"
-                        ),
-                    }.get(causal_stage, "post_open_costmap_refresh_timeout")
-                    detail["post_open_costmap_fresh"] = False
+                    detail.update(reason=freshness.timeout_reason, post_open_costmap_fresh=False)
                     rospy.logwarn(
-                        "[semantic_behavior_executor] post-open causal-map "
-                        "timeout: portal=%s stage=%s raw=%d planning=%d "
-                        "update=%s->%d full=%s->%d wait=%.3fs",
-                        baseline.portal_id,
-                        causal_stage,
-                        current_raw_count,
-                        current_planning_count,
-                        str(costmap_baseline_update_count),
-                        current_update_count,
-                        str(costmap_baseline_full_count),
-                        current_full_count,
+                        "[semantic_behavior_executor] post-open causal-map timeout: "
+                        "portal=%s stage=%s raw=%d planning=%d update=%d full=%d wait=%.3fs",
+                        baseline.portal_id, freshness.stage, snapshot.raw.count,
+                        snapshot.planning.count, snapshot.update.count, snapshot.full.count,
                         elapsed_s,
                     )
                     return False, detail
                 self._global_costmap_condition.wait(
-                    timeout=min(
-                        remaining_s,
-                        self.post_interaction_costmap_fresh_poll_interval_s,
-                    )
+                    timeout=min(remaining_s, self.post_interaction_costmap_fresh_poll_interval_s)
                 )
 
     def _global_plan_callback(self, message: Path) -> None:
@@ -5743,42 +5306,7 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _has_valid_drawer_visual_contract(interaction: dict) -> bool:
-        sequence_type = str(interaction.get("sequence_type") or "").strip().casefold()
-        regions = interaction.get("open_regions")
-        if not isinstance(regions, list):
-            return False
-        if regions:
-            valid_region = False
-            for region in regions:
-                if not isinstance(region, dict):
-                    continue
-                center = region.get("center")
-                if not isinstance(center, (list, tuple)) or len(center) < 2:
-                    continue
-                try:
-                    x, y = float(center[0]), float(center[1])
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-                    valid_region = True
-                    break
-            if not valid_region:
-                return False
-        elif sequence_type != "drawer_scan" or not bool(
-            interaction.get("drawer_scan_fallback_to_all", False)
-        ):
-            # ``drawer_open`` and legacy hand-authored commands must remain
-            # grounded to at least one visible action region.  Only the sealed
-            # drawer_scan macro may use the trusted bridge's explicit
-            # all-slide-joints fallback when a low view has no usable region.
-            return False
-        if SemanticBehaviorExecutor._finite_public_bbox(
-            interaction.get("drawer_container_bbox_2d")
-        ) is None:
-            return False
-        return SemanticBehaviorExecutor._public_step_or_none(
-            interaction.get("drawer_container_capture_step")
-        ) is not None
+        return has_valid_drawer_visual_contract(interaction)
 
     def _reject_drawer_command_without_visual_contract(
         self, candidate: dict, reason: str, *, retryable: bool = False
@@ -5833,150 +5361,18 @@ class SemanticBehaviorExecutor:
                     "drawer_visual_contract_missing_before_bridge",
                 )
                 return
-        action = action_for_opaque_open_contract(
-            interaction.get("action", "open"),
-            enabled=self.evaluator_opaque_open_only,
-        )
-        target_kind = str(
-            interaction.get("target_kind")
-            or interaction.get("container_kind")
-            or metadata.get("semantic_type")
-            or metadata.get("semantic_class")
-            or ""
-        ).casefold()
-        node_type = str(
-            interaction.get("node_type") or metadata.get("node_type") or ""
-        ).casefold()
-        if node_type == "portal":
-            target_kind = "door"
-        elif target_kind in {"refrigerator", "refrigerator_door", "fridge_door"}:
-            target_kind = "fridge"
         with self.lock:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
-        payload = {
-            # The bridge deduplicates physical requests by command_id.  One
-            # semantic decision may legitimately issue a second physical
-            # attempt from a different bounded recovery anchor, so the
-            # per-decision base id is not a sufficient physical request id.
-            "command_id": (
-                f"{self._command_id(candidate)}:interaction:{interaction_sequence:03d}"
+        payload = build_interaction_command(
+            candidate,
+            command_id_base=self._command_id(candidate),
+            interaction_sequence=interaction_sequence,
+            fallback_episode_id=str(
+                (getattr(self, "latest_graph", {}) or {}).get("episode_id") or ""
             ),
-            "decision_id": candidate.get("decision_id", ""),
-            "candidate_id": candidate.get("candidate_id", ""),
-            "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
-            "episode_id": str(
-                candidate.get("episode_id")
-                or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
-                or ""
-            ),
-            "node_id": interaction.get("node_id", candidate.get("target_id", "")),
-            "object_id": interaction.get("object_id", candidate.get("target_name", "")),
-            "node_type": node_type,
-            "target_kind": target_kind,
-            "action": action,
-            "interaction_mode": interaction.get("interaction_mode", "open_close"),
-            "container_kind": str(interaction.get("container_kind") or ""),
-            "expected_state": str(
-                "closed"
-                if action == "close"
-                else "open"
-                if action == "open"
-                else interaction.get("expected_state") or ""
-            ),
-            "sequence_type": interaction.get("sequence_type", ""),
-            "operation_method": interaction.get("operation_method", "unknown"),
-            "open_regions": list(interaction.get("open_regions") or []),
-            "approach_goal_xyyaw": list(
-                interaction.get("interaction_approach_pose_xyyaw")
-                or candidate.get("goal_xyyaw")
-                or []
-            ),
-            "visual_operation_plan": dict(
-                interaction.get("visual_operation_plan") or {}
-            ),
-            "interaction_approach_pose_xyyaw": list(
-                interaction.get("interaction_approach_pose_xyyaw") or []
-            ),
-            "interaction_approach_axis_xy": list(
-                interaction.get("interaction_approach_axis_xy") or []
-            ),
-            "interaction_target_center_xy": list(
-                interaction.get("interaction_target_center_xy") or []
-            ),
-            "interaction_front_axis_source": str(
-                interaction.get("interaction_front_axis_source") or ""
-            ),
-            "interaction_front_axis_validation_required": bool(
-                interaction.get("interaction_front_axis_validation_required", False)
-            ),
-            "m1_observation_fallback": bool(
-                metadata.get("interaction_observation_fallback_used", False)
-            ),
-            "m1_observation_fallback_reason": str(
-                metadata.get("interaction_observation_fallback_reason") or ""
-            ),
-            "interaction_ready_distance_m": float(
-                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
-            ),
-            "interaction_ready_yaw_tolerance_rad": float(
-                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
-            ),
-            # Preserve the explicit per-goal navigation contract through the
-            # ROS JSON bridge.  Without forwarding these two fields the bridge
-            # falls back to its broad legacy ready envelope and can accept a
-            # pose that move_base was never required to converge to.
-            "navigation_goal_position_tolerance_m": float(
-                interaction.get(
-                    "navigation_goal_position_tolerance_m",
-                    interaction.get("interaction_ready_distance_m", 0.45),
-                )
-                or 0.45
-            ),
-            "navigation_goal_yaw_tolerance_rad": float(
-                interaction.get(
-                    "navigation_goal_yaw_tolerance_rad",
-                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
-                )
-                or 0.55
-            ),
-            "navigation_goal_tolerance_contract_explicit": bool(
-                interaction.get("navigation_goal_tolerance_contract_explicit", False)
-            ),
-            "interaction_front_position_tolerance_rad": float(
-                interaction.get(
-                    "interaction_front_position_tolerance_rad",
-                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
-                )
-                or 0.55
-            ),
-            "interaction_front_yaw_tolerance_rad": float(
-                interaction.get(
-                    "interaction_front_yaw_tolerance_rad",
-                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
-                )
-                or 0.55
-            ),
-        }
-        # The bridge accepts only this compact public geometry contract for a
-        # fixed portal.  Do not forward graph internals, source object names,
-        # joints, or asset identifiers with the interaction command.
-        aperture_observation = interaction.get("portal_aperture_observation")
-        if payload["node_type"] == "portal" and isinstance(aperture_observation, dict):
-            payload["portal_aperture_observation"] = {
-                key: aperture_observation[key]
-                for key in ("door_leaf", "connectivity", "confidence")
-                if key in aperture_observation
-            }
-        if drawer_sequence_type in {"drawer_scan", "drawer_open"}:
-            drawer_box = interaction.get("drawer_container_bbox_2d")
-            if isinstance(drawer_box, (list, tuple)):
-                payload["drawer_container_bbox_2d"] = list(drawer_box)
-            drawer_capture_step = interaction.get("drawer_container_capture_step")
-            if isinstance(drawer_capture_step, int) and not isinstance(
-                drawer_capture_step, bool
-            ):
-                payload["drawer_container_capture_step"] = drawer_capture_step
+            opaque_open_only=self.evaluator_opaque_open_only,
+        )
         with self.lock:
             self.pre_interaction_image_sequence = self.latest_image_sequence
             if drawer_sequence_type == "drawer_scan":
@@ -6617,13 +6013,7 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _public_step_or_none(value: object) -> int | None:
-        if isinstance(value, bool):
-            return None
-        try:
-            step = int(value)
-        except (TypeError, ValueError):
-            return None
-        return step if step >= 0 else None
+        return public_step_or_none(value)
 
     def _needs_fresh_drawer_scan_locked(self) -> bool:
         """Return whether the arrived interaction must re-ground a drawer box."""
@@ -7108,79 +6498,55 @@ class SemanticBehaviorExecutor:
         self.cmd_vel_pub.publish(command)
 
     def _run_post_interaction_exit_observation(
-        self, decision_id: str, candidate: dict
+        self, decision_id: str, candidate: dict, *, navigation_run_token: int | None = None,
     ) -> dict:
-        """Observe both sides from the fixed post-open doorway waypoint.
-
-        This is intentionally a bounded, synchronous handoff after move_base
-        reports the traversal goal reached.  It does not alter frontier
-        scoring or create another navigation goal; the existing executor owns
-        cmd_vel until the sweep returns to the arrival heading.
-        """
+        """Run the pure sweep under the original executor's navigation lease."""
         if not self.post_interaction_exit_observation_enabled:
             return {"enabled": False, "status": "disabled"}
+
+        def owns_navigation():
+            return (self._navigation_is_current(decision_id)
+                    and self._navigation_run_is_active(decision_id, navigation_run_token))
+
         with self.lock:
+            if not owns_navigation():
+                return {"enabled": True, "status": "canceled", "views": []}
             if decision_id in self._post_interaction_exit_observation_decisions:
                 return {"enabled": True, "status": "already_done"}
             self._post_interaction_exit_observation_decisions.add(decision_id)
         pose = self._current_pose(self.map_frame)
         if pose is None:
             return {"enabled": True, "status": "skipped", "reason": "pose_unavailable"}
-        home_yaw = float(pose[2])
-        angle = float(self.post_interaction_exit_observation_angle_rad)
-        targets = [normalize_angle(home_yaw - angle), normalize_angle(home_yaw + angle)]
-        if self.post_interaction_exit_observation_return_home:
-            targets.append(normalize_angle(home_yaw))
-        views = []
-        started = time.monotonic()
+        config = ExitObservationConfig(
+            angle_rad=self.post_interaction_exit_observation_angle_rad,
+            speed_rad_s=self.post_interaction_exit_observation_speed_rad_s,
+            tolerance_rad=self.post_interaction_exit_observation_tolerance_rad,
+            settle_s=self.post_interaction_exit_observation_settle_s,
+            view_timeout_s=self.post_interaction_exit_observation_view_timeout_s,
+            return_home=self.post_interaction_exit_observation_return_home,
+        )
+        sweep = ExitObservationSweep(float(pose[2]), config, now=time.monotonic())
         try:
-            for index, target_yaw in enumerate(targets):
-                if not self._navigation_is_current(decision_id):
-                    return {"enabled": True, "status": "canceled", "views": views}
-                reached = False
-                deadline = time.monotonic() + self.post_interaction_exit_observation_view_timeout_s
-                while not rospy.is_shutdown() and time.monotonic() < deadline:
-                    if not self._navigation_is_current(decision_id):
-                        return {"enabled": True, "status": "canceled", "views": views}
-                    current = self._current_pose(self.map_frame)
-                    if current is None:
-                        time.sleep(0.05)
-                        continue
-                    error = normalize_angle(target_yaw - float(current[2]))
-                    if abs(error) <= self.post_interaction_exit_observation_tolerance_rad:
-                        reached = True
-                        break
-                    speed = min(
-                        abs(self.post_interaction_exit_observation_speed_rad_s),
-                        max(0.05, abs(error) * 1.5),
-                    )
-                    self._publish_rotation(speed if error > 0.0 else -speed)
-                    time.sleep(0.05)
-                self._publish_rotation(0.0)
-                if not reached:
-                    return {
-                        "enabled": True,
-                        "status": "timeout",
-                        "views": views,
-                        "failed_view_index": index,
-                        "elapsed_s": time.monotonic() - started,
-                    }
+            while True:
                 current = self._current_pose(self.map_frame)
-                views.append({
-                    "index": index,
-                    "target_yaw": target_yaw,
-                    "yaw": float(current[2]) if current is not None else None,
-                })
-                if self.post_interaction_exit_observation_settle_s > 0.0:
-                    time.sleep(self.post_interaction_exit_observation_settle_s)
-            return {
-                "enabled": True,
-                "status": "completed",
-                "views": views,
-                "elapsed_s": time.monotonic() - started,
-            }
+                with self.lock:
+                    owned = owns_navigation()
+                    step = sweep.advance(
+                        now=time.monotonic(), yaw=float(current[2]) if current is not None else None,
+                        current=owned, shutdown=rospy.is_shutdown(),
+                    )
+                    # Ownership check and publication must be atomic against
+                    # replacement selections, including the final zero command.
+                    if owned:
+                        self._publish_rotation(step.angular_z)
+                if step.result is not None:
+                    return step.result
+                if step.wait_s > 0.0:
+                    time.sleep(step.wait_s)
         finally:
-            self._publish_rotation(0.0)
+            with self.lock:
+                if owns_navigation():
+                    self._publish_rotation(0.0)
 
     def _fresh_rear_local_costmap_snapshot(self) -> tuple[OccupancyGrid | None, dict]:
         """Return a recent local costmap or a fail-closed diagnostic."""
@@ -10574,7 +9940,7 @@ class SemanticBehaviorExecutor:
             # original navigation result if the optional sweep times out.
             if success and is_post_interaction_traversal_navigation(candidate):
                 observation_detail = self._run_post_interaction_exit_observation(
-                    decision_id, candidate
+                    decision_id, candidate, navigation_run_token=navigation_run_token,
                 )
                 if observation_detail:
                     detail = {**dict(detail or {}), "exit_observation": observation_detail}
