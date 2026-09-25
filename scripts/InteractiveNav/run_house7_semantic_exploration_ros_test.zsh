@@ -113,7 +113,7 @@ GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
-ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
+ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/path_follower_precise_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-}
@@ -601,7 +601,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
-  base_local_planner:="${BASE_LOCAL_PLANNER:-dwa_local_planner/DWAPlannerROS}" \
+  base_local_planner:="${BASE_LOCAL_PLANNER:-nav_pkg/PathFollower}" \
   exploration_only:=true \
   randomize_camera:=false \
   publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \

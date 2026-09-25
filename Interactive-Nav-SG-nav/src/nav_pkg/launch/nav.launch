@@ -1,7 +1,7 @@
 <launch>
 
     <arg name="override_config_file" default=""/>
-    <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
+    <arg name="base_local_planner" default="nav_pkg/PathFollower"/>
     <arg name="base_global_planner" default="nav_pkg/OrientedGlobalPlanner"/>
     <arg name="global_planner_allow_unknown" default="false"/>
     <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
@@ -40,7 +40,8 @@
         <param name="OrientedGlobalPlanner/orient_path_tangents" value="true" />
         <param name="OrientedGlobalPlanner/terminal_orientation_window_size" value="8" />
         <param name="base_local_planner" value="$(arg base_local_planner)"/>
-        <rosparam file="$(find nav_pkg)/configs/controller/dwa_controller_params.yaml" command="load" />
+        <rosparam if="$(eval arg('base_local_planner') == 'dwa_local_planner/DWAPlannerROS')"
+                  file="$(find nav_pkg)/configs/controller/dwa_controller_params.yaml" command="load" />
         <rosparam if="$(eval arg('override_config_file') != '')"
                   file="$(arg override_config_file)"
                   command="load" />

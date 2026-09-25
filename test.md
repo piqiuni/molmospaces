@@ -3256,7 +3256,9 @@ resume 跳过已完成场景、dry-run 不等待。排队时间不占场景 time
 `nav_pkg/PathFollower` 通过 `BASE_LOCAL_PLANNER=nav_pkg/PathFollower` 启用；
 同时将 `NAV_CONFIG_OVERRIDE` 指向
 `scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml`。
-不设置时仍使用 DWA 与 `semantic_interaction_nav.yaml`。
+2026-09-23 对照实验中，不设置时使用 DWA 与 `semantic_interaction_nav.yaml`。
+当前 V3 评测和 ROS 导航启动默认使用 PathFollower；V3 默认参数为
+`path_follower_precise_nav.yaml`。复现 DWA 对照时需同时显式覆盖插件与导航参数文件。
 插件沿实时全局路径前瞻 0.2 m，按 V3 桥接器实际 0.2 秒控制步长预测运动，检查 footprint
 和横向偏离；`/move_base/PathFollower/set_parameters` 提供每次交互到达容差租约。
 
@@ -3323,7 +3325,8 @@ python scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
 恢复版本实际发出三次 `-0.08 m/s` 短倒退、没有出现“no collision-free command”警告，
 公开有效路径样本 P95 偏离 0.034 m，超过 0.2 m 的样本占 0.1%；但它仍在 749 step
 因无可执行候选退出，正式成功率和 SPL 均为零。对比实验中的倒退恢复可用，不等于
-已解决上游候选耗尽。不要把 PathFollower 替换为默认规划器。实际候选配置为
+已解决上游候选耗尽。当时的建议是不把 PathFollower 替换为默认规划器；
+2026-09-25 按实验需求切换默认值，不代表已证实整体性能提升。实际候选配置为
 `path_follower_precise_nav.yaml` 和 `path_follower_smooth_nav.yaml`，其中前者
 整体指标较好；`path_follower_cautious_nav.yaml` 仅保留为限速失败对照，
 首轮 `path_follower_nav.yaml` 只用于 300-step 控制验证。

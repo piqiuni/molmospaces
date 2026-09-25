@@ -56,7 +56,7 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
-    "BASE_LOCAL_PLANNER": "dwa_local_planner/DWAPlannerROS",
+    "BASE_LOCAL_PLANNER": "nav_pkg/PathFollower",
     "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
     "RECORDER_SAVE_EVENTS": "false",
     "RECORDER_COMPACT_STEPS": "true",
@@ -99,7 +99,7 @@ _RUNNER_ENV_DEFAULTS: dict[str, str] = {
         REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "semantic_controlled_explore.yaml"
     ),
     "NAV_CONFIG_OVERRIDE": str(
-        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "semantic_interaction_nav.yaml"
+        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "path_follower_precise_nav.yaml"
     ),
     "ROS_SETUP": str(REPO_ROOT / "Interactive-Nav-SG-nav" / "devel" / "setup.bash"),
 }

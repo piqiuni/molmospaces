@@ -52,7 +52,7 @@
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
   <arg name="explore_py_config_override_file" default=""/>
   <arg name="nav_config_override_file" default=""/>
-  <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
+  <arg name="base_local_planner" default="nav_pkg/PathFollower"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>

@@ -13,6 +13,19 @@ sys.modules[SPEC.name] = batch
 SPEC.loader.exec_module(batch)
 
 
+def test_default_local_planner_uses_precise_path_follower():
+    defaults = batch._RUNNER_ENV_DEFAULTS
+    config = (
+        batch.REPO_ROOT
+        / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"
+    ).read_text(encoding="utf-8")
+
+    assert defaults["BASE_LOCAL_PLANNER"] == "nav_pkg/PathFollower"
+    assert Path(defaults["NAV_CONFIG_OVERRIDE"]).name == "path_follower_precise_nav.yaml"
+    assert "BASE_LOCAL_PLANNER=${BASE_LOCAL_PLANNER:-nav_pkg/PathFollower}" in config
+    assert "path_follower_precise_nav.yaml" in config
+
+
 def test_default_command_starvation_budget_covers_one_m2_timeout_retry(
     tmp_path, monkeypatch
 ):
