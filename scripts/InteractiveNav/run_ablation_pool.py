@@ -180,8 +180,13 @@ def main():
     for ordinal, (variant, index) in enumerate(jobs):
         plans[(variant, index)] = batch.EpisodePlan(ordinal, -1, index, 0,
                                                    output / variant / f"episode_{index:04d}")
-    manifest["git_head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True)
+    frozen_commit = os.environ.get("ABLATION_SOURCE_COMMIT")
+    if frozen_commit:
+        manifest["git_head"] = frozen_commit
+        manifest["git_status"] = "frozen git archive"
+    else:
+        manifest["git_head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True)
     batch.atomic_json(output / "pool_manifest.json", manifest)
     for runtime_dir in (output / "tmp", output / "cache"):
         runtime_dir.mkdir()
