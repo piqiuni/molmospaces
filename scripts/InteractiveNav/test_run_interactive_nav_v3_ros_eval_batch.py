@@ -24,6 +24,7 @@ def test_default_local_planner_uses_precise_path_follower():
     assert Path(defaults["NAV_CONFIG_OVERRIDE"]).name == "path_follower_precise_nav.yaml"
     assert "BASE_LOCAL_PLANNER=${BASE_LOCAL_PLANNER:-nav_pkg/PathFollower}" in config
     assert "path_follower_precise_nav.yaml" in config
+    assert defaults["PAPER_COST_BUDGET"] == "30.0"
 
 
 def test_default_command_starvation_budget_covers_one_m2_timeout_retry(
@@ -293,6 +294,7 @@ def test_planned_invocation_tracks_effective_inherited_runtime(tmp_path, monkeyp
     monkeypatch.setattr(batch, "infer_conda_prefix", lambda: None)
     monkeypatch.delenv("PYTHON_BIN", raising=False)
     monkeypatch.setenv("CONDA_ENV", str(conda_a))
+    monkeypatch.setenv("PAPER_COST_BUDGET", "30.0")
 
     first = batch.planned_invocation_record(plan, args)
     assert first is not None
@@ -300,6 +302,13 @@ def test_planned_invocation_tracks_effective_inherited_runtime(tmp_path, monkeyp
     assert first["planned_invocation"]["runtime_python"] == str(
         (conda_a / "bin" / "python").resolve()
     )
+    assert first["planned_invocation"]["runner_settings"]["PAPER_COST_BUDGET"] == "30.0"
+
+    monkeypatch.setenv("PAPER_COST_BUDGET", "20.0")
+    changed_budget = batch.planned_invocation_record(plan, args)
+    assert changed_budget is not None
+    assert changed_budget["planned_invocation_signature"] != first["planned_invocation_signature"]
+    monkeypatch.setenv("PAPER_COST_BUDGET", "30.0")
 
     monkeypatch.setenv("CONDA_ENV", str(conda_b))
     second = batch.planned_invocation_record(plan, args)

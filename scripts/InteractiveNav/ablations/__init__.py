@@ -5,7 +5,7 @@ import sys
 
 VARIANTS = ("full", "no_interaction_graph", "no_task_decision", "no_outcome_update")
 BASELINE_COMMIT = "154aa0226e7ce42bcbc8b3efe31bfd1990ab5a36"
-DESIGN_REVISION = 3
+DESIGN_REVISION = 4
 
 
 def add_source_paths(repo: Path) -> None:

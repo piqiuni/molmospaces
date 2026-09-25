@@ -97,7 +97,8 @@ def test_flat_memory_reaches_http_client_with_native_response_schema(monkeypatch
     assert received[0]["context"]["object_memory"][0]["label"] == "door"
     assert "graph" not in received[0]["context"]
     assert received[0]["response_schema"]
-    assert policy.last_metrics == {"request_count": 1}
+    assert policy.last_metrics["request_count"] == 1
+    assert policy.last_metrics["attempts"][0]["error"] == ""
 
 
 def test_flat_curator_keeps_safety_and_quota_without_relational_ranking():
@@ -187,6 +188,7 @@ def test_generated_launch_uses_only_explicit_wrappers_and_valid_shell(tmp_path, 
     assert set(wrapped) == expected
     assert (tmp_path / "semantic_mapping_py.launch" in artifacts) == (variant == "no_outcome_update")
     assert "adapter_sha256=" in artifacts[tmp_path / "runner.sh"]
+    assert f"SCRIPT_DIR={REPO}/scripts/InteractiveNav" in artifacts[tmp_path / "runner.sh"]
     assert 'module2: "mllm_score"' in artifacts[tmp_path / "runner.sh"]
 
 
@@ -201,6 +203,7 @@ def test_dry_run_reuses_baseline_budget_and_writes_nothing(tmp_path, capsys, var
     if variant != "full":
         command += ["--runner", str(output / "ablation/runner.sh")]
     assert payload["command"] == command
+    assert payload["config"]["paper_cost_budget"] == 30.0
     assert not output.exists()
 
 
@@ -234,6 +237,8 @@ def test_launcher_records_effective_variant_and_uses_owned_cleanup(tmp_path, mon
     monkeypatch.setattr(launcher.signal, "signal", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
     monkeypatch.setattr(launcher.subprocess, "check_output", lambda args, **kwargs: "test-head\n" if "rev-parse" in args else "")
+    monkeypatch.setattr(baseline, "check_mujoco_gpu_inventory", lambda config: ["0", "1"])
+    monkeypatch.setattr(launcher, "check_model_endpoints", lambda config: None)
     monkeypatch.setattr(baseline, "cleanup", lambda owner, force: cleaned.append(owner))
     monkeypatch.setattr(baseline, "progress", lambda *_: "test progress")
     monkeypatch.setattr(baseline, "completion_report", lambda *a, **k: "test complete")
@@ -246,6 +251,7 @@ def test_launcher_records_effective_variant_and_uses_owned_cleanup(tmp_path, mon
     command, kwargs = launched[0]
     assert command == manifest["command"]
     assert kwargs["env"][baseline.OWNER_KEY] == str(output)
+    assert kwargs["env"]["PAPER_COST_BUDGET"] == "30.0"
     assert Path(kwargs["env"]["TMPDIR"]).is_relative_to(output)
     assert ("--runner" in command) == (variant != "full")
     if variant != "full":

@@ -82,7 +82,7 @@ def render_artifacts(repo: Path, directory: Path, variant: str, python_bin: str,
     artifacts[nav_path] = ET.tostring(nav, encoding="unicode") + "\n"
     runner = native_runner(repo).read_text()
     runner = _replace_once(
-        runner, 'SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)',
+        runner, 'SCRIPT_DIR=${INTERACTIVE_NAV_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}',
         "SCRIPT_DIR=" + shlex.quote(str(native_runner(repo).parent)),
     )
     runner = _replace_once(

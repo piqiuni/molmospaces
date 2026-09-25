@@ -4,6 +4,7 @@
 import argparse
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -16,6 +17,7 @@ import run_benchmark_eval as baseline
 from ablations import BASELINE_COMMIT, DESIGN_REVISION, VARIANTS
 from ablations.perception import REFRESH_PROFILES
 from ablations.launch import artifact_digests, render_artifacts, runner_path, write_artifacts
+from ablations.preflight import check_model_endpoints
 
 
 def main(argv=None):
@@ -29,6 +31,7 @@ def main(argv=None):
     parser.add_argument("--base-master-port", type=int)
     parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--recording", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--paper-cost-budget", type=float)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true", help="validate and print; no files, ROS or model calls")
     args = parser.parse_args(argv)
@@ -37,9 +40,12 @@ def main(argv=None):
     if refresh_profile not in REFRESH_PROFILES:
         parser.error("invalid m1_refresh_profile in config")
     config["m1_refresh_profile"] = refresh_profile
-    for key in ("workers", "max_steps", "base_master_port", "episode_indices", "recording"):
+    for key in ("workers", "max_steps", "base_master_port", "episode_indices", "recording", "paper_cost_budget"):
         if getattr(args, key) is not None:
             config[key] = getattr(args, key)
+    config["paper_cost_budget"] = float(config.get("paper_cost_budget", 30.0))
+    if not math.isfinite(config["paper_cost_budget"]) or config["paper_cost_budget"] <= 0:
+        parser.error("paper_cost_budget must be finite and positive")
     name = datetime.datetime.now().strftime(f"ablation-{args.variant}-%Y%m%d_%H%M%S_%f")
     output = (args.output_dir or Path(config["output_root"]) / name).expanduser().resolve()
     if not output.is_relative_to(Path("/home/ldl")):
@@ -51,12 +57,14 @@ def main(argv=None):
         command += ["--runner", str(runner_path(baseline.REPO, directory, args.variant, refresh_profile))]
     manifest = {"variant": args.variant, "design_revision": DESIGN_REVISION,
                 "m1_refresh_profile": refresh_profile, "m1_refresh_overrides": REFRESH_PROFILES[refresh_profile],
-                "reference_baseline_commit": BASELINE_COMMIT,
+                "historical_baseline_commit": BASELINE_COMMIT,
                 "output_dir": str(output), "command": command,
                 "artifact_sha256": artifact_digests(artifacts), "config": config}
     if args.dry_run:
         print(json.dumps(manifest, indent=2))
         return 0
+    baseline.check_mujoco_gpu_inventory(config)
+    check_model_endpoints(config)
     for port in range(config["base_master_port"], config["base_master_port"] + config["workers"]):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", port))
@@ -74,6 +82,7 @@ def main(argv=None):
         path.mkdir()
         environment[key] = str(path)
     environment.update({baseline.OWNER_KEY: str(output),
+                        "PAPER_COST_BUDGET": str(config["paper_cost_budget"]),
                         "MIN_STEPS": str(min(config.get("min_steps", 200), config["max_steps"])),
                         "CONDA_ENV": config["conda_env"], "PYTHON_BIN": config["python_bin"],
                         "NLTK_DATA": "/home/ldl/nltk_data",

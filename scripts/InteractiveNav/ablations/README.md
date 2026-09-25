@@ -1,4 +1,17 @@
-# 模块级消融（设计版本 3；第三组视觉重观测修正）
+# 模块级消融（设计版本 4；论文指标 v4）
+
+2026-09-26 更新：新运行必须把 Full 和三组消融放在同一代码版本、导航器、
+M1 profile、模型服务、资源并发和评分配置下配对执行。当前默认局部导航器为
+`nav_pkg/PathFollower`；历史 Full 及 v1–v3 指标产物不能混入新论文表。
+`run_ablation_pool.py --dry-run` 会实际渲染四组 runner 并检查 Shell 语法，
+但不会启动 ROS/模型；正式运行前还会检查 EGL GPU 清单和外部模型端点的 TCP 可达性。论文主表只报告
+SR、SPL、ISR、IP、Cost 五项，定义见 `docs/interactive_navigation_metrics.md`。
+报告入口 `ablations/report_large_pool.py` 和兼容入口 `ablations/report_pool.py`
+共享评测器的 v4 汇总实现，仅在四组任务完成、可评分 episode 配对一致、
+指标齐全且 Cost 参数一致时标记 `complete=true`。
+Cost 预算通过 `paper_cost_budget` 配置或 `--paper-cost-budget` 显式冻结，
+默认 30，并进入 episode 的 resume 签名。
+设计版本 4 是运行与评分接口更新；三组消融的算法干预保持下述版本 3 设计。
 
 ## 版本 3：交互后先完成视觉更新
 
@@ -72,25 +85,33 @@ Full + baseline 直接使用原始 runner。
 ## 运行与记录
 
 60 个 mixed 场景为场景 0–59，对应 benchmark episode 2000–2059。
-新版公共配置：`scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json`。
-保留动态 200–2000 步、20 workers、观测倍率 1、无录制，新增共同 continuous M1 与独立输出目录。
-论文指标从 `interactive_nav_v3_paper_metrics_v2` 起按目标交互对象类别统计 IP，Total Cost 的错误罚分只计失败或无新效果重复；v1 已存结果的 IP/Cost 不能与 v2 直接比较，配对消融须使用同一评分版本。
+旧公共配置 `scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json`
+仅保留作历史复现，不作为新一轮的默认资源配置。新实验应单独冻结场景、worker、EGL GPU、
+MLLM 端点、M1 profile、动态预算与 `paper_cost_budget`，四组共用一个共享队列。
+当前论文指标为 `interactive_nav_v3_paper_metrics_v4`：ISR 使用必要效果完成比例，IP 按目标类别的物理效果逐场平均，Cost 归一化到 [0,1] 且失败记 1。旧产物不能与 v4 直接比较，配对消融须使用同一评分版本和 Cost 参数。
 
-以下仅验证计划，不创建文件或启动仿真：
+新一轮可用以下入口预检；`--dry-run` 不创建输出，也不启动仿真：
 
 ```bash
-/home/ldl/conda_envs/mlspaces/bin/python /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_benchmark_ablation.py --variant full --config /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/configs/evaluation/ablation_v2_mixed_0_59_20w_dynamic2000_no_recording.json --dry-run
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/run_ablation_pool.py \
+  --config <new-v4-config.json> --selection-source <benchmark.json> \
+  --output-dir <new-output-under-/home/ldl> \
+  --variants full no_interaction_graph no_task_decision no_outcome_update \
+  --selection-mode stride --scenes <N> --workers <W> --dry-run
 ```
 
-四组分别替换 `--variant`，每次创建独立目录。正式运行不应混用旧版 Full 数据；
-并发启动不同组时需要独立 master 端口和相同资源安排。
-`ablation_manifest.json` 记录 design_revision=2、M1 profile/实际覆盖值、基线 SHA、
-当前 Git 状态、配置、命令和适配文件哈希。原生 ROS/算法源码与 launch 不改动；
+若依据历史结果预先冻结了非连续 mixed 索引，使用仅包含这些 episode 的
+`selection.json` 作 `--selection-source`，并指定 `--selection-mode explicit`；
+该模式校验索引唯一、数量一致且位于 2000–2999，不再重新按历史成功率排序。
+
+正式运行不应混用旧版 Full 数据；共享池为每个 worker 分配独立 master 端口。
+`pool_manifest.json` 与 `ablation_manifest.json` 记录 design_revision=4、M1 profile、
+当前 Git 状态、配置和适配文件哈希。原生 ROS/算法源码与 launch 不改动；
 适配代码及生成的 launch/runner 存于本轮输出目录。原 YAML 模块名不能代替 manifest 判断干预。
 
 ## 如何判断 Full 的贡献
 
-主表保持四行：SR、SPL、有效交互精度、重复/无关交互数、路径/动作成本、M1/M2 调用及墙钟耗时。
+主表保持四行方法、五列指标：SR、SPL、ISR、IP、Cost；重复/无关交互数、M1/M2 调用及墙钟耗时放在诊断附表。
 使用同 episode/seed/初态/成功条件/动态预算，固定模型参数、并发度与录制开关。
 
 - Full vs Flat：关注跨房间、容器搜索和多步状态依赖场景，报告失败原因、绕行与重复操作。

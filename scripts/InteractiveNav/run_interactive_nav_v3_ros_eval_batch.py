@@ -56,6 +56,7 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "PAPER_COST_BUDGET": "30.0",
     "BASE_LOCAL_PLANNER": "nav_pkg/PathFollower",
     "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
     "RECORDER_SAVE_EVENTS": "false",

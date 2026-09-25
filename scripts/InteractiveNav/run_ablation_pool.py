@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -18,7 +19,8 @@ import time
 import run_benchmark_eval as baseline
 import run_interactive_nav_v3_ros_eval_batch as batch
 from ablations import DESIGN_REVISION, VARIANTS
-from ablations.launch import render_artifacts, write_artifacts, artifact_digests
+from ablations.launch import render_artifacts, runner_path, write_artifacts, artifact_digests
+from ablations.preflight import check_model_endpoints
 
 
 def select_scenes(source, count, *, episode_start=2000, episode_stride=1,
@@ -30,6 +32,15 @@ def select_scenes(source, count, *, episode_start=2000, episode_stride=1,
     """
     if episode_stride < 1 or episode_start < 0:
         raise ValueError("episode_start and episode_stride must be positive")
+    if selection_mode == "explicit":
+        rows = [r for r in source["episodes"]
+                if r.get("completed", True) and r.get("scoring_eligible", True)]
+        indices = [r["episode_index"] for r in rows]
+        if len(indices) != count or len(indices) != len(set(indices)):
+            raise ValueError("explicit selection must contain exactly count unique eligible episodes")
+        if any(index < 2000 or index >= 3000 for index in indices):
+            raise ValueError("explicit selection must contain mixed episode indices 2000..2999")
+        return sorted(rows, key=lambda row: row["episode_index"])
     wanted = {episode_start + episode_stride * i for i in range(count)}
     rows = [r for r in source["episodes"]
             if r.get("episode_index") in wanted
@@ -91,7 +102,8 @@ def main():
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument("--episode-start", type=int, default=2000)
     parser.add_argument("--episode-stride", type=int, default=1)
-    parser.add_argument("--selection-mode", choices=("rank", "stride"), default="rank")
+    parser.add_argument("--paper-cost-budget", type=float)
+    parser.add_argument("--selection-mode", choices=("rank", "stride", "explicit"), default="rank")
     parser.add_argument("--dry-run", action="store_true")
     cli = parser.parse_args()
     output = cli.output_dir.resolve()
@@ -114,6 +126,12 @@ def main():
     config.update(workers=cli.workers, base_master_port=cli.base_master_port,
                   episode_indices=sorted(r["episode_index"] for r in selected),
                   recording=False, max_steps=2000, step_budget_mode="dynamic", resume=False)
+    config["paper_cost_budget"] = float(
+        cli.paper_cost_budget if cli.paper_cost_budget is not None
+        else config.get("paper_cost_budget", 30.0)
+    )
+    if not math.isfinite(config["paper_cost_budget"]) or config["paper_cost_budget"] <= 0:
+        parser.error("paper_cost_budget must be finite and positive")
     variants = tuple(dict.fromkeys(cli.variants))
     # Launch historically long scenes first; interleave variants instead of
     # reserving fixed worker quotas for each ablation.
@@ -122,24 +140,39 @@ def main():
     manifest = {"design_revision": DESIGN_REVISION, "created_at": batch.utc_now(),
                 "config": config, "selection_source": str(cli.selection_source.resolve()),
                 "selection_rule": ("fixed mixed stride" if cli.selection_mode == "stride"
+                                   else "explicit mixed indices from selection source" if cli.selection_mode == "explicit"
                                    else "eligible mixed; success, required interaction, task success, correct/attempt, correct count, index"),
-                "selected_full_rows": selected, "jobs": jobs, "full_launched": False,
+                "selected_full_rows": selected, "jobs": jobs, "full_launched": "full" in variants,
                 "scheduling": "one shared queue; fixed port per slot; immediate refill across variants",
                 "m1_refresh_profile": config.get("m1_refresh_profile", "continuous")}
+    artifacts_by_variant = {}
+    for variant in variants:
+        directory = output / variant
+        artifacts = render_artifacts(baseline.REPO, directory / "ablation", variant,
+                                     config["python_bin"], manifest["m1_refresh_profile"])
+        runner = artifacts.get(directory / "ablation/runner.sh")
+        if runner is not None:
+            subprocess.run(["bash", "-n"], input=runner, text=True, check=True)
+        artifacts_by_variant[variant] = artifacts
     if cli.dry_run:
         print(json.dumps({k: v for k, v in manifest.items() if k != "selected_full_rows"}, indent=2))
         return 0
+    baseline.check_mujoco_gpu_inventory(config)
+    check_model_endpoints(config)
     for port in range(cli.base_master_port, cli.base_master_port + cli.workers):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", port))
     output.mkdir(parents=True, exist_ok=False)
     args_by_variant, plans, results = {}, {}, {v: [] for v in variants}
+    launch_gate = batch.SceneLaunchGate(float(config.get("scene_start_interval_s", 10.0)))
     for variant in variants:
         directory = output / variant
-        artifacts = render_artifacts(baseline.REPO, directory / "ablation", variant,
-                                     config["python_bin"], manifest["m1_refresh_profile"])
+        artifacts = artifacts_by_variant[variant]
         write_artifacts(artifacts)
-        args_by_variant[variant] = native_args(config, directory, directory / "ablation/runner.sh")
+        runner = runner_path(baseline.REPO, directory / "ablation", variant,
+                             manifest["m1_refresh_profile"])
+        args_by_variant[variant] = native_args(config, directory, runner)
+        args_by_variant[variant]._scene_launch_gate = launch_gate
         batch.atomic_json(directory / "ablation_manifest.json", {
             "variant": variant, "design_revision": DESIGN_REVISION,
             "m1_refresh_profile": manifest["m1_refresh_profile"], "config": config,
@@ -150,7 +183,13 @@ def main():
     manifest["git_head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True)
     batch.atomic_json(output / "pool_manifest.json", manifest)
+    for runtime_dir in (output / "tmp", output / "cache"):
+        runtime_dir.mkdir()
     os.environ.update({baseline.OWNER_KEY: str(output), "MIN_STEPS": str(config.get("min_steps", 200)),
+                       "PAPER_COST_BUDGET": str(config["paper_cost_budget"]),
+                       "TMPDIR": str(output / "tmp"), "XDG_CACHE_HOME": str(output / "cache"),
+                       "HF_HOME": "/home/ldl/.cache/huggingface",
+                       "TORCH_HOME": "/home/ldl/.cache/torch",
                        "NLTK_DATA": "/home/ldl/nltk_data", "PYTHONDONTWRITEBYTECODE": "1"})
     stop, lock = threading.Event(), threading.Lock()
     finished = queue.Queue()
