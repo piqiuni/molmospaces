@@ -21,6 +21,7 @@ import run_interactive_nav_v3_ros_eval_batch as batch
 from ablations import DESIGN_REVISION, VARIANTS
 from ablations.launch import render_artifacts, runner_path, write_artifacts, artifact_digests
 from ablations.preflight import check_model_endpoints
+from ablations.progress import format_pool
 
 
 def select_scenes(source, count, *, episode_start=2000, episode_stride=1,
@@ -254,7 +255,7 @@ def main():
                      "per_variant": {v: {"reported": len(rows), "success": sum(bool(r.get("success")) for r in rows)}
                                      for v, rows in results.items()}}
             batch.atomic_json(output / "pool_status.json", state)
-            print(json.dumps(state, ensure_ascii=False), flush=True)
+            print(format_pool(output), flush=True)
         thread.join()
     finally:
         resource = telemetry.stop()

@@ -109,6 +109,13 @@ MLLM 端点、M1 profile、动态预算与 `paper_cost_budget`，四组共用一
 当前 Git 状态、配置和适配文件哈希。原生 ROS/算法源码与 launch 不改动；
 适配代码及生成的 launch/runner 存于本轮输出目录。原 YAML 模块名不能代替 manifest 判断干预。
 
+运行中的简洁终端视图可用 `python scripts/InteractiveNav/ablations/monitor_pool.py
+<campaign-root> --follow` 查看三个独立任务，也可传单个 `run/pool` 目录。
+每组显示完成、运行/收尾、排队、异常，以及已完成且可评分的 v4 指标均值；
+不完整或旧指标 episode 不进入均值。新启动的共享池直接打印同样的格式。
+已经按旧代码快照启动的任务，其平台原始日志不会因本地脚本更新而改变，
+可用这个只读监控入口查看当前状态。
+
 ## 如何判断 Full 的贡献
 
 主表保持四行方法、五列指标：SR、SPL、ISR、IP、Cost；重复/无关交互数、M1/M2 调用及墙钟耗时放在诊断附表。
