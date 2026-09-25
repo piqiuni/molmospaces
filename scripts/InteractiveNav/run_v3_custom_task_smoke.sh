@@ -10,13 +10,23 @@ BENCHMARK_LAUNCHER_CONFIG="${BENCHMARK_LAUNCHER_CONFIG:-scripts/InteractiveNav/c
 EXPECTED_EPISODES="${EXPECTED_EPISODES:-10}"
 SHORT_TASK_ID="${TASK_ID##*-}"
 STATE_DIR="${RUN_ROOT}/task-state"
-QWEN_ROOT=/home/ldl/qwen36-fp8
-QWEN_SERVICE_MODE="${QWEN_SERVICE_MODE:-legacy}"
-QWEN_MANAGE_SCRIPT="${QWEN_MANAGE_SCRIPT:-${QWEN_ROOT}/manage_qwen36_mtp3.sh}"
+QWEN_ROOT="${QWEN_ROOT:-/home/ldl/qwen36-fp8}"
+export QWEN_ROOT
+export QWEN36_MAX_MODEL_LEN="${QWEN36_MAX_MODEL_LEN:-16384}"
+export QWEN36_MAX_NUM_SEQS="${QWEN36_MAX_NUM_SEQS:-16}"
+export SEMANTIC_M2_CONTEXT_WINDOW_TOKENS="${QWEN36_MAX_MODEL_LEN}"
 PYTHON310_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include/python3.10
 PYTHON310_MULTIARCH_INCLUDE=/home/ldl/.cache/python3.10-dev/usr/include
 EGL_RUNTIME_LIB=/home/ldl/.cache/egl-runtime/usr/lib/x86_64-linux-gnu
 EGL_VENDOR_CONFIG="${REPO_ROOT}/scripts/InteractiveNav/configs/custom_task/10_nvidia.json"
+
+cd "${REPO_ROOT}"
+if [[ "${CUSTOM_TASK_DRY_RUN:-false}" == true ]]; then
+  exec /home/ldl/conda_envs/mlspaces/bin/python -u \
+    scripts/InteractiveNav/run_benchmark_eval.py \
+    --config "${BENCHMARK_LAUNCHER_CONFIG}" --expected-episodes "${EXPECTED_EPISODES}" \
+    --output-dir "${EVALUATION_OUTPUT_DIR}" --start-qwen --dry-run
+fi
 
 mkdir -p "${STATE_DIR}" "${RUN_ROOT}/cache" "${RUN_ROOT}/ros" \
   "/home/ldl/tmp/inav-${SHORT_TASK_ID}-q0" \
@@ -68,4 +78,5 @@ fi
 exec /home/ldl/conda_envs/mlspaces/bin/python -u \
   scripts/InteractiveNav/run_benchmark_eval.py \
   --config "${BENCHMARK_LAUNCHER_CONFIG}" \
+  --expected-episodes "${EXPECTED_EPISODES}" \
   --output-dir "${EVALUATION_OUTPUT_DIR}" --start-qwen

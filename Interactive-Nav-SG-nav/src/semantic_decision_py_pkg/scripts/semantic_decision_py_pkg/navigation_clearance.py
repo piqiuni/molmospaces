@@ -58,11 +58,18 @@ class ArrivalClearanceGrid:
                 self.__dict__[key] = result
         return self
 
-    def reachable(self, start, goal):
+    @cached_property
+    def optimistic_components(self):
+        result = label(self.values < (self.inscribed_threshold or self.occupied_threshold))[0]
+        result.flags.writeable = False
+        return result
+
+    def reachable(self, start, goal, *, allow_unknown=False):
         a, b = self.cell(start), self.cell(goal)
         if a is None or b is None:
             return {"clear": False, "reason": "path_outside_map"}
-        start_id, goal_id = int(self.components[a]), int(self.components[b])
+        components = self.optimistic_components if allow_unknown else self.components
+        start_id, goal_id = int(components[a]), int(components[b])
         return {"clear": bool(start_id and start_id == goal_id),
                 "reason": "path_connected" if start_id and start_id == goal_id else "path_disconnected",
                 "start_component": start_id, "goal_component": goal_id,
@@ -138,7 +145,7 @@ class ArrivalClearanceGrid:
                    float(info.origin.position.y), yaw, str(message.header.frame_id),
                    100 if costmap else 50, 99 if costmap else None)._reuse_preprocessing(previous)
 
-    def check(self, goal_xy, arrival_tolerance_m, *, robot_radius_m=0.25, safety_margin_m=0.05):
+    def check(self, goal_xy, arrival_tolerance_m, *, robot_radius_m=0.25, safety_margin_m=0.05, allow_unknown=False):
         # Arrival tolerance controls stopping, not obstacle clearance.
         radius = robot_radius_m + safety_margin_m + self.resolution/math.sqrt(2.0)
         detail = {"clearance_radius_m": radius, "arrival_region_radius_m": 0.0,
@@ -155,7 +162,7 @@ class ArrivalClearanceGrid:
         col, row = int(gx/self.resolution), int(gy/self.resolution)
         center = int(self.values[row, col])
         detail["center_cost"] = center
-        if center < 0 or center >= (self.inscribed_threshold or self.occupied_threshold):
+        if (center < 0 and not allow_unknown) or center >= (self.inscribed_threshold or self.occupied_threshold):
             return {**detail, "clear": False, "reason": "center_blocked"}
         extent = int(math.ceil(max(radius, 0.8)/self.resolution)) + 1
         x0, x1 = max(0, col-extent), min(width, col+extent+1)
@@ -163,7 +170,7 @@ class ArrivalClearanceGrid:
         patch = self.values[y0:y1, x0:x1]
         # Inscribed cost already includes the robot footprint. Sweep only
         # lethal/unknown cells, otherwise the footprint is inflated twice.
-        yy, xx = np.where((patch < 0) | (patch >= self.occupied_threshold))
+        yy, xx = np.where(((patch < 0) & (not allow_unknown)) | (patch >= self.occupied_threshold))
         distances = np.hypot((xx+x0+.5)*self.resolution-gx, (yy+y0+.5)*self.resolution-gy)
         nearest = float(distances.min()) if distances.size else max(radius, 0.8)
         clear = not distances.size or nearest > radius

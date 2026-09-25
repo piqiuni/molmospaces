@@ -64,6 +64,7 @@ def build_command(config: dict, output: Path) -> tuple[list[str], list[int]]:
                 "semantic_attribute_request_timeout_s", "scene_timeout_s", "conda_env", "python_bin"):
         command += ["--" + key.replace("_", "-"), str(config[key])]
     model_env = Path(config["semantic_model_env_file"])
+    command += ["--scene-start-interval-s", str(config.get("scene_start_interval_s", 10.0))]
     command += ["--semantic-model-env-file", str(model_env if model_env.is_absolute() else REPO / model_env)]
     for key in ("model_endpoints", "mujoco_egl_devices"):
         command += ["--" + key.replace("_", "-"), *map(str, config[key])]
@@ -323,6 +324,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--workers", type=int)
+    parser.add_argument("--expected-episodes", type=int)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--episode-indices", type=int, nargs="+", help="场景编号，如 10 11 1010")
@@ -372,6 +374,10 @@ def main() -> int:
     name = datetime.datetime.now().strftime("eval-%Y%m%d_%H%M%S_%f")
     output = (args.output_dir or Path(config["output_root"]) / name).resolve()
     command, indices = build_command(config, output)
+    if args.expected_episodes is not None:
+        if args.expected_episodes < 1 or len(indices) != args.expected_episodes:
+            parser.error(f"expected {args.expected_episodes} episodes, selected {len(indices)}")
+        config["expected_episodes"] = args.expected_episodes
     if args.dry_run:
         print(json.dumps({"output_dir": str(output), "command": command}, indent=2))
         return 0

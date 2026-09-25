@@ -23,6 +23,7 @@ def cluster_to_proposal(cluster: Any, frame_id: str) -> dict[str, Any]:
         "source": "explore_py",
         "frame_id": str(frame_id),
         "cluster_id": str(cluster.cluster_id),
+        "frontier_center_fallback": bool(getattr(cluster, "frontier_center_fallback", False)),
         "goal_xyyaw": [
             float(cluster.subgoal_world[0]),
             float(cluster.subgoal_world[1]),

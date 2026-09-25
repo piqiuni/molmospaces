@@ -45,7 +45,7 @@ def test_v3_runner_bounds_observation_turns_and_gives_m1_worker_pool_headroom() 
 
     assert "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}" in source
     assert 'semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}"' in source
-    assert "ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.2}" in source
+    assert "ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.4}" in source
     assert "ROS_STEP_READY_BARRIER_ENABLED=${ROS_STEP_READY_BARRIER_ENABLED:-true}" in source
     assert '--ros-step-ready-topic "${ROS_STEP_READY_TOPIC}"' in source
     assert "EVAL_ARGS+=(--ros-step-ready-barrier-enabled)" in source

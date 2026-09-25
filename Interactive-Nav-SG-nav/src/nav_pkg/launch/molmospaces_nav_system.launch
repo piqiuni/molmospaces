@@ -223,6 +223,7 @@
 
   <group if="$(arg start_nav)">
     <include file="$(find nav_pkg)/launch/nav.launch">
+      <arg name="global_planner_allow_unknown" value="true"/>
       <arg name="override_config_file" value="$(arg nav_config_override_file)"/>
       <arg name="base_local_planner" value="$(arg base_local_planner)"/>
       <arg name="global_map_topic" value="$(arg global_map_topic)"/>

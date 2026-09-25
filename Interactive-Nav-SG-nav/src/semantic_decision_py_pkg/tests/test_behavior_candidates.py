@@ -114,6 +114,31 @@ def test_frontier_recovery_keeps_identity_and_rechecks_original_tolerance(safe_r
     assert status["proposals"][0]["goal_xyyaw"] == [1., 0., 0.]
 
 
+def test_frontier_clearance_fallback_requests_optimistic_center_only():
+    generator = CandidateGenerator(CandidateGeneratorConfig(frontier_center_fallback_enabled=True))
+    status = {"proposals": [{"proposal_id": "wall", "goal_xyyaw": [1., 0., 0.],
+                              "frontier_point": [1., 1.], "frame_id": "map"}]}
+    def check(goal, tolerance, **kwargs):
+        return {"clear": kwargs.get("allow_unknown") and goal[:2] == [1., 1.]}
+    candidates = generator.generate(status, {}, (0., 0.), clearance_check=check)
+    assert len(candidates) == 1
+    assert candidates[0].goal_xyyaw[:2] == [1., 1.]
+    assert candidates[0].metadata["frontier_center_fallback"]
+    assert candidates[0].metadata["clearance_original_goal_xyyaw"] == [1., 0., 0.]
+    assert not generator.generate(status, {}, (0., 0.), clearance_check=lambda *args, **kwargs: {"clear": False})
+
+
+def test_frontier_without_observation_subgoal_uses_center():
+    generator = CandidateGenerator(CandidateGeneratorConfig(frontier_center_fallback_enabled=True))
+    status = {"proposals": [{"proposal_id": "edge", "goal_xyyaw": [],
+                              "frontier_point": [1.0, 1.0], "frame_id": "map"}]}
+    candidates = generator.generate(status, {}, (0.0, 0.0),
+        clearance_check=lambda *args, **kwargs: {"clear": bool(kwargs.get("allow_unknown"))})
+    assert len(candidates) == 1
+    assert candidates[0].goal_xyyaw[:2] == [1.0, 1.0]
+    assert candidates[0].metadata["frontier_center_fallback"]
+
+
 def test_clearance_filter_does_not_rotate_portal_normal_when_primary_is_blocked():
     node = {"id": "door", "type": "portal", "aabb_center": [0., 0., 1.],
             "aabb_size": [.2, 2., 2.], "state_age_sec": 0., "is_currently_visible": True,
@@ -2533,7 +2558,7 @@ def test_refrigerator_fan_reserves_arrival_yaw_budget() -> None:
     )
     assert math.isclose(
         command["navigation_goal_yaw_tolerance_rad"],
-        math.radians(10.0),
+        0.20,
         abs_tol=1e-9,
     )
 
@@ -3499,6 +3524,22 @@ def test_container_interaction_can_require_same_room() -> None:
     assert candidates[0].metadata["target_room_id"] == 2
 
 
+def test_visible_arrived_target_overrides_inconsistent_room_label(monkeypatch):
+    generator = CandidateGenerator(CandidateGeneratorConfig(target_require_same_room=True))
+    monkeypatch.setattr(generator, "_room_id_for_xy", lambda *args: 1)
+    graph = {"nodes": [{"id": "public_target", "type": "object", "label": "remotecontrol",
+        "room_id": 2, "aabb_center": [0.7, 0.0, 0.8], "aabb_size": [0.1, 0.1, 0.1],
+        "is_currently_visible": True, "attributes": {"visible_pixels": 150}}]}
+    candidates = generator.generate({}, graph, (0.0, 0.0), target_context={
+        "enabled": True, "object_labels": ["remotecontrol"], "success_distance_threshold_m": 1.5},
+        clearance_check=lambda *args, **kwargs: {"clear": False})
+    assert len(candidates) == 1
+    assert not candidates[0].metadata["target_navigation_required"]
+    graph["nodes"][0]["aabb_center"][0] = 3.0
+    assert not generator.generate({}, graph, (0.0, 0.0), target_context={
+        "enabled": True, "object_labels": ["remotecontrol"], "success_distance_threshold_m": 1.5})
+
+
 def test_target_can_require_robot_to_be_in_target_room() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(target_require_same_room=True)
@@ -3774,3 +3815,28 @@ def test_target_same_room_filter_allows_traversable_room_transition() -> None:
 
     assert len(candidates) == 1
     assert candidates[0].metadata["room_hops"] == 1
+def test_public_cellphone_goal_matches_actual_perception_category():
+    from scripts.InteractiveNav.evaluation.public_goal import build_public_target_context
+    from scripts.InteractiveNav.evaluation.restricted_gt_perception import normalize_semantic_category
+
+    context = build_public_target_context({"referral_expressions": {"object_name": "cellphone"}})
+    category = normalize_semantic_category("CellPhone")
+    assert category == "cell phone"
+    assert CandidateGenerator._matches_target({"label": category}, {"object_labels": ["cellphone"]})
+    assert CandidateGenerator._matches_target({"label": category}, context)
+
+
+def test_target_category_matching_rejects_substrings_and_preserves_identity():
+    from scripts.InteractiveNav.evaluation.public_goal import public_goal_labels
+
+    assert "bed" not in public_goal_labels({}, "find bedside table")
+    assert "phone" not in public_goal_labels({}, "find cell phone")
+    assert "mug" in public_goal_labels({}, "find a red mug")
+    for requested, observed in [("book", "bookshelf"), ("cup", "cupboard"), ("phone", "cell phone")]:
+        assert not CandidateGenerator._matches_target({"label": observed}, {"object_labels": [requested]})
+    for requested, observed in [("CellPhone", "cell_phone"), ("fridge", "refrigerator")]:
+        assert CandidateGenerator._matches_target({"label": observed}, {"object_labels": [requested]})
+    assert not CandidateGenerator._matches_target(
+        {"id": "obj_2", "label": "egg"},
+        {"target_instance_id": "obj_1", "object_labels": ["egg"]},
+    )

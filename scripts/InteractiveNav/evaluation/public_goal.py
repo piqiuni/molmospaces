@@ -30,6 +30,8 @@ _PUBLIC_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
     "bowl": ("bowl",),
     "cabinet": ("cabinet", "cupboard"),
     "chair": ("chair",),
+    "cellphone": ("cellphone", "cell phone", "mobile phone", "cellular telephone", "cellulartelephone"),
+    "cell phone": ("cellphone", "cell phone", "mobile phone", "cellular telephone", "cellulartelephone"),
     "clock": ("clock", "alarmclock", "alarm clock"),
     "couch": ("couch", "sofa"),
     "dresser": ("dresser", "chest_of_drawers", "chest of drawers"),
@@ -49,6 +51,7 @@ _PUBLIC_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _normalise_text(value: str) -> str:
+    value = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(value))
     return " ".join(
         re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).split()
     )
@@ -76,13 +79,15 @@ def public_goal_labels(language: dict[str, Any] | None, instruction: str = "") -
     labels: list[str] = []
     if normalised:
         labels.append(normalised)
+    category_phrase = re.sub(
+        r"^(?:(?:the|a|an|red|green|blue|white|black|yellow|orange|purple|pink|brown|small|large|big)\s+)+",
+        "", normalised,
+    )
+    if category_phrase:
+        labels.append(category_phrase)
     for key, aliases in _PUBLIC_LABEL_ALIASES.items():
-        if key == normalised or (key and key in normalised):
+        if key == category_phrase:
             labels.extend(aliases)
-    # A noun phrase often includes colour/shape adjectives.  Retaining its
-    # individual content tokens is a harmless fallback for category labels
-    # such as ``mug`` and ``vase`` that need no explicit synonym entry.
-    labels.extend(token for token in normalised.split() if len(token) > 2)
     return list(dict.fromkeys(label for label in labels if label))
 
 

@@ -14,6 +14,15 @@ launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
 
+def test_launcher_defaults_to_ten_second_scene_spacing(tmp_path):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    command, _ = launcher.build_command(config, tmp_path)
+    assert command[command.index("--scene-start-interval-s") + 1] == "10.0"
+    config["scene_start_interval_s"] = 0
+    command, _ = launcher.build_command(config, tmp_path)
+    assert command[command.index("--scene-start-interval-s") + 1] == "0"
+
+
 def test_retry_queue_excludes_completed_algorithm_failures(tmp_path):
     for index, row in [(0, {"completed": True, "success": False}),
                        (5, {"completed": False, "success": True, "exit_code": 2})]:
@@ -56,6 +65,20 @@ def test_shared_qwen_gpu_preflight_fails_before_two_card_run(monkeypatch):
         launcher.check_mujoco_gpu_inventory(config, {})
 
 
+
+def test_expected_episode_count_is_checked_before_launch(tmp_path, monkeypatch, capsys):
+    config = json.loads(launcher.DEFAULT_CONFIG.read_text())
+    config.update(episode_indices=[2000, 2001], check_mujoco_gpu_inventory=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(sys, "argv", ["eval", "--config", str(config_path),
+                                     "--expected-episodes", "30", "--dry-run"])
+    with pytest.raises(SystemExit) as error:
+        launcher.main()
+    assert error.value.code == 2
+    assert "expected 30 episodes, selected 2" in capsys.readouterr().err
+
+
 def test_qwen_failure_does_not_restart(tmp_path):
     class DeadProcess:
         returncode = 1
@@ -91,6 +114,8 @@ def test_qwen_starts_single_vllm_instance_for_all_gpus(tmp_path, monkeypatch, co
     assert environments[0]["QWEN36_TP_SIZE"] == "1"
     assert environments[0]["QWEN36_DP_SIZE"] == str(count)
     assert environments[0]["QWEN36_API_SERVER_COUNT"] == "1"
+    assert environments[0]["QWEN36_MAX_MODEL_LEN"] == "16384"
+    assert environments[0]["QWEN36_MAX_NUM_SEQS"] == "16"
     assert service.endpoint == "http://127.0.0.1:8000/v1"
     assert service.tensor_parallel_size == 1
     assert service.data_parallel_size == count
@@ -495,3 +520,29 @@ def test_cleanup_finds_detached_child_and_preserves_unrelated_process(tmp_path):
         unrelated.wait(timeout=5)
         for pid in launcher.owned_processes(owner):
             os.kill(pid, 9)
+
+
+def test_shared_qwen_gpu_preflight_checks_inventory_and_records_assignment(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1", "2", "3"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["1", "2", "3", "0"],
+    }
+    assert launcher.check_mujoco_gpu_inventory(config, {}) == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["visible_devices"] == ["0", "1", "2", "3"]
+    assert config["gpu_preflight"]["workers_per_gpu_if_even"] == 15.0
+
+
+
+def test_shared_qwen_gpu_preflight_fails_before_two_card_run(monkeypatch):
+    monkeypatch.setattr(launcher, "visible_devices", lambda environment: ["0", "1"])
+    config = {
+        "check_mujoco_gpu_inventory": True,
+        "required_mujoco_gpu_count": 4,
+        "workers": 60,
+        "mujoco_egl_devices": ["0", "1"],
+    }
+    with pytest.raises(RuntimeError, match="at least 4 visible GPUs"):
+        launcher.check_mujoco_gpu_inventory(config, {})

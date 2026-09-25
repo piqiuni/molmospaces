@@ -942,7 +942,7 @@ class SemanticBehaviorExecutor:
             config.get("make_plan_preflight_enabled", True)
         )
         self.make_plan_service = str(
-            config.get("make_plan_service", "/move_base/make_plan")
+            config.get("make_plan_service", "/move_base/GlobalPlanner/make_plan")
         )
         self.make_plan_service_wait_sec = float(
             config.get("make_plan_service_wait_sec", 2.0)
@@ -1694,7 +1694,8 @@ class SemanticBehaviorExecutor:
             active_decision_id = str(self.selection.get("decision_id") or "")
             if requested_decision_id != active_decision_id:
                 return
-            if str(request.get("reason") or "") != "preempted_by_target":
+            reason = str(request.get("reason") or "")
+            if reason not in {"preempted_by_target", "frontier_resolved_by_observation"}:
                 return
             if str(self.selection.get("behavior_type") or "").upper() != "EXPLORE":
                 return
@@ -1710,7 +1711,7 @@ class SemanticBehaviorExecutor:
         if cancel_navigation:
             self.move_base.cancel_goal()
         detail = {
-            "reason": "preempted_by_target",
+            "reason": reason,
             "replacement_candidate_id": str(
                 request.get("replacement_candidate_id") or ""
             ),
@@ -1747,8 +1748,13 @@ class SemanticBehaviorExecutor:
                     detail=payload.get("detail") or {}
                 )
             elif status in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
+                detail = dict(payload.get("detail") or {})
+                detail.setdefault("explore_feedback_status", status)
+                detail.setdefault("command_id", str(payload.get("command_id") or ""))
+                if status != "SUCCEEDED":
+                    detail.setdefault("reason", str(payload.get("reason") or status.lower()))
                 commands = self.machine.on_explore_result(
-                    status == "SUCCEEDED", detail=payload
+                    status == "SUCCEEDED", detail=detail
                 )
             else:
                 return
@@ -3564,6 +3570,9 @@ class SemanticBehaviorExecutor:
             received_at = time.monotonic()
             self._latest_step_sync_received_at = received_at
             action_source = str(payload.get("action_source") or "")
+            supervisor = getattr(self, "_semantic_navigation_progress", None)
+            if supervisor is not None and self.machine.state in {STATE_INTERACTING, STATE_VERIFYING}:
+                supervisor.pause(step_index)
             if self.startup_scan_enabled:
                 self._startup_scan_gate.record_step_sync(
                     step_index,
@@ -8793,6 +8802,8 @@ class SemanticBehaviorExecutor:
             )
             or "/move_base/DWAPlannerROS"
         ).strip()
+        if rospy.get_param("/move_base/base_local_planner", "") == "nav_pkg/PathFollower":
+            server = "/move_base/PathFollower"
         if not server:
             return None, {"reason": "container_m1_capture_dwa_reconfigure_server_missing"}
         try:
@@ -10540,7 +10551,9 @@ class SemanticBehaviorExecutor:
                     option_lookahead,
                     preflight_reason,
                 ) = self._preflight_navigation_plan(
-                    goal_frame, option_x, option_y, option_yaw
+                    goal_frame, option_x, option_y, option_yaw,
+                    **({"allow_unknown": True} if any((candidate.get("metadata") or {}).get(key)
+                        for key in ("frontier_center_fallback", "allow_unknown_planning")) else {}),
                 )
                 preflight_call_elapsed_s = max(
                     0.0, time.monotonic() - preflight_call_started_at
@@ -11033,41 +11046,34 @@ class SemanticBehaviorExecutor:
                 "[semantic_behavior_executor] rear-goal safe recovery refused direct navigation: %s",
                 self._last_rear_goal_recovery_detail,
             )
-            # A normal pre-turn needs the initial direction of a verified
-            # global plan.  If move_base has just restarted or its make_plan
-            # service has disappeared, normal fail-open preflight can still
-            # select a later *outer M1 staging* option, but it cannot safely
-            # invent that direction.  Likewise, a bounded turn with confirmed
-            # commands but no yaw progress may be retried from another *outer*
-            # staging face.  Do not move blind and do not weaken the M1/bridge
-            # contracts: this exception is deliberately limited to a two-stage
-            # container before M1 has been accepted.  Other rear-goal refusals
-            # (stale/local costmap, blocked turn sweep, control budget) remain
-            # terminal fail-closed safety gates.
             rear_reason = str(
                 self._last_rear_goal_recovery_detail.get("reason") or ""
+            )
+            outer_m1_staging = (
+                bool(metadata.get("container_two_stage_approach", False))
+                and str(metadata.get("container_two_stage_phase") or "staging").casefold()
+                == "staging"
+                and bool(metadata.get("m1_observation_staging_required", False))
+            )
+            portal_alternate_pose = (
+                rear_reason == "rear_goal_turn_failed"
+                and is_clearance_aware_portal(candidate)
+                and int(selected_goal_option_index or 0) + 1 < len(goal_options)
             )
             if (
                 str(behavior_type).upper() == "INTERACT"
                 and rear_reason
                 in {"rear_goal_heading_unavailable", "rear_goal_turn_failed"}
-                and bool(metadata.get("container_two_stage_approach", False))
-                and str(metadata.get("container_two_stage_phase") or "staging").casefold()
-                == "staging"
-                and bool(metadata.get("m1_observation_staging_required", False))
+                and (outer_m1_staging or portal_alternate_pose)
             ):
                 retry_detail = dict(self._last_rear_goal_recovery_detail)
                 retry_detail.update(
-                {
+                    {
                         "failure_reason": rear_reason,
-                        # Reuse the existing bounded approach-retry classifier
-                        # without broadening it for unsafe rear-goal failures.
                         "reason": "navigation_terminal_failure",
                         "interaction_approach_reposition": True,
-                        # Audit this narrow safety exception separately from
-                        # normal approach retries.  A physical action point is
-                        # intentionally excluded by the phase predicate above.
-                        "rear_goal_turn_retry_to_next_outer_staging": True,
+                        "rear_goal_turn_retry_to_next_outer_staging": outer_m1_staging,
+                        "rear_goal_turn_retry_to_next_portal_pose": portal_alternate_pose,
                         "interaction_approach_attempts": (
                             interaction_approach_attempt_history
                         ),
@@ -11086,7 +11092,8 @@ class SemanticBehaviorExecutor:
                 terminal_rear_detail.update(
                     {
                         "failure_reason": rear_reason,
-                        "rear_goal_turn_retry_to_next_outer_staging": True,
+                        "rear_goal_turn_retry_to_next_outer_staging": outer_m1_staging,
+                        "rear_goal_turn_retry_to_next_portal_pose": portal_alternate_pose,
                         "interaction_approach_reposition": True,
                     }
                 )
@@ -11095,9 +11102,6 @@ class SemanticBehaviorExecutor:
                     terminal_rear_detail,
                 )
                 return
-            # This candidate is not an outer container M1 staging pose (for
-            # example it may be the already-authorized physical action pose),
-            # so retain the original fail-closed terminal result.
             report_result(
                 False,
                 dict(self._last_rear_goal_recovery_detail),
@@ -13409,6 +13413,8 @@ class SemanticBehaviorExecutor:
         goal_x: float,
         goal_y: float,
         goal_yaw: float,
+        *,
+        allow_unknown: bool = False,
     ) -> tuple[bool, tuple[float, float] | None, str]:
         if not self.make_plan_preflight_enabled:
             return True, None, "disabled"
@@ -13430,7 +13436,7 @@ class SemanticBehaviorExecutor:
                     ]
                 except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                     return False, None, "clearance_tf_unavailable"
-            path = grid.reachable(start_xy, goal_xy)
+            path = grid.reachable(start_xy, goal_xy, allow_unknown=allow_unknown)
             if not path["clear"]:
                 return False, None, path["reason"]
         stamp = rospy.Time.now()
@@ -14246,6 +14252,10 @@ class SemanticBehaviorExecutor:
             }
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
+            if status == "FAILED" and str(selection.get("behavior_type") or "").upper() == "EXPLORE":
+                feedback_status = str(detail.get("explore_feedback_status") or "")
+                if feedback_status in {"CANCELED", "REJECTED"}:
+                    status = feedback_status
             if decision_id:
                 self._navigation_failure_recovery_attempts.pop(decision_id, None)
             drawer_scan_wait = self._drawer_scan_wait_records.pop(decision_id, None)
@@ -14306,9 +14316,21 @@ class SemanticBehaviorExecutor:
             return False
         command_id = str(payload.get("command_id") or "")
         candidate_id = str(payload.get("candidate_id") or "")
-        return command_id == self._command_id(self.selection) or (
-            candidate_id and candidate_id == str(self.selection.get("candidate_id") or "")
-        )
+        if command_id:
+            expected = self._command_id(self.selection)
+            if command_id == expected:
+                return True
+            return bool(
+                command_id.startswith(expected + ":interaction:")
+                and command_id == getattr(self, "_interaction_command_sent_id", "")
+                and candidate_id == str(self.selection.get("candidate_id") or "")
+                and str(payload.get("decision_id") or "")
+                == str(self.selection.get("decision_id") or "")
+            )
+        decision_id = str(payload.get("decision_id") or "")
+        if decision_id and decision_id != str(self.selection.get("decision_id") or ""):
+            return False
+        return bool(candidate_id and candidate_id == str(self.selection.get("candidate_id") or ""))
 
     @staticmethod
     def _command_id(candidate: dict) -> str:

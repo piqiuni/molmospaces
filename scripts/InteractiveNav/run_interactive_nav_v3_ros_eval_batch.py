@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -55,6 +56,7 @@ PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
 # variables.  Keep the defaults mirrored here so a resumed batch can prove it
 # is reusing the same launch contract without serialising output-local paths.
 _RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "BASE_LOCAL_PLANNER": "dwa_local_planner/DWAPlannerROS",
     "EVAL_CONFIG": str(REPO_ROOT / "scripts/InteractiveNav/configs/evaluation/benchmark_eval.conf"),
     "RECORDER_SAVE_EVENTS": "false",
     "RECORDER_COMPACT_STEPS": "true",
@@ -142,6 +144,10 @@ _V3_EVALUATOR_PROTOCOL_FILES = (
 # resume is invalidated by a relevant ROS change without making every batch
 # startup scan unrelated assets/tests.
 _ROS_RUNTIME_PROTOCOL_FILES = (
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "src" / "path_follower.cpp",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "include" / "nav_pkg" / "path_follower.h",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "path_follower_plugin.xml",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "cfg" / "PathFollower.cfg",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "molmospaces_nav_system.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "nav.launch",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "scripts" / "run_nav_ros_sim.py",
@@ -157,6 +163,7 @@ _ROS_RUNTIME_PROTOCOL_FILES = (
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_result_contract.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_graph_store.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "launch" / "explore_py.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_node.py",
     REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_pkg" / "frontier_core.py",
 )
 
@@ -233,6 +240,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episode-indices", nargs="+", type=int, required=True)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--scene-start-interval-s", type=float, default=10.0,
+                        help="Minimum interval between scene process launches (default: 10 seconds; 0 disables).")
     parser.add_argument("--base-master-port", type=int, default=12600)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument(
@@ -1419,6 +1428,23 @@ def recover_unreported_task_summaries(
             reported_indices.add(plan.episode_index)
 
 
+class SceneLaunchGate:
+    def __init__(self, interval_s: float) -> None:
+        self.interval_s = interval_s
+        self._lock = threading.Lock()
+        self._last_start = None
+
+    def launch(self, *args, **kwargs):
+        with self._lock:
+            if self._last_start is not None:
+                delay = self.interval_s - (time.monotonic() - self._last_start)
+                if delay > 0:
+                    time.sleep(delay)
+            process = subprocess.Popen(*args, **kwargs)
+            self._last_start = time.monotonic()
+            return process
+
+
 def run_episode(
     plan: EpisodePlan,
     args: argparse.Namespace,
@@ -1484,11 +1510,11 @@ def run_episode(
 
     timed_out = False
     exception_text: str | None = None
-    if telemetry is not None:
-        telemetry.mark_started(plan)
     try:
         with runner_log.open("wb") as log_handle:
-            process = subprocess.Popen(
+            launch_gate = getattr(args, "_scene_launch_gate", None)
+            launcher = launch_gate.launch if launch_gate is not None else subprocess.Popen
+            process = launcher(
                 command,
                 cwd=str(REPO_ROOT),
                 env=environment,
@@ -1496,6 +1522,10 @@ def run_episode(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            started = time.monotonic()
+            append_task_log(task_log, f"[{utc_now()}] process_started pid={process.pid}")
+            if telemetry is not None:
+                telemetry.mark_started(plan)
             try:
                 runner_exit_code = process.wait(timeout=args.scene_timeout_s)
             except subprocess.TimeoutExpired:
@@ -1743,6 +1773,7 @@ def write_summary(
             "runner": str(args.runner),
             "runner_shell": args.runner_shell,
             "workers": args.workers,
+            "scene_start_interval_s": getattr(args, "scene_start_interval_s", 10.0),
             "base_master_port": args.base_master_port,
             "max_steps": args.max_steps,
             "step_budget_mode": str(args.step_budget_mode),
@@ -2092,6 +2123,8 @@ def validate_args(args: argparse.Namespace) -> None:
         args.semantic_model_env_file = args.semantic_model_env_file.expanduser().resolve()
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if not math.isfinite(args.scene_start_interval_s) or args.scene_start_interval_s < 0:
+        raise ValueError("--scene-start-interval-s must be finite and non-negative")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be positive")
     if args.scene_timeout_s <= 0:
@@ -2176,6 +2209,7 @@ def run_worker(
 def main() -> int:
     args = parse_args()
     validate_args(args)
+    args._scene_launch_gate = SceneLaunchGate(args.scene_start_interval_s)
     plans = [
         EpisodePlan(
             ordinal=ordinal,
@@ -2205,6 +2239,7 @@ def main() -> int:
                 "runner_shell": args.runner_shell,
                 "benchmark": str(args.benchmark),
                 "workers": args.workers,
+                "scene_start_interval_s": args.scene_start_interval_s,
                 "base_master_port": args.base_master_port,
                 "max_steps": args.max_steps,
                 "step_budget_mode": str(args.step_budget_mode),

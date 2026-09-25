@@ -960,6 +960,16 @@ def build_restricted_gt_frame(
         if camera_position is not None
         else None
     )
+    container_categories = {"refrigerator", "cabinet", "drawer", "dresser", "wardrobe"}
+    semantic_names = [
+        normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name)
+        for spec in private_specs
+    ]
+    container_bounds = [
+        _runtime_aabb(spec, model, data)
+        for spec, name in zip(private_specs, semantic_names)
+        if camera_xyz is not None and name in container_categories
+    ]
     object_type = _mujoco_geom_object_type() if geom_object_type is None else int(geom_object_type)
     mapping = _geom_to_spec_mapping(model, private_specs) if geom_to_spec is None else np.asarray(geom_to_spec, dtype=np.int32)
     height, width = int(array.shape[0]), int(array.shape[1])
@@ -984,7 +994,25 @@ def build_restricted_gt_frame(
         for spec_index, spec in enumerate(private_specs):
             selection = spec_indices == spec_index
             visible_count = int(np.count_nonzero(selection))
-            if visible_count < int(min_visible_pixels):
+            if visible_count == 0:
+                continue
+            center, size = _runtime_aabb(spec, model, data)
+            semantic_name = semantic_names[spec_index]
+            near_container_visible = (
+                camera_xyz is not None
+                and math.dist(center, camera_xyz) <= 2.0
+                and semantic_name != "door"
+                and (
+                    semantic_name in container_categories
+                    or any(
+                        all(abs(coordinate - origin) <= extent / 2.0
+                            for coordinate, origin, extent in zip(center, bounds_center, bounds_size))
+                        for bounds_center, bounds_size in container_bounds
+                    )
+                )
+            )
+            required_pixels = 1 if near_container_visible else int(min_visible_pixels)
+            if visible_count < required_pixels:
                 continue
             component = _largest_connected_component(
                 xs[selection],
@@ -995,10 +1023,9 @@ def build_restricted_gt_frame(
             if component is None:
                 continue
             mask, visible_count, bbox_2d = component
-            if visible_count < int(min_visible_pixels):
+            if visible_count < required_pixels:
                 continue
-            center, size = _runtime_aabb(spec, model, data)
-            if _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
+            if not near_container_visible and _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
                 continue
             semantic_name = normalize_semantic_category(
                 spec.semantic_category,
@@ -1009,7 +1036,7 @@ def build_restricted_gt_frame(
                 if semantic_name == "door"
                 else int(min_bbox_short_side_pixels)
             )
-            if _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
+            if not near_container_visible and _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
                 continue
             if (
                 camera_xyz is not None
@@ -1018,7 +1045,8 @@ def build_restricted_gt_frame(
             ):
                 continue
             if (
-                float(min_visible_fraction) > 0.0
+                not near_container_visible
+                and float(min_visible_fraction) > 0.0
                 and camera_xyz is not None
                 and camera_forward is not None
                 and camera_up is not None

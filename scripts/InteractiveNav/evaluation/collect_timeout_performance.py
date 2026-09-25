@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 import csv
 import json
 from pathlib import Path
+import re
 import statistics
 
 
@@ -39,19 +40,25 @@ def _model_metrics(attempts: list[Path]):
                     row = json.loads(line)
                 except ValueError:
                     continue  # Another worker may still be appending this line.
+                if not isinstance(row, dict):
+                    continue
                 role = str(row.get("role") or "unknown")
                 group = roles[role]
                 group["calls"] += 1
                 error = str(row.get("error") or "")
-                group["errors"] += bool(error)
-                group["timeouts"] += "timed out" in error.lower() or "timeout" in error.lower()
+                timed_out = (
+                    row.get("timed_out") is True
+                    or row.get("is_timeout") is True
+                    or bool(re.search(r"timeout|timed[\s_-]*out|deadline[^\n]*exceeded|超时", error, re.I))
+                )
+                group["errors"] += bool(error) or timed_out
+                group["timeouts"] += timed_out
                 for field, destination in (("latency_s", "latency_s"), ("queue_lag_sec", "queue_lag_s")):
                     value = row.get(field)
                     if isinstance(value, (int, float)):
                         group[destination].append(float(value))
                 if role == "attribute_inference" and row.get("object_id"):
-                    episode = str(row.get("episode_id") or attempt.parent.name)
-                    m1_objects[(episode, str(row["object_id"]))] += 1
+                    m1_objects[(str(attempt), str(row["object_id"]))] += 1
     return {
         "by_role": {
             role: {

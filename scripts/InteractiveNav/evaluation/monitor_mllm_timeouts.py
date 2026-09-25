@@ -38,8 +38,9 @@ class BackendLogMonitor:
         snapshots = []
         names = sorted(
             (path.name.removesuffix(".launcher.log")
-             for path in self.directory.glob("gpu*.launcher.log")),
-            key=lambda name: int(name[3:]) if name[3:].isdigit() else name,
+             for path in self.directory.glob("*.launcher.log")
+             if path.name == "vllm.launcher.log" or path.name.startswith("gpu")),
+            key=lambda name: (0, int(name[3:])) if name[3:].isdigit() else (1, name),
         )
         for name in names:
             path = self.directory / f"{name}.launcher.log"
@@ -51,6 +52,8 @@ class BackendLogMonitor:
                         self.offsets[name] = 0
                         self.pending[name] = b""
                         self.responses[name] = 0
+                        self.previous_responses[name] = 0
+                        self.latest.pop(name, None)
                     stream.seek(self.offsets.get(name, 0))
                     chunk = stream.read()
                     self.offsets[name] = stream.tell()
@@ -182,7 +185,7 @@ def main():
         print(f"  最近{args.window}s: {format_groups(recent)}", flush=True)
         print(f"  累计: {format_groups(total)}", flush=True)
         if backends:
-            print(f"  LB后端: {backends.report()}", flush=True)
+            print(f"  模型后端: {backends.report()}", flush=True)
         if status in TERMINAL:
             break
         time.sleep(args.interval)

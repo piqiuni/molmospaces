@@ -37,6 +37,30 @@ def test_default_command_starvation_budget_covers_one_m2_timeout_retry(
     m2_worst_case_s = 12.0 + 1.0 + 12.0
     assert args.ros_command_starvation_timeout_s == 90.0
     assert args.ros_command_starvation_timeout_s > m2_worst_case_s
+    assert args.scene_start_interval_s == 10.0
+
+
+def test_scene_launch_gate_spaces_actual_launches(monkeypatch):
+    clock = [0.0]
+    starts = []
+    monkeypatch.setattr(batch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(batch.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(batch.subprocess, "Popen", lambda *args, **kwargs: starts.append(clock[0]))
+    gate = batch.SceneLaunchGate(10.0)
+    gate.launch([])
+    gate.launch([])
+    clock[0] += 12.0
+    gate.launch([])
+    gate.launch([])
+    assert starts == [0.0, 10.0, 22.0, 32.0]
+
+
+def test_scene_launch_gate_zero_disables_delay(monkeypatch):
+    monkeypatch.setattr(batch.time, "sleep", lambda delay: (_ for _ in ()).throw(AssertionError(delay)))
+    monkeypatch.setattr(batch.subprocess, "Popen", lambda *args, **kwargs: None)
+    gate = batch.SceneLaunchGate(0.0)
+    gate.launch([])
+    gate.launch([])
 
 
 def _recovery_args(tmp_path):
@@ -565,3 +589,11 @@ def test_recovery_rejects_ambiguous_current_attempt_and_stale_fallback(tmp_path)
     _write_recovery_attempt(plan, args, attempt_name="attempt_001")
     (plan.task_dir / "attempt_002").mkdir()
     assert batch.recover_missing_task_summary(plan, args) is None
+
+
+def test_ros_action_wait_defaults_to_point_four_seconds(monkeypatch):
+    monkeypatch.delenv("ROS_ACTION_TIMEOUT_S", raising=False)
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.4"
+
+    monkeypatch.setenv("ROS_ACTION_TIMEOUT_S", "0.6")
+    assert batch._resolved_runner_setting("ROS_ACTION_TIMEOUT_S") == "0.6"

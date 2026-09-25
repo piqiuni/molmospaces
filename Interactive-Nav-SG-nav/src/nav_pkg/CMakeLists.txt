@@ -9,7 +9,9 @@ add_compile_options(-std=c++17)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   actionlib
+  base_local_planner
   costmap_2d
+  dynamic_reconfigure
   geometry_msgs
   global_planner
   nav_core
@@ -17,6 +19,8 @@ find_package(catkin REQUIRED COMPONENTS
   pluginlib
   roscpp
   rospy
+  tf2_geometry_msgs
+  tf2_ros
 )
 
 ## System dependencies are found with CMake's conventions
@@ -108,10 +112,12 @@ find_package(catkin REQUIRED COMPONENTS
 ## LIBRARIES: libraries you create in this project that dependent projects also need
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
+generate_dynamic_reconfigure_options(cfg/PathFollower.cfg)
+
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES oriented_global_planner
-  CATKIN_DEPENDS actionlib costmap_2d geometry_msgs global_planner nav_core nav_msgs pluginlib roscpp rospy
+  LIBRARIES oriented_global_planner path_follower
+  CATKIN_DEPENDS actionlib base_local_planner costmap_2d dynamic_reconfigure geometry_msgs global_planner nav_core nav_msgs pluginlib roscpp rospy tf2_geometry_msgs tf2_ros
 #  DEPENDS system_lib
 )
 
@@ -141,6 +147,8 @@ include_directories(
 ## The recommended prefix ensures that target names across packages don't collide
 add_executable(relay_node src/relay_node.cpp)
 add_library(oriented_global_planner src/oriented_global_planner.cpp)
+add_library(path_follower src/path_follower.cpp)
+add_dependencies(path_follower ${PROJECT_NAME}_gencfg)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -159,6 +167,7 @@ target_link_libraries(relay_node
 target_link_libraries(oriented_global_planner
   ${catkin_LIBRARIES}
 )
+target_link_libraries(path_follower ${catkin_LIBRARIES})
 
 #############
 ## Install ##
@@ -177,7 +186,7 @@ catkin_install_python(PROGRAMS
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
-install(TARGETS relay_node oriented_global_planner
+install(TARGETS relay_node oriented_global_planner path_follower
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -198,7 +207,7 @@ install(DIRECTORY include/${PROJECT_NAME}/
 )
 
 ## Mark other files for installation (e.g. launch and bag files, etc.)
-install(FILES oriented_global_planner_plugin.xml
+install(FILES oriented_global_planner_plugin.xml path_follower_plugin.xml
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 

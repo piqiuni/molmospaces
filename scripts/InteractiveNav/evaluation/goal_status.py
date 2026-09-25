@@ -211,6 +211,7 @@ class RosGoalStatusObserver(GoalStatusObserver):
         self._rospy = rospy_module
         self._string_type = string_type
         self._subscriber: Any | None = None
+        self._verification_publisher: Any | None = None
 
     def _ensure_ros(self) -> bool:
         if self._rospy is not None and self._string_type is not None:
@@ -229,6 +230,9 @@ class RosGoalStatusObserver(GoalStatusObserver):
         if self._subscriber is not None or not self._ensure_ros():
             return
         try:
+            self._verification_publisher = self._rospy.Publisher(
+                self.topic + "_verification", self._string_type, queue_size=16, latch=True,
+            )
             self._subscriber = self._rospy.Subscriber(
                 self.topic,
                 self._string_type,
@@ -241,8 +245,24 @@ class RosGoalStatusObserver(GoalStatusObserver):
     def _callback(self, message: Any) -> None:
         self.ingest(getattr(message, "data", message))
 
+    def publish_verification(self, payload: Mapping[str, Any], accepted: bool) -> None:
+        if self._verification_publisher is None:
+            return
+        self._verification_publisher.publish(self._string_type(data=json.dumps({
+            "episode_id": self.expected_episode_id,
+            "claim_id": (payload.get("detail") or {}).get("claim_id"),
+            "accepted": bool(accepted),
+            "timestamp": time.time(),
+        })))
+
     def close(self) -> None:
         subscriber = self._subscriber
+        if self._verification_publisher is not None:
+            try:
+                self._verification_publisher.unregister()
+            except Exception:
+                pass
+            self._verification_publisher = None
         self._subscriber = None
         if subscriber is not None:
             unregister = getattr(subscriber, "unregister", None)

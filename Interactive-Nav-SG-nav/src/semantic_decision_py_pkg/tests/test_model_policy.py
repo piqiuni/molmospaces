@@ -19,6 +19,28 @@ from semantic_decision_py_pkg.model_policy import (
 from semantic_mllm_py_pkg.client import MLLMResponse
 
 
+def test_m2_budget_preserves_mission_candidates_and_input():
+    client = ModelPolicyClient(ModelPolicyConfig(context_window_tokens=4096, max_tokens=1536))
+    payload = {"instruction": "Rank current candidates", "mission": {"target": "requested"},
+               "candidates": [{"id": "current:1", "effect": "approach_target"}],
+               "recent_decisions": [{"reason": "history" * 1000}],
+               "graph": {"nodes": [{"id": str(index), "detail": "geometry" * 500} for index in range(5)]}}
+    context, output_tokens, metrics = client._bounded_http_context(payload)
+    assert output_tokens == 512
+    assert metrics["m2_input_utf8_bytes_after"] + output_tokens + 1024 <= 4096
+    assert context["candidates"] == payload["candidates"]
+    assert context["mission"] == payload["mission"]
+    assert len(payload["graph"]["nodes"]) == 5
+    assert metrics["m2_context_compacted"]
+
+
+def test_m2_budget_rejects_oversized_mandatory_context():
+    client = ModelPolicyClient(ModelPolicyConfig(context_window_tokens=2048))
+    with pytest.raises(ValueError, match="mandatory mission/candidates"):
+        client._bounded_http_context({"mission": {"instruction": "长" * 3000},
+                                      "candidates": [{"id": "current"}]})
+
+
 def make_candidate(candidate_id: str, target_relevance: float, distance_m: float) -> BehaviorCandidate:
     return BehaviorCandidate(
         candidate_id=candidate_id,
@@ -1171,6 +1193,64 @@ def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_pos
     assert selected is traversal
 
 
+@pytest.mark.parametrize(
+    ("confidence", "expected_new_room"),
+    [("high", False), ("medium", True)],
+)
+def test_new_room_guard_preserves_high_confidence_target_container_choice(
+    monkeypatch, confidence, expected_new_room
+) -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="mock", pre_score_guard_margin=0.75))
+    fridge = BehaviorCandidate(
+        candidate_id="interaction:container_obj_000037:open",
+        behavior_type="INTERACT",
+        source="test",
+        target_id="container_obj_000037",
+        target_name="refrigerator",
+        goal_xyyaw=[1.0, 0.0, 0.0],
+        interaction_command={"action": "open"},
+        features={"distance_m": 1.0},
+        metadata={"node_type": "container"},
+    )
+    new_room = BehaviorCandidate(
+        candidate_id="frontier:19:3",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="frontier_19_3",
+        target_name="frontier",
+        goal_xyyaw=[3.0, 0.0, 0.0],
+        features={"distance_m": 3.0},
+        metadata={"room_status": "unentered_new_room"},
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload, metrics_context=None: {
+            "ranked_ids": [fridge.candidate_id, new_room.candidate_id],
+            "reason": "REVEAL_TARGET_CONTAINER",
+            "confidence": confidence,
+        },
+    )
+
+    selected = client.select(
+        [fridge, new_room],
+        robot_context={
+            "candidate_pre_scores": {
+                fridge.candidate_id: 0.97,
+                new_room.candidate_id: 2.013,
+            },
+            "candidate_decision_hints": {new_room.candidate_id: "NEW_ROOM_FRONTIER"},
+        },
+    )
+
+    assert selected is (new_room if expected_new_room else fridge)
+    assert client.last_pre_score_guard == (
+        "NEW_ROOM_FRONTIER:interaction:container_obj_000037:open->frontier:19:3:margin=1.043"
+        if expected_new_room
+        else ""
+    )
+
+
 def test_request_leaves_room_target_reasoning_to_model() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     fridge = BehaviorCandidate(
@@ -1253,7 +1333,16 @@ def test_request_leaves_room_target_reasoning_to_model() -> None:
     positions = [request["instruction"].index(stage) for stage in stages]
     assert positions == sorted(positions)
     assert "return only the final JSON, not the reasoning" in request["instruction"]
-    assert "A toilet cannot be inside a refrigerator" in request["instruction"]
+    assert "extremely low priority" in request["instruction"]
+    assert "NEGATIVE PRIORITY" in request["instruction"]
+    assert "POSITIVE CONTAINER PRIORITY" in request["instruction"]
+    assert "CLOSED DOOR PRIORITY" in request["instruction"]
+    assert "FAILURE MEMORY" in request["instruction"]
+    assert "over generic frontiers" in request["instruction"]
+    assert "unknown room" in request["instruction"]
+    assert "newly accessible, unentered room" in request["instruction"]
+    assert "toilet" not in request["instruction"]
+    assert "refrigerator" not in request["instruction"]
 
 
 def test_room_object_reasoning_context_caps_observed_graph_evidence() -> None:

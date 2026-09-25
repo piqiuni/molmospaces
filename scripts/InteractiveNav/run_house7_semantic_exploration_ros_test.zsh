@@ -601,6 +601,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
+  base_local_planner:="${BASE_LOCAL_PLANNER:-dwa_local_planner/DWAPlannerROS}" \
   exploration_only:=true \
   randomize_camera:=false \
   publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \

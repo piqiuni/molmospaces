@@ -1,6 +1,200 @@
 # 交互导航开发测试手册
 
-最后更新：2026-09-17
+最后更新：2026-09-23
+
+### 2026-09-23：分割伪像素导致初始资格误判
+
+`MjOpenGLRenderer` 的物体 ID 分割改用按需创建、复用的无 MSAA 渲染上下文，
+RGB 和深度继续使用原上下文。切换时显式绑定对应缓冲，关闭时释放两个上下文。
+保持 benchmark 可见性阈值与评分规则不变，不对个别场次做豁免。
+
+最小回归：`python -m pytest -q mlspaces_tests/test_opengl_segmentation.py`。
+需要可用的 OpenGL/EGL 环境；缓存、临时目录按本文件约定设置到大容量存储。
+测试只渲染静态合成场景，检查遮挡目标为零像素、移除遮挡后可见、上下文复用、
+RGB/深度切换结果不变和重复关闭安全，不执行策略或物理 rollout。
+
+2027 初始验证使用同一项目渲染器、同一冻结状态对照：原 4x MSAA 缓冲得到
+目标 1 像素并触发 `initial_target_visibility_mismatch`；无 MSAA 分割得到 0 像素，
+全部适用的一致性检查通过，重复检查仍通过。未执行导航或交互动作。
+该场景 RGB 前后有少量通道值相差 1 灰度级（最终验证为 56 个），未达到逐像素完全相等；
+静态合成回归中的 RGB/深度逐值比较通过。未重跑完整场景或批量评测。
+
+### 2026-09-23：M2 交互优先级与失败区域记忆
+
+- M2 公共提示增加：无关容器最后考虑、相关且未搜索容器优先于普通前沿、
+  通向未知/未进入空间的可执行关闭门优先；不引入隐藏目标容器名或场景白名单。
+- 失败前沿按同坐标系内 0.75m 空间邻域记忆，不依赖 frontier ID 或在线 room 标签。
+  首次失败冷却 120 observation steps，再失败后等待成功开门带来的拓扑变化或新 episode。
+  目标抢占的 CANCELED 不计失败；重复终态反馈不重复累计。
+- 低收益 repeat guard 移至模型成功返回、规则 fallback 和候选更新校验之后的共同路径。
+- 修复公开目标 `cellphone` 与感知 `CellPhone -> cell phone` 的同义词匹配；
+  修复扫描因公开目标可见提前停止时仍把打开状态上报成 closed。仍需 evaluator 核验成功。
+- 上一轮 2010 的宏动作证据位于 attempt_002/eval/smooth_interactions/000890.json：
+  target_discovery 距离 0.5674m、806 像素，stopped_on_public_target=true。
+  不应再将其归因为“扫描没看见”或直接按公共 closed 字段认定物理关上。
+- 2003 在开冰箱后仅9个GT目标像素，低于公共感知16像素门槛，M2仍是visible=false。
+  应区分交互位姿误差与目标物体距离；后者当时没有公开目标候选，不能用GT补给策略。
+
+最小检查：`test_frontier_failure_memory.py`、`test_rule_decision_navigation_recovery.py`、
+`test_behavior_candidates.py`、`test_model_policy.py`、`test_candidate_curator.py`；
+评测侧检查 `mlspaces_tests/data_generation/test_benchmark_smooth_interaction.py` 及
+`test_interactive_nav_v3_benchmark_evaluation.py`、`test_interactive_nav_v3_goal_status.py`。
+本轮未启动新30场仿真，既有M2-16K一轮已结束3/30，不能作为本次修改的验证结果。
+
+### 2026-09-23：离线目标外部画面
+
+`scripts/InteractiveNav/render_target_external.py` 读取冻结 benchmark 初态，从目标容器
+前上方绘图。方向来自离线 oracle 接近点，不输出到策略；橙框标识目标容器。
+默认隐藏显式屋顶/天花板；`--hide-walls` 额外隐藏墙体，适合目标被前景墙遮挡时查看。
+画面不是机器人第一视角，也不是评测终态。容器保持冻结初态，不会为展示而自动打开。
+
+```bash
+TMPDIR=/home/ldl/tmp/target-external \
+XDG_CACHE_HOME=/home/ldl/.cache/target-external \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=2 \
+/home/ldl/conda_envs/mlspaces/bin/python scripts/InteractiveNav/render_target_external.py \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-index 2007 --scenes-root /home/ldl/molmospaces/assets/scenes \
+  --distance 6 --elevation -50 --hide-walls \
+  --output /home/ldl/outputs/interactive-nav/scene-audit-20260923/2007_external_annotated.png
+```
+
+先创建命令中的 TMPDIR 与缓存目录。替换 episode-index/output 即可绘制其他场景；
+`--azimuth` 可覆盖前向方向。输出同名 JSON 记录相机、隐藏几何、对象状态恢复及可见像素。
+本次 2007/2016 实际渲染成功；8 项辅助函数测试通过。
+
+### 2026-09-23：M2 16K 与抽屉目标完成链路
+
+- 本机本轮使用的 Qwen 8102/8103 已重启为 16384 context、TP1、单卡各 16 并发；
+  保留 GPU 0/1 服务。自定义任务入口与批次托管 Qwen 默认也使用 16384/16。
+- M2 结构化输出最多 512 tokens，输入采用 UTF-8 字节数保守上界，并预留 1024
+  tokens 的模板余量；依次裁剪旧决策历史、额外房间推理、图上下文。
+  不裁剪 mission 或当前候选 ID；若必需内容仍超预算，发送前明确失败，由现有失败路径处理。
+  请求指标记录裁剪前后字节数、窗口大小与保留候选数。
+  `SEMANTIC_M2_CONTEXT_WINDOW_TOKENS` 必须与模型部署窗口匹配；自定义任务入口自动同步。
+- 当前可靠可见、公开距离满足条件的目标在 IDLE / EXPLORE / NAVIGATE / INTERACT
+  均可发起完成核验，不再仅在交互进行中触发。核验等待优先于全局无进展判断。
+  已在成功距离内的当前可见目标不因不一致房间标签被丢弃；远处目标仍遵守房间约束。
+  不利用私有可见性直接成功，保留 evaluator 对实例、距离与必要交互的最终核验。
+- 292 项定向测试与 213 项额外相邻测试通过；补充部署默认值断言后，启动器 23 项测试再次通过。
+  日志：`/home/ldl/tmp/m2-drawer-fix/tests.log`、`/home/ldl/tmp/m2-drawer-fix/adjacent-tests.log`、
+  `/home/ldl/tmp/m2-drawer-fix/launcher-tests.log`。
+- 新回归：`/home/ldl/outputs/interactive-nav/m2-16k-drawer-20260923-local2gpu-30mixed/evaluation`。
+  30 worker、2000–2029 共 30 场，GPU 2/3，ROS 18900–18929；保持原动态预算与
+  observation-turn multiplier=1，不录视频、无自动重试。启动前已通过模型接口确认 16K。
+  本次预算分析针对上一轮，不是尚在运行的新回归结果。
+
+### 2026-09-23：五场针对性修复与本机双卡回归
+
+- 2005：M2 增加通用负面先验，尺寸/用途/存储语义明显不匹配的容器极低优先级，
+  不硬禁未知但合理的容器；移除提示词中的具体物体示例，不注入 episode 名称或私有答案。
+  executor 在 INTERACTING / VERIFYING 的公开 step-sync 到达时暂停自身导航无进展计数，
+  补齐只在决策层暂停、执行层累计跨宏动作 step 的缺口；交互自己的超时限制仍有效。
+- 2004：预规划改用 `/move_base/GlobalPlanner/make_plan`，避免 move_base 顶层服务
+  对 ACTIVE/PREEMPTING 的拒绝；既有导航目标取消/静默确认流程不变。
+  开门后把门另一侧、距门中心 2.5 米内的当前前沿中心加入穿门候选，近点优先，
+  保留原穿门点作备选；这些规划允许未知栅格，但已知障碍仍受 clearance 和 planner 约束。
+- 2013：提示词明确开门后优先探索新可达、未进入的房间，远穿门点失败不代表房间耗尽。
+- 2015：此前仅在收到成功声明并核验后才能提前结束抽屉宏动作。
+  现在将 observe 阶段实际公开发布的目标证据锁存，完成当前抽屉的 10 帧观察后，
+  保持抽屉打开并停止继续扫描/关闭；不等待异步成功声明，也不直接宣告 episode 成功。
+  最终成功仍必须经过声明与 evaluator 核验；私有瞬时可见性不会触发此停止。
+- 2029：无观察 subgoal 的有效前沿 proposal 可直接生成中心候选；中心贴已知墙时，
+  尝试该前沿上距中心最近的足迹安全点，允许未知，仍尊重已知障碍和黑名单。
+
+验证：582 项定向及相邻测试通过；日志 `/home/ldl/tmp/scene-targeted-tests/final-pytest.log`。
+最初的五场测试已按用户要求停止，确认所属子进程已清理，旧产物保留在
+`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu/evaluation`。
+替代测试目录：`/home/ldl/outputs/interactive-nav/scene-targeted-20260923-local2gpu-mixed30/evaluation`。
+启动日志在同级 `launcher.log`，配置在同级 `config.json`。
+替代测试为 episode 2000–2029，共 30 场、30 worker、GPU 2/3，复用端口 8102/8103 的现有模型服务，
+不重启服务、不占用 GPU 0/1。动态预算 200–2000、M1/M2 30 秒、场景 7200 秒，
+不录视频、不开自动重试，ROS master 使用 18800–18829。
+算法仍为 `8ebb6c33f`；替代测试已通过 30 场入口校验并启动，完整场景性能以最终结果为准。
+
+### 2026-09-23：mixed 2000–2029 场景针对性修复
+
+在 `ee2b3c895` 迁移基线上完成以下修改：
+
+- V3 目标声明必须由 evaluator 核验后通过 `goal_status_verification` 回执确认；
+  决策节点只接受当前 episode、当前 claim ID 的回执。拒绝后恢复 ACTIVE 并等待新候选，
+  回执缺失不视为成功。核验失败不再以 `target_claim_unverified` 结束 rollout。
+  回执只包含是否接受，不把 GT 距离、位置或实例映射传给 policy。
+- 有效前沿没有可用观察点时回退到前沿中心；未知栅格可通行，已知障碍、
+  地图边界、足迹约束及已有前沿黑名单仍有效。标记贯穿 proposal、候选、
+  clearance 与预规划；仿真 launch 启用 global planner 的 allow_unknown。
+- 全局无进展预算保留，但新语义子目标获得最多 20 个 task-step 的启动宽限
+  （不超过单目标无进展预算）；旧任务的累计时间不能在新目标刚选中时终止它。
+  同一子目标的私有 worker 替换不会重置计时，episode 总预算仍保留。
+- 自定义任务入口增加 `CUSTOM_TASK_DRY_RUN=true`，真正校验 `EXPECTED_EPISODES`；
+  入口尊重 `REPO_ROOT` 与 `QWEN_ROOT`，可使用独立固定代码工作树。
+
+定向及相邻回归：714 passed、1 deselected。被排除的旧测试
+`test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill`
+使用不含 `success_criteria` 的 fake episode，报 `KeyError`；已核对相关 runtime
+builder 与 `ee2b3c895` 的 AST 完全相同，没有修改生产逻辑来绕过该旧夹具问题。
+日志：`/home/ldl/tmp/scene-fixes-tests/final-regression.log`。
+
+本次计划运行与 22 日诊断相同的 mixed episode 2000–2029，2 卡、30 worker、
+动态预算上限 2000、M1/M2 30 秒、不录视频；保留当前分支同类过滤与指标 v3，
+因此不能把新旧分数差异全部归因于这三项算法修复。云端资源规格、模型服务参数、
+任务 ID 与部署 SHA 在提交回执中单独记录；测试通过不等于场景成功率已提高。
+
+#### 云任务提交回执
+
+- 任务 ID：`t-20260923165300-kmn8w`；已由 `Queue` 转为 `Running`。
+  EGL preflight 通过，入口确认 30 场 / 30 worker；提交回执时模型服务仍在启动，
+  尚无完整 episode 结果。
+- 平台确认 `Preemptible=false`、`Priority=6`，单实例 `ml.pni2.7xlarge`（2 GPU）。
+- 部署代码固定为 `cdaa6b060734557f2fb62c087e935dc23769e9c8`；
+  独立工作树 `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/code`。
+  该工作树已完成 Release catkin 构建，两个 ROS 包均解析到本工作树。
+- episode 2000–2029、30 worker、动态 step 200–2000、场景超时 7200 秒、
+  M1/M2 请求超时 30 秒、不录视频；入口 dry-run 已校验恰好 30 个 episode。
+- Qwen 保留单 API 服务、TP=1/DP=2；每 rank `max_num_seqs=16`，
+  `max_model_len=10240`、显存比例 0.6。显式覆盖服务脚本默认的并发上限 1。
+  与 22 日本地两独立 endpoint 的部署不同，比较超时/吞吐时必须单独考虑此差异。
+- 任务配置、入口、提交回执保存在
+  `/home/ldl/outputs/interactive-nav/scene-fixes-20260923/`；
+  运行日志为其下 `run/launcher.log`，评测产物为 `run/evaluation/`。
+- 此处回执对应后续文档提交，不改变已冻结的部署代码 SHA。
+  构建和单测通过不代表云端 30 场已完成，也不代表成功率或速度已经改善。
+
+### 2026-09-23：22 日基线八项选择性迁移
+
+分支 `codex/migrate-22-selected` 基于 `d3f27870b`，迁移来源 `8fb9460ae`。
+范围、保留的模型超时、未迁入项与性能验收边界见
+[迁移报告](docs/migration_22_selected_20260923.md)。
+本轮 706 项定向与相邻回归通过，没有运行 ROS 长时仿真。
+
+复现此次测试集合：
+
+```bash
+cd /home/ldl/molmospaces-exp-setting
+export TMPDIR=/home/ldl/tmp/migrate22-tests
+export XDG_CACHE_HOME=/home/ldl/.cache/migrate22-tests
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+export PYTHONPATH=/home/ldl/conda_envs/ros-noetic/lib/python3.11/site-packages:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$PWD/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q -p no:cacheprovider \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_{attribute_inference_request_state,room_attribute_inference,interaction_graph_store}.py \
+  Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/tests/test_{behavior_candidates,mission_completion,semantic_behavior_executor_static,behavior_execution,rule_decision_navigation_recovery,target_distance_verification}.py \
+  scripts/InteractiveNav/test_{run_benchmark_eval,run_interactive_nav_v3_ros_eval_batch,timeout_monitoring,scene_distractor_filter}.py \
+  mlspaces_tests/data_generation/test_interactive_nav_v3_{metrics,benchmark_evaluation,goal_status,round_summary,benchmark_cli,public_evaluator_contract,evaluation}.py
+```
+
+监控脚本应从仓库根目录以模块方式启动，避免 evaluation 目录的 `types.py`
+遮蔽标准库。以下 `RUN` 和 `TASK_ID` 需要替换为实际运行目录与云任务 ID。
+collector 只读取已有产物，不启动模型/仿真；周期监控会查询云任务状态。
+
+```bash
+RUN=/home/ldl/outputs/interactive-nav/your-evaluation-run
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.collect_timeout_performance "$RUN"
+TASK_ID=your-cloud-task-id
+/home/ldl/conda_envs/mlspaces/bin/python -m scripts.InteractiveNav.evaluation.monitor_mllm_timeouts \
+  --task-id "$TASK_ID" --evaluation-dir "$RUN" \
+  --qwen-dir "$RUN/qwen-service" --interval 30 --window 120
+```
 
 ### 2026-09-17: 独立模块消融入口
 
@@ -3046,6 +3240,115 @@ python scripts/InteractiveNav/run_benchmark_eval.py \
 volc ml_task submit \
   -c scripts/InteractiveNav/configs/custom_task/m2_online_mixed0_29_8arm_remote.yaml
 ```
+
+### 标准评测启动：场景间隔 10 秒
+
+本地与远程统一入口 `run_benchmark_eval.py`、批处理入口 `run_interactive_nav_v3_ros_eval_batch.py`
+默认将所有 worker 的实际场景进程启动串行限流，相邻启动至少间隔 10 秒；第一场立即启动。
+30 worker 仍可并发执行，初始 30 场启动展开约 290 秒。后续场景及本轮补跑同样限流，
+resume 跳过已完成场景、dry-run 不等待。排队时间不占场景 timeout，成功启动后的场景耗时不含排队。
+配置键 `scene_start_interval_s`，批处理参数 `--scene-start-interval-s`；仅明确需要同步启动的对照实验才设为 0。
+远程双卡 30 场模板：`scripts/InteractiveNav/configs/evaluation/benchmark_remote2gpu_30mixed_stagger10.json`，
+保持 2000–2029、30 worker、dynamic/max 2000、M1 30s、M2 16K、不录制、不自动补跑。
+
+### 2026-09-23 路径跟随局部规划器 A/B 回归
+
+`nav_pkg/PathFollower` 通过 `BASE_LOCAL_PLANNER=nav_pkg/PathFollower` 启用；
+同时将 `NAV_CONFIG_OVERRIDE` 指向
+`scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml`。
+不设置时仍使用 DWA 与 `semantic_interaction_nav.yaml`。
+插件沿实时全局路径前瞻 0.2 m，按 V3 桥接器实际 0.2 秒控制步长预测运动，检查 footprint
+和横向偏离；`/move_base/PathFollower/set_parameters` 提供每次交互到达容差租约。
+
+先用 `2015 2016 2017 2020 2026 2029` 六场运行固定 300 step，再用
+`2004 2007 2008 2009 2010 2015 2016 2017 2020 2024 2025 2026 2029`
+十三场运行固定 1000 step。新旧两组必须设置独立输出目录、ROS 端口段和相同
+`--workers`、`--max-steps`、模型服务、种子及录制模式；每组 `--workers`
+等于该组场景数，EGL 设备由 `--mujoco-egl-devices 0 1 2 3` 轮转分配。
+例如首次 300-step 新版：
+
+```bash
+BASE_LOCAL_PLANNER=nav_pkg/PathFollower \
+NAV_CONFIG_OVERRIDE="$PWD/scripts/InteractiveNav/configs/semantic_decision/path_follower_nav.yaml" \
+TMPDIR=/home/ldl/tmp/path-follower-eval XDG_CACHE_HOME=/home/ldl/.cache/path-follower-eval \
+python scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --output-dir /home/ldl/outputs/interactive-nav/path-follower-ab/new-300 \
+  --benchmark /home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json \
+  --episode-indices 2015 2016 2017 2020 2026 2029 \
+  --workers 6 --max-steps 300 --step-budget-mode fixed \
+  --base-master-port 23400 --mujoco-egl-devices 0 1 2 3 \
+  --model-endpoints http://127.0.0.1:8100/v1 http://127.0.0.1:8101/v1 \
+    http://127.0.0.1:8102/v1 http://127.0.0.1:8103/v1 \
+  --semantic-model-env-file "$PWD/.env" --allow-failures
+```
+
+将 `BASE_LOCAL_PLANNER` 改为 `dwa_local_planner/DWAPlannerROS`、配置改回
+`semantic_interaction_nav.yaml`、ROS 端口和输出目录改为不冲突的值以运行基线。
+完成后可用 `scripts/InteractiveNav/analyze_path_follower_ab.py --new <目录>
+--dwa <目录> --episodes <索引...>` 查看每场成功、实际 step、移动距离和退出原因。
+检查六宫格中的局部轨迹及 `debug/move_base_plans.csv`，区分没有下发 subgoal 的
+上游停滞与已激活导航后的路径跟随失败；只用目标成功率无法证明局部规划改进。
+新插件会同时发布 `/move_base/DWAPlannerROS/local_plan` 以兼容现有消费者；该话题名
+不表示实际使用 DWA，应以 `config/effective_config.env` 的 `BASE_LOCAL_PLANNER` 为准。
+录制模式还可用 `scripts/InteractiveNav/path_following_diagnostics.py --run-dir <目录>
+--episodes <索引...>` 对齐活动导航期间的机器人位姿与最近一次公开全局路径；
+统计只包括正式 `applied_action_step_count` 内的帧，不把录像收尾时仍带 ACTIVE 状态的
+额外帧算成路径偏离。空的全局路径消息不写入 CSV，因此从录制的
+`debug/raw/step_boundaries.jsonl.gz` 还原空消息并清除旧路径；没有公开有效路径的时段
+不参与统计。此值仅是公开路径的诊断代理，外部 `make_plan` 可能覆盖最新路径。
+对照结果必须同时核对正式成功率/SPL、有效交互、无候选早停、实际动作步数和墙钟耗时；
+移动距离增加或路径误差下降不能单独视为整体任务性能提升。
+
+该测试集实测结果（同为 13 worker、固定 1000 step、4 张 GPU、同一批 13 个 episode，
+使用独立 ROS master；墙钟受同时运行的模型服务负载影响，不能直接当作算法提速）：
+
+| 局部规划 | 成功数 | 平均 SPL | 正确交互数 | 无候选早停数 | 平均移动距离 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DWA 原配置 | 2/13 | 0.0705 | 12 | 4 | 15.25 m |
+| PathFollower，0.20 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0476 | 16 | 7 | 27.41 m |
+| PathFollower，0.26 m 前瞻、0.12 m 到达容差 | 3/13 | 0.0393 | 15 | 7 | 27.76 m |
+| PathFollower，0.20 m 前瞻、最高 0.23 m/s | 1/13 | 0.0141 | 14 | 6 | 22.39 m |
+| PathFollower，0.20 m 前瞻、受约束转向/倒退恢复 | 2/13 | 0.0386 | 15 | 9 | 24.06 m |
+
+六场录制版的 300-step 局部轨迹诊断：最新版在导航 ACTIVE 的记录样本中
+六场均没有超过 0.2 m 的公开全局路径偏离；DWA 在 2015、2020、2029 的超限
+比例分别为 8.9%、5.1%、11.8%。此诊断依赖公开路径话题，可能受到外部
+`make_plan` 发布的路径影响，不是内部真实跟踪误差的严格证明。
+前两个 PathFollower 配置提高了该批次的成功数，但 SPL、早停及移动距离明显退化；
+0.23 m/s 限速配置也失去了原有成功场景，**均未通过整体性能
+提升门槛**。加入仅在正常指令全部失败后启用、限制横向偏离与累计倒退距离的
+转向/倒退恢复后，七场 300-step 录制中 2029 成功、SPL 0.951；但该次没有实际发出
+倒退命令，13 场 1000-step 复跑中 2029 未成功、早停反而升至九场，不能将单场成功
+归因于恢复动作或视为稳定提升。另以失败的 0.23 m/s 配置单独录制 2029 1000-step，
+恢复版本实际发出三次 `-0.08 m/s` 短倒退、没有出现“no collision-free command”警告，
+公开有效路径样本 P95 偏离 0.034 m，超过 0.2 m 的样本占 0.1%；但它仍在 749 step
+因无可执行候选退出，正式成功率和 SPL 均为零。对比实验中的倒退恢复可用，不等于
+已解决上游候选耗尽。不要把 PathFollower 替换为默认规划器。实际候选配置为
+`path_follower_precise_nav.yaml` 和 `path_follower_smooth_nav.yaml`，其中前者
+整体指标较好；`path_follower_cautious_nav.yaml` 仅保留为限速失败对照，
+首轮 `path_follower_nav.yaml` 只用于 300-step 控制验证。
+新版提前结束的七场都报 `no_eligible_candidates_after_bounded_recovery`；例如 2004
+仍有未知连通区域及两个未解决的交互目标，但可执行候选数为零。这类故障发生在
+局部规划器收到 subgoal 之前，需要单独排查上游前沿视点、候选生成和恢复逻辑。
+2009 单场录制复跑还原了路径效率退化：DWA 290 step、8.42 m、SPL 0.505，
+0.35 m/s 配置的 PathFollower 903 step、44.89 m、SPL 0.095。两组最初都依次选择
+前沿 11:3、同一扇门及穿门导航；之后 DWA 直接交互冰箱，PathFollower 先选择四个
+新房间前沿，绕远后才返回冰箱。两者 M2 都收到冰箱候选：DWA 给出距离 0.36 m
+并优先交互，PathFollower 给出距离 0.68 m 却优先探索新房间。PathFollower 对公开
+全局路径的 P95 偏离为 0.118 m，DWA 为 0.134 m；所以不能把额外 36 m 误判为
+局部跟踪脱轨。虽然穿门候选 ID 相同，执行前上游给出的穿门 subgoal 已经不同：
+DWA 为 `(1.45, 4.95)`，PathFollower 为 `(2.45, 4.35)`；局部规划器不能在
+保持跟随下发全局路径的同时自行把后者改成前者。减少局部运动速度会改变进门
+后的视点及候选优先级，必须重新跑
+完整场景验证，而不是凭这一次录制宣称成功率或 SPL 提升。
+
+### 2026-09-23 近距离容器感知与目标匹配
+
+restricted-GT 对 refrigerator/cabinet/drawer/dresser/wardrobe 及中心位于这些容器动态 AABB 内的物体，
+在相机到物体 AABB 中心的三维距离 ≤2m 且分割中至少有 1 个真实可见像素时，放宽像素数、框尺寸与可见比例过滤。
+容器内判定是几何近似，不读取任务指定目标；门不适用。零像素对象仍不发布，远处对象保持原阈值，最大感知距离仍生效。
+公共目标可靠性接受已通过发布端过滤的 1 像素观测；正式成功仍由 evaluator 核验，不修改成功距离。
+目标类别统一大小写、CamelCase、分隔符和明确同义词后精确匹配，不再双向子串匹配或拆分复合类别。
 
 总体监控入口 `scripts/InteractiveNav/evaluation/m2_online_monitor.py --run-dir <RUN>`，
 每30秒写 `overall.log` 和原子更新的 `overall_status.json`；可用 `tail -f <RUN>/overall.log`。
