@@ -41,6 +41,7 @@ from explore_py_pkg.debug_semantic_viz import (  # noqa: E402
 )
 from explore_py_pkg.subgoal_overlay import SubgoalOverlay  # noqa: E402
 from explore_py_pkg.room_colors import room_color  # noqa: E402
+from explore_py_pkg.video_layout import draw_room_navigation_cues, room_panel_background  # noqa: E402
 
 
 def _frame_name(value: object) -> str:
@@ -855,6 +856,7 @@ def draw_task_subgoal_header(
     *,
     box_width_px: int | None = None,
     background_alpha: float = 1.0,
+    compact: bool = False,
 ) -> None:
     """Draw the OCC task/subgoal banner with configurable compact opacity."""
 
@@ -863,7 +865,10 @@ def draw_task_subgoal_header(
     target = (candidates.get("target_context") or {}).get("target_name")
     behavior = selection.get("behavior_type")
     name = selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id")
-    SubgoalOverlay.draw_header(panel, target, behavior, name, box_width_px=box_width_px, background_alpha=background_alpha)
+    SubgoalOverlay.draw_header(
+        panel, target, behavior, name,
+        box_width_px=box_width_px, background_alpha=background_alpha, compact=compact,
+    )
 
 
 def _draw_robot_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int) -> None:
@@ -1694,6 +1699,9 @@ class OfflineSixPanelRenderer:
         snapshot_meta: dict | None = None,
         display_stamp_sec: float = 0.0,
         snapshot_selection_reason: str = "",
+        unify_background: bool = False,
+        show_navigation: bool = False,
+        episode_trajectory: list[tuple[float, float, float, float]] | None = None,
     ) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), 246, dtype=np.uint8)
@@ -1706,11 +1714,73 @@ class OfflineSixPanelRenderer:
         view_bounds = zoom_world_bounds(world_bounds, view_scale)
         scale, to_px = self._world_view(view_bounds, panel_size, margin=18, vertical_center=0.5)
         occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
-        if occ_layer is not None:
-            panel = cv2.addWeighted(occ_layer, 0.72, panel, 0.28, 0.0)
         room_layer = self._warp_grid(panel_size, room, _room_base(room) if room else None, to_px, (246, 246, 246))
-        if room_layer is not None:
-            panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
+        room_mask = None
+        wall_mask = None
+        if room is not None and unify_background:
+            mask_source = np.repeat((room.image_values >= 0)[:, :, None].astype(np.uint8) * 255, 3, axis=2)
+            warped_mask = self._warp_grid(panel_size, room, mask_source, to_px, (0, 0, 0))
+            room_mask = warped_mask[:, :, 0] > 0
+            if occupancy is not None:
+                wall_source = np.repeat((occupancy.image_values >= 50)[:, :, None].astype(np.uint8) * 255, 3, axis=2)
+                warped_walls = self._warp_grid(panel_size, occupancy, wall_source, to_px, (0, 0, 0))
+                wall_mask = warped_walls[:, :, 0] > 0
+        panel = room_panel_background(
+            panel, occ_layer, room_layer,
+            room_mask=room_mask, wall_mask=wall_mask,
+        )
+        navigation_cues = None
+        if show_navigation:
+            map_frame = self.transforms.map_frame
+            def visible(point):
+                if point is None:
+                    return None
+                pixel = to_px(point[0], point[1])
+                return pixel if 0 <= pixel[0] < width and 0 <= pixel[1] < height else None
+
+            def converted_plan(plan):
+                source = str((plan or {}).get("frame_id") or "")
+                return [point for pose in (plan or {}).get("poses") or []
+                        if (point := self._transform(pose, source, map_frame, step_index)) is not None]
+
+            def pixels(points):
+                return [pixel for point in points if (pixel := visible(point)) is not None]
+
+            trajectory_source = episode_trajectory if episode_trajectory is not None else step.get("trajectory") or []
+            trail = [point for raw in trajectory_source if len(raw) >= 4
+                     if (point := self._transform(raw[1:4], self.transforms.odom_frame, map_frame, step_index)) is not None]
+            selection = active_semantic_selection(step)
+            selected_id = str(selection.get("candidate_id") or "")
+            candidates = []
+            for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
+                if str(candidate.get("candidate_id") or "") == selected_id:
+                    continue
+                point = self._transform(candidate.get("goal_xyyaw"), map_frame, map_frame, step_index)
+                if (pixel := visible(point)) is not None:
+                    candidates.append((pixel, str(candidate.get("behavior_type") or "EXPLORE")))
+            goal = self._transform(selection.get("goal_xyyaw") or step.get("active_goal"), map_frame, map_frame, step_index)
+            live = (visible(goal), str(selection.get("behavior_type") or "NAVIGATE"), goal[2]) if visible(goal) is not None else None
+            routes = []
+            for index, subgoal in enumerate((step.get("route_plan") or {}).get("subgoals") or [], 1):
+                point = self._transform(subgoal.get("goal_xyyaw"), map_frame, map_frame, step_index)
+                if (pixel := visible(point)) is not None:
+                    routes.append((index, pixel, point[2]))
+            interaction_point = self._transform(
+                (step.get("route_plan") or {}).get("interaction_goal_xyyaw"),
+                map_frame, map_frame, step_index,
+            )
+            interaction_goal = (
+                (pixel, interaction_point[2])
+                if (pixel := visible(interaction_point)) is not None else None
+            )
+            navigation_cues = dict(
+                trajectory=pixels(trail),
+                global_plan=pixels(converted_plan(step.get("global_plan"))),
+                local_plan=pixels(converted_plan(step.get("local_plan"))),
+                candidates=candidates, live_goal=live, route_subgoals=routes,
+                interaction_goal=interaction_goal,
+            )
+            draw_room_navigation_cues(panel, **navigation_cues, draw_markers=False)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
@@ -1766,13 +1836,22 @@ class OfflineSixPanelRenderer:
         pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
         if pose is not None:
             _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
-        _draw_panel_title(panel, "ROOM SEGMENTS + INTERACTION", step_index)
+        if navigation_cues is not None:
+            draw_room_navigation_cues(panel, **navigation_cues, draw_paths=False)
+        if show_navigation:
+            cv2.rectangle(panel, (width - 185, 0), (width - 1, 26), (218, 233, 244), -1)
+        _draw_panel_title(panel, "ROOM + NAV" if show_navigation else "ROOM SEGMENTS + INTERACTION", step_index)
+        if show_navigation:
+            draw_task_subgoal_header(
+                panel, step, box_width_px=panel_size[0] // 2 - 10,
+                background_alpha=0.65, compact=True,
+            )
         draw_map_snapshot_note(
             panel,
             snapshot_meta,
             display_stamp_sec=display_stamp_sec,
             selection_reason=snapshot_selection_reason,
-            y=42,
+            y=57 if show_navigation else 42,
         )
         return panel
 
@@ -1792,11 +1871,18 @@ class OfflineSixPanelRenderer:
         snapshot_meta: dict | None = None,
         display_stamp_sec: float = 0.0,
         snapshot_selection_reason: str = "",
+        compact_title: bool = False,
     ) -> np.ndarray:
         width, height = panel_size
         map_width = max(180, int(round(width * 0.66)))
         map_size = (map_width, height)
         panel = np.full((height, map_width, 3), 246, dtype=np.uint8)
+        def draw_spatial_title() -> None:
+            if compact_title:
+                cv2.putText(panel, "SEMANTIC XY", (6, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.38, (25, 25, 25), 1, cv2.LINE_AA)
+            else:
+                _draw_panel_title(panel, "SEMANTIC XY", step_index)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
@@ -1808,7 +1894,7 @@ class OfflineSixPanelRenderer:
             positions.append((pose[0], pose[1]))
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
-            _draw_panel_title(panel, "SEMANTIC XY", step_index)
+            draw_spatial_title()
             return np.concatenate(
                 [panel, self._render_candidate_sidebar((width - map_width, height), step, step_index)],
                 axis=1,
@@ -1883,7 +1969,7 @@ class OfflineSixPanelRenderer:
                 view_bounds,
                 pose,
             )
-        _draw_panel_title(panel, "SEMANTIC XY", step_index)
+        draw_spatial_title()
         draw_map_snapshot_note(
             panel,
             snapshot_meta,
@@ -1909,6 +1995,7 @@ class OfflineSixPanelRenderer:
             (step.get("semantic_candidates") or {}).get("candidates") or [],
             active_semantic_selection(step),
             step_index,
+            graph=step.get("unified_graph"),
         )
 
         width, height = panel_size
@@ -2108,7 +2195,22 @@ def camera_title(step: dict, step_index: int) -> str:
     return f"STEP={_step4(step_index)}  dist={distance:.2f}m  dist_to_goal={goal_distance}"
 
 
-def draw_camera_title(frame: np.ndarray, step: dict, step_index: int) -> None:
+def draw_camera_title(frame: np.ndarray, step: dict, step_index: int, *, compact: bool = False) -> None:
+    if compact:
+        selection = active_semantic_selection(step)
+        goal = selection.get("goal_xyyaw") or step.get("active_goal") or []
+        pose = step.get("pose") or []
+        goal_distance = (
+            f"{math.hypot(float(pose[0]) - float(goal[0]), float(pose[1]) - float(goal[1])):.2f}m"
+            if len(pose) >= 2 and len(goal) >= 2 else "-"
+        )
+        text = f"STEP {_step4(step_index)}  GOAL {goal_distance}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        size = cv2.getTextSize(text, font, 0.42, 1)[0]
+        x = frame.shape[1] - size[0] - 8
+        cv2.rectangle(frame, (x - 5, 3), (frame.shape[1] - 3, 26), (245, 245, 245), -1)
+        cv2.putText(frame, text, (x, 19), font, 0.42, (25, 25, 25), 1, cv2.LINE_AA)
+        return
     text = camera_title(step, step_index)
     font_scale = 0.46 if frame.shape[1] < 700 else 0.58
     thickness = 1 if frame.shape[1] < 700 else 2

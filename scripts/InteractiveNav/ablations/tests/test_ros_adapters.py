@@ -167,4 +167,6 @@ def test_full_and_greedy_receive_identical_curated_candidate_pools(node_factory,
         node._decide_from_snapshot(data)
         assert node.active_candidate_id in pools[variant]
     assert pools["full"] == pools["no_task_decision"]
-    assert 0 < len(pools["full"]) < len(raw)
+    # The configured all_actions_12_frontiers pool retains every executable
+    # interaction; only exploration frontiers are capped.
+    assert len(pools["full"]) == len(raw)

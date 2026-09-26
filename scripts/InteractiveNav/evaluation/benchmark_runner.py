@@ -3913,6 +3913,10 @@ def _consume_pending_ros_object_goal_interaction(
     }
     _capture_head_frame(task, frames, config.record_video)
     _publish_restricted_ros_frame(runtime, task, decision_index=decision_index + max(0, int(executor_metadata.get("task_steps_consumed", 1)) - 1))
+    # The next policy turn must see the post-interaction state.  Reusing the
+    # pre-execution observation here replayed a closed-door RGB frame after a
+    # successful opening (for example episode 2769, steps 213 and 590).
+    observation = task.get_observations()
     _discard_task_rollout_cache(task)
     return {
         "task_steps_consumed": int(executor_metadata.get("task_steps_consumed", 1)),

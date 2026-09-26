@@ -31,9 +31,22 @@ from offline_semantic_renderer import (
     load_raw_grid,
     selection_target_ids,
 )
+from explore_py_pkg.video_layout import compose_video_panels
 
 
 _CAUSAL_RECEIPT_EPSILON_SEC = 1e-6
+
+
+def require_ffmpeg() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError) as exc:
+        raise RuntimeError("H.264 encoding requires ffmpeg or imageio_ffmpeg") from exc
 
 
 def scene_display_id(scene_dir: Path) -> str:
@@ -46,6 +59,14 @@ def scene_display_id(scene_dir: Path) -> str:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             payload = {}
+    invocation = load_json(scene_dir / "planned_invocation.json").get("planned_invocation") or {}
+    episode_index = invocation.get("episode_index")
+    if episode_index is None:
+        results = load_json(scene_dir / "eval" / "results.json")
+        if isinstance(results, list) and results:
+            episode_index = results[0].get("episode_index")
+    if episode_index is not None:
+        return f"BENCHMARK {episode_index}"
     house_value = (
         payload.get("house_id")
         or payload.get("house_ind")
@@ -749,6 +770,7 @@ def draw_gt(
     payload: dict | None,
     target_object_id: str | set[str] = "",
     source_image_size: tuple[int, int] | None = None,
+    show_status: bool = True,
 ) -> None:
     if not payload:
         return
@@ -777,6 +799,8 @@ def draw_gt(
             1,
             cv2.LINE_AA,
         )
+    if not show_status:
+        return
     gt_frame = payload.get("frame_index", "-")
     status_text = f"GT visible={len(observations)} frame={gt_frame} source=public_gt"
     cv2.putText(
@@ -901,7 +925,7 @@ def build_panel_video(
         writer.release()
     ffmpeg_log = videos_dir / f"{output_stem}_ffmpeg.log"
     command = [
-        "ffmpeg", "-y", "-i", str(raw_video), "-an", "-c:v", "libx264",
+        require_ffmpeg(), "-y", "-i", str(raw_video), "-an", "-c:v", "libx264",
         "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "veryfast",
         "-movflags", "+faststart", str(temp_video),
     ]
@@ -1063,9 +1087,11 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
 
     raw_dir = debug_dir / "raw"
     raw_step_manifest = resolve_jsonl_path(raw_dir / "step_boundaries.jsonl")
-    completion_status_reconciled = persist_final_completion_status_to_raw_steps(
-        raw_step_manifest,
-        scene_dir / "completion_status.json",
+    completion_status_reconciled = (
+        persist_final_completion_status_to_raw_steps(
+            raw_step_manifest, scene_dir / "completion_status.json"
+        )
+        if not args.output_dir else False
     )
     steps = load_jsonl(raw_step_manifest)
     maps = load_jsonl(raw_dir / "map_manifest.jsonl")
@@ -1125,7 +1151,8 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         or [2.5]
     )
     panel_size = (480, 270)
-    videos_dir = scene_dir / "videos"
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else scene_dir
+    videos_dir = output_dir / "videos"
     frames_dir = videos_dir / "offline_composite_frames"
     videos_dir.mkdir(parents=True, exist_ok=True)
     save_composites = bool(getattr(args, "save_composite_frames", True))
@@ -1134,8 +1161,8 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     raw_video = videos_dir / f"{args.output_stem}_offline_raw.mp4"
     temp_video = videos_dir / f"{args.output_stem}_offline_h264_tmp.mp4"
     final_video = videos_dir / f"{args.output_stem}.mp4"
-    alignment_path = scene_dir / "offline_render_alignment.jsonl"
-    output_size = (panel_size[0] * 3, panel_size[1] * 2)
+    alignment_path = output_dir / "offline_render_alignment.jsonl"
+    output_size = (panel_size[0] * (2 if args.layout == "four_panel" else 3), panel_size[1] * 2)
     writer = cv2.VideoWriter(
         str(raw_video), cv2.VideoWriter_fourcc(*"mp4v"),
         max(0.1, float(args.fps)), output_size,
@@ -1267,8 +1294,11 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     public_gt_payload_for_sim_frame(sim_record, step),
                     selection_target_ids(selection),
                     _sim_record_image_size(sim_record),
+                    show_status=args.layout != "four_panel",
                 )
-                draw_camera_title(camera, step, step_index)
+                if args.layout == "four_panel":
+                    cv2.rectangle(camera, (0, 0), (panel_size[0] - 1, 26), (245, 245, 245), -1)
+                draw_camera_title(camera, step, step_index, compact=args.layout == "four_panel")
                 occ = renderer.render_map_panel(
                     planning, panel_size, step, step_index, title="OCC", kind="occupancy",
                     world_bounds=occ_world_bounds, draw_global_plan=True, draw_local_plan=True,
@@ -1308,6 +1338,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     snapshot_meta=room_meta,
                     display_stamp_sec=sim_stamp,
                     snapshot_selection_reason=room_selection.reason,
+                    unify_background=args.layout == "four_panel",
+                    show_navigation=args.layout == "four_panel",
+                    episode_trajectory=trajectory,
                 )
                 global_width = panel_size[0] // 2
                 global_panel = renderer.render_map_panel(
@@ -1346,12 +1379,13 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     snapshot_meta=planning_meta,
                     display_stamp_sec=sim_stamp,
                     snapshot_selection_reason=planning_selection.reason,
+                    compact_title=args.layout == "four_panel",
                 )
                 topology = renderer.render_topology(panel_size, step, step_index)
-                frame = np.vstack([
-                    np.concatenate([camera, occ, room_panel], axis=1),
-                    np.concatenate([costmaps, spatial, topology], axis=1),
-                ])
+                frame = compose_video_panels(
+                    camera, occ, room_panel, costmaps, spatial, topology,
+                    layout=args.layout,
+                )
                 draw_scene_id_badge(frame, display_id)
                 output_path = frames_dir / f"frame_{written + 1:06d}_composite.png"
                 # Every offline panel is rendered with OpenCV's native BGR
@@ -1380,24 +1414,19 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 written += 1
     finally:
         writer.release()
-    ffmpeg = shutil.which("ffmpeg")
-    codec = "mp4v"
-    if ffmpeg:
-        command = [
-            ffmpeg, "-y", "-i", str(raw_video), "-an", "-c:v", "libx264",
-            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "veryfast",
-            "-movflags", "+faststart", str(temp_video),
-        ]
-        log_path = videos_dir / f"{args.output_stem}_offline_ffmpeg.log"
-        with log_path.open("w", encoding="utf-8") as handle:
-            completed = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
-        if completed.returncode != 0 or not temp_video.exists() or temp_video.stat().st_size <= 0:
-            raise RuntimeError(f"Raw offline H264 encoding failed; see {log_path}")
-        temp_video.replace(final_video)
-        raw_video.unlink(missing_ok=True)
-        codec = "h264"
-    else:
-        raw_video.replace(final_video)
+    command = [
+        require_ffmpeg(), "-y", "-i", str(raw_video), "-an", "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "veryfast",
+        "-movflags", "+faststart", str(temp_video),
+    ]
+    log_path = videos_dir / f"{args.output_stem}_offline_ffmpeg.log"
+    with log_path.open("w", encoding="utf-8") as handle:
+        completed = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
+    if completed.returncode != 0 or not temp_video.exists() or temp_video.stat().st_size <= 0:
+        raise RuntimeError(f"Raw offline H264 encoding failed; see {log_path}")
+    temp_video.replace(final_video)
+    raw_video.unlink(missing_ok=True)
+    codec = "h264"
     summary = {
         "recording_format": "png_json_v1",
         "sim_frame_count": len(sim_records),
@@ -1422,11 +1451,12 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         "episode_trajectory_sample_count": len(episode_trajectory),
         "alignment_jsonl": str(alignment_path),
         "fps": float(args.fps),
+        "layout": args.layout,
         "codec": codec,
         "video": str(final_video),
         "frame_dir": str(frames_dir) if save_composites else None,
     }
-    (scene_dir / "offline_video_summary.json").write_text(
+    (output_dir / "offline_video_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False))
@@ -1447,6 +1477,8 @@ def main() -> None:
         default="exact",
     )
     parser.add_argument("--output-stem", default="overview_6panel")
+    parser.add_argument("--output-dir", default="", help="Write rendered files outside the recorded scene directory.")
+    parser.add_argument("--layout", choices=("six_panel", "four_panel"), default="six_panel")
     parser.add_argument(
         "--semantic-xy-overview-inset",
         action="store_true",
@@ -1686,7 +1718,7 @@ def main() -> None:
 
     ffmpeg_log = videos_dir / f"{args.output_stem}_offline_ffmpeg.log"
     command = [
-        "ffmpeg",
+        require_ffmpeg(),
         "-y",
         "-i",
         str(raw_video),

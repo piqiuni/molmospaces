@@ -1,0 +1,23 @@
+{
+  "output_root": "/home/ldl/outputs/interactive-nav",
+  "benchmark": "/home/ldl/molmospaces/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_2/benchmark/benchmark.json",
+  "episode_ranges": [[1000, 1999]],
+  "workers": 30,
+  "scene_start_interval_s": 10.0,
+  "max_steps": 2000,
+  "step_budget_mode": "dynamic",
+  "ros_observation_turn_multiplier": 1,
+  "ros_command_starvation_timeout_s": 90,
+  "semantic_attribute_request_timeout_s": 30,
+  "scene_timeout_s": 7200,
+  "base_master_port": 19000,
+  "conda_env": "/home/ldl/conda_envs/mlspaces",
+  "python_bin": "/home/ldl/conda_envs/mlspaces/bin/python",
+  "semantic_model_env_file": ".env",
+  "model_endpoints": ["http://127.0.0.1:8000/v1"],
+  "mujoco_egl_devices": ["0", "1"],
+  "required_mujoco_gpu_count": 2,
+  "progress_interval_s": 30,
+  "recording": false,
+  "retry_rounds": 0
+}

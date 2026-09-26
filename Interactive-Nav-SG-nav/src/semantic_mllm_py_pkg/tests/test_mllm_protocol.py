@@ -180,6 +180,81 @@ def test_openai_chat_stream_assembles_content_and_usage(monkeypatch) -> None:
     assert events["client_closed"] is True
 
 
+def test_typesafe_choice_maps_candidates_and_usage(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps({
+                "model": "jev-1.13.0",
+                "answers": {"next_subgoal": {
+                    "type": "choice",
+                    "choice": "door",
+                    "confidence": 0.82,
+                    "probabilities": {"door": 0.7, "fridge": 0.2, "frontier": 0.1},
+                }},
+                "usage": {"input_tokens": 120, "output_tokens": 9},
+            }).encode()
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data)
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("TYPESAFE_TEST_KEY", "test-secret")
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    response = MLLMClient(MLLMClientConfig(
+        mode="http",
+        protocol="typesafe_systemone",
+        endpoint="https://api.typesafe.ai/v1/systemone",
+        api_key_env="TYPESAFE_TEST_KEY",
+        model="jev-1.13.0",
+        timeout_s=60,
+    )).request_json(
+        role="subgoal_selection",
+        instruction="Select the next subgoal.",
+        context={"candidates": [{"id": "door"}, {"id": "fridge"}, {"id": "frontier"}]},
+    )
+
+    assert response.error == ""
+    assert response.payload == {
+        "ranked_ids": ["door", "fridge", "frontier"],
+        "reason": "NO_SEMANTIC_PREFERENCE",
+        "confidence": "high",
+    }
+    assert response.prompt_tokens == 120
+    assert response.completion_tokens == 9
+    assert response.total_tokens == 129
+    assert captured["payload"]["questions"]["next_subgoal"]["criteria"] == {
+        "door": None, "fridge": None, "frontier": None,
+    }
+    assert captured["timeout"] <= 60
+
+
+def test_typesafe_choice_rejects_images(monkeypatch) -> None:
+    monkeypatch.setenv("TYPESAFE_TEST_KEY", "test-secret")
+    response = MLLMClient(MLLMClientConfig(
+        mode="http",
+        protocol="typesafe_systemone",
+        endpoint="https://api.typesafe.ai/v1/systemone",
+        api_key_env="TYPESAFE_TEST_KEY",
+    )).request_json(
+        role="subgoal_selection",
+        instruction="Select",
+        context={"candidates": [{"id": "door"}]},
+        images=["/no/image.jpg"],
+    )
+
+    assert response.payload is None
+    assert "text-only" in response.error
+
+
 def test_ablation_modes_are_independent() -> None:
     config = AblationConfig("static_semantic", "mllm_score", "direct_atomic")
     assert config.to_dict() == {

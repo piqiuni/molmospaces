@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import cv2
 import numpy as np
@@ -35,28 +36,43 @@ class SubgoalOverlay:
         cv2.arrowedLine(panel, tuple(start.astype(np.int32)), tuple(end.astype(np.int32)), tuple(int(v) for v in color), 2, cv2.LINE_AA, tipLength=0.42)
 
     @staticmethod
-    def draw_header(panel, target, behavior, name, *, box_width_px=None, background_alpha=1.0):
+    def draw_header(panel, target, behavior, name, *, box_width_px=None, background_alpha=1.0, compact=False):
         box_width = min(panel.shape[1] - 4, max(120, int(box_width_px if box_width_px is not None else 460)))
-        max_chars = max(13, int((box_width - 16) / 7.0))
+        max_chars = max(13, int((box_width - 16) / (5.5 if compact else 7.0)))
         target, behavior, name = str(target or "-"), str(behavior or "-"), str(name or "-")
         def clipped(value, prefix):
             available = max(4, max_chars - len(prefix))
             return value if len(value) <= available else value[:max(1, available - 3)] + "..."
         overlay = panel.copy()
-        cv2.rectangle(overlay, (4, 4), (box_width, 49), (255, 255, 255), -1)
+        cv2.rectangle(overlay, (4, 2 if compact else 4), (box_width, 27 if compact else 49), (255, 255, 255), -1)
         alpha = max(0.0, min(1.0, float(background_alpha)))
         if alpha >= 1.0:
             panel[:] = overlay
         elif alpha > 0.0:
             cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0.0, panel)
         for index, (prefix, value) in enumerate((("TASK TARGET: ", target), ("MODULE2: ", f"{behavior} {name}"))):
-            cv2.putText(panel, prefix + clipped(value, prefix), (9, 20 + index * 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (30, 30, 30), 1, cv2.LINE_AA)
+            baseline = (11 + index * 12) if compact else (20 + index * 21)
+            cv2.putText(panel, prefix + clipped(value, prefix), (9, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.31 if compact else 0.38, (30, 30, 30), 1, cv2.LINE_AA)
 
     @staticmethod
-    def render_candidate_sidebar(panel_size, candidates, selection, step_index=0):
+    def render_candidate_sidebar(panel_size, candidates, selection, step_index=0, *, graph=None):
         """Render the canonical ALL SUBGOALS sidebar used by both recorders."""
         width, height = panel_size
         panel = np.full((height, width, 3), (238, 242, 248), dtype=np.uint8)
+        graph_names = {}
+        for node in (graph or {}).get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            attributes = node.get("attributes") or {}
+            name = next(
+                (str(value) for value in (node.get("label"), node.get("name"), attributes.get("category"))
+                 if value and not re.fullmatch(r"obj_\d+", str(value))),
+                None,
+            )
+            if name:
+                for key in (node.get("id"), attributes.get("instance_id")):
+                    if key:
+                        graph_names[str(key)] = name
         selected_id = str((selection or {}).get("candidate_id") or "")
         by_id = {}
         for raw in (candidates or []):
@@ -97,6 +113,10 @@ class SubgoalOverlay:
             cv2.rectangle(panel, (3, y1), (width - 4, y2), (15, 15, 15), 2 if selected else 1)
             cv2.rectangle(panel, (4, y1 + 1), (10, max(y1 + 1, y2 - 1)), color, -1)
             target = str(item.get("target_name") or item.get("target_id") or cid or "-")
+            if re.fullmatch(r"obj_\d+", target):
+                name = graph_names.get(str(item.get("target_id") or "")) or graph_names.get(target)
+                if name:
+                    target = f"{name} #{int(target.rsplit('_', 1)[1])}"
             # Re-observation rows are NAVIGATE candidates used only as a
             # fallback to refresh a portal view.  Keep their NAVIGATE color
             # (the behavior type is still navigation), but label them

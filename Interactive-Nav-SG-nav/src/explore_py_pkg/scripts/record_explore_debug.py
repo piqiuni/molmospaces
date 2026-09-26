@@ -58,6 +58,7 @@ from explore_py_pkg.debug_semantic_viz import (
 )
 from explore_py_pkg.subgoal_overlay import SubgoalOverlay
 from explore_py_pkg.room_colors import room_color
+from explore_py_pkg.video_layout import compose_video_panels, draw_room_navigation_cues, room_panel_background
 from step_sync_image_cache import CachedStepImage, ExactStepImageCache
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -1707,6 +1708,14 @@ def _bresenham(x0: int, y0: int, x1: int, y1: int):
 class ExploreDebugRecorder:
     def __init__(self, output_dir: Path, args: argparse.Namespace):
         self.output_dir = output_dir
+        self.video_benchmark_label = ""
+        try:
+            invocation = json.loads((output_dir / "planned_invocation.json").read_text())
+            episode_index = (invocation.get("planned_invocation") or {}).get("episode_index")
+            if episode_index is not None:
+                self.video_benchmark_label = f"BENCHMARK {episode_index}"
+        except (OSError, ValueError, TypeError):
+            pass
         self.overlay_dir = output_dir / "subgoal_overlays"
         self.uniform_overlay_dir = output_dir / "subgoal_overlays_uniform_crop"
         self.uniform_overlay_titled_dir = output_dir / "subgoal_overlays_uniform_titled"
@@ -1966,7 +1975,10 @@ class ExploreDebugRecorder:
         }
         self.plan_records = {"global": [], "local_global": [], "local": []}
         self.subgoal_records: list[dict] = []
-        video_stem = "overview_6panel" if args.semantic_video else "first_person"
+        video_stem = (
+            "overview_4panel" if args.semantic_video and args.video_layout == "four_panel"
+            else "overview_6panel" if args.semantic_video else "first_person"
+        )
         self.first_person_video_path = str(self.video_dir / f"{video_stem}.mp4")
         self.first_person_video_raw_path = str(self.video_dir / f"{video_stem}_raw.mp4")
         self.first_person_video_writer = None
@@ -2411,7 +2423,9 @@ class ExploreDebugRecorder:
             image_encoding = categorical_encoding
         elif render_kind == "scene":
             rgb = self._scene_id_grid_to_rgb(grid)
-            known_world_bounds = None
+            known_world_bounds = _world_bounds_from_cell_bounds(
+                grid, _known_cell_bounds_from_grid(grid)
+            )
             known_cell_bounds = None
             visual_crop_margin_m = 0.0
             visual_lower_margin_m = 0.0
@@ -3861,6 +3875,8 @@ class ExploreDebugRecorder:
             )
             label_y = max(18, start[1] - 5)
             cv2.putText(frame, label[:48], (start[0], label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        if self.args.video_layout == "four_panel":
+            return
         status_text = (
             f"GT visible={len(observations)} frame={gt_observations.get('frame_index', '-')} source=realtime_gt"
         )
@@ -4189,10 +4205,13 @@ class ExploreDebugRecorder:
             positions.append((float(pose[0]), float(pose[1])))
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
-            self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+            if self.args.video_layout == "four_panel":
+                cv2.putText(panel, "SEMANTIC XY", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (25, 25, 25), 1, cv2.LINE_AA)
+            else:
+                self._draw_panel_title(panel, "SEMANTIC XY", image_step)
             sidebar_width = max(150, int(panel_width * 0.34))
             panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
-                (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+                (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step, graph=graph
             )
             return panel
         if world_bounds is None:
@@ -4318,10 +4337,13 @@ class ExploreDebugRecorder:
         if pose is not None:
             center = to_px(float(pose[0]), float(pose[1]))
             self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
-        self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+        if self.args.video_layout == "four_panel":
+            cv2.putText(panel, "SEMANTIC XY", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (25, 25, 25), 1, cv2.LINE_AA)
+        else:
+            self._draw_panel_title(panel, "SEMANTIC XY", image_step)
         sidebar_width = max(150, int(panel_width * 0.34))
         panel[:, panel_width - sidebar_width :] = SubgoalOverlay.render_candidate_sidebar(
-            (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step
+            (sidebar_width, panel_height), (semantic_candidates or {}).get("candidates") or [], semantic_selection or {}, image_step, graph=graph
         )
         return panel
 
@@ -4341,6 +4363,11 @@ class ExploreDebugRecorder:
         world_bounds: tuple[float, float, float, float] | None = None,
         draw_title: bool = True,
         task_target: dict | None = None,
+        trajectory=None,
+        global_plan=None,
+        local_plan=None,
+        semantic_candidates: dict | None = None,
+        route_plan: dict | None = None,
     ):
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -4449,11 +4476,97 @@ class ExploreDebugRecorder:
             )
 
         occupancy_layer = warp_grid(occupancy_grid, occupancy_rgb)
-        if occupancy_layer is not None:
-            panel = cv2.addWeighted(occupancy_layer, 0.72, panel, 0.28, 0.0)
         segment_layer = warp_grid(scene_grid, scene_rgb)
-        if segment_layer is not None:
-            panel = cv2.addWeighted(segment_layer, 0.38, panel, 0.62, 0.0)
+        room_mask = None
+        wall_mask = None
+        if scene_grid is not None and self.args.video_layout == "four_panel":
+            if getattr(scene_grid, "data", None) is not None:
+                scene_values = np.asarray(scene_grid.data, dtype=np.int16).reshape(
+                    (int(scene_grid.info.height), int(scene_grid.info.width))
+                )
+                source_mask = np.flipud(scene_values) >= 0
+            else:
+                source_mask = np.any(scene_rgb != 0, axis=2)
+            mask_rgb = np.repeat(source_mask[:, :, None].astype(np.uint8) * 255, 3, axis=2)
+            warped_mask = warp_grid(scene_grid, mask_rgb)
+            room_mask = warped_mask[:, :, 0] > 0
+            if occupancy_grid is not None and getattr(occupancy_grid, "data", None) is not None:
+                occupancy_values = np.asarray(occupancy_grid.data, dtype=np.int16).reshape(
+                    (int(occupancy_grid.info.height), int(occupancy_grid.info.width))
+                )
+                wall_rgb = np.repeat((np.flipud(occupancy_values) >= 50)[:, :, None].astype(np.uint8) * 255, 3, axis=2)
+                warped_walls = warp_grid(occupancy_grid, wall_rgb)
+                wall_mask = warped_walls[:, :, 0] > 0
+        panel = room_panel_background(
+            panel, occupancy_layer, segment_layer,
+            room_mask=room_mask, wall_mask=wall_mask,
+        )
+        navigation_cues = None
+        if self.args.video_layout == "four_panel":
+            frame_id = reference_grid.header.frame_id or self.args.map_frame
+            def visible(point):
+                if point is None:
+                    return None
+                pixel = to_px(float(point[0]), float(point[1]))
+                return pixel if 0 <= pixel[0] < panel_width and 0 <= pixel[1] < panel_height else None
+
+            def pixels(points):
+                return [pixel for point in points or [] if (pixel := visible(point)) is not None]
+
+            trail = [point for raw in trajectory or [] if len(raw) >= 4
+                     if (point := self._transform_xy_yaw_to_frame(
+                         float(raw[1]), float(raw[2]), float(raw[3]),
+                         self.args.odom_frame, frame_id)) is not None]
+            selected_id = str((semantic_selection or {}).get("candidate_id") or "")
+            candidates = []
+            for candidate in (semantic_candidates or {}).get("candidates") or []:
+                if str(candidate.get("candidate_id") or "") == selected_id:
+                    continue
+                goal_values = list(candidate.get("goal_xyyaw") or [])
+                if len(goal_values) < 2:
+                    continue
+                point = self._transform_xy_yaw_to_frame(
+                    float(goal_values[0]), float(goal_values[1]),
+                    float(goal_values[2]) if len(goal_values) > 2 else 0.0,
+                    self.args.map_frame, frame_id,
+                )
+                if (pixel := visible(point)) is not None:
+                    candidates.append((pixel, str(candidate.get("behavior_type") or "EXPLORE")))
+            goal_values = list((semantic_selection or {}).get("goal_xyyaw") or [])
+            goal = self._transform_xy_yaw_to_frame(
+                float(goal_values[0]), float(goal_values[1]),
+                float(goal_values[2]) if len(goal_values) > 2 else 0.0,
+                self.args.map_frame, frame_id,
+            ) if len(goal_values) >= 2 else None
+            live_pixel = visible(goal)
+            live = (live_pixel, str((semantic_selection or {}).get("behavior_type") or "NAVIGATE"), goal[2]) if live_pixel else None
+            routes = []
+            for index, subgoal in enumerate((route_plan or {}).get("subgoals") or [], 1):
+                values = list(subgoal.get("goal_xyyaw") or [])
+                if len(values) < 2:
+                    continue
+                point = self._transform_xy_yaw_to_frame(
+                    float(values[0]), float(values[1]),
+                    float(values[2]) if len(values) > 2 else 0.0,
+                    self.args.map_frame, frame_id,
+                )
+                if (pixel := visible(point)) is not None:
+                    routes.append((index, pixel, point[2]))
+            interaction_values = list((route_plan or {}).get("interaction_goal_xyyaw") or [])
+            interaction_point = self._transform_xy_yaw_to_frame(
+                float(interaction_values[0]), float(interaction_values[1]),
+                float(interaction_values[2]) if len(interaction_values) > 2 else 0.0,
+                self.args.map_frame, frame_id,
+            ) if len(interaction_values) >= 2 else None
+            interaction_pixel = visible(interaction_point)
+            navigation_cues = dict(
+                trajectory=pixels(trail),
+                global_plan=pixels(self._plan_poses_for_grid(reference_grid, global_plan)),
+                local_plan=pixels(self._plan_poses_for_grid(reference_grid, local_plan)),
+                candidates=candidates, live_goal=live, route_subgoals=routes,
+                interaction_goal=(interaction_pixel, interaction_point[2]) if interaction_pixel is not None else None,
+            )
+            draw_room_navigation_cues(panel, **navigation_cues, draw_markers=False)
 
         # Keep the room label on the same causal room-segmentation frame.  The
         # old panel showed only numeric colours, which made a stable room ID
@@ -4590,9 +4703,14 @@ class ExploreDebugRecorder:
                 float(pose[2]),
                 14,
             )
+        if navigation_cues is not None:
+            draw_room_navigation_cues(panel, **navigation_cues, draw_paths=False)
         if draw_title:
+            if self.args.video_layout == "four_panel":
+                cv2.rectangle(panel, (panel_width - 185, 0), (panel_width - 1, 26), (218, 233, 244), -1)
             self._draw_panel_title(
                 panel,
+                "ROOM + NAV" if self.args.video_layout == "four_panel" else
                 "ROOM SEGMENTS + OBJECT GOAL" if self.args.semantic_focus_mode == "object_goal" else "ROOM SEGMENTS + INTERACTION",
                 image_step,
             )
@@ -5703,13 +5821,25 @@ class ExploreDebugRecorder:
                     world_bounds=occupancy_world_bounds,
                     draw_title=not self.args.paper_frame_exports,
                     task_target=task_target,
+                    trajectory=trajectory,
+                    global_plan=global_plan,
+                    local_plan=local_plan,
+                    semantic_candidates=semantic_candidates,
+                    route_plan=route_plan,
                 )
                 if self.args.paper_frame_exports:
                     room_segment_clean_panel = room_segment_panel.copy()
                     self._draw_panel_title(
                         room_segment_panel,
-                        "ROOM SEGMENTS + INTERACTION",
+                        "ROOM + NAV" if self.args.video_layout == "four_panel" else "ROOM SEGMENTS + INTERACTION",
                         image_step,
+                    )
+                if self.args.video_layout == "four_panel":
+                    self._draw_task_subgoal_header(
+                        room_segment_panel,
+                        semantic_candidates=semantic_candidates,
+                        semantic_selection=semantic_selection,
+                        compact=True,
                     )
                 semantic_spatial_panel = self._render_semantic_spatial_panel_locked(
                     frame_width,
@@ -5771,10 +5901,22 @@ class ExploreDebugRecorder:
                 else float("inf")
             )
             dist_to_goal_text = "-" if not math.isfinite(dist_to_goal) else f"{dist_to_goal:.2f}m"
-            self._draw_panel_title(
-                camera_frame,
-                f"STEP={_step4(image_step)}  dist={distance_m:.2f}m  dist_to_goal={dist_to_goal_text}",
-            )
+            if self.args.video_layout == "four_panel":
+                cv2.rectangle(camera_frame, (0, 0), (frame_width - 1, 26), (245, 245, 245), -1)
+                label = f"STEP {_step4(image_step)}  GOAL {dist_to_goal_text}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+                label_x = frame_width - label_size[0] - 8
+                cv2.rectangle(camera_frame, (label_x - 5, 3), (frame_width - 3, 26), (245, 245, 245), -1)
+                cv2.putText(camera_frame, label, (label_x, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (25, 25, 25), 1, cv2.LINE_AA)
+                if self.video_benchmark_label:
+                    badge_size = cv2.getTextSize(self.video_benchmark_label, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)[0]
+                    cv2.rectangle(camera_frame, (3, 3), (badge_size[0] + 13, 25), (30, 30, 30), -1)
+                    cv2.putText(camera_frame, self.video_benchmark_label, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (250, 250, 250), 1, cv2.LINE_AA)
+            else:
+                self._draw_panel_title(
+                    camera_frame,
+                    f"STEP={_step4(image_step)}  dist={distance_m:.2f}m  dist_to_goal={dist_to_goal_text}",
+                )
             video_size = (frame_width, frame_height)
             if (
                 occ_panel is not None
@@ -5783,7 +5925,11 @@ class ExploreDebugRecorder:
                 and semantic_spatial_panel is not None
                 and semantic_topology_panel is not None
             ):
-                video_size = (frame_width * 3, frame_height * 2)
+                video_size = (
+                    (frame_width * 2, frame_height * 2)
+                    if self.args.video_layout == "four_panel"
+                    else (frame_width * 3, frame_height * 2)
+                )
             elif occ_panel is not None and global_costmap_panel is not None and local_costmap_panel is not None:
                 video_size = (frame_width * 2, frame_height * 2)
             if self.first_person_video_size is None:
@@ -5795,13 +5941,12 @@ class ExploreDebugRecorder:
                 and costmap_panel is not None
                 and semantic_spatial_panel is not None
                 and semantic_topology_panel is not None
-                and target_size == (frame_width * 3, frame_height * 2)
+                and target_size == video_size
             ):
-                frame = np.vstack(
-                    [
-                        np.concatenate([camera_frame, occ_panel, room_segment_panel], axis=1),
-                        np.concatenate([costmap_panel, semantic_spatial_panel, semantic_topology_panel], axis=1),
-                    ]
+                frame = compose_video_panels(
+                    camera_frame, occ_panel, room_segment_panel, costmap_panel,
+                    semantic_spatial_panel, semantic_topology_panel,
+                    layout=self.args.video_layout,
                 )
             elif (
                 occ_panel is not None
@@ -6549,6 +6694,7 @@ class ExploreDebugRecorder:
         *,
         semantic_candidates: dict,
         semantic_selection: dict,
+        compact: bool = False,
     ) -> None:
         if panel is None or cv2 is None:
             return
@@ -6556,7 +6702,12 @@ class ExploreDebugRecorder:
         target_name = target_context.get("target_name") or target_context.get("target_source_object_name")
         behavior_type = semantic_selection.get("behavior_type")
         subgoal_name = semantic_selection.get("target_name") or semantic_selection.get("target_id") or semantic_selection.get("candidate_id")
-        SubgoalOverlay.draw_header(panel, target_name, behavior_type, subgoal_name)
+        SubgoalOverlay.draw_header(
+            panel, target_name, behavior_type, subgoal_name,
+            box_width_px=panel.shape[1] // 2 - 10 if compact else None,
+            background_alpha=0.65 if compact else 1.0,
+            compact=compact,
+        )
 
     @staticmethod
     def _draw_panel_title(panel, title: str, step: int | None = None) -> None:
@@ -9268,6 +9419,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-person-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-with-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--semantic-video", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--video-layout", choices=("six_panel", "four_panel"), default="six_panel")
     parser.add_argument("--external-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--external-video-overlay",

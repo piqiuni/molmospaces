@@ -32,11 +32,13 @@ namespace nav_pkg {
 
 PathFollower::PathFollower()
     : tf_(nullptr), costmap_ros_(nullptr), last_segment_(0), last_progress_(0.0),
-      last_linear_speed_(0.0), last_angular_speed_(0.0), lookahead_(0.2),
+      last_linear_speed_(0.0), last_angular_speed_(0.0), lookahead_(0.32),
+      lookahead_time_(0.75), max_lookahead_(0.60), max_lateral_accel_(0.22),
       corridor_(0.18), control_dt_(0.2), max_linear_speed_(0.35),
       max_angular_speed_(1.1), max_linear_accel_(2.5), max_angular_accel_(1.2),
-      xy_tolerance_(0.2), yaw_tolerance_(0.2), turn_threshold_(0.7),
-      initialized_(false), position_reached_(false), goal_reached_(false) {}
+      xy_tolerance_(0.2), yaw_tolerance_(0.2), turn_threshold_(0.8),
+      turn_exit_threshold_(0.45), initialized_(false), position_reached_(false),
+      goal_reached_(false), rotating_to_path_(false) {}
 
 void PathFollower::initialize(std::string name, tf2_ros::Buffer* tf,
                               costmap_2d::Costmap2DROS* costmap_ros) {
@@ -45,6 +47,9 @@ void PathFollower::initialize(std::string name, tf2_ros::Buffer* tf,
   costmap_ros_ = costmap_ros;
   ros::NodeHandle parameters("~/" + name);
   parameters.param("lookahead_m", lookahead_, lookahead_);
+  parameters.param("lookahead_time_s", lookahead_time_, lookahead_time_);
+  parameters.param("max_lookahead_m", max_lookahead_, max_lookahead_);
+  parameters.param("max_lateral_accel_mps2", max_lateral_accel_, max_lateral_accel_);
   parameters.param("max_path_deviation_m", corridor_, corridor_);
   parameters.param("control_dt_s", control_dt_, control_dt_);
   parameters.param("max_vel_x", max_linear_speed_, max_linear_speed_);
@@ -58,10 +63,14 @@ void PathFollower::initialize(std::string name, tf2_ros::Buffer* tf,
   xy_tolerance_.store(xy_tolerance);
   yaw_tolerance_.store(yaw_tolerance);
   parameters.param("turn_in_place_threshold", turn_threshold_, turn_threshold_);
+  parameters.param("turn_in_place_exit_threshold", turn_exit_threshold_, turn_exit_threshold_);
   ros::NodeHandle move_base("~");
   local_plan_pub_ = parameters.advertise<nav_msgs::Path>("local_plan", 1);
   legacy_local_plan_pub_ = move_base.advertise<nav_msgs::Path>("DWAPlannerROS/local_plan", 1);
-  initialized_ = tf_ && costmap_ros_ && lookahead_ > 0.0 && corridor_ > 0.0 &&
+  initialized_ = tf_ && costmap_ros_ && lookahead_ > 0.0 &&
+                 lookahead_time_ >= 0.0 && max_lookahead_ >= lookahead_ &&
+                 max_lateral_accel_ > 0.0 && turn_exit_threshold_ > 0.0 &&
+                 turn_exit_threshold_ < turn_threshold_ && corridor_ > 0.0 &&
                  control_dt_ > 0.0 && max_linear_speed_ > 0.0 && max_angular_speed_ > 0.0;
   if (!initialized_) ROS_ERROR("PathFollower invalid initialization or parameters");
   if (initialized_) {
@@ -102,6 +111,7 @@ bool PathFollower::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan) 
     goal_reached_ = false;
     last_linear_speed_ = 0.0;
     last_angular_speed_ = 0.0;
+    rotating_to_path_ = false;
   }
   return true;
 }
@@ -231,10 +241,20 @@ bool PathFollower::computeVelocityCommands(geometry_msgs::Twist& command) {
       return true;
     }
   }
-  const Point target = atDistance(std::min(lengths_.back(), nearest.progress + lookahead_));
+  const double lookahead_distance = std::clamp(
+      lookahead_ + lookahead_time_ * std::abs(last_linear_speed_),
+      lookahead_, max_lookahead_);
+  const double available = std::max(0.0, lengths_.back() - nearest.progress);
+  const double ahead = std::min(available, lookahead_distance);
+  const Point target = atDistance(nearest.progress + ahead);
   const double path_heading = std::atan2(target.y - current.y, target.x - current.x);
   const double heading_error = wrapAngle(path_heading - tf2::getYaw(in_path.pose.orientation));
-  const bool rotate_only = position_reached_ || std::abs(heading_error) > turn_threshold_;
+  if (rotating_to_path_) {
+    rotating_to_path_ = std::abs(heading_error) > turn_exit_threshold_;
+  } else {
+    rotating_to_path_ = std::abs(heading_error) > turn_threshold_;
+  }
+  const bool rotate_only = position_reached_ || rotating_to_path_;
   const double target_error = position_reached_
       ? wrapAngle(tf2::getYaw(destination.orientation) - tf2::getYaw(in_path.pose.orientation))
       : heading_error;
@@ -244,8 +264,23 @@ bool PathFollower::computeVelocityCommands(geometry_msgs::Twist& command) {
   const double angular = std::clamp(angular_target,
                                     last_angular_speed_ - max_angular_change,
                                     last_angular_speed_ + max_angular_change);
-  const double speed_limit = std::min(max_linear_speed_,
-      std::max(0.08, std::min(distance_to_goal, lookahead_) / control_dt_));
+  double curvature = 0.0;
+  if (ahead >= 0.15) {
+    const Point middle = atDistance(nearest.progress + ahead * 0.5);
+    const double first_heading = std::atan2(middle.y - nearest.point.y,
+                                            middle.x - nearest.point.x);
+    const double second_heading = std::atan2(target.y - middle.y,
+                                             target.x - middle.x);
+    curvature = std::abs(wrapAngle(second_heading - first_heading)) /
+                std::max(0.05, ahead * 0.5);
+  }
+  double speed_limit = std::min(max_linear_speed_,
+      std::max(0.08, std::min(distance_to_goal, lookahead_distance) / control_dt_));
+  if (curvature > 1e-6) {
+    speed_limit = std::min({speed_limit,
+        std::sqrt(max_lateral_accel_ / curvature),
+        max_angular_speed_ / curvature});
+  }
   const double desired_speed = rotate_only ? 0.0 :
       speed_limit * std::max(0.3, std::cos(heading_error));
   const double linear = std::clamp(desired_speed,

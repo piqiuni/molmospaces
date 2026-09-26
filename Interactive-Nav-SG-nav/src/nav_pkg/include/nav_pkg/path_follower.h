@@ -60,6 +60,9 @@ class PathFollower : public nav_core::BaseLocalPlanner {
   double last_linear_speed_;
   double last_angular_speed_;
   double lookahead_;
+  double lookahead_time_;
+  double max_lookahead_;
+  double max_lateral_accel_;
   double corridor_;
   double control_dt_;
   double max_linear_speed_;
@@ -69,9 +72,11 @@ class PathFollower : public nav_core::BaseLocalPlanner {
   std::atomic<double> xy_tolerance_;
   std::atomic<double> yaw_tolerance_;
   double turn_threshold_;
+  double turn_exit_threshold_;
   bool initialized_;
   bool position_reached_;
   bool goal_reached_;
+  bool rotating_to_path_;
 };
 
 }

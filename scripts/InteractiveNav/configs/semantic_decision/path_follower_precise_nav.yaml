@@ -6,7 +6,10 @@ GlobalPlanner:
   orientation_window_size: 8
 
 PathFollower:
-  lookahead_m: 0.20
+  lookahead_m: 0.32
+  lookahead_time_s: 0.75
+  max_lookahead_m: 0.60
+  max_lateral_accel_mps2: 0.22
   max_path_deviation_m: 0.18
   control_dt_s: 0.20
   max_vel_x: 0.35
@@ -15,7 +18,8 @@ PathFollower:
   acc_lim_theta: 1.2
   xy_goal_tolerance: 0.12
   yaw_goal_tolerance: 0.20
-  turn_in_place_threshold: 0.70
+  turn_in_place_threshold: 0.80
+  turn_in_place_exit_threshold: 0.45
 
 global_costmap:
   transform_tolerance: 3.0

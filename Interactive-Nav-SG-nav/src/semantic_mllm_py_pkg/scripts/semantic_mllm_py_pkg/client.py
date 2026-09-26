@@ -157,6 +157,10 @@ class MLLMClient:
         if config.timeout_s <= 0.0:
             raise TimeoutError("timed out")
         protocol = str(config.protocol or "openai_chat").casefold()
+        if protocol == "typesafe_systemone":
+            return self._request_typesafe_choice(
+                role, instruction, context, images, started, config
+            )
         request_instruction = self._instruction_for_request(instruction, config)
         if protocol in {"generic", "interactive_navigation"}:
             body_payload: dict[str, Any] = {
@@ -226,6 +230,10 @@ class MLLMClient:
             else:
                 body_payload["enable_thinking"] = True
                 body_payload["chat_template_kwargs"] = {"enable_thinking": True}
+            # MiMo uses thinking.type rather than enable_thinking to disable CoT.
+            thinking_type = os.environ.get("SEMANTIC_MODEL_THINKING_TYPE", "").casefold()
+            if thinking_type in {"enabled", "disabled"}:
+                body_payload["thinking"] = {"type": thinking_type}
         is_openai_chat = protocol in {"openai_chat", "chat_completions", "openai"}
         if is_openai_chat:
             body_payload["stream"] = True
@@ -279,6 +287,98 @@ class MLLMClient:
             raw_http_response=raw,
             usage=dict(usage),
             error=parse_error,
+        )
+
+    def _request_typesafe_choice(
+        self,
+        role: str,
+        instruction: str,
+        context: dict[str, Any],
+        images: list[str],
+        started: float,
+        config: MLLMClientConfig,
+    ) -> MLLMResponse:
+        if role != "subgoal_selection" or images:
+            raise ValueError("TypeSafe choice supports text-only subgoal selection")
+        candidate_ids = list(dict.fromkeys(
+            str(item.get("id") or "")
+            for item in context.get("candidates") or []
+            if isinstance(item, dict) and item.get("id")
+        ))
+        if not 1 <= len(candidate_ids) <= 255:
+            raise ValueError("TypeSafe choice requires 1–255 candidates")
+        body = {
+            "model": config.model,
+            "state": context,
+            "questions": {
+                "next_subgoal": {
+                    "type": "choice",
+                    "instructions": instruction,
+                    "criteria": {candidate_id: None for candidate_id in candidate_ids},
+                }
+            },
+        }
+        key = os.environ.get(config.api_key_env, "") if config.api_key_env else ""
+        if not key:
+            raise ValueError("TypeSafe API key is missing")
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        endpoint = self._resolved_endpoint("typesafe_systemone", config.endpoint)
+        encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        deadline = time.monotonic() + config.timeout_s
+        for attempt in range(4):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            req = request.Request(endpoint, data=encoded, headers=headers, method="POST")
+            try:
+                with request.urlopen(req, timeout=remaining) as response_obj:
+                    raw = response_obj.read().decode("utf-8")
+                break
+            except urllib_error.HTTPError as exc:
+                if exc.code not in {429, 529} or attempt == 3:
+                    raise
+                retry_after = exc.headers.get("Retry-After", "")
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = 0.5 * 2**attempt
+                time.sleep(min(max(0.0, delay), 8.0, max(0.0, deadline - time.monotonic())))
+        envelope = json.loads(raw)
+        usage = envelope.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        answer = (envelope.get("answers") or {}).get("next_subgoal") or {}
+        choice = str(answer.get("choice") or "")
+        probabilities = answer.get("probabilities") or {}
+        if choice not in candidate_ids or not isinstance(probabilities, dict):
+            payload = None
+            error = "TypeSafe choice omitted a valid current candidate"
+        else:
+            others = sorted(
+                (candidate_id for candidate_id in candidate_ids if candidate_id != choice),
+                key=lambda candidate_id: -float(probabilities.get(candidate_id) or 0.0),
+            )
+            confidence = float(answer.get("confidence") or 0.0)
+            payload = {
+                "ranked_ids": [choice, *others[:2]],
+                "reason": "NO_SEMANTIC_PREFERENCE",
+                "confidence": "high" if confidence >= 0.75 else "medium" if confidence >= 0.45 else "low",
+            }
+            error = ""
+        return MLLMResponse(
+            payload=payload,
+            latency_s=time.perf_counter() - started,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            raw_text=json.dumps(payload, ensure_ascii=False) if payload is not None else raw,
+            raw_http_response=raw,
+            usage=dict(usage),
+            error=error,
         )
 
     def _request_openai_chat_stream(
