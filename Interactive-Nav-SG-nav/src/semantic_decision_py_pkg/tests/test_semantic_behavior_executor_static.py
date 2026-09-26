@@ -274,6 +274,47 @@ def _portal_selection() -> dict:
     }
 
 
+@pytest.mark.parametrize("outcome", ["ready", "empty", "error", "resumed", "reselected"])
+def test_paused_plan_preview_never_dispatches_motion(executor_module, monkeypatch, outcome):
+    m = executor_module
+    executor = object.__new__(m.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    candidate = _portal_selection()
+    executor.selection = dict(candidate)
+    executor._execution_pause_generation = 1
+    executor._paused_plan_preview_busy = True
+    executor.map_frame = "map"
+    executor.make_plan_service = "/move_base/GlobalPlanner/make_plan"
+    executor.make_plan_tolerance_m = .2
+    executor._current_pose = lambda frame: (0., 0., 0.)
+    executor._execution_is_paused = lambda: outcome != "resumed"
+    plans = []
+    executor.paused_plan_pub = SimpleNamespace(publish=plans.append)
+    monkeypatch.setattr(m.rospy.Time, "now", staticmethod(lambda: m.rospy.Time(10)))
+    monkeypatch.setattr(m.rospy, "wait_for_service", lambda *a, **kw: None)
+    def request(**kwargs):
+        assert kwargs["goal"].pose.position.x == 1.0
+        if outcome == "error":
+            raise RuntimeError("planner unavailable")
+        if outcome == "reselected":
+            executor.selection = {**candidate, "decision_id": "new"}
+        path = m.Path()
+        if outcome != "empty":
+            path.poses = [kwargs["start"], kwargs["goal"]]
+        return SimpleNamespace(plan=path)
+    monkeypatch.setattr(m.rospy, "ServiceProxy", lambda *a, **kw: request)
+    # No action client, velocity publisher or machine is provided: this path
+    # must only call GetPlan and publish its visualization result.
+    executor._paused_plan_preview_worker(candidate, 1)
+    assert not executor._paused_plan_preview_busy
+    if outcome in {"resumed", "reselected"}:
+        assert not plans
+    else:
+        assert len(plans) == 1
+        assert executor._paused_plan_preview_status["planning_only"]
+        assert len(plans[0].poses) == (2 if outcome == "ready" else 0)
+
+
 @pytest.mark.parametrize(
     "timeout_reason",
     ("navigation_timeout", "interaction_navigation_timeout"),
@@ -2605,6 +2646,9 @@ def _direct_m1_capture_navigation_executor(
     class _Watchdog:
         def __init__(self, **kwargs) -> None:
             trace["watchdog_kwargs"].append(dict(kwargs))
+
+        def set_execution_enabled(self, *_args):
+            return 0, 0.0
 
         def reset(self, *_args, **_kwargs) -> None:
             return None
@@ -7136,3 +7180,172 @@ def test_portal_preflight_ranks_all_safe_goals_and_binds_chosen_tolerance(execut
     assert chosen["interaction_command"]["interaction_approach_pose_xyyaw"] == goals[1]
     assert chosen["interaction_command"]["navigation_goal_position_tolerance_m"] < .15
     assert chosen["interaction_command"]["interaction_approach_axis_xy"] == [1., 0.]
+
+
+def _paused_executor(executor_module):
+    from semantic_decision_py_pkg.progress_pause import ProgressPause
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.execution_pause_enabled = True
+    executor.progress_execution_state = SimpleNamespace(enabled=False)
+    executor._execution_pause_clock = ProgressPause()
+    executor._execution_was_paused = False
+    executor._execution_pause_generation = 0
+    executor._deferred_execution_commands = []
+    executor._active_navigation_run_tokens = {"decision_static": 1}
+    executor._latest_step_sync_index = 0
+    executor.selection = _portal_selection()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.machine.start(executor.selection, now=0.0, task_step_index=0)
+    executor.machine.state = executor_module.STATE_APPROACH_INTERACTION
+    messages = []
+    executor.state_pub = SimpleNamespace(messages=messages, publish=lambda msg: messages.append(json.loads(msg.data)))
+    executor.stops = []
+    executor._send_owned_base_stop = lambda: executor.stops.append("stop")
+    return executor
+
+
+@pytest.mark.parametrize("kind", ["navigate", "interact", "reserve_frontier", "scan",
+                                  "request_interaction_observation", "publish_drawer_scan"])
+def test_execution_disabled_defers_commands_without_starting_workers(executor_module, monkeypatch, kind):
+    executor = _paused_executor(executor_module)
+    monkeypatch.setattr(executor_module.threading, "Thread", lambda **kw: pytest.fail("disabled execution spawned worker"))
+    executor._publish_interaction_command = lambda candidate: pytest.fail("disabled interaction sent")
+    command = {"kind": kind, "candidate": executor.selection}
+    executor._dispatch([command, command])
+    assert executor._deferred_execution_commands == [command]
+    assert executor.selection["decision_id"] == "decision_static"
+
+
+def test_execution_pause_freezes_machine_timeout_and_preserves_budget(executor_module, monkeypatch):
+    executor = _paused_executor(executor_module)
+    executor.machine.config.interaction_navigation_timeout_task_steps = 10
+    executor.progress_execution_state.enabled = True
+    now = [0.0]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: now[0])
+    executor._update_execution_pause_locked()
+    executor._latest_step_sync_index = 4
+    now[0] = 4.0
+    executor._update_execution_pause_locked()
+    executor.progress_execution_state.enabled = False
+    executor._update_execution_pause_locked()
+    now[0] = 100.0
+    executor._latest_step_sync_index = 100
+    executor._tick(None)
+    assert not executor._effective_timeout_reason_locked()
+    assert executor.stops == ["stop"]
+    assert executor._active_navigation_run_tokens == {}
+    assert executor.state_pub.messages[-1]["execution_paused"] is True
+    executor.progress_execution_state.enabled = True
+    executor._latest_step_sync_index = 104
+    now[0] = 104
+    executor._update_execution_pause_locked()
+    assert executor.machine.state_started_task_step_index == 100
+    assert not executor.machine.timeout_reason(now=109, task_step_index=109)
+    assert executor.machine.timeout_reason(now=110, task_step_index=110) == "interaction_navigation_timeout"
+
+
+def test_sent_interaction_preserves_remaining_budget_after_long_pause(executor_module, monkeypatch):
+    executor = _paused_executor(executor_module)
+    now = [10.0]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: now[0])
+    executor._interaction_command_sent_id = "sent_once"
+    executor._interaction_command_sent_at = 8.0
+    executor._interaction_execution_progress = {
+        "command_id": "sent_once", "received_at": 9.0, "progress_age_s": 0.0,
+    }
+    executor._drawer_scan_execution_wait = {
+        "command_id": "sent_once", "started_step_index": 0,
+        "started_at_monotonic_s": 8.0, "max_task_steps": 10, "step_budget_margin": 0,
+    }
+    executor._latest_step_sync_index = 2
+    executor._update_execution_pause_locked()
+    now[0] = 1010.0
+    executor._latest_step_sync_index = 1002
+    executor.progress_execution_state.enabled = True
+    executor._update_execution_pause_locked()
+    executor._guard_interaction_execution_locked()
+    assert not getattr(executor, "_interaction_execution_terminal", {})
+    assert executor._interaction_execution_progress["received_at"] == 1009.0
+    assert executor._drawer_scan_execution_wait["started_at_monotonic_s"] == 1008.0
+    assert executor._drawer_scan_execution_wait["started_step_index"] == 1000
+    assert executor._interaction_command_sent_id == "sent_once"
+    executor._latest_step_sync_index = 1011
+    executor._guard_interaction_execution_locked()
+    assert executor._interaction_execution_terminal["reason"] == "drawer_scan_execution_step_budget_exhausted"
+
+
+def test_paused_goal_is_never_sent_and_stale_decision_cannot_resume(executor_module):
+    executor = _paused_executor(executor_module)
+    sent = []
+    executor.move_base = SimpleNamespace(send_goal=sent.append)
+    assert not executor._send_navigation_goal(object(), "decision_static")
+    executor.progress_execution_state.enabled = True
+    assert not executor._send_navigation_goal(object(), "old_decision")
+    assert not sent
+    assert executor._send_navigation_goal("goal", "decision_static")
+    assert sent == ["goal"]
+
+
+def test_pause_fails_closed_without_state_and_suppresses_direct_velocity(executor_module):
+    executor = _paused_executor(executor_module)
+    del executor.progress_execution_state
+    published = []
+    executor.cmd_vel_pub = SimpleNamespace(publish=published.append)
+    assert executor._execution_is_paused()
+    command = executor_module.Twist()
+    command.linear.x = 0.5
+    command.angular.z = 0.8
+    executor._publish_execution_twist(command)
+    executor._publish_rotation(0.8)
+    assert len(published) == 2
+    assert all(msg.linear.x == 0 and msg.angular.z == 0 for msg in published)
+
+
+def test_old_worker_cannot_send_after_quick_disable_enable(executor_module):
+    executor = _paused_executor(executor_module)
+    executor.progress_execution_state.enabled = True
+    executor._execution_worker_context = threading.local()
+    executor._execution_worker_context.generation = 0
+    executor._execution_pause_generation = 1
+    sent, velocities = [], []
+    executor.move_base = SimpleNamespace(send_goal=sent.append)
+    executor.cmd_vel_pub = SimpleNamespace(publish=velocities.append)
+    assert not executor._send_navigation_goal("stale", "decision_static", 1)
+    assert not executor._navigation_is_current("decision_static")
+    executor._publish_rotation(0.8)
+    assert not sent
+    assert velocities[-1].angular.z == 0
+
+
+def test_paused_commands_cannot_leak_into_next_decision_or_phase(executor_module):
+    executor = _paused_executor(executor_module)
+    old_command = {"kind": "interact", "candidate": dict(executor.selection)}
+    executor._dispatch([old_command])
+    executor.progress_execution_state.enabled = True
+    executor.selection = {**executor.selection, "decision_id": "replacement"}
+    executor._publish_interaction_command = lambda candidate: pytest.fail("stale interaction leaked")
+    executor._dispatch(executor._deferred_execution_commands)
+    executor.selection["decision_id"] = "decision_static"
+    executor.machine.state = executor_module.STATE_NAVIGATING
+    executor._dispatch(executor._deferred_execution_commands)
+
+
+def test_pause_resume_reuses_one_navigation_worker_and_ignores_old_result(executor_module, monkeypatch):
+    executor = _paused_executor(executor_module)
+    executor.progress_execution_state.enabled = True
+    executor._move_base_action_name = "move_base"
+    calls = []
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+    def run(decision_id, candidate, *_args):
+        calls.append(decision_id)
+        if len(calls) == 1:
+            executor.progress_execution_state.enabled = False
+            executor._update_execution_pause_locked()
+            assert not executor._navigation_run_is_active(decision_id, 1)
+            executor._handle_navigation_result(decision_id, False, {"reason": "PREEMPTED"}, navigation_run_token=1)
+            executor.progress_execution_state.enabled = True
+    executor._run_navigation_serialized = run
+    executor._run_navigation("decision_static", executor.selection)
+    assert calls == ["decision_static", "decision_static"]
+    assert executor.stops == ["stop"]

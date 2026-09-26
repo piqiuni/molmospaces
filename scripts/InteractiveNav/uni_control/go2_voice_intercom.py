@@ -23,6 +23,7 @@ import time
 import types
 from typing import Any, Optional
 import wave
+from speech_assets import prerecorded_audio, is_english_text
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -383,6 +384,13 @@ class PersistentSpeechSession:
         speed = getattr(self.matcha_synthesizer, "speech_speed", 1.0)
         silence = getattr(self.matcha_synthesizer, "silence_scale", 0.2)
         profile = f"{self.synthesis_backend}:{speed:.3f}:{silence:.3f}"
+        asset = prerecorded_audio(text)
+        if asset is not None and not asset.is_file():
+            raise RuntimeError(f"missing prerecorded speech asset: {asset}; run prepare_interaction_audio.py")
+        if asset is not None and asset.is_file():
+            profile = "prerecorded-v1:" + hashlib.sha256(asset.read_bytes()).hexdigest()
+        elif is_english_text(text):
+            profile = "english-edge-v1"
         digest = hashlib.sha256(
             f"{profile}\0{voice}\0{text}".encode("utf-8")
         ).hexdigest()[:20]
@@ -427,12 +435,21 @@ class PersistentSpeechSession:
         }
         mp3_path = wav_path.with_suffix(".mp3")
         started = time.perf_counter()
+        asset = prerecorded_audio(text)
+        if asset is not None and asset.is_file():
+            with wave.open(str(asset), "rb") as audio:
+                duration = audio.getnframes() / audio.getframerate()
+                if duration < 1.5 or audio.getnchannels() != 1 or audio.getsampwidth() != 2:
+                    raise RuntimeError(f"invalid prerecorded speech asset: {asset}")
+            shutil.copyfile(asset, wav_path)
+            return {**summary, "synthesis_backend": "prerecorded", "audio_duration_seconds": duration,
+                    "total_synthesis_seconds": 0.0, "wav_bytes": wav_path.stat().st_size}
         try:
-            if self.synthesis_backend == "matcha":
+            if self.synthesis_backend == "matcha" and not is_english_text(text):
                 synthesizer = self.matcha_synthesizer or MatchaTtsSynthesizer()
                 summary.update(synthesizer.synthesize(text, wav_path))
             else:
-                await synthesize_text(text, voice, mp3_path, wav_path)
+                await synthesize_text(text, "en-US-AriaNeural" if is_english_text(text) else voice, mp3_path, wav_path)
                 summary["synthesis_backend"] = "edge"
         except Exception as primary_error:
             if self.synthesis_backend == "edge" or self.fallback_backend != "edge":
@@ -463,7 +480,7 @@ class PersistentSpeechSession:
                 return cached_id, {
                     "audio_cache_hit": True,
                     "preloaded": True,
-                    "synthesis_backend": self.synthesis_backend,
+                    "synthesis_backend": "prerecorded" if prerecorded_audio(text) else self.synthesis_backend,
                     "requested_synthesis_backend": self.synthesis_backend,
                     "total_synthesis_seconds": 0.0,
                 }
@@ -473,7 +490,7 @@ class PersistentSpeechSession:
                 return cached_id, {
                     "audio_cache_hit": True,
                     "preloaded": True,
-                    "synthesis_backend": self.synthesis_backend,
+                    "synthesis_backend": "prerecorded" if prerecorded_audio(text) else self.synthesis_backend,
                     "requested_synthesis_backend": self.synthesis_backend,
                     "total_synthesis_seconds": 0.0,
                 }

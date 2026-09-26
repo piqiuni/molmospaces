@@ -35,7 +35,8 @@ def test_defaults_and_environment_are_shared_with_supervisor():
     result = launch()
     assert option(result, "--device") == "cuda:0"
     assert option(result, "--rate") == "10"
-    assert option(result, "--camera-z") == "0.98"
+    assert option(result, "--camera-z") == "0.885"
+    assert option(result, "--camera-pitch") == "0.157079633"
     result = launch(PHYSICAL_NAV_YOLO_GPU="1", PHYSICAL_NAV_YOLO_RATE="5",
                     PHYSICAL_NAV_CAMERA_Z="1.2", PHYSICAL_NAV_START_WEB="0")
     assert option(result, "--device") == "cuda:1"

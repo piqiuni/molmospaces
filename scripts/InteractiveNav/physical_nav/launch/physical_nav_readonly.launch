@@ -3,10 +3,10 @@
   <arg name="config_file" default="$(find physical_nav)/config/physical_nav.yaml"/>
   <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"/>
   <arg name="device" default="cuda:0"/>
-  <!-- Normal standing Go2 base_link height is 0.305 m; camera ground height 1.285 m => relative z 0.980 m. -->
-  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
-  <!-- Camera points 8 degrees forward/down; RPY values are radians. -->
-  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.1396263"/><arg name="camera_yaw" default="0.0"/>
+  <!-- Normal standing Go2 base_link height is 0.305 m; camera ground height 1.190 m => relative z 0.885 m. -->
+  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.885"/>
+  <!-- Camera points 9 degrees forward/down; RPY values are radians. -->
+  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.157079633"/><arg name="camera_yaw" default="0.0"/>
   <!-- D435i gravity correction is applied to both colour/depth TF children.
        It is inert until Go2 sends a calibrated camera_imu sample; yaw stays
        disabled because gyro integration has no absolute heading reference.
@@ -45,17 +45,15 @@
     <!-- 256 tokens frequently truncates M1's JSON before the closing
          interaction_parts/action_regions fields.  Keep the response small,
          but leave enough room for a valid structured result. -->
-    <param name="max_output_tokens" value="384"/>
+    <param name="max_output_tokens" value="768"/>
     <param name="request_timeout_s" value="20.0"/>
     <param name="min_interval_s" value="2.0"/>
     <!-- Generic locker/safe tracks that M1 calls refrigerator receive one
          independent recheck; stop after two confirmations to avoid a permanent
          GPU refresh loop. -->
     <param name="m1_recheck_refresh_interval_s" value="2.0"/>
-    <!-- Keep M1's admission vocabulary identical to the physical interaction
-         candidate whitelist: only door and fridge objects may trigger VLM
-         attribute analysis. -->
-    <rosparam param="include_keywords">[door, fridge, refrigerator, locker]</rosparam>
+    <!-- M1 include/exclude_keywords are owned by config_file, independently
+         of the M2/M3 interaction-goal whitelist. Do not narrow review here. -->
     <!-- Physical M1 consumes the 3-D ObjectMap's stable tracked detections;
          the raw mapper topic remains unchanged. Thin door masks commonly
          occupy 5-15% of their 2-D rectangle, so use a physical-only gate. -->

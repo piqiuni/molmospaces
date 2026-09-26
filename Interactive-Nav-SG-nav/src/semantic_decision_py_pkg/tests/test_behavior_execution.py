@@ -183,6 +183,16 @@ def test_navigation_progress_watchdog_resets_on_translation_or_rotation() -> Non
     assert bounded.observe((0.0, 0.0, -0.40), now=12.0)
 
 
+def test_physical_stall_expires_at_five_seconds_despite_fresh_plan():
+    watchdog = NavigationProgressWatchdog(timeout_s=5.0, timeout_task_steps=25,
+                                          allow_yaw_progress=False)
+    watchdog.reset((0.0, 0.0, 0.0), 0.0, 2.0, 0)
+    assert not watchdog.observe((0.0, 0.0, 0.0), 4.8,
+        goal_distance_m=2.0, local_plan_fresh=True, task_step_index=24)
+    assert watchdog.observe((0.0, 0.0, 0.0), 5.0,
+        goal_distance_m=2.0, local_plan_fresh=True, task_step_index=25)
+
+
 def test_navigation_progress_watchdog_keeps_a_fresh_local_plan_making_goal_progress() -> None:
     watchdog = NavigationProgressWatchdog(
         timeout_s=12.0,

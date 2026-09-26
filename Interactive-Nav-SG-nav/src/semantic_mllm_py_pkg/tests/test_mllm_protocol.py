@@ -34,6 +34,34 @@ def _patch_openai_stream(monkeypatch, raw_response: str, captured: dict | None =
     return captured
 
 
+@pytest.mark.parametrize("message", ["", "connection reset by peer"])
+def test_httpx_read_error_preserves_transport_failure(monkeypatch, message) -> None:
+    def fail_client(**kwargs):
+        raise client_module.httpx.ReadError(message)
+
+    monkeypatch.setattr(client_module.httpx, "AsyncClient", fail_client)
+    response = MLLMClient(
+        MLLMClientConfig(mode="http", endpoint="http://127.0.0.1:8317/v1")
+    ).request_json(role="room_attribute_inference", instruction="classify", context={})
+
+    assert response.payload is None
+    assert response.error.startswith("ReadError")
+    assert message in response.error
+
+
+def test_exception_without_message_is_never_reported_as_success(monkeypatch) -> None:
+    def fail_request(*args, **kwargs):
+        raise OSError()
+
+    monkeypatch.setattr(MLLMClient, "_request_http", fail_request)
+    response = MLLMClient(
+        MLLMClientConfig(mode="http", endpoint="http://127.0.0.1:8317/v1")
+    ).request_json(role="room_attribute_inference", instruction="classify", context={})
+
+    assert response.payload is None
+    assert response.error == "OSError"
+
+
 def test_openai_chat_stream_timeout_closes_response(monkeypatch) -> None:
     events = {}
 
@@ -688,6 +716,21 @@ def test_invalid_http_json_keeps_raw_text_and_usage(monkeypatch) -> None:
     assert response.completion_tokens == 5
 
 
+def test_length_limited_response_is_not_accepted_even_if_json_parses(monkeypatch):
+    raw_response = json.dumps({
+        "choices": [{"message": {"content": '{"confidence":0.9}'},
+                     "finish_reason": "length"}],
+        "usage": {"completion_tokens": 384},
+    })
+    _patch_openai_stream(monkeypatch, raw_response)
+    response = MLLMClient(MLLMClientConfig(
+        mode="http", endpoint="http://localhost:8317/v1"
+    )).request_json(role="attribute_inference", instruction="inspect", context={})
+    assert response.payload is None
+    assert "output truncated" in response.error
+    assert response.metrics()["finish_reason"] == "length"
+
+
 def test_openai_chat_reasoning_off_uses_enable_thinking(monkeypatch) -> None:
     captured = {}
     raw_response = (
@@ -713,6 +756,7 @@ def test_openai_chat_reasoning_off_uses_enable_thinking(monkeypatch) -> None:
 
     assert captured["endpoint"] == "http://localhost:8317/v1/chat/completions"
     assert captured["payload"]["enable_thinking"] is False
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["payload"]["reasoning_effort"] == "none"
     assert "/no_think" in captured["payload"]["messages"][1]["content"][0]["text"]
     assert response.payload == {"candidate_id": "candidate_1"}

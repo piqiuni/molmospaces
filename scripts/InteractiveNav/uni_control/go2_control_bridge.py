@@ -65,6 +65,9 @@ class SpeechJob:
 PRELOADED_INTERACTION_PROMPTS = (
     "您好，请帮我把前面的门打开，谢谢。",
     "您好，请帮我把前面的冰箱打开，谢谢。",
+    "Please open the door in front of me. Thank you.",
+    "Please open the refrigerator in front of me. Thank you.",
+    "Please open the drawer in front of me. Thank you.",
 )
 
 

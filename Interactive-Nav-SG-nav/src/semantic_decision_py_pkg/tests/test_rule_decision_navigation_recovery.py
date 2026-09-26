@@ -218,6 +218,23 @@ def test_global_mission_timer_grants_new_goal_its_navigation_window(node, monkey
     assert published_statuses == ["EXPLORATION_STALLED"]
 
 
+def test_physical_global_stall_preempts_without_terminating_mission(node):
+    node.global_no_progress_terminal = False
+    node.active_candidate_id = "frontier:stuck"
+    node.active_decision_id = "decision_stuck"
+    node.active_behavior_type = "EXPLORE"
+    node._observe_global_navigation_progress(snapshot(0))
+    node._observe_global_navigation_progress(snapshot(180))
+    assert not node.goal_complete
+    assert node.preempt_pub.messages[-1]["reason"] == "semantic_mission_no_progress"
+    assert node.goal_status_pub.messages[-1]["status"] == "NAVIGATION_RECOVERY"
+    node._handle_feedback({"candidate_id": "frontier:stuck",
+                           "decision_id": "decision_stuck", "status": "FAILED",
+                           "detail": {"semantic_mission_no_progress": True}})
+    assert not node.goal_complete
+    assert not node.active_candidate_id
+
+
 def test_resolved_frontier_preempts_only_after_consecutive_observations(node):
     node.active_candidate_id = "frontier:old"
     node.active_decision_id = "decision_old"
@@ -469,6 +486,63 @@ def test_three_navigation_failures_use_existing_terminal_limit(node):
     ) == ([], {CANDIDATE_ID: "interaction_approach_terminal_unreachable"})
 
 
+def test_physical_door_exhaustion_cools_down_then_retries(node, monkeypatch):
+    node.portal_approach_retry_enabled = True
+    node.portal_approach_retry_cooldown_s = 15.0
+    monkeypatch.setattr(decision.time, "monotonic", lambda: 100.0)
+    door = candidate()
+    door.update(target_name="door", interaction_command={"action": "open", "node_type": "portal"})
+    for attempt in range(4):
+        node.latest_candidates_payload = snapshot(426, candidates=[door])
+        node.active_candidate_id = CANDIDATE_ID
+        node.active_decision_id = f"door_retry_{attempt}"
+        node.active_behavior_type = "INTERACT"
+        node.active_interaction_candidate = door
+        node._handle_feedback({
+            "status": "FAILED", "episode_id": "h5", "candidate_id": CANDIDATE_ID,
+            "decision_id": node.active_decision_id,
+            "detail": {"reason": "interaction_approach_options_exhausted",
+                       "failure_stage": "interaction_approach_exhausted", "action_executed": False},
+        })
+        assert not node.interaction_failure_tracker.terminal_candidate_ids
+        assert not node.approach_exhausted_fingerprints
+        assert node.cooldown_until[CANDIDATE_ID] == 115.0
+        assert node.cooldown_until[TARGET_KEY] == 115.0
+        eligible, rejected = node._eligible_candidates_from_snapshot(
+            snapshot(500, candidates=[door]), now=110.0, region_history={})
+        assert rejected[CANDIDATE_ID] == "candidate_cooldown"
+        eligible, rejected = node._eligible_candidates_from_snapshot(
+            snapshot(500, candidates=[door]), now=116.0, region_history={})
+        assert CANDIDATE_ID not in rejected
+        assert any(c.candidate_id == CANDIDATE_ID for c in eligible)
+
+
+def test_nearby_exploration_defers_far_goals_but_falls_back(node, monkeypatch):
+    node.nearby_exploration_enabled = True
+    node.nearby_exploration_ratio = 1.5
+    node.nearby_exploration_slack_m = 1.0
+    monkeypatch.setattr(node.candidate_curator, "filter_candidates", lambda c, **kw: (c, {}))
+    def frontier(cid, distance):
+        return BehaviorCandidate(candidate_id=cid, behavior_type="EXPLORE", source="explore_py",
+                                 target_id=cid, target_name=cid,
+                                 goal_xyyaw=[distance, 0, 0], features={"distance_m": distance}).to_dict()
+    payload = snapshot(20, candidates=[frontier("frontier:near", 2), frontier("frontier:far", 8), candidate()])
+    payload["robot_xy"] = [0, 0]
+    eligible, rejected = node._eligible_candidates_from_snapshot(payload, now=100, region_history={})
+    assert rejected["frontier:far"] == "deferred_for_nearby_frontier"
+    assert {c.candidate_id for c in eligible} == {"frontier:near", CANDIDATE_ID}
+    node.cooldown_until["frontier:near"] = 200
+    eligible, rejected = node._eligible_candidates_from_snapshot(payload, now=100, region_history={})
+    assert "frontier:far" in {c.candidate_id for c in eligible}
+    node.cooldown_until.clear()
+    near = BehaviorCandidate(**payload["candidates"][0])
+    key = decision.candidate_history_key(near, {}, node.candidate_curator.config.region_size_m)
+    eligible, rejected = node._eligible_candidates_from_snapshot(
+        payload, now=100, region_history={key: {"low_gain_repeat_count": 2}})
+    assert rejected["frontier:near"] == "deferred_repeated_low_gain_frontier"
+    assert "frontier:far" in {c.candidate_id for c in eligible}
+
+
 def test_no_step_navigation_feedback_uses_finite_wall_fallback(node, monkeypatch):
     node.latest_candidates_payload = snapshot(426)
     node.latest_candidates_payload["exploration_context"].pop("observation_step")
@@ -686,6 +760,109 @@ def decide(node, payload):
     node._decide_from_snapshot(copy.deepcopy(payload))
 
 
+@pytest.mark.parametrize("enabled,ready", [(False, True), (True, False), (False, False)])
+def test_no_candidate_clock_does_not_start_until_execution_and_map_ready(enabled, ready):
+    tracker = decision.NoEligibleCandidateTracker(recovery_scan_enabled=False)
+    for step in (0, 200, 1000):
+        detail = tracker.update(snapshot(step, [], ready=ready), eligible_candidate_count=0,
+                                has_active_behavior=False, execution_enabled=enabled, require_ready=True)
+        assert detail["paused"] and not detail["blocked"]
+    assert tracker.since_step is None
+
+
+def test_no_candidate_pause_preserves_used_budget(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(decision.time, "monotonic", lambda: now[0])
+    tracker = decision.NoEligibleCandidateTracker(min_steps=10, recovery_scan_enabled=False)
+    def update(step, enabled=True):
+        now[0] = float(step)
+        return tracker.update(snapshot(step, [], ready=True), eligible_candidate_count=0,
+                              has_active_behavior=False, execution_enabled=enabled, require_ready=True)
+    update(0)
+    update(4)
+    update(4, False)
+    update(100, False)
+    assert not update(104)["blocked"]
+    assert not update(109)["blocked"]
+    assert update(110)["blocked"]
+
+
+def test_disabled_motion_still_selects_candidate(node):
+    node.execution_pause_enabled = True
+    node.progress_execution_state = SimpleNamespace(enabled=False)
+    decide(node, snapshot(200, ready=True))
+    assert node.active_candidate_id == CANDIDATE_ID
+    assert node.selected_pub.messages[-1]["candidate_id"] == CANDIDATE_ID
+    assert not node.goal_complete
+
+
+def test_candidate_recovery_unlatches_only_no_candidate_stall(node):
+    node.execution_pause_enabled = True
+    node.goal_complete = True
+    node._recoverable_no_candidate_stall = True
+    node.target_context = {}
+    payload = snapshot(200, ready=True)
+    node.latest_candidates_payload = copy.deepcopy(payload)
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert not node.goal_complete
+    assert node.goal_status_pub.messages[-1]["detail"]["reason"] == "candidates_recovered"
+    node.goal_complete = True
+    node._recoverable_no_candidate_stall = False
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert node.goal_complete
+
+
+def test_recoverable_stall_does_not_unlatch_for_still_ineligible_candidate(node):
+    node.goal_complete = True
+    node._recoverable_no_candidate_stall = True
+    node.container_anchor_unreachable_until_step[TARGET_KEY] = 500
+    payload = snapshot(200, ready=True)
+    node.latest_candidates_payload = copy.deepcopy(payload)
+    node._candidate_callback(SimpleNamespace(data=json.dumps(payload)))
+    assert node.goal_complete
+
+
+@pytest.mark.parametrize("backend", ["rule", "model"])
+def test_interaction_scope_covers_rule_and_model_failure_fallback(node, monkeypatch, backend):
+    from semantic_decision_py_pkg.interaction_scope import InteractionGoalScope
+    node.interaction_goal_scope = InteractionGoalScope.from_config({
+        "allowed_semantic_types": ["door", "fridge"],
+    })
+    node.policy_backend = backend
+    forbidden = candidate(semantic_name="locker", node_type="container")
+    forbidden.update(candidate_id="interaction:locker:open", target_id="locker", target_name="locker")
+    allowed = candidate(semantic_name="refrigerator", node_type="container")
+    if backend == "model":
+        def unavailable(candidates, **kwargs):
+            assert all(node.interaction_goal_scope.allows_candidate(c) for c in candidates)
+            node.model_policy.last_error = "model HTTP response must be a JSON object"
+            node.model_policy.last_result_source = "rule_fallback"
+            return None
+        monkeypatch.setattr(node.model_policy, "select", unavailable)
+    decide(node, snapshot(10, [forbidden, allowed]))
+    assert node.selected_pub.messages[-1]["candidate_id"] == CANDIDATE_ID
+    assert node.trace_pub.messages[-1]["eligibility_rejections"][forbidden["candidate_id"]] == "interaction_semantic_not_allowed"
+
+
+def test_delayed_model_cannot_execute_target_demoted_outside_whitelist(node, monkeypatch):
+    from semantic_decision_py_pkg.interaction_scope import InteractionGoalScope
+    node.interaction_goal_scope = InteractionGoalScope.from_config({"allowed_semantic_types": ["door", "fridge"]})
+    node.policy_backend = "model"
+    fridge = candidate(semantic_name="fridge", node_type="container")
+    frontier = BehaviorCandidate(candidate_id="frontier:safe", behavior_type="EXPLORE",
+                                 source="frontier", target_id="safe", target_name="frontier",
+                                 goal_xyyaw=[1, 2, 0]).to_dict()
+    def delayed_result(candidates, **kwargs):
+        demoted = copy.deepcopy(fridge)
+        demoted["metadata"]["semantic_name"] = "water_dispenser"
+        node.latest_candidates_payload = snapshot(11, [demoted, frontier])
+        node.model_policy.last_result_source = "model"
+        return next(c for c in candidates if c.candidate_id == CANDIDATE_ID)
+    monkeypatch.setattr(node.model_policy, "select", delayed_result)
+    decide(node, snapshot(10, [fridge, frontier]))
+    assert node.selected_pub.messages[-1]["candidate_id"] == "frontier:safe"
+
+
 def test_node_retries_at_20_steps_without_silent_long_idle(node):
     fail(node, NAVIGATION_DETAIL)
     decide(node, snapshot(426))
@@ -756,6 +933,19 @@ def test_recovery_scan_has_two_attempts_without_spending_wait_step_budget():
     tracker.finish_recovery(second.candidate_id)
     assert not observe(tracker, 159)["blocked"]
     assert observe(tracker, 160)["blocked"]
+
+
+def test_disabled_recovery_scan_preserves_bounded_wait():
+    tracker = decision.NoEligibleCandidateTracker(recovery_scan_enabled=False)
+    for step in (0, 20, 60):
+        assert not observe(tracker, step)["blocked"]
+        assert tracker.recovery_candidate(snapshot(step)) is None
+    tracker.reset()
+    for step in (0, 20, 60):
+        observe(tracker, step)
+        assert tracker.recovery_candidate(snapshot(step)) is None
+    assert observe(tracker, 120)["blocked"]
+    assert tracker.recovery_count == 0
 
 
 def test_stale_costmap_feedback_does_not_consume_interaction_failure_budget(node):

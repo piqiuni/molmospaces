@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
+import math
 
 import numpy as np
 
 from .geometry_utils import grid_origin_yaw, world_to_grid
+from .semantic_evidence import _has_m1_portal_confirmation
 
 
 class RoomSegmentationState:
@@ -19,6 +21,7 @@ class RoomSegmentationState:
         self.candidate_room_count = 0
         self.next_room_segment_id = 1
         self.portal_hints = {}
+        self.portal_revision = 0
         self.pending_merges = {}
         self.last_confirmed_merges = {}
 
@@ -164,16 +167,19 @@ class RoomSegmenter:
             if center is None or size is None:
                 continue
             span = max(float(size[0]), float(size[1]))
-            if span <= 0.0:
+            if span <= 0.0 or not all(math.isfinite(v) for v in center + size):
                 continue
+            yaw = self._observation_yaw(observation)
             key = self._portal_hint_key(observation, center)
             hint = self.state.portal_hints.get(key)
             if hint is None:
                 hint = {
                     "center": center,
                     "size": size,
+                    "yaw": yaw,
                     "candidate_center": center,
                     "candidate_size": size,
+                    "candidate_yaw": yaw,
                     "confirmations": 0,
                     "active": False,
                     "source_mode": str(source_mode),
@@ -183,9 +189,12 @@ class RoomSegmenter:
                 # A successful interaction supplies the pre-open doorway
                 # reference geometry.  Preserve it as the virtual cut anchor:
                 # subsequent GT observations can describe the rotated door
-                # leaf instead of the doorway plane.  Ordinary detector
-                # updates intentionally retain the existing frozen behavior.
-                if refresh_active:
+                # leaf instead of the doorway plane. Other detector anchors
+                # follow the graph's accepted, stabilized geometry.
+                if refresh_active or (
+                    observation.get("_authoritative_portal")
+                    and not hint.get("fixed_reference")
+                ):
                     geometry_changed = (
                         self._distance_xy(hint["center"], center) > 1e-6
                         or any(
@@ -193,17 +202,22 @@ class RoomSegmenter:
                             > 1e-6
                             for axis in range(3)
                         )
+                        or abs(math.sin(float(hint.get("yaw", 0.0)) - yaw)) > 1e-6
                     )
                     hint["center"] = list(center)
                     hint["size"] = list(size)
+                    hint["yaw"] = yaw
                     hint["candidate_center"] = list(center)
                     hint["candidate_size"] = list(size)
+                    hint["candidate_yaw"] = yaw
+                    hint["fixed_reference"] = bool(refresh_active)
                     hint["confirmations"] = max(
                         int(hint.get("confirmations", 0)), 1
                     )
                     changed = changed or geometry_changed
                 continue
             jump = self._distance_xy(hint["candidate_center"], center)
+            hint["candidate_yaw"] = yaw
             if jump > self.room_portal_detector_max_center_jump_m:
                 hint["candidate_center"] = center
                 hint["candidate_size"] = size
@@ -221,12 +235,82 @@ class RoomSegmenter:
                 ]
                 hint["confirmations"] = count + 1
             required = 1 if is_gt else self.room_portal_detector_min_confirmations
-            if int(hint["confirmations"]) >= required:
+            if observation.get("_authoritative_portal"):
+                hint["confirmations"] = max(int(hint["confirmations"]), required)
+                hint["candidate_center"] = list(center)
+                hint["candidate_size"] = list(size)
+            confirmed = is_gt or _has_m1_portal_confirmation(observation.get("attributes") or {})
+            if confirmed and int(hint["confirmations"]) >= required:
                 hint["center"] = list(hint["candidate_center"])
                 hint["size"] = list(hint["candidate_size"])
+                hint["yaw"] = float(hint["candidate_yaw"])
                 hint["active"] = True
+                hint["fixed_reference"] = bool(refresh_active)
+                changed = True
+        if changed:
+            self.state.portal_revision += 1
+        return changed
+
+    def sync_graph_portals(self, graph):
+        """Use accepted graph evidence, not detector repetition, for room cuts."""
+        if str((graph or {}).get("source_mode") or "") == "realtime_gt_observation":
+            return False
+        allowed = set()
+        observations = []
+        for node in (graph or {}).get("nodes") or []:
+            attrs = node.get("attributes") or {}
+            source_type = str(attrs.get("topology_type") or attrs.get("observation_node_type") or node.get("type") or "")
+            if source_type != "portal" or str(node.get("type") or "") != "portal":
+                continue
+            if not _has_m1_portal_confirmation(attrs):
+                continue
+            count = max(int(node.get("observation_count", 0) or 0), int(attrs.get("max_consecutive_observations", 0) or 0))
+            if count < 2:
+                continue
+            key = str(attrs.get("instance_id") or attrs.get("source_object_name") or node.get("id") or "")
+            identities = {key, str(attrs.get("source_object_name") or ""), str(node.get("id") or "")}
+            # An interaction reference can be keyed by the GT/source identity
+            # rather than the tracker identity. Do not add a second leaf cut.
+            if any(self.state.portal_hints.get(identity, {}).get("fixed_reference")
+                   for identity in identities):
+                continue
+            allowed.add(key)
+            observations.append({
+                "id": key, "name": "door", "is_door": True,
+                "aabb_center": node.get("aabb_center"), "aabb_size": node.get("aabb_size"),
+                "yaw": attrs.get("yaw", node.get("yaw", 0.0)),
+                "attributes": attrs, "_authoritative_portal": True,
+            })
+        changed = self.update_portal_hints(observations)
+        for key, hint in list(self.state.portal_hints.items()):
+            if (hint.get("source_mode") == "detector_online" and hint.get("active")
+                    and not hint.get("fixed_reference") and key not in allowed):
+                del self.state.portal_hints[key]
+                self.state.portal_revision += 1
                 changed = True
         return changed
+
+    @staticmethod
+    def _observation_yaw(observation):
+        box = observation.get("box_3d") or {}
+        attrs = observation.get("attributes") or {}
+        value = observation.get("yaw", attrs.get("yaw", box.get("yaw")))
+        if value is not None:
+            try:
+                value = float(value)
+                if math.isfinite(value):
+                    return value
+            except (TypeError, ValueError):
+                pass
+        orientation = box.get("orientation") or observation.get("orientation")
+        if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+            try:
+                x, y, z, w = [float(v) for v in orientation[:4]]
+                if all(math.isfinite(v) for v in (x, y, z, w)):
+                    return math.atan2(2 * (w * z + x * y), 1 - 2 * (y*y + z*z))
+            except (TypeError, ValueError):
+                pass
+        return 0.0
 
     def segment(self, occ_grid, *, force_stable=False):
         try:
@@ -824,8 +908,11 @@ class RoomSegmenter:
             ) + 2.0 * self.room_portal_cut_margin_m
             start = list(center)
             end = list(center)
-            start[span_axis] -= 0.5 * span
-            end[span_axis] += 0.5 * span
+            yaw = float(hint.get("yaw", 0.0)) + span_axis * math.pi / 2.0
+            direction = (math.cos(yaw), math.sin(yaw))
+            for axis in (0, 1):
+                start[axis] -= 0.5 * span * direction[axis]
+                end[axis] += 0.5 * span * direction[axis]
             start_cell = world_to_grid(
                 start[0],
                 start[1],

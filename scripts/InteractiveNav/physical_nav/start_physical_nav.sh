@@ -37,6 +37,16 @@ export ROS_IP="${ROS_IP:-127.0.0.1}"
 export ROS_HOSTNAME="${ROS_HOSTNAME:-localhost}"
 export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11311}"
 
+# Missing Conda ABI dependencies otherwise fail only inside subscriber threads:
+# nodes remain alive while every ROS input silently stops connecting.
+if [[ "${PHYSICAL_NAV_SKIP_ROS:-0}" != 1 ]] && command -v roslaunch >/dev/null 2>&1; then
+  if ! "${PHYSICAL_NAV_ALGORITHM_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}" \
+      -c 'import netifaces; import rosgraph.network; rosgraph.network.get_local_addresses()'; then
+    echo "ROS Python preflight failed; install requirements_policy.txt in PHYSICAL_NAV_ALGORITHM_PYTHON's environment" >&2
+    exit 1
+  fi
+fi
+
 WEB_HOST="${PHYSICAL_NAV_WEB_HOST:-0.0.0.0}"
 GATEWAY_PYTHON="${PHYSICAL_NAV_GATEWAY_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}"
 WEB_PORT="${PHYSICAL_NAV_WEB_PORT:-8765}"
@@ -68,9 +78,9 @@ fi
 # the base centre (38 cm from a 70 cm rear-to-front body) and 0.62 m above
 # the base. The base-to-ground offset is therefore about 0.43 m (1.05 m
 # camera height), which is not part of this base-frame extrinsic.
-# Normal standing base_link height is 0.305 m; camera ground height is 1.285 m,
-# so the camera is 0.980 m above base_link. Camera is pitched 8 degrees down.
-CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.98}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0.1396263}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
+# Normal standing base_link height is 0.305 m; camera ground height is 1.190 m,
+# so the camera is 0.885 m above base_link. Camera is pitched 9 degrees down.
+CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.885}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0.157079633}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
 CAMERA_IMU="${PHYSICAL_NAV_CAMERA_IMU:-0}"
 RUNTIME_DIR="${PHYSICAL_NAV_RUNTIME_DIR:-/tmp/molmospaces-physical-nav-${UID}}"
 LOG_DIR="${PHYSICAL_NAV_LOG_DIR:-${RUNTIME_DIR}/logs}"
@@ -169,7 +179,7 @@ if [[ "${PHYSICAL_NAV_START_QWEN_TUNNEL:-0}" == "1" ]]; then
   python3 "${ROOT_DIR}/qwen_ssh_tunnel.py" \
     --ssh-port "${PHYSICAL_NAV_QWEN_SSH_PORT:-41051}" \
     --user "${PHYSICAL_NAV_QWEN_USER:-root}" --host "${PHYSICAL_NAV_QWEN_HOST:-115.190.90.101}" \
-    --local-port "${PHYSICAL_NAV_QWEN_LOCAL_PORT:-18080}" --remote-port "${PHYSICAL_NAV_QWEN_REMOTE_PORT:-8000}" \
+    --local-port "${PHYSICAL_NAV_QWEN_LOCAL_PORT:-18080}" --remote-port "${PHYSICAL_NAV_QWEN_REMOTE_PORT:-8100}" \
     >>"${LOG_DIR}/qwen_tunnel.log" 2>&1 &
   register_process qwen_tunnel "$!"
 fi
@@ -216,12 +226,17 @@ start_or_reuse_gateway() {
   if [[ "${gateway_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${gateway_pid}" 2>/dev/null &&
      [[ "$(tr '\0' ' ' <"/proc/${gateway_pid}/cmdline" 2>/dev/null || true)" == *physical_six_panel_server.py* ]]; then
     [[ -f "${GATEWAY_FINGERPRINT_FILE}" ]] && recorded_fingerprint="$(<"${GATEWAY_FINGERPRINT_FILE}")"
-    if [[ -n "${recorded_fingerprint}" && "${recorded_fingerprint}" == "${expected_fingerprint}" ]]; then
+    if [[ "${PHYSICAL_NAV_FORCE_GATEWAY_RESTART:-0}" != "1" &&
+          -n "${recorded_fingerprint}" && "${recorded_fingerprint}" == "${expected_fingerprint}" ]]; then
       GATEWAY_PID="${gateway_pid}"
       log_supervisor "reusing persistent gateway pid=${GATEWAY_PID}"
       return 0
     fi
-    log_supervisor "restarting stale persistent gateway pid=${gateway_pid} (source/config fingerprint changed)"
+    if [[ "${PHYSICAL_NAV_FORCE_GATEWAY_RESTART:-0}" == "1" ]]; then
+      log_supervisor "restarting gateway pid=${gateway_pid} (explicit restart resets navigation step)"
+    else
+      log_supervisor "restarting stale persistent gateway pid=${gateway_pid} (source/config fingerprint changed)"
+    fi
     kill -TERM "${gateway_pid}" 2>/dev/null || true
     for _ in {1..50}; do
       if ! kill -0 "${gateway_pid}" 2>/dev/null; then break; fi

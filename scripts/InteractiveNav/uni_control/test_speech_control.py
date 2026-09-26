@@ -20,6 +20,21 @@ from go2_control_bridge import SpeakerWorker
 from policy_control_server import PolicyControlServer
 
 
+def test_execution_enabled_requires_fresh_connected_robot_telemetry():
+    server = PolicyControlServer(ack_timeout=1, telemetry_print_period=10)
+    assert not server.execution_enabled(0)
+    server.connected.set()
+    server.latest_telemetry_at = 10
+    server.latest_telemetry = {"motion_enabled": True}
+    assert server.execution_enabled(11)
+    assert not server.execution_enabled(13)
+    server.latest_telemetry["motion_enabled"] = False
+    assert not server.execution_enabled(11)
+    server.latest_telemetry["motion_enabled"] = True
+    server.connected.clear()
+    assert not server.execution_enabled(11)
+
+
 class SpeechProtocolTest(unittest.TestCase):
     def test_round_trip(self) -> None:
         payload = make_speech_message(

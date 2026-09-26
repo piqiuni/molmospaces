@@ -1377,6 +1377,7 @@ class SixPanelRenderer:
                 (2, occ),
                 (3, room_panel),
                 (4, costmaps),
+                (5, spatial),
             ):
                 panel_ok, panel_encoded = cv2.imencode(
                     ".jpg", panel, [cv2.IMWRITE_JPEG_QUALITY, 95]
@@ -1825,7 +1826,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     "event_type", "stage", "module", "timestamp", "role", "model",
                     "episode_id", "object_id", "target_id", "target_name", "target_kind",
                     "request_sequence", "latency_s", "error", "raw_text",
-                    "sample_period_s", "next_call_at", "deadline_at", "phase", "result",
+                    "sample_period_s", "next_call_at", "deadline_at", "policy_deadline_at", "command_id", "decision_id", "candidate_id", "phase", "result",
                     "m1_input_image_key", "m1_input_bbox", "m1_input_label",
                     "m1_input_track_id", "m1_input_object_id",
                 )
@@ -1870,6 +1871,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "selection": nav.get("selection", {}),
                 "execution_state": nav.get("execution_state", {}),
                 "behavior_feedback": nav.get("behavior_feedback", {}),
+                "goal_status": nav.get("goal_status", {}),
                 "interaction_result": nav.get("interaction_result", {}),
                 "decision_trace": {
                     key: trace.get(key)
@@ -1936,6 +1938,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "interaction_result": navigation.get("interaction_result", {}),
                 "behavior_feedback": navigation.get("behavior_feedback", {}),
                 "execution_state": navigation.get("execution_state", {}),
+                "policy_event": next((item for item in reversed(mllm) if item.get("module") == "POLICY"), {}),
             },
             "navigation": navigation,
             "last_error": snapshot.get("last_error", ""),
@@ -2501,9 +2504,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         if self.path == "/api/ros-state":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
             name, value = str(payload.get("name", "")), payload.get("value")
-            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "global_plan", "local_global_plan", "local_plan", "telemetry", "mllm_events", "explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace"}:
+            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "global_plan", "local_global_plan", "local_plan", "telemetry", "mllm_events", "explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace", "goal_status"}:
                 self._json({"accepted": False, "error": "unsupported ROS state"}, 400); return
-            if name in {"explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace", "global_plan", "local_global_plan", "local_plan"}:
+            if name in {"explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace", "goal_status", "global_plan", "local_global_plan", "local_plan"}:
                 # Keep the navigation assignment and revision update atomic.
                 # In particular, do not mutate ``navigation`` directly: the
                 # visualization delta endpoint uses ``navigation_revision``
@@ -2569,9 +2572,38 @@ _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='v
 @media(max-width:1150px){.right .card:nth-child(2),.right .card:nth-child(3){width:100%!important;max-width:none}}
 </style>
 <h1 class='title'>Go2 Physical Interactive Navigation <span class='readonly'>动作控制需显式启动</span></h1>
+<div class='controlbar' aria-label='后台录制'><button id='record-start'>● 开始录制</button><button id='record-stop' disabled>■ 停止录制</button><span id='record-status' role='status'>正在检查录制状态…</span></div>
 <main class='dashboard'><div class='left'><div class='overview-wrap'><img id='overview' class='overview' src='/snapshot.jpg' alt='实时六面板'><img id='overview-camera' class='overview-camera' src='/camera-box-overlay.jpg' alt='10 Hz 实时感知'></div><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 10 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>对象类别 · 周期 · 历史</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div class='go2-layout'><div id='go2'></div><div class='go2-controls' aria-label='运动控制'><button id='nav-start'>Start</button><button id='nav-restart'>重启导航栈 + Goal</button><input id='nav-goal' placeholder='goalname' maxlength='80' autocomplete='off'><button id='nav-stop' class='danger'>Stop</button><button id='nav-enable'>开启运动</button><span class='control-status' id='control-status'>Esc / S：Stop</span></div></div></section><section class='card panel-suppressed'><h3>5 · 图 1 放大 <span class='hint'>当前测试已关闭</span></h3><div class='empty'>暂时关闭以测试网页负载</div></section><section class='card panel-suppressed'><h3>6 · 图 5 放大 <span class='hint'>当前测试已关闭</span></h3><div class='empty'>暂时关闭以测试网页负载</div></section></aside></main>
 <script>
 const q=s=>document.querySelector(s), text=v=>String(v??'').replace(/\\s+/g,' ').trim(), clip=(v,n=150)=>{v=text(v);return v.length>n?v.slice(0,n)+'…':v};
+let recordingBusy=false,recordingPollBusy=false,recordingSession='';
+function showRecording(s){
+  recordingSession=s.session_id||'';
+  q('#record-start').disabled=recordingBusy||!!s.active;
+  q('#record-stop').disabled=recordingBusy||!s.active;
+  const stats=s.stats||{},sum=o=>Object.values(o||{}).reduce((a,b)=>a+Number(b||0),0);
+  const drops=sum(stats.queue_dropped),errors=sum(stats.write_failed);
+  q('#record-status').textContent=(s.active?'录制中 · '+Math.floor(s.duration_s||0)+' s':'未录制')+
+    ' · 队列 '+(s.queue_size||0)+'/'+(s.queue_capacity||0)+
+    ' · 丢弃 '+drops+' · 写入失败 '+errors+(s.degraded?' · ⚠ 录制不完整':'')+
+    (s.record_dir?' · '+s.record_dir:'');
+}
+async function refreshRecording(){
+  if(recordingBusy||recordingPollBusy)return;recordingPollBusy=true;
+  try{const r=await fetch('/api/recording/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);showRecording(await r.json())}
+  catch(e){q('#record-status').textContent='录制状态不可用：'+e.message}
+  finally{recordingPollBusy=false}
+}
+async function setRecording(action){
+  if(recordingBusy)return;recordingBusy=true;
+  q('#record-start').disabled=q('#record-stop').disabled=true;
+  q('#record-status').textContent=action==='start'?'正在开始录制…':'正在排空队列并保存，请稍候…';
+  try{const r=await fetch('/api/recording/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action==='start'?{mode:'raw_plus_panels',label:'six_panel'}:{session_id:recordingSession,reason:'six_panel_button'})});const s=await r.json();if(!r.ok)throw new Error(s.error||('HTTP '+r.status));recordingBusy=false;showRecording(s)}
+  catch(e){recordingBusy=false;q('#record-status').textContent='录制操作失败：'+e.message;q('#record-start').disabled=false;q('#record-stop').disabled=!recordingSession}
+}
+q('#record-start').addEventListener('click',()=>setRecording('start'));
+q('#record-stop').addEventListener('click',()=>setRecording('stop'));
+setInterval(refreshRecording,1000);refreshRecording();
 async function navControl(action, goal=''){
   const status=q('#control-status'); status.textContent=action+' 提交中…';
   try{
@@ -2614,15 +2646,19 @@ const classNames={door:'门',fridge:'冰箱',refrigerator:'冰箱',cabinet:'柜�
 function classZh(value){const key=text(value).toLowerCase().replace(/[ -]+/g,'_');return classNames[key]||text(value)||'目标物体'}
 function eventObjectClass(e){let id=text(e?.object_id||e?.target_kind||e?.context?.semantic_class||'');if(id.startsWith('physical_')){const parts=id.slice(9).split('_');while(parts.length>1&&/^-?\\d+$/.test(parts[parts.length-1]))parts.pop();id=parts.join('_')}return classZh(id)}
 function isRoomM1(e){if(e?.m1_input_image_key||e?.object_id||e?.m1_input_label)return false;let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';try{const o=typeof raw==='string'?JSON.parse(raw):raw;return !!(o&&('room_attribute' in o||'room_id' in o))}catch(_){return false}}
-function m1DisplayName(e){if(isRoomM1(e))return '房间属性';const label=text(e?.m1_input_label||eventObjectClass(e)).replaceAll('_',' '),raw=text(e?.m1_input_object_id??e?.m1_input_track_id??e?.object_id),match=raw.match(/(\\d+)$/);return label+(match?' #'+Number(match[1]):'')}
+function m1DisplayName(e){if(isRoomM1(e))return '房间属性（纯文本物体标签，无图像）';const label=text(e?.m1_input_label||eventObjectClass(e)).replaceAll('_',' '),raw=text(e?.m1_input_object_id??e?.m1_input_track_id??e?.object_id),match=raw.match(/(\\d+)$/);return label+(match?' #'+Number(match[1]):'')}
 function m1InputCanvas(e,index){const kind=text(e?.target_kind||e?.context?.target_kind||'').toLowerCase();if(isRoomM1(e)||kind==='room'||kind==='room_attribute'||kind.includes('room'))return null;const canvas=make('canvas','thumb');canvas.width=320;canvas.height=180;const key=text(e?.m1_input_image_key);if(!key)return null;const image=new Image();image.onload=()=>{const c=canvas.getContext('2d'),sx=canvas.width/image.width,sy=canvas.height/image.height;c.drawImage(image,0,0,canvas.width,canvas.height);const b=e?.m1_input_bbox||[];if(b.length>=4){c.strokeStyle='#ffe04b';c.lineWidth=3;c.strokeRect(Number(b[0])*sx,Number(b[1])*sy,(Number(b[2])-Number(b[0]))*sx,(Number(b[3])-Number(b[1]))*sy);const name=m1DisplayName(e),x=Math.max(0,Number(b[0])*sx),y=Math.max(15,Number(b[1])*sy-4);c.font='bold 14px sans-serif';const w=c.measureText(name).width+8;c.fillStyle='#ffe04b';c.fillRect(x,y-15,w,18);c.fillStyle='#101418';c.fillText(name,x+4,y)}};image.src='/api/m1-input-image?key='+encodeURIComponent(key)+'&v='+(e.timestamp||index);return canvas}
 function simplifiedQuestion(e,stage){if(stage==='M1'){const k=eventObjectClass(e),raw=text(e?.m1_input_label||e?.context?.semantic_class||'').toLowerCase();if(raw==='locker'||k==='locker')return '判断图中标注的 locker 是否为冰箱，给出冰箱置信度，并识别其开合状态。';return `判断图中的${k}是否可交互，并识别它的开合状态。`;}if(stage==='M2')return '结合历史和候选目标，选择下一个导航子目标。';return `判断画面中的${eventObjectClass(e)}是否已经打开，并给出置信度。`}
-function m1Prompt(e){const kind=text(e?.target_kind||e?.context?.target_kind||'').toLowerCase();if(isRoomM1(e)||kind==='room'||kind==='room_attribute'||kind.includes('room'))return '根据当前空间观测判断房间属性与语义类别，并给出房间类别置信度。';return e?.instruction||e?.prompt||e?.request?.instruction||e?.request?.prompt||simplifiedQuestion(e,'M1')}
-function m1Answer(e){let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??e?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);if(!raw)return '（无 M1 回答）';try{const o=JSON.parse(raw);if(o.room_attribute||o.room_id){return [o.room_attribute||'unknown',o.confidence!=null?'置信度 '+Number(o.confidence).toFixed(2):''].filter(Boolean).join(' · ')}const name=o.observed_object_name||o.semantic_name||o.object_name||o.label||o.interaction_class||o.semantic_class||'';const state=o.coarse_state||o.state||o.status||'';const conf=o.confidence??o.score;const fridgeConf=o.fridge_confidence??o.refrigerator_confidence??o.is_refrigerator_confidence;const category=o.interaction_class||o.semantic_class||'';const confidence=fridgeConf??conf;return [name,category,state,confidence!=null?'置信度 '+Number(confidence).toFixed(2):''].filter(Boolean).join(' · ')}catch(_){return raw.replace(/[{}\[\]"]/g,'').replace(/[:,]/g,' · ').slice(0,180)}}
+function m1Prompt(e){const actual=e?.instruction||e?.prompt||e?.request?.instruction||e?.request?.prompt;if(isRoomM1(e)){const c=e?.context||{},nl=String.fromCharCode(10);return '实际提交物体：'+nl+(c.objects||[]).map(o=>`${o.object_id}: ${o.category||o.name}（${o.currently_visible?'当前可见':'历史观测'}）`).join(nl)+nl+'实际提示词：'+nl+(actual||'此记录未保存提示词')+nl+'房间上下文：'+JSON.stringify({room_id:c.room_id,room_box:c.room_box})}return actual||simplifiedQuestion(e,'M1')}
+function m1Answer(e){let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??e?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);if(!raw)return '（无 M1 回答）';try{const o=JSON.parse(raw);if(o.room_attribute||o.room_id){const objects=e?.context?.objects||[],nl=String.fromCharCode(10);const evidence=(o.evidence_object_ids||[]).map(id=>{const obj=objects.find(x=>x.object_id===id);return id+': '+(obj?.category||obj?.name||'输入中未找到')});return raw+nl+'依据：'+evidence.join('、')+nl+'置信度为模型自报，不代表实测准确率。'}const name=o.observed_object_name||o.semantic_name||o.object_name||o.label||o.interaction_class||o.semantic_class||'';const state=o.coarse_state||o.state||o.status||'';const conf=o.confidence??o.score;const fridgeConf=o.fridge_confidence??o.refrigerator_confidence??o.is_refrigerator_confidence;const category=o.interaction_class||o.semantic_class||'';const confidence=fridgeConf??conf;return [name,category,state,confidence!=null?'置信度 '+Number(confidence).toFixed(2):''].filter(Boolean).join(' · ')}catch(_){return raw.replace(/[{}\[\]"]/g,'').replace(/[:,]/g,' · ').slice(0,180)}}
 function outputSummary(e){if(e?.error)return '调用失败：'+clip(e.error,120);let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);try{const o=JSON.parse(raw),choice=o.ranked_ids||o.candidate_id||o.label||o.interaction_class||o.coarse_state||o.state||'',state=o.coarse_state&&o.coarse_state!==choice?o.coarse_state:'';return clip([Array.isArray(choice)?choice.join(' → '):choice,state,o.reason,o.confidence!=null?'置信度 '+o.confidence:''].filter(Boolean).join(' · '),150)}catch(_){return clip(raw||'已完成（无文本结果）',150)}}
 function addChips(parent,items,max=5){const wrap=make('div','chips');items.slice(0,max).forEach(v=>wrap.append(make('span','chip',clip(v,28))));if(items.length>max)wrap.append(make('span','chip','+'+(items.length-max)));parent.append(wrap)}
 function m2EventsWithLiveState(s){
   const events=[...(s?.mllm?.M2||[])],nav=s?.navigation||{},exec=nav.execution_state||{},selection=nav.selection||{};
+  const goal=nav.goal_status||{};
+  if(!selection.active&&['EXPLORATION_STALLED','NAVIGATION_RECOVERY'].includes(goal.status)){
+    events.push({stage:'M2',timestamp:goal.timestamp,role:'mission_status',model:'决策状态',raw_text:JSON.stringify({reason:goal.status+' · '+(goal.detail?.reason||'')})});
+  }
   const state=text(exec.state||''),behavior=text(exec.behavior_type||selection.behavior_type||'').toUpperCase();
   if(behavior!=='INTERACT'&&!state.toUpperCase().includes('INTERACTION'))return events;
   const id=text(exec.candidate_id||selection.candidate_id||selection.model_selected_candidate_id||''),target=text(selection.target_name||selection.target_id||id||'交互目标');
@@ -2635,14 +2671,17 @@ function firstObj(...values){return values.find(v=>v&&typeof v==='object')||{}}
 function renderM3(m3){
   const box=q('#m3');box.replaceChildren();
   const events=Array.isArray(m3?.events)?m3.events:[],latest=events[events.length-1]||{},sample=firstObj(latest.result),fb=firstObj(m3?.behavior_feedback,m3?.interaction_result),detail=firstObj(fb.detail,fb.result),exec=firstObj(m3?.execution_state),humanAssist=String(exec.state||'').toUpperCase()==='INTERACTING';
-  let status=humanAssist?'HUMAN ASSIST':text(latest.phase||sample.status||fb.status||detail.status||sample.state||'WAITING').toUpperCase(),success=humanAssist?null:(fb.success??detail.success);
+  const approaching=String(exec.state||'').toUpperCase()==='APPROACH_INTERACTION',paused=Boolean(exec.execution_paused),rawPolicy=firstObj(m3?.policy_event),policy=rawPolicy.decision_id&&exec.decision_id&&rawPolicy.decision_id!==exec.decision_id?{}:rawPolicy,policyResult=firstObj(policy.result),policyFinished=policy.stage==='FINISHED'&&Number(policy.timestamp||0)>=Number(latest.timestamp||0);
+  let status=approaching?'APPROACHING':policyFinished?text(policyResult.status||'FINISHED').toUpperCase():humanAssist?'HUMAN ASSIST':text(latest.phase||sample.status||fb.status||detail.status||sample.state||'WAITING').toUpperCase(),success=approaching?null:policyFinished?policyResult.success:humanAssist?null:(fb.success??detail.success);
   const kind=success===true||/PASS|SUCCESS|COMPLETE|OPEN/.test(status)?'good':success===false||/FAIL|ERROR|BLOCK/.test(status)?'bad':'warn';
   const targetKind=classZh(latest.target_kind||fb.target_kind||detail.target_kind||'暂无交互对象');
   const targetRef=text(latest.target_id||fb.object_id||fb.candidate_id||latest.target_name||fb.source_object_name||exec.candidate_id||'');
-  const head=make('div','m3head');head.append(make('div','m3status',status),make('span','badge '+kind,humanAssist?'等待人工操作':success===true?'验证通过':success===false?'验证未通过':events.length?'模型观察中':'等待交互 policy'));box.append(head);
+  const head=make('div','m3head');head.append(make('div','m3status',status),make('span','badge '+kind,approaching?(paused?'接近目标已暂停；M3 未启动':'正在接近交互位置；M3 未启动'):success===true?'验证通过':success===false?'验证未通过':humanAssist?'等待人工操作':events.length?'模型观察中':'尚未启动交互策略'));box.append(head);
+  const activePolicy=humanAssist&&!policyFinished,deadline=Number(policy.policy_deadline_at||latest.policy_deadline_at||0),verifyDeadline=Number(latest.deadline_at||0);
+  if(activePolicy&&deadline>0){box.append(make('div','badge warn','策略剩余：'+Math.max(0,deadline-Date.now()/1000).toFixed(1)+' s（超时退出）'));if(verifyDeadline>0&&Number(latest.timestamp||0)>=Number(policy.timestamp||0))box.append(make('div','badge','视觉验证剩余：'+Math.max(0,verifyDeadline-Date.now()/1000).toFixed(1)+' s'))}
   const period=Number(latest.sample_period_s||m3?.sample_period_s||1),next=Number(latest.next_call_at||m3?.next_call_at||0),remaining=next>0?Math.max(0,next-Date.now()/1000):null,evaluating=String(latest.phase||'').toUpperCase()==='EVALUATING',schedule=make('div','m3schedule');schedule.append(make('span','badge','评价周期 '+period.toFixed(1)+' s'),make('span','badge '+(humanAssist||evaluating?'warn':remaining===null?'':remaining<=0?'good':'warn'),humanAssist?'当前：语音请求 / 人工操作':evaluating?'当前：正在评价':remaining===null?'下次：等待交互触发':remaining<=0?'下次：立即评价':'下次：'+remaining.toFixed(1)+' s'));box.append(schedule);
   const grid=make('div','m3details');
-  [['评价对象类别',targetKind],['实例 ID（跟踪/回写）',targetRef||'等待具体目标'],['结果原因',humanAssist?'已到达交互位姿，等待语音播放与人工操作':sample.reason||detail.reason||fb.reason||detail.failure_stage||'等待交互反馈'],['状态变化',detail.pre_state&&detail.post_state?detail.pre_state+' → '+detail.post_state:(sample.state||'未产生')]].forEach(([n,v])=>{const d=make('div','mini');d.append(make('span','',n),make('b','',clip(v,60)));grid.append(d)});
+  [['评价对象类别',targetKind],['实例 ID（跟踪/回写）',targetRef||'等待具体目标'],['结果原因',approaching?'尚未通过到达与朝向检查，不触发语音和 M3':policyFinished?(policyResult.detail?.reason||policyResult.verification?.reason||policyResult.status):humanAssist?'已到达交互位姿，等待语音播放与人工操作':sample.reason||detail.reason||fb.reason||detail.failure_stage||'等待交互反馈'],['状态变化',detail.pre_state&&detail.post_state?detail.pre_state+' → '+detail.post_state:(sample.state||'未产生')]].forEach(([n,v])=>{const d=make('div','mini');d.append(make('span','',n),make('b','',clip(v,60)));grid.append(d)});
   const question=make('div','mini question');question.append(make('span','','简化问题'),make('b','',`判断画面中的${targetKind}是否已经打开，并给出置信度。`));grid.append(question);
   box.append(grid,make('div','m3history-title','近期交互评价历史'));
   const history=make('div','m3history');if(!events.length)history.append(make('div','empty','尚无 M3 调用；到达交互目标后开始评价'));else events.slice(-10).reverse().forEach(event=>{const result=firstObj(event.result),row=make('div','m3event');row.append(make('span','object',classZh(event.target_kind||event.target_name||'目标物体')),make('span','state',String(result.state||result.status||'unknown').toUpperCase()),make('span','reason',clip(result.reason||'无补充说明',80)),make('time','',event.timestamp?new Date(event.timestamp*1000).toLocaleTimeString():'--:--:--'));history.append(row)});box.append(history)
@@ -3234,9 +3273,9 @@ class PhysicalGateway:
                     # and must not be triggered by every camera frame.
                     # The showcase page paints the current overlay over panel
                     # 1 while this key gates only panels 2--6.
-                    render_key = self.renderer.heavy_render_key(self.state)
                     recording_active = self.recorder.is_active()
-                    if not recording_active and render_key == last_render_key:
+                    render_key = (self.renderer.heavy_render_key(self.state), recording_active)
+                    if render_key == last_render_key:
                         time.sleep(min(render_period, 0.05))
                         continue
                     # A pose-bearing RGB-D packet advances telemetry_revision
@@ -3244,11 +3283,10 @@ class PhysicalGateway:
                     # intentionally advertised at 5 Hz.  Key invalidation
                     # keeps the arrow fresh, but must not turn every pose
                     # receipt into another full OCC raster/JPEG pass.
-                    if not recording_active:
-                        remaining = render_period - (time.monotonic() - last_render_at)
-                        if remaining > 0.0:
-                            time.sleep(min(remaining, 0.05))
-                            continue
+                    remaining = render_period - (time.monotonic() - last_render_at)
+                    if remaining > 0.0:
+                        time.sleep(min(remaining, 0.05))
+                        continue
                     self.renderer.set_capture_panel_streams(self.recorder.is_active())
                     frame = self.renderer.render()
                     last_render_at = time.monotonic()
@@ -3278,6 +3316,9 @@ class PhysicalGateway:
                         # direct raw chain and panel 6 for exact showcase
                         # replay; all are source rasters, not browser crops.
                         record_panels = dict(self.renderer.latest_panel_streams)
+                        # Preserve the exact JPEG served at /stream, without
+                        # a second render or another lossy encode.
+                        record_panels[0] = frame
                         topology_bytes = self.renderer.latest_original_panels.get(6, b"")
                         record_stamp = self.state.frame_stamp
                         record_seq = self.state.frame_seq

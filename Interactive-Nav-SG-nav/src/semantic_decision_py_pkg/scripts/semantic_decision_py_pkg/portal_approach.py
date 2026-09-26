@@ -12,7 +12,7 @@ def is_clearance_aware_portal(candidate: dict) -> bool:
 
 
 def bounded_portal_tolerances(goal, center, axis, xy_tolerance, yaw_tolerance,
-                              position_angle_tolerance, yaw_angle_tolerance):
+                              position_angle_tolerance, yaw_angle_tolerance, *, shrink_arrival_disc=True):
     """Fit the entire arrival disc and yaw interval inside one immutable face."""
     try:
         x, y, yaw = map(float, goal[:3])
@@ -35,7 +35,8 @@ def bounded_portal_tolerances(goal, center, axis, xy_tolerance, yaw_tolerance,
         yaw_budget = ya-heading_offset-0.005
         if min(position_budget, yaw_budget) <= 0.0:
             return None
-        xy = min(xy, radius*math.sin(position_budget))
+        if shrink_arrival_disc:
+            xy = min(xy, radius*math.sin(position_budget))
         yt = min(yt, yaw_budget)
         if xy < 0.05 or yt < 0.05:
             return None
@@ -58,4 +59,5 @@ def portal_approach_profile(candidate: dict, goal):
         command.get("interaction_approach_axis_xy", []), *base[:2],
         command.get("interaction_front_position_tolerance_rad", 0.15),
         command.get("interaction_front_yaw_tolerance_rad", 0.15),
+        shrink_arrival_disc=metadata.get("portal_shrink_arrival_disc", True),
     )

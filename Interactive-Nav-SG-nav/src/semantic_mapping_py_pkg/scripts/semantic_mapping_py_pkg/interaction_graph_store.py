@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import copy
 import math
 from collections import defaultdict
 
@@ -453,6 +454,7 @@ def _portal_visual_state_gate(
     aperture_evidence,
     *,
     visual_evidence_truncated=False,
+    require_full_frame=True,
 ):
     """Gate MLLM portal state claims on direct visual aperture evidence.
 
@@ -467,6 +469,7 @@ def _portal_visual_state_gate(
         node.type == "portal"
         and requested in {"open", "ajar", "static_open", "closed"}
         and bool(visual_evidence_truncated)
+        and require_full_frame
     ):
         # Border-clipped evidence is incomplete in both directions: it cannot
         # prove an aperture and it cannot prove that the whole leaf is closed.
@@ -542,7 +545,7 @@ def _is_confirmed_portal_open_result(result, resolved_state):
     return state in {"open", "opened"}
 
 
-def _portal_result_state_gate(node, result, resolved_state):
+def _portal_result_state_gate(node, result, resolved_state, *, require_full_frame=True):
     """Allow result-lane portal opening only after a real successful action."""
 
     requested = str(resolved_state or "").strip().casefold()
@@ -555,7 +558,7 @@ def _portal_result_state_gate(node, result, resolved_state):
         return True, "not_applicable"
     if result.get("success") is False:
         return False, "unsuccessful_result"
-    if bool(
+    if require_full_frame and bool(
         result.get("visual_evidence_truncated")
         or result.get("visual_evidence_truncated_edges")
     ):
@@ -632,9 +635,19 @@ class InteractionGraphStore:
         portal_child_room_offset_m=0.9,
         portal_child_room_depth_m=1.2,
         portal_child_room_min_width_m=1.2,
+        persistent_object_classes=None,
+        object_persistence_requires_m1=True,
+        portal_require_full_frame=True,
+        room_large_object_memory=None,
     ):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
+        self.persistent_object_classes = frozenset(
+            normalize_label(label) for label in (persistent_object_classes or [])
+        )
+        self.object_persistence_requires_m1 = bool(object_persistence_requires_m1)
+        self.portal_require_full_frame = bool(portal_require_full_frame)
+        self.room_large_object_memory = dict(room_large_object_memory or {})
         self.room_id_to_name = dict(room_id_to_name or {})
         self.room_box_height = float(room_box_height)
         self.portal_room_max_radius_m = max(0.1, float(portal_room_max_radius_m))
@@ -874,7 +887,7 @@ class InteractionGraphStore:
             node.attributes["cell_count"] = geom["cell_count"]
 
     def update_observations(
-        self, observations, stamp=None, source_mode=None, capture_step=None
+        self, observations, stamp=None, source_mode=None, capture_step=None, track_aliases=None
     ):
         now = float(stamp if stamp is not None else time.time())
         if source_mode:
@@ -898,6 +911,7 @@ class InteractionGraphStore:
         # new detector track after an occlusion or a large viewpoint change.
         # The opaque track id is not a semantic identity, so collapse portal
         # nodes again at the graph boundary before rebuilding room relations.
+        self._merge_tracker_aliases(track_aliases or {})
         self._merge_duplicate_portal_nodes()
         # Portal deduplication can remove or move graph nodes.  No further
         # observation association happens in this batch, so reconcile lazily
@@ -1006,7 +1020,8 @@ class InteractionGraphStore:
         if requested_state is None and result.get("success") is False:
             requested_state = result.get("state") or result.get("post_state")
         result_state_allowed, result_state_gate_reason = _portal_result_state_gate(
-            node, result, requested_state
+            node, result, requested_state,
+            require_full_frame=self.portal_require_full_frame,
         )
         if node.type == "portal" and str(requested_state or "").casefold() in {
             "open",
@@ -1504,6 +1519,21 @@ class InteractionGraphStore:
         patch_source = str(patch.get("source") or "mllm_attribute_inference")
         is_visual_mllm_patch = "mllm" in patch_source.casefold()
         m1_observed_name = _m1_observed_object_name(patch)
+        # Material/state adjectives are descriptions, not new semantic classes.
+        # Deliberately exclude appliance/furniture modifiers (e.g. fridge door).
+        raw_m1_name = m1_observed_name
+        door_words = m1_observed_name.replace("-", "_").split("_")
+        door_modifiers = {
+            "wooden", "wood", "glass", "metal", "steel", "aluminum", "aluminium",
+            "white", "black", "brown", "blue", "red", "grey", "gray",
+            "sliding", "hinged", "swing", "swinging", "folding", "double", "single",
+            "open", "closed", "interior", "exterior", "entrance", "room", "office",
+            "fire", "security", "automatic",
+        }
+        if (interaction_class == "portal" and len(door_words) > 1
+                and door_words[-1] == "door"
+                and all(word in door_modifiers for word in door_words[:-1])):
+            m1_observed_name = "door"
         # A generic detector label (locker/safe/object) is only a hypothesis
         # until M1 has independently confirmed the refrigerator name twice.
         # One crop is not enough to distinguish the field refrigerator from a
@@ -1742,6 +1772,7 @@ class InteractionGraphStore:
                 "m1_detector_class_hypothesis": str(
                     patch.get("m1_detector_class_hypothesis") or ""
                 ),
+                "m1_observed_object_description": raw_m1_name,
                 "m1_class_override": m1_class_override,
                 "m1_refrigerator_confirmation_count": confirmation_count,
                 "m1_refrigerator_confirmation_signatures": confirmation_signatures,
@@ -1922,6 +1953,7 @@ class InteractionGraphStore:
                     visual_evidence_truncated=bool(
                         patch.get("visual_evidence_truncated", False)
                     ),
+                    require_full_frame=self.portal_require_full_frame,
                 )
             if node.type == "portal":
                 node.attributes["portal_state_gate"] = {
@@ -2049,12 +2081,14 @@ class InteractionGraphStore:
         # may leave mode=none and every later patch preserves that value.
         if (
             bool(patch.get("interactable", False))
-            and _is_refrigerator_label(m1_observed_name or node.label)
-            and any(
-                str(part.get("type") or "").casefold() in {"door", "lid", "drawer"}
-                for part in (patch.get("interaction_parts") or [])
-                if isinstance(part, dict)
-            )
+            and ((node.type == "portal" and node.interaction.get("is_interactable", False)) or (
+                _is_refrigerator_label(m1_observed_name or node.label)
+                and any(
+                    str(part.get("type") or "").casefold() in {"door", "lid", "drawer"}
+                    for part in (patch.get("interaction_parts") or [])
+                    if isinstance(part, dict)
+                )
+            ))
         ):
             node.interaction["interaction_mode"] = "open_close"
             override = dict(node.attributes.get("interaction_state_override") or {})
@@ -2115,6 +2149,13 @@ class InteractionGraphStore:
             or patch.get("attribute_status")
             or "ready"
         ).casefold()
+        is_rule_fallback = bool(patch.get("fallback", False)) or str(
+            patch.get("source") or ""
+        ).startswith("weighted_object_types")
+        if is_rule_fallback:
+            # Older publishers used ready for a local rule result. Do not
+            # confuse that estimate with an accepted room-model response.
+            attribute_status = "fallback"
         patch_stamp = float(stamp if stamp is not None else time.time())
         request_sequence = int(patch.get("request_sequence", 0) or 0)
         latest_request_sequence = int(
@@ -2193,7 +2234,7 @@ class InteractionGraphStore:
                     patch.get("total_lag_sec", 0.0) or 0.0
                 ),
                 "room_attribute_error": str(patch.get("error") or ""),
-                "room_attribute_fallback": bool(patch.get("fallback", False)),
+                "room_attribute_fallback": is_rule_fallback,
             }
         )
         if attribute_status == "ready":
@@ -2285,6 +2326,7 @@ class InteractionGraphStore:
                 and node.last_seen is not None
                 and now - float(node.last_seen) > stale_after_sec
                 and not _has_persistent_semantic_evidence(node)
+                and not self._has_persistent_tracking_evidence(node)
                 # Successful interaction state is mission memory, not a
                 # detector track. Keep it even when the object leaves view;
                 # ordinary unconfirmed/stale detections may be reclaimed.
@@ -2305,6 +2347,31 @@ class InteractionGraphStore:
             if edge.src_id not in stale_id_set and edge.dst_id not in stale_id_set
         }
         self._rebuild_relations(now=now)
+
+    def _has_persistent_tracking_evidence(self, node):
+        """Keep confirmed detector identity without granting M1/topology status."""
+        if not self.persistent_object_classes:
+            return False
+        attrs = node.attributes
+        # The physical mapper can first expose a track on its second source
+        # frame. Use its confirmed streak for tracking memory only; the M1
+        # semantic/room gate still requires its own graph observations.
+        if int(attrs.get("max_consecutive_observations", 0) or 0) < 2:
+            return False
+        evidence = _accepted_semantic_evidence(attrs)
+        accepted_m1 = bool(
+            str(evidence.get("attribute_status") or "").casefold() == "ready"
+            and 0.5 <= float(evidence.get("attribute_confidence", 0.0) or 0.0) <= 1.0
+            and not evidence.get("m1_refrigerator_pending_confirmation", False)
+        )
+        # A concrete, accepted M1 correction wins over the old detector label.
+        label = normalize_label(
+            evidence.get("m1_observed_object_name") if accepted_m1 else node.label
+        ) or normalize_label(node.label)
+        return bool(
+            label in self.persistent_object_classes
+            and (not self.object_persistence_requires_m1 or accepted_m1)
+        )
 
     def _find_or_create_node(self, observation):
         instance_id = str(observation.get("instance_id") or "")
@@ -2460,6 +2527,58 @@ class InteractionGraphStore:
             vertical_overlap / max(min(first_height, second_height), 1e-3)
             >= 0.35
         )
+
+    def _merge_tracker_aliases(self, aliases):
+        """Propagate confirmed tracker merges into persistent semantic identity."""
+        for room in self.nodes.values():
+            if room.type != "room":
+                continue
+            memory = room.attributes.get("large_object_memory") or {}
+            for old_track, new_track in aliases.items():
+                old_record = memory.pop(old_track, None)
+                if old_record is not None and new_track not in memory:
+                    memory[new_track] = {**old_record, "object_id": new_track}
+        by_track = {str(node.attributes.get("instance_id") or ""): node
+                    for node in self.nodes.values()
+                    if node.type not in {"room", "scene"}}
+        redirects = {}
+        for old_track, new_track in aliases.items():
+            old, new = by_track.get(old_track), by_track.get(new_track)
+            if old is None or new is None or old.id == new.id:
+                continue
+            # Keep the newest successful semantic evidence, irrespective of
+            # which detector track won the geometric merge.
+            if (old.attributes.get("attribute_status") == "ready" and
+                float(old.attributes.get("attribute_updated_at") or 0) >
+                float(new.attributes.get("attribute_updated_at") or 0)):
+                for key, value in old.attributes.items():
+                    if key.startswith(("m1_", "mllm_", "attribute_")) or key in {
+                        "semantic_name", "category", "interaction_state_override",
+                        "persistent_semantic_node", "semantic_confirmation",
+                    }:
+                        new.attributes[key] = copy.deepcopy(value)
+                new.label = old.label
+            for key in ("operation_history", "completed_interaction_groups", "failed_interaction_groups"):
+                values = list(new.interaction.get(key) or [])
+                for item in old.interaction.get(key) or []:
+                    if item not in values:
+                        values.append(copy.deepcopy(item))
+                new.interaction[key] = values
+            if float(old.interaction.get("state_observed_step") or 0) > float(new.interaction.get("state_observed_step") or 0):
+                for key, value in old.interaction.items():
+                    if key not in {"operation_history", "completed_interaction_groups", "failed_interaction_groups"}:
+                        new.interaction[key] = copy.deepcopy(value)
+            new.observation_count = max(old.observation_count, new.observation_count)
+            redirects[old.id] = new.id
+            self.nodes.pop(old.id, None)
+        if redirects:
+            for node in self.nodes.values():
+                node.parent_id = redirects.get(node.parent_id, node.parent_id)
+            for edge in self.edges.values():
+                edge.src_id = redirects.get(edge.src_id, edge.src_id)
+                edge.dst_id = redirects.get(edge.dst_id, edge.dst_id)
+            self._parent_relation_cache.clear()
+            self._rebuild_identity_index()
 
     def _merge_duplicate_portal_nodes(self):
         """Merge split doorway graph nodes while retaining the strongest node."""
@@ -3183,10 +3302,13 @@ class InteractionGraphStore:
 
         self._update_persistent_semantic_gate(node)
 
-    @staticmethod
-    def _update_persistent_semantic_gate(node):
+    def _update_persistent_semantic_gate(self, node):
         """Latch persistence after two detector frames and a valid M1 result."""
 
+        if self.persistent_object_classes:
+            node.attributes["persistent_tracking_node"] = (
+                self._has_persistent_tracking_evidence(node)
+            )
         if node.type not in {"portal", "container"}:
             return
         action = persistence_action(node.type, node.observation_count, node.attributes)
@@ -4960,7 +5082,65 @@ class InteractionGraphStore:
         ranked = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
         return _finish(ranked)
 
+    def _refresh_room_large_object_memory(self):
+        """Keep room evidence after detector tracks expire, not new graph objects."""
+        config = getattr(self, "room_large_object_memory", {})
+        if not config.get("enabled", False):
+            return
+        labels = {normalize_label(x) for x in config.get("labels", [])}
+        rooms = {int(n.room_id): n for n in self.nodes.values()
+                 if n.type == "room" and n.room_id is not None}
+        records = {}
+        for rid, room in rooms.items():
+            for key, value in (room.attributes.get("large_object_memory") or {}).items():
+                records[key] = {**value, "room_id": self._resolve_room_id(rid),
+                                "currently_visible": False}
+            room.attributes["large_object_memory"] = {}
+        for node in self.nodes.values():
+            if node.type in {"scene", "room"}:
+                continue
+            key = str(node.attributes.get("instance_id") or node.id)
+            previous = records.get(key)
+            label = normalize_label(node.label)
+            if node.type == "portal":
+                records.pop(key, None)
+                continue
+            # Explicit M1 renaming can retract a mistaken long-lived memory.
+            if previous and node.attributes.get("m1_name_override") and label not in labels:
+                records.pop(key, None)
+                continue
+            if node.room_id is None:
+                continue
+            rid = self._resolve_room_id(node.room_id)
+            if rid not in rooms:
+                continue
+            if previous:
+                previous["room_id"] = rid
+                previous["currently_visible"] = bool(node.is_currently_visible)
+            count = max(int(node.observation_count or 0),
+                        int(node.attributes.get("max_consecutive_observations", 0) or 0))
+            size = list(node.aabb_size or [])
+            if (label not in labels or count < int(config.get("min_observations", 2))
+                    or float(node.confidence or 0) < float(config.get("min_confidence", .5))
+                    or len(size) != 3 or not all(math.isfinite(float(x)) for x in size)
+                    or max(size) < float(config.get("min_extent_m", .4))):
+                continue
+            records[key] = {
+                "object_id": key, "node_id": node.id, "name": label, "category": label,
+                "type": node.type, "room_id": rid, "confidence": float(node.confidence),
+                "aabb_center": list(node.aabb_center), "aabb_size": size,
+                "first_seen": (previous or {}).get("first_seen", node.first_seen),
+                "last_seen": node.last_seen, "observation_count": count,
+                "currently_visible": bool(node.is_currently_visible),
+                "evidence_source": "persistent_room_large_object_memory",
+            }
+        for key, record in records.items():
+            room = rooms.get(record["room_id"])
+            if room is not None:
+                room.attributes["large_object_memory"][key] = record
+
     def _refresh_room_attributes(self):
+        self._refresh_room_large_object_memory()
         room_nodes = {
             int(node.room_id): node
             for node in self.nodes.values()
@@ -5005,6 +5185,10 @@ class InteractionGraphStore:
             )
             mllm_is_usable = (
                 room_node.attributes.get("room_attribute_status") == "ready"
+                and not room_node.attributes.get("room_attribute_fallback", False)
+                and not str(
+                    room_node.attributes.get("room_mllm_attribute_source") or ""
+                ).startswith("weighted_object_types")
                 and mllm_attribute not in {"", "unknown"}
                 and mllm_confidence >= self.room_mllm_min_confidence
             )

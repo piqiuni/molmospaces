@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 pytest.importorskip("rospy")
 import physical_interaction_policy_node as module
+from interaction_policy import HumanAssistActuator, InteractionRequest, InteractionResult
 
 
 def message(seq):
@@ -22,6 +23,39 @@ def node():
     value._encoded_image_message = None
     value._encoded_sample = None
     return value
+
+
+def test_human_assist_speaks_english():
+    calls = []
+    actuator = HumanAssistActuator(lambda text, wait: calls.append(text) or {"accepted": True})
+    actuator.execute(InteractionRequest("test", target_kind="door"), lambda: False)
+    assert calls == ["Please open the door in front of me. Thank you."]
+
+
+def test_policy_deadline_returns_timeout_and_clears_owner(monkeypatch):
+    import json
+    value = node()
+    value._active_command = "command"
+    value._cancel = threading.Event()
+    value._param = lambda name, default: 2.0 if name == "policy_timeout_s" else default
+    results, events = [], []
+    value._result_pub = SimpleNamespace(publish=lambda m: results.append(json.loads(m.data)))
+    value._event_pub = SimpleNamespace(publish=lambda m: events.append(json.loads(m.data)))
+    now = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    def execute(request, cancel):
+        assert not cancel()
+        now[0] = 103.0
+        assert cancel()
+        return InteractionResult(request.command_id, True, "SUCCEEDED", request.target_id, request.target_kind)
+    monkeypatch.setattr(module, "build_interaction_policy", lambda *a, **kw: SimpleNamespace(execute=execute))
+    value._run(InteractionRequest("command", target_kind="door"))
+    assert results[-1]["status"] == "TIMEOUT"
+    assert results[-1]["success"] is False
+    assert results[-1]["detail"]["reason"] == "interaction_policy_timeout"
+    assert events[-1]["stage"] == "FINISHED"
+    assert value._active_command == ""
+    assert value._policy_deadline == 0.0
 
 
 def test_idle_camera_callbacks_do_not_encode_and_repeated_reads_use_cache(monkeypatch):

@@ -53,6 +53,7 @@ class MLLMResponse:
     raw_text: str = ""
     raw_http_response: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str = ""
 
     @property
     def tps(self) -> float:
@@ -79,6 +80,7 @@ class MLLMResponse:
                 else 0.0
             ),
             "error": self.error,
+            "finish_reason": self.finish_reason,
             "raw_text_chars": len(self.raw_text),
             "raw_text": self.raw_text,
         }
@@ -141,7 +143,11 @@ class MLLMClient:
                 raw_http_response=body,
             )
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
-            response = MLLMResponse(payload=None, latency_s=time.perf_counter() - started, error=str(exc))
+            response = MLLMResponse(
+                payload=None,
+                latency_s=time.perf_counter() - started,
+                error=str(exc).strip() or type(exc).__name__,
+            )
         self._record_metrics(role, response, config, metrics_context, instruction=instruction, context=context, images=images)
         return response
 
@@ -224,6 +230,9 @@ class MLLMClient:
                 body_payload["reasoning_effort"] = reasoning_effort
             if self._thinking_disabled(config):
                 body_payload["enable_thinking"] = False
+                # vLLM Qwen templates read this nested flag; the top-level
+                # compatibility flag alone does not disable reasoning there.
+                body_payload["chat_template_kwargs"] = {"enable_thinking": False}
             else:
                 body_payload["enable_thinking"] = True
                 body_payload["chat_template_kwargs"] = {"enable_thinking": True}
@@ -255,6 +264,7 @@ class MLLMClient:
         usage = envelope.get("usage") or {}
         output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
         raw_text = self._extract_text(envelope)
+        finish_reason = str(((envelope.get("choices") or [{}])[0]).get("finish_reason") or "")
         if not raw_text:
             raise ValueError("MLLM response contained no output text")
         try:
@@ -263,6 +273,9 @@ class MLLMClient:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             payload = None
             parse_error = f"invalid JSON response: {exc}"
+        if finish_reason == "length":
+            payload = None
+            parse_error = "output truncated: finish_reason=length; increase output token budget"
         return MLLMResponse(
             payload=payload,
             latency_s=time.perf_counter() - started,
@@ -279,6 +292,7 @@ class MLLMClient:
             raw_text=raw_text,
             raw_http_response=raw,
             usage=dict(usage),
+            finish_reason=finish_reason,
             error=parse_error,
         )
 
@@ -300,6 +314,7 @@ class MLLMClient:
             non_sse_lines: list[str] = []
             content_parts: list[str] = []
             usage: dict[str, Any] = {}
+            finish_reason = ""
             try:
                 async with httpx.AsyncClient(timeout=None, trust_env=trust_env) as client:
                     stream_request = client.build_request(
@@ -345,6 +360,8 @@ class MLLMClient:
                             or not isinstance(choices[0], dict)
                         ):
                             continue
+                        if choices[0].get("finish_reason"):
+                            finish_reason = str(choices[0]["finish_reason"])
                         delta = choices[0].get("delta") or {}
                         content = delta.get("content") if isinstance(delta, dict) else ""
                         if isinstance(content, str):
@@ -366,7 +383,8 @@ class MLLMClient:
                     raise ValueError("MLLM response envelope must be a JSON object")
                 return envelope, raw_response
             envelope = {
-                "choices": [{"message": {"content": "".join(content_parts)}}],
+                "choices": [{"message": {"content": "".join(content_parts)},
+                             "finish_reason": finish_reason}],
                 "usage": usage,
             }
             return envelope, "\n".join(raw_lines)
@@ -386,7 +404,9 @@ class MLLMClient:
         try:
             return asyncio.run(run_with_deadline())
         except httpx.HTTPError as exc:
-            raise OSError(str(exc)) from exc
+            # ReadError/ConnectError can have an empty message. Preserve their
+            # type so a transport failure is not reported as an empty model answer.
+            raise OSError(f"{type(exc).__name__}: {str(exc).strip()}".rstrip(": ")) from exc
 
     def _request_command(
         self,

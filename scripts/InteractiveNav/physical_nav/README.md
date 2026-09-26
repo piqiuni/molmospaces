@@ -22,6 +22,23 @@ grids and their calibration are retained; downstream RGB-mask lifting uses
 the depth-to-color transform, not equal pixel coordinates. Override alignment
 explicitly with `PHYSICAL_NAV_GO2_ALIGN_TO` when testing other modes.
 
+The current physical mount is inverted by 180 degrees. The all-in-one launcher
+defaults `PHYSICAL_NAV_GO2_IMAGE_ROTATION_DEG=180`; the Go2 bridge rotates both
+native RGB/depth arrays before encoding, shifts each principal point, and changes
+the depth-to-color transform into the upright virtual optical frames. There is
+no crop, resampling, second JPEG pass, or extra host-side TF roll. Existing host
+camera RPY describes these upright frames. Use `PHYSICAL_NAV_GO2_IMAGE_ROTATION_DEG=0`
+after returning the hardware to an upright mount. The standalone sensor script
+defaults to 0 for compatibility; deploy the updated Go2 script before using the
+new launcher. Camera IMU plus 180-degree normalization is explicitly rejected
+until the IMU axes are normalized too (camera IMU remains off by default).
+
+Install `requirements_policy.txt` in the actual algorithm Python environment,
+including `netifaces` for ROS subscriber transport. A system-Python binary module
+cannot satisfy Conda Python 3.11. The supervisor now checks this before launching
+ROS: otherwise processes appear alive while subscriber threads fail and the
+dashboard only receives the direct camera mirror.
+
 YOLO has one shared launch entry point for foreground debugging and the full
 navigation supervisor (run from the repository root):
 
@@ -84,6 +101,9 @@ position-quantized detector ID. The dashboard stores the exact source RGB for
 each completed call and redraws only that track's box as `door #42`. Physical
 M1 admission requires at least 1024 segmented pixels, a 1600 px bounding box,
 and the configured visible-fraction/distance checks.
+Capture-time `observation_pose_xyyaw`, image size and frame identity are
+preserved through YOLO → ROS gateway → tracked detections. Missing pose is
+not replaced by current odometry; portal M1 requires an actual observed view.
 
 The room-segmentation grid uses the complete occupancy-grid geometry. Colored
 cells are discovered free space assigned to a stable room; occupied and
@@ -299,6 +319,15 @@ transition.
 
 ### Manual speech test without interaction execution
 
+Physical interaction arrival uses a 0.30 m positional tolerance (including door
+re-observation), matching DWA; front-face and heading checks remain enabled.
+Human-assistance requests are spoken in English. The M3 card shows APPROACHING
+until arrival instead of treating navigation STARTED feedback as policy startup.
+Once the policy starts, the card displays the backend deadline: `interaction_policy.policy_timeout_s`
+defaults to 60 s including speech/retries, with a separate 15 s visual-verification
+budget after speech. Timeout returns a failed result; the webpage does not drive
+the timeout or require staying open.
+
 With the continuous control server running, publish a speech request from the
 policy host:
 
@@ -428,8 +457,11 @@ alignment, graph, telemetry, consistency and Qwen request/result history, and
 
 The web gateway is persistent and is no longer a critical child of the
 navigation supervisor. Therefore a watchdog-triggered navigation stop or a
-`physical_nav_service.sh restart` keeps port 8765 and the control bar online;
+plain `physical_nav_service.sh stop` keeps port 8765 and the control bar online;
 the page reports the navigation stack as offline until it is started again.
+An explicit `physical_nav_all.sh restart` or `physical_nav_service.sh restart`
+replaces the gateway after stopping the old stack, so the dashboard navigation
+step starts again at zero. A plain `start` may reuse the existing gateway.
 Use `physical_nav_service.sh web-stop` only when the web gateway itself must
 be shut down.
 
@@ -491,11 +523,100 @@ requests/results and latency in the status area.
 
 ```bash
 PHYSICAL_NAV_START_QWEN_TUNNEL=1 \
-PHYSICAL_NAV_QWEN_REMOTE_PORT=8000 \
+PHYSICAL_NAV_QWEN_REMOTE_PORT=8100 \
 bash scripts/InteractiveNav/physical_nav/start_physical_nav.sh
 ```
 
+## Interaction goals versus persistent graph memory
+
+实物交互目标的唯一白名单位于 `config/semantic_shadow_override.yaml`：
+
+```yaml
+interaction_goals:
+  enabled: true
+  allowed_semantic_types: [door, fridge]
+```
+
+候选生成、M2 模型选择以及规则/模型失败回退共享该限制。`refrigerator` 归一为
+`fridge`；添加其他类别只需改此列表。显式空列表或 `enabled: false` 禁止全部
+交互目标，不影响 EXPLORE/NAVIGATE。旧配置路径仅兼容未设置该节的实验，
+不要再在 candidate/model 下各自维护一份白名单。
+
+graph 不受目标白名单删减：locker 等仍可进入图并交给 M1 判别；只有接受并提交的
+冰箱重命名才能通过当前白名单，待确认的 fridge 假设不能提前放行 locker。
+M1 后续确认是饮水机时，旧的 fridge 假设也不能重新生成交互目标。
+
+M1 审核范围由 `config/physical_nav.yaml` 的 `include_keywords` /
+`exclude_keywords` 独立指定，不跟随 subgoal 白名单。默认覆盖门、冰箱、柜子、
+抽屉、衣柜、微波炉、洗碗机及 locker/safe 等可开容器假设；仍保留图像可见性、
+连续观测及请求缓存/预算限制。普通 box/storage_bin 没有默认可开属性；只有明确
+具有 `is_receptacle` 和 `is_articulable` 证据时才进入这条属性审核路径。
+
+房间模型推理由 `room_mllm.enabled: true` 的独立后台队列处理，全局发起间隔
+`dispatch_interval_s: 1.0`，同一房间另受证据变化/缓存限制。`room_inference`
+中的 `object_rules` 是规则先验，不是成功的 M1 回答：模型失败时公开状态为
+`fallback`，来源为 `weighted_object_types`，不能获得 M1 确认或永久语义资格。
+有效 M1 结果使用 `ready`；房间模型依据房间内物体标签和房间框推断，不是假定
+已经提供整间房的图像。
+
+Qwen 默认连接为本机 `18080` → SSH → 远端 `8100`，可用
+`PHYSICAL_NAV_QWEN_REMOTE_PORT` 覆盖。隧道包装器使用 exec，使监督进程记录的
+PID 就是 SSH 本身。一键启动会在终端显示 `Qwen remote=IP:端口`、本地健康检查
+URL 及 `Qwen health=PASS/FAIL`；检查通过 SSH 转发的 `/v1/models` 返回非空模型列表，
+随后向 `/v1/chat/completions` 发送固定的文本探针，要求在默认 8 秒内返回非空回答，
+终端显示 `Qwen inference=PASS`、模型和耗时。任一步失败都会以非零退出码中止后续启动。
+`start/restart` 不允许通过 `PHYSICAL_NAV_START_QWEN_TUNNEL=0` 跳过检查；该变量
+只供内部子启动链避免重复创建隧道使用。模型可用 `PHYSICAL_NAV_QWEN_MODEL` 指定，
+检查超时可用 `PHYSICAL_NAV_QWEN_HEALTH_TIMEOUT_S` 指定。这是文本推理检查，不代表
+完整视觉推理已成功。一键启动通过 `qwen_ssh_tunnel.py --ensure` 核对实际 SSH
+参数并检查 `/v1/models`；同用户、同 SSH 目标、同本地端口的旧 `8000` 转发
+会被精确替换，不再仅凭 PID 存活复用。未知端口占用、多个匹配进程会报错，
+不强杀其它服务，也不启动本地 Qwen。需要单独修复隧道时：
+
+```bash
+python3 scripts/InteractiveNav/physical_nav/qwen_ssh_tunnel.py --ensure \
+  --pid-file /tmp/molmospaces-physical-nav-all-1000/qwen_tunnel.pid \
+  --log-file /tmp/molmospaces-physical-nav-all-1000/logs/qwen_tunnel.log
+```
+
+实物 `attribute_inference.portal_m1_require_full_frame: false` 取消门贴边的
+请求前及图状态写回拦截，仍记录裁切事实。门的几何准入仍使用点云最高世界 Z
+`1.40 m`，不是可见部分的箱体高度；两帧确认、模型置信度和开口证据要求保留。
+柜子正面交互的裁切安全检查不受这个门专用开关影响。
+
+房间切口仅接受 M1 已确认门，按 OBB yaw 绘制并随证据纠正/撤销；成功交互后
+保留开门前门框参考。切口不会修改原始 OCC。图3层级为房间底图、物体框、
+文字；真正切断已观测自由空间后才生成不同房间 ID/颜色，未观测门后空间
+不会被涂成一块虚构房间。
+
+储物家具的巨框上限独立为 `max_container_box_span_m: 3.5` 和体积 `8.0 m³`。
+已确认物体收到有效新几何即可更新图；预算没处理的 2-D 检测不算新 3-D 观测。
+初次准入仍需两帧。连续三次一致、置信度/点数合格的新几何可修正错误初始框，
+单次巨框仍被拒绝；此逻辑是低开销稳健估计，不是多视角点云融合。
+
+跟踪保留范围独立配置在 `config/physical_nav.yaml` 的
+`semantic_map.object_persistent_classes`，并设置 `object_persistence_requires_m1: false`。
+达到两帧及原有类别确认门槛后，保留身份、box 和状态；看不到仅标记不可见，不因
+30 秒 TTL 删除。单帧噪声仍回收，显式纠错、合并和新实验重置仍有效。
+持久记忆不等同于 M1 状态确认，不能跳过执行前观测或提前生成门后房间。
+实时 YOLO 调试框仍只表示当前观测；语义图中的 box 才是持续维护的地图记忆。
+
+上述参数在节点启动时读取；修改文件不会自动取消当前任务或开启机器人运动。
+
 ## Safety and acceptance gates
+
+运动关闭时，无进展计时暂停：policy control 根据 Go2 控制桥的实时
+`motion_enabled` 遥测发布 `/physical_nav/execution_enabled`（ROS Bool 心跳）。
+执行器导航停滞、交互末端转向无进展、任务级停滞均扣除暂停区间；恢复后
+保留已消耗额度，切换边界保守忽略一个观测周期。尚未收到状态、遥测超过
+2 秒或控制桥断线时按暂停处理，不依赖网页。仿真不配置该话题时保持原行为。
+实物另外启用 `executor.execution_pause_enabled: true`：运动关闭时 M2 仍选
+subgoal，执行器保留选择但不发导航/交互/非零速度命令，动作状态超时也暂停。
+地图未就绪或执行关闭时不累计无候选停滞；有效候选恢复后仅解除这一类可恢复
+停滞，不解除任务成功或安全终态。未配置、未收到或过期的使能遥测均禁止动作。
+恢复后的导航由原串行 worker 重新规划，已发出的一次性交互不会因暂停重发。
+独立模型请求/网络健康检查仍有有限超时。代码更新后需重载对应节点，不会自动
+开启运动；现场测试不要主动使能机器人。
 
 1. No `SportClient`, `ObstaclesAvoidClient`, motion publisher or manipulation
    API is imported by the Go2 read-only bridge.

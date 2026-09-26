@@ -707,6 +707,15 @@ def test_legacy_room_granularity_remains_available_for_ablation() -> None:
     assert request["recent_decisions"][0]["candidate_id"] == "frontier:a"
 
 
+def test_physical_nearby_exploration_instruction_is_opt_in():
+    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled", nearby_exploration_enabled=True))
+    request = client.build_request([], {}, {}, {})
+    assert "LOCAL EXPLORATION CONSTRAINT" in request["instruction"]
+    assert "Distance is a primary cost" in request["instruction"]
+    default = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+    assert "LOCAL EXPLORATION CONSTRAINT" not in default.build_request([], {}, {}, {})["instruction"]
+
+
 def test_candidate_request_includes_spatial_history_without_rule_score() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     candidate = BehaviorCandidate(

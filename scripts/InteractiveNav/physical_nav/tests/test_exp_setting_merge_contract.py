@@ -43,6 +43,9 @@ def test_physical_config_preserves_safety_and_uses_time_not_camera_frames():
     assert not override["executor"]["navigation_failure_recovery_enabled"]
     assert override["executor"]["post_interaction_costmap_fast_path_enabled"]
     assert not override["model"]["force_unentered_room_exploration"]
+    assert override["interaction_goals"] == {"enabled": True, "allowed_semantic_types": ["door", "fridge"]}
+    assert "interaction_semantic_types" not in override["candidate"]
+    assert "subgoal_interaction_semantic_types" not in override["model"]
     assert config["attribute_inference"]["include_detector_class_hypothesis"]
     assert config["attribute_inference"]["portal_state_cooldown_s"] == 120.0
     assert config["semantic_map"]["object_min_confirmations"] == 2

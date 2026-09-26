@@ -14,9 +14,9 @@ DWAPlannerROS:
   # The planner must be able to accelerate from rest inside one 10-Hz DWA
   # window.  The physical minimum speed is applied downstream by
   # physical_velocity_safety; do not duplicate that floor here.
-  max_vel_x: 0.56
+  max_vel_x: 0.50
   min_vel_x: 0.05
-  max_vel_trans: 0.60
+  max_vel_trans: 0.50
   min_vel_trans: 0.05
   max_vel_theta: 1.30
   # Keep DWA angular sampling independent from the physical minimum-turn
@@ -27,8 +27,8 @@ DWAPlannerROS:
   # simulator profile, but at a 10 Hz physical loop it leaves only a 0.01 m/s
   # translational dynamic window per cycle.  The planner then frequently
   # selects angular-only samples even when the local path is forward.  This
-  # value remains below the Go2 safety limiter's 0.60 m/s cap and lets the
-  # window open quickly enough for normal forward tracking.
+  # acceleration lets the window open quickly enough for normal forward
+  # tracking; the planner and Go2 safety limiter both cap speed at 0.50 m/s.
   acc_lim_trans: 1.0
   # If the next path segment is behind the base, rotate in place first. This
   # uses DWA's collision-checked zero-vx trajectory instead of trying to
@@ -39,7 +39,7 @@ DWAPlannerROS:
   # the shared 1.75-rad rear-path threshold is too late for the physical base.
   rear_path_enter_angle: 1.00
   rear_path_exit_angle: 0.20
-  rear_path_rotate_speed: 0.40
+  rear_path_rotate_speed: 0.80
   # A temporary forced reverse after three failed samples changes the sign of
   # vx abruptly and is unsafe on the long camera mast. Let move_base stop and
   # replan instead; valid reverse trajectories remain available through DWA's

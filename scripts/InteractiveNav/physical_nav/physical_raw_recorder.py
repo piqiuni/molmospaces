@@ -164,14 +164,14 @@ class _Job:
 class PhysicalRawRecorder:
     """Durable session writer with non-blocking normal ingress.
 
-    ``critical`` jobs (JSON state/MLLM receipts and step boundaries) wait for a
-    short period if the queue is full and then mark the session degraded.  Raw
-    camera/presentation frames are best-effort in the bounded queue; every
-    drop is exposed in ``session.json`` rather than being silent.
+    All ingress is best-effort and non-blocking, including JSON events.
+    Queue overflow marks the session degraded; optional recording must never
+    stall live callbacks. Only explicit stop waits for the writer to drain.
     """
 
     MODES = {"raw_replay", "raw_plus_panels", "page_capture"}
     PANEL_NAMES = {
+        0: "overview_6panel",
         1: "panel1_perception",
         2: "panel2_occ",
         3: "panel3_spatial",
@@ -490,14 +490,11 @@ class PhysicalRawRecorder:
         job = _Job(kind, stage, payload, dict(metadata or {}), critical)
         started = time.perf_counter()
         try:
-            if critical:
-                jobs.put(job, timeout=1.0)
-            else:
-                jobs.put_nowait(job)
+            jobs.put_nowait(job)
         except queue.Full:
             with self._lock:
                 self._note("queue_dropped", stage)
-                self._degraded = True if critical else self._degraded
+                self._degraded = True
             return False
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         with self._lock:
@@ -854,6 +851,13 @@ class PhysicalRawRecorder:
             name = f"{receipt}_{seq}.{extension}"
             path = self._write_bytes(f"{directory}/{name}", data)
             files[key] = str(path.relative_to(self._session_dir or path.parent))
+            if key == "rgb":
+                # Concatenated original JPEGs are an MJPEG elementary video
+                # stream. Keep per-frame timing in the manifest for offline
+                # MP4 export; do not decode/re-encode on the live pipeline.
+                video = (self._session_dir or path.parent) / "raw/camera/first_person.mjpeg"
+                with video.open("ab") as handle:
+                    handle.write(data)
         record = {
             **meta,
             "files": files,

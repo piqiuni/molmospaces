@@ -44,9 +44,17 @@ class PolicyControlServer:
         self.ack_waiters: dict[int, asyncio.Future] = {}
         self.status_waiters: dict[int, asyncio.Future] = {}
         self.latest_telemetry: Optional[dict[str, Any]] = None
+        self.latest_telemetry_at = float("-inf")
         self.telemetry_event = asyncio.Event()
         self.last_telemetry_print = 0.0
         self.text_entry_active = False
+
+    def execution_enabled(self, now: float) -> bool:
+        return bool(
+            self.connected.is_set()
+            and now - self.latest_telemetry_at < 2.0
+            and (self.latest_telemetry or {}).get("motion_enabled") is True
+        )
 
     async def handler(self, websocket: ServerConnection) -> None:
         if self.bridge is not None:
@@ -71,6 +79,8 @@ class PolicyControlServer:
             self.bridge = None
             self.bridge_peer = ""
             self.connected.clear()
+            self.latest_telemetry = None
+            self.latest_telemetry_at = float("-inf")
             error = ConnectionError("Go2 bridge disconnected")
             for waiter in list(self.ack_waiters.values()) + list(
                 self.status_waiters.values()
@@ -102,6 +112,7 @@ class PolicyControlServer:
             return
         if message_type == "telemetry":
             self.latest_telemetry = message
+            self.latest_telemetry_at = time.monotonic()
             self.telemetry_event.set()
             if self.text_entry_active:
                 return
@@ -411,7 +422,7 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
     try:
         import rospy
         from geometry_msgs.msg import Twist
-        from std_msgs.msg import String
+        from std_msgs.msg import Bool, String
     except ImportError as exc:
         raise RuntimeError(
             "ROS source requires ROS 1 rospy and geometry_msgs in the current environment"
@@ -437,6 +448,10 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
         loop.call_soon_threadsafe(enqueue_velocity, value)
 
     rospy.init_node(args.ros_node_name, anonymous=False, disable_signals=True)
+    motion_publisher = rospy.Publisher(
+        "/physical_nav/execution_enabled", Bool, queue_size=1, latch=True
+    )
+    motion_publisher.publish(Bool(data=False))
     subscriber = rospy.Subscriber(args.cmd_vel_topic, Twist, on_cmd_vel, queue_size=1)
     speech_subscriber = None
     speech_status_publisher = None
@@ -533,6 +548,8 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
                         break
 
             now = time.monotonic()
+            # Publish independently of incoming cmd_vel and the optional web UI.
+            motion_publisher.publish(Bool(data=server.execution_enabled(now)))
             if (
                 latest_command is None
                 or now - latest_command_at > args.ros_command_stale_after_s
@@ -555,6 +572,7 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
             except ConnectionError:
                 pass
     finally:
+        motion_publisher.publish(Bool(data=False))
         subscriber.unregister()
         if speech_subscriber is not None:
             speech_subscriber.unregister()

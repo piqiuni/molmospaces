@@ -9,7 +9,19 @@ ROS `move_base` 连续速度和交互导航语音提示。
 - `continuous`：ROS `geometry_msgs/Twist` 连续速度，默认订阅 `/cmd_vel`。
 - `lidar`：开启、关闭或切换 Unitree LiDAR。
 - `posture`：显式卧倒和站立。
-- `speak`：默认使用 Go2 本地 Matcha + Vocos 合成，失败时回退到在线 Edge TTS。
+- `speak`：固定英文开门/冰箱/抽屉请求优先播放预生成 WAV，启动时预上传 AudioHub；
+  其它中文请求使用本地 Matcha，英文请求不送入中文 Matcha，而使用英文 Edge TTS。
+
+固定音频使用本机已有 FFmpeg/libflite 离线生成，无需下载模型：
+
+```bash
+python scripts/InteractiveNav/uni_control/prepare_interaction_audio.py
+paplay scripts/InteractiveNav/uni_control/audio/open_door_en.wav
+```
+
+部署时必须同时复制 `speech_assets.py` 和 `audio/*.wav` 到 Go2 对应目录。
+缓存键包含音频内容哈希，避免复用旧中文模型对英文生成的无效音频。
+若本机 PulseAudio 只有 `auto_null`，播放命令成功不代表硬件出声。
 - `telemetry`：回传 `rt/sportmodestate`、控制状态和语音后端状态。
 
 运动、遥测和语音队列彼此隔离。语音合成或 AudioHub 播放失败不会阻塞运动 watchdog；

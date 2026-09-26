@@ -15,6 +15,30 @@ from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
 from semantic_decision_py_pkg.candidate_curator import CandidateCuratorConfig
 
 
+def test_idle_mission_progress_pauses_while_execution_disabled():
+    from semantic_decision_py_pkg.behavior_execution import SemanticNavigationProgressSupervisor
+    node = object.__new__(SemanticRuleDecisionNode)
+    node.goal_complete = False
+    node.progress_execution_state = SimpleNamespace(enabled=True)
+    node.global_navigation_progress = SemanticNavigationProgressSupervisor()
+    node.active_behavior_type = ""
+    node.active_candidate_id = ""
+    node.no_eligible_candidate_tracker = SimpleNamespace(since_step=None)
+    def observe(step):
+        node._observe_global_navigation_progress({
+            "exploration_context": {"observation_step": step}, "robot_xy": [0, 0],
+        })
+    observe(0)
+    observe(20)
+    node.progress_execution_state.enabled = False
+    observe(20)
+    observe(1000)
+    node.progress_execution_state.enabled = True
+    observe(1000)
+    assert not node.goal_complete
+    assert node.global_navigation_progress.mission_reference_step_index == 980
+
+
 def test_candidate_publish_rejects_goal_changed_during_generation_and_aba():
     node = object.__new__(SemanticCandidateNode)
     node._target_lock = threading.Lock()

@@ -208,6 +208,8 @@ object_detection:
   ground_reject_max_center_z: 0.25
   max_noninteraction_box_span_m: 2.50
   max_noninteraction_box_volume_m3: 4.00
+  max_container_box_span_m: 3.50
+  max_container_box_volume_m3: 8.00
   projection_frame_id: "tf_frame_map"
   publish_debug_markers: true
   # Optional Foxglove/RViz evidence only. The gateway additionally checks
@@ -216,7 +218,7 @@ object_detection:
   publish_debug_segmented_cloud: false
   publish_debug_detection_image: true
   publish_debug_world_markers: true
-  publish_debug_world_segmented_cloud: false
+  publish_debug_world_segmented_cloud: true
   # Exact-frame instance points for RViz only. Keep the local HTTP/ROS debug
   # payload bounded; future multi-view fusion will maintain a voxel map.
   debug_cloud_max_points_per_instance: 400
@@ -237,6 +239,12 @@ object_detection:
   debug_world_segmented_cloud_topic: "/physical_nav/segmented_cloud_world"
 
 semantic_map:
+  # Existing confirmed tracks may refresh from a valid sample even when
+  # geometry-budget rotation prevents consecutive 3-D processing.
+  object_confirmed_geometry_reacquisition: true
+  object_stable_box_recovery_confirmations: 3
+  object_stable_box_recovery_min_confidence: 0.25
+  object_stable_box_recovery_min_depth_points: 64
   # Physical M3 carries exact command IDs; never match a result by object alone.
   require_interaction_command_id: true
   enable_object_mapping: true
@@ -245,11 +253,38 @@ semantic_map:
   # consumes tracked 3-D detections directly, so deserializing a second full
   # PointCloud2 here only burns CPU and can delay OCC/room callbacks.
   subscribe_pointcloud: false
-  # Keep an object track through occlusions. Once a door/container has two
-  # detector frames plus a valid M1 result, both the semantic map and graph
-  # latch its identity indefinitely; visibility is represented separately.
-  # Unconfirmed detector-only tracks remain reclaimable after this timeout.
+  # The TTL reclaims unconfirmed/noisy and non-persistent classes only.
+  # Two consecutive observations retain these identities/boxes even while M1
+  # is unavailable. This is graph memory, NOT the interaction-goal whitelist;
+  # M1 confirmation is still required for portal room topology.
   object_stale_after_sec: 30.0
+  object_persistence_requires_m1: false
+  object_persistent_classes:
+    - door
+    - portal
+    - doorframe
+    - doorway
+    - door_leaf
+    - gate
+    - entrance
+    - fridge
+    - refrigerator
+    - freezer
+    - locker
+    - safe
+    - water_dispenser
+    - dispenser
+    - cabinet
+    - drawer
+    - wardrobe
+    - closet
+    - cupboard
+    - dresser
+    - chest_of_drawers
+    - microwave
+    - dishwasher
+    - box
+    - storage_bin
   # Fuse/publish the latest RGB-D/YOLO result at 10 Hz. Navigation consumes
   # these receipts at its independent 5 Hz logical step. Room topology is
   # much slower and is published independently below.
@@ -266,6 +301,8 @@ semantic_map:
   # object into the persistent semantic map. Detection confidence is kept
   # unchanged here; this is a temporal confirmation gate only.
   object_min_confirmations: 2
+  # Size-scaled XYZ gates distinguish adjacent bottles and different shelves.
+  object_size_aware_xyz_matching: true
   # Interaction classes must be present in two uninterrupted detector
   # receipts. A missed frame resets the streak for both doors and fridges.
   object_class_min_confirmations:
@@ -323,10 +360,57 @@ semantic_map:
 
 room_inference:
   backend: "object_rules"
+  large_object_memory:
+    enabled: true
+    min_observations: 2
+    min_confidence: 0.5
+    min_extent_m: 0.4
+    labels: [chair, armchair, office_chair, sofa, couch, bench, desk, office_desk,
+      table, dining_table, coffee_table, bureau, cabinet, locker, wardrobe,
+      bookshelf, bookcase, shelf, shelving, bed, refrigerator, fridge,
+      smart_vending_refrigerator, vending_machine, water_dispenser, dispenser,
+      television, tv, air_conditioning, air_conditioner, washing_machine,
+      stove, oven, sink]
+
+# M1 review scope is independent of interaction_goals.allowed_semantic_types.
+# Cover graph portals/openable containers plus ambiguous appliance hypotheses;
+# review may reject or rename them, and does not grant permission to interact.
+# Plain box/storage_bin have no open/close prior: without an explicit
+# is_receptacle + is_articulable observation they remain ordinary graph objects.
+include_keywords:
+  - portal
+  - door
+  - doorframe
+  - doorway
+  - door_leaf
+  - gate
+  - entrance
+  - barrier
+  - fridge
+  - refrigerator
+  - freezer
+  - cabinet
+  - drawer
+  - wardrobe
+  - closet
+  - cupboard
+  - dresser
+  - chest_of_drawers
+  - microwave
+  - dishwasher
+  - locker
+  - safe
+# Legacy exclusions are substrings over labels/names/assets: "bed" would
+# reject a bedroom_door or bedside_cabinet. The positive scope above is the
+# admission gate; let M1 decide interactability instead of excluding context.
+exclude_keywords: []
 
 # Object M1 uses image evidence. The object_rules room backend is separate
 # from the text-only M1 room worker configured under room_mllm below.
 attribute_inference:
+  # Hardware views often clip the top of a real door. Keep the measured
+  # world-Z top gate (semantic_map: 1.40 m), not a full-image-border gate.
+  portal_m1_require_full_frame: false
   # Preserve physical admission: two detector frames plus one valid M1 vote.
   # Stable portal state refresh is wall-clock based, independent of camera FPS.
   portal_state_confirmation_count: 1
@@ -345,7 +429,7 @@ velocity_safety:
   input_topic: "/physical_nav/shadow_cmd_vel"
   output_topic: "/physical_nav/actuated_cmd_vel"
   scale: 1.0
-  max_linear_mps: 0.60
+  max_linear_mps: 0.50
   # Keep the physical base above its static-friction threshold. Explicit zero
   # commands still stop immediately in VelocitySafetyLimiter.stop()/limit().
   min_linear_mps: 0.30
@@ -353,12 +437,12 @@ velocity_safety:
   # dead zone; the deadband below still removes tiny numerical yaw residues.
   linear_deadband_mps: 0.05
   max_angular_rps: 1.30
-  min_angular_rps: 0.40
+  min_angular_rps: 0.80
   # Applied only to pure in-place rotations. Moving commands preserve their
   # DWA curvature in velocity_safety.py, so this floor cannot turn an arc into
   # a tight circle.
   angular_deadband_rps: 0.05
-  # Keep a bounded one-second ramp to the 0.60 m/s cap without adding the
+  # Keep a bounded ramp to the 0.50 m/s cap without adding the
   # multi-second lag caused by the previous 0.15 m/s^2 limit.
   max_linear_accel_mps2: 0.60
   max_angular_accel_rps2: 2.00
@@ -381,6 +465,8 @@ interaction_policy:
   # This includes cached AudioHub playback. M3's 10-second window starts only
   # after the Go2 bridge reports the final completed status.
   speech_ack_timeout_s: 30.0
+  # Total policy budget including speech/retries; visual verification has its own 15 s budget.
+  policy_timeout_s: 60.0
   # The local navigation graph can select an already-nearby door while the
   # remote Go2 speech/control bridge is still reconnecting after a restart.
   # Keep the interaction in its human-assist phase instead of immediately
@@ -390,6 +476,10 @@ interaction_policy:
   speech_retry_interval_s: 12.0
 
 room_mllm:
+  # Room-purpose evidence only; objects remain in the graph and door M1 lane.
+  excluded_object_labels: [door, portal, doorway, doorframe, gate, window,
+    window_frame, door_handle, doorknob, lock, keyhole, wall, floor, ceiling,
+    socket, thermostat]
   # Physical room attributes are inferred by the M1 room worker.  Keep the
   # latest-only queue so room classification cannot block OCC/room-grid flow.
   enabled: true

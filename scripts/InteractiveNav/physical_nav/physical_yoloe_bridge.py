@@ -1209,12 +1209,19 @@ def _is_excluded_scene_label(value: Any, config: dict[str, Any]) -> bool:
 
 
 def _is_implausibly_large_object(label: Any, size: np.ndarray, config: dict[str, Any]) -> bool:
-    """Keep close-up interaction targets while gating giant ordinary tracks."""
+    """Gate wall-sized storage boxes without adding a door-size admission gate."""
     semantic = str(label or "").casefold()
-    if any(marker in semantic for marker in ("door", "portal", "fridge", "refrigerator", "cabinet", "drawer")):
+    if any(marker in semantic for marker in ("door", "portal", "fridge", "refrigerator")):
         return False
     span = max(abs(float(value)) for value in size)
     volume = abs(float(size[0]) * float(size[1]) * float(size[2]))
+    if any(marker in semantic for marker in (
+        "cabinet", "drawer", "locker", "closet", "cupboard", "dresser", "wardrobe",
+    )):
+        return bool(
+            span > float(config.get("max_container_box_span_m", 3.5))
+            or volume > float(config.get("max_container_box_volume_m3", 8.0))
+        )
     return bool(
         span > float(config.get("max_noninteraction_box_span_m", 2.50))
         or volume > float(config.get("max_noninteraction_box_volume_m3", 4.00))

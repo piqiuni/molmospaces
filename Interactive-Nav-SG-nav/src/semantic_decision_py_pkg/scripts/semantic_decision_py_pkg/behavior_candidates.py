@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .interaction_scope import InteractionGoalScope, semantic_family
+
 from .approach_geometry import portal_approach_pose
 
 from dataclasses import asdict, dataclass, field
@@ -232,6 +234,7 @@ class CandidateGeneratorConfig:
     # keeps the historical type-only behaviour; the Go2 shadow lane narrows
     # this to door/portal and fridge.
     interaction_semantic_types: tuple[str, ...] = ()
+    interaction_goal_scope: InteractionGoalScope | None = None
     container_require_same_room: bool = False
     container_allow_connected_room: bool = False
     max_state_age_sec: float = 300.0
@@ -431,6 +434,8 @@ class CandidateGeneratorConfig:
     container_m1_front_axis_from_capture: bool = True
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
+    portal_ready_distance_cap_m: float = 0.15
+    portal_shrink_arrival_disc: bool = True
     # This is the public yaw gate shared by final approach validation and the
     # physical bridge.  Keep the conservative legacy default while allowing a
     # policy YAML to require a more front-facing interaction pose.
@@ -658,7 +663,7 @@ class CandidateGenerator:
             normal_goal = goals[0] if goals else None
             goals, labels = self._clear_interaction_goals(
                 goals, labels, node, target_xy, clearance_check,
-                min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                min(self.config.portal_ready_distance_cap_m, max(0.05, self.config.interaction_ready_distance_m)),
                 min(0.20, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
             )
             if not goals:
@@ -666,7 +671,7 @@ class CandidateGenerator:
             center = list(attributes.get("interaction_reference_aabb_center") or position)
             size = list(attributes.get("interaction_reference_aabb_size") or node.get("aabb_size") or [])
             yaw_tolerance = min(0.20, max(0.05, float(self.config.interaction_ready_yaw_tolerance_rad)))
-            position_tolerance = min(0.15, max(0.05, float(self.config.interaction_ready_distance_m)))
+            position_tolerance = min(self.config.portal_ready_distance_cap_m, max(0.05, float(self.config.interaction_ready_distance_m)))
             interaction_command = {
                 "node_id": node_id,
                 "node_type": "portal",
@@ -711,6 +716,7 @@ class CandidateGenerator:
                         "reobserve_interaction_target": True,
                         "portal_clearance_aware_approach": True,
                         "portal_approach_base_tolerances": [position_tolerance, yaw_tolerance],
+                        "portal_shrink_arrival_disc": self.config.portal_shrink_arrival_disc,
                         "node_type": "portal",
                         "observation_required": True,
                         "interaction_observation_source": "mllm_attribute_inference",
@@ -1736,7 +1742,33 @@ class CandidateGenerator:
                 for value in self.config.interaction_semantic_types
                 if str(value).strip()
             }
-            if allowed_semantics and self._interaction_semantic_label(node) not in allowed_semantics:
+            semantic_label = self._interaction_semantic_label(node)
+            scope = self.config.interaction_goal_scope
+            if scope is not None and semantic_label in {"object", "container", "portal"}:
+                for value in (node_attributes.get("semantic_name"), node.get("label"),
+                              node.get("name"), node_attributes.get("category")):
+                    public_label = semantic_family(value)
+                    if public_label and public_label not in {"object", "container", "portal", "fridge"}:
+                        # Preserve configurable classes such as microwave. Fridge
+                        # promotion must still pass the dedicated body-size gate.
+                        semantic_label = public_label
+                        break
+            if scope is not None and m1_name_override:
+                confirmed_label = semantic_family(
+                    node_attributes.get("m1_observed_object_name")
+                    or node_attributes.get("semantic_name") or node.get("label")
+                )
+                # A committed demotion overrides old pending/source fridge labels;
+                # a promotion still needs the existing refrigerator geometry gate.
+                if confirmed_label and (confirmed_label != "fridge" or semantic_label == "fridge"):
+                    semantic_label = confirmed_label
+            if (scope is not None and not m1_name_override
+                    and _normalized_marker_match("locker", source_labels)):
+                # A pending M1 fridge hypothesis is not a committed rename.
+                semantic_label = "locker"
+            if scope is not None and not scope.allows_label(semantic_label):
+                continue
+            if scope is None and allowed_semantics and semantic_label not in allowed_semantics:
                 continue
             interaction = node.get("interaction") or {}
             node_state = str(interaction.get("state") or "unknown")
@@ -1781,13 +1813,12 @@ class CandidateGenerator:
             ):
                 continue
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
-            persistent_portal = bool(
-                node_type == "portal"
-                and (node.get("attributes") or {}).get(
-                    "persistent_semantic_node", False
-                )
+            persistent_interaction = bool(
+                node_type in {"portal", "container"}
+                and (attributes.get("persistent_semantic_node", False)
+                     or attributes.get("persistent_tracking_node", False))
             )
-            if state_age_sec > self.config.max_state_age_sec and not persistent_portal:
+            if state_age_sec > self.config.max_state_age_sec and not persistent_interaction:
                 continue
             if node_type == "portal":
                 if (
@@ -2194,7 +2225,7 @@ class CandidateGenerator:
                     continue
             goal_candidates, approach_pose_labels = self._clear_interaction_goals(
                 goal_candidates, approach_pose_labels, node, position, clearance_check,
-                container_staging_ready_distance_m if node_type == "container" else min(0.15, self.config.interaction_ready_distance_m),
+                container_staging_ready_distance_m if node_type == "container" else min(self.config.portal_ready_distance_cap_m, self.config.interaction_ready_distance_m),
                 self.config.portal_interaction_front_angle_tolerance_rad,
                 portal_normal_goal=normal_goal,
             )
@@ -2482,7 +2513,7 @@ class CandidateGenerator:
                     0.05,
                     min(
                         float(self.config.interaction_ready_distance_m),
-                        0.15,
+                        self.config.portal_ready_distance_cap_m,
                     ),
                 )
                 if node_type == "portal"
@@ -2613,6 +2644,7 @@ class CandidateGenerator:
                     },
                     metadata={
                         "node_type": node_type,
+                        "interaction_semantic_type": semantic_label,
                         "interaction_admission_stage": (
                             "provisional_m1_pending"
                             if m1_pending_refrigerator
@@ -3049,6 +3081,7 @@ class CandidateGenerator:
                         # to select an AABB-clear goal on the far side instead
                         # of recreating one radial point at the door center.
                         "portal_clearance_aware_approach": node_type == "portal",
+                        "portal_shrink_arrival_disc": self.config.portal_shrink_arrival_disc,
                         "portal_approach_base_tolerances": [
                             interaction_command["navigation_goal_position_tolerance_m"],
                             interaction_command["navigation_goal_yaw_tolerance_rad"],
@@ -3698,7 +3731,8 @@ class CandidateGenerator:
             tolerance = arrival_tolerance
             if node.get("type") == "portal":
                 profile = bounded_portal_tolerances(goal, center, axis, tolerance,
-                                                   front_tolerance, front_tolerance, front_tolerance)
+                                                   front_tolerance, front_tolerance, front_tolerance,
+                                                   shrink_arrival_disc=self.config.portal_shrink_arrival_disc)
                 if profile is None:
                     continue
                 tolerance = profile["distance_tolerance_m"]
@@ -3768,9 +3802,10 @@ class CandidateGenerator:
                             tangent_offset_m=tangent_offset,
                         )
                         profile = bounded_portal_tolerances(
-                            pose, center, axis, min(0.15, max(0.05, self.config.interaction_ready_distance_m)),
+                            pose, center, axis, min(self.config.portal_ready_distance_cap_m, max(0.05, self.config.interaction_ready_distance_m)),
                             min(front_tolerance, max(0.05, self.config.interaction_ready_yaw_tolerance_rad)),
                             front_tolerance, front_tolerance,
+                            shrink_arrival_disc=self.config.portal_shrink_arrival_disc,
                         )
                         if tangent_offset and profile is None:
                             continue

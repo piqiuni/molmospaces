@@ -276,6 +276,7 @@ class InteractionAttributeInferenceNode:
             ),
         )
         self.room_enabled = bool(room_mllm_config.get("enabled", True))
+        self.room_excluded_object_labels = tuple(room_mllm_config.get("excluded_object_labels", []) or [])
         self.room_worker_count = max(
             1, int(room_mllm_config.get("worker_count", 1))
         )
@@ -1193,7 +1194,8 @@ class InteractionAttributeInferenceNode:
                     self.room_counts["filtered"] += 1
                 continue
             room_node_id = str(room.get("room_node_id") or f"room_{room_id}")
-            objects = self._room_objects(room.get("objects"))
+            objects = self._room_objects(room.get("objects"),
+                excluded_labels=getattr(self, "room_excluded_object_labels", ()))
             box = room.get("room_box")
             if not isinstance(box, dict):
                 box = {}
@@ -1289,18 +1291,25 @@ class InteractionAttributeInferenceNode:
         self._publish_status()
 
     @staticmethod
-    def _room_objects(raw_objects) -> list[dict]:
+    def _room_objects(raw_objects, excluded_labels=()) -> list[dict]:
         """Allow only room-member object metadata into the no-image lane."""
 
         if not isinstance(raw_objects, list):
             return []
         normalized = []
+        excluded = {str(label).strip().casefold().replace("-", "_").replace(" ", "_")
+                    for label in excluded_labels if str(label).strip()}
         for raw in raw_objects:
             if not isinstance(raw, dict):
                 continue
             object_id = str(raw.get("object_id") or raw.get("node_id") or "")
             name = str(raw.get("name") or raw.get("category") or "object")
             if not object_id or not name:
+                continue
+            labels = [str(value).strip().casefold().replace("-", "_").replace(" ", "_")
+                      for value in (name, raw.get("category"), raw.get("type"))]
+            if any(label == item or label.endswith("_" + item)
+                   for label in labels for item in excluded):
                 continue
             try:
                 confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
@@ -1462,7 +1471,7 @@ class InteractionAttributeInferenceNode:
             "source": "weighted_object_types_fallback",
             "model_name": "",
             "request_sequence": int(request_payload["request_sequence"]),
-            "room_attribute_status": "ready",
+            "room_attribute_status": "fallback",
             "fallback": True,
             "error": str(error)[:240],
             "queue_lag_sec": float(queue_lag_sec),
@@ -3412,6 +3421,16 @@ class InteractionAttributeInferenceNode:
                 else "interaction_class is portal, container, none, or unknown. "
             )
             portal_instruction = (
+                "First verify portal identity independently of the detector label. A flat wall, "
+                "wall panel, decorative rectangle, shadow or vertical seam alone is not a door. "
+                "A closed door needs visible structural evidence of a distinct movable leaf "
+                "in a frame (leaf/frame gap, hinge or handle hardware, or consistent recessed "
+                "leaf boundaries); do not invent missing hardware. An open doorway needs a real "
+                "aperture, not a dark wall patch. Inspect surrounding wall context. For a clear "
+                "wall/panel return observed_object_name=wall or wall_panel, interaction_class=none "
+                "and interactable=false. If identity is ambiguous, return interaction_class=unknown, "
+                "needs_reobserve=true and approach_ready=false rather than a confident door guess. "
+                "Partial framing alone does not reject a real door with visible structural evidence. "
                 "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
                 "confidence: 0..1}; report absent only when the image visibly shows a clear "
                 "opening with no door leaf. It is visual morphology only: never infer "
@@ -3705,7 +3724,7 @@ class InteractionAttributeInferenceNode:
             if observed_bbox is not None:
                 patch["observed_bbox_2d"] = observed_bbox
             # Keep this detector fact separate from the M1 answer.  Portal
-            # state still treats any clipped side as incomplete evidence.  For
+            # state may require a complete frame, as configured by the mapper. For
             # a container contact view, the executor can distinguish a missing
             # *lateral* boundary (unsafe frontality) from a low camera view
             # that clips only the top/bottom while retaining a grounded handle
@@ -4009,9 +4028,8 @@ class InteractionAttributeInferenceNode:
                                 fallback_error,
                             )
             if fallback_patch is not None:
-                # Publish the fallback as a ready room patch.  The mapper
-                # records it as a fallback (and keeps the room dirty), while
-                # the failure cooldown admits a later MLLM refresh.
+                # A usable rule estimate is not a successful M1 result. Keep
+                # that distinction public while allowing a later MLLM refresh.
                 self._publish_room_updates(
                     episode_id,
                     float(stamp),

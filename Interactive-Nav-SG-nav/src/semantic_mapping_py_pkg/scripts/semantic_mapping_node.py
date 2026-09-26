@@ -284,10 +284,25 @@ class SemanticMappingNode:
 
         self.object_store = ObjectMapStore(
             match_distance=config.get("object_match_distance", 0.5),
+            size_aware_xyz_matching=config.get("object_size_aware_xyz_matching", False),
             stale_after_sec=self.object_stale_after_sec,
+            persistent_classes=config.get("object_persistent_classes"),
+            persistence_requires_m1=config.get("object_persistence_requires_m1", True),
             min_confirmations=config.get("object_min_confirmations", 2),
             size_match_ratio=config.get("object_size_match_ratio", 0.7),
             stable_history_size=config.get("object_stable_history_size", 5),
+            confirmed_geometry_reacquisition=config.get(
+                "object_confirmed_geometry_reacquisition", False
+            ),
+            stable_box_recovery_confirmations=config.get(
+                "object_stable_box_recovery_confirmations", 0
+            ),
+            stable_box_recovery_min_confidence=config.get(
+                "object_stable_box_recovery_min_confidence", 0.25
+            ),
+            stable_box_recovery_min_depth_points=config.get(
+                "object_stable_box_recovery_min_depth_points", 64
+            ),
             duplicate_bbox_iou_threshold=config.get("object_duplicate_bbox_iou_threshold", 0.0),
             duplicate_3d_overlap_threshold=config.get("object_duplicate_3d_overlap_threshold", 0.15),
             class_min_confirmations=config.get("object_class_min_confirmations", {}),
@@ -313,8 +328,16 @@ class SemanticMappingNode:
             confidence_step=config.get("scene_confidence_step", 5),
         )
         self.graph_store = InteractionGraphStore(
+            room_large_object_memory=room_inference_config.get("large_object_memory", {}),
+            portal_require_full_frame=bool(
+                (get_nested_param(rospy, "attribute_inference", {}) or {}).get(
+                    "portal_m1_require_full_frame", True
+                )
+            ),
             scene_id=graph_config.get("scene_id", rospy.get_name().strip("/") or "semantic_mapping_scene"),
             match_distance=graph_config.get("match_distance", config.get("object_match_distance", 0.5)),
+            persistent_object_classes=config.get("object_persistent_classes"),
+            object_persistence_requires_m1=config.get("object_persistence_requires_m1", True),
             room_id_to_name={},
             room_box_height=self.room_box_height,
             portal_room_max_radius_m=graph_config.get(
@@ -990,6 +1013,7 @@ class SemanticMappingNode:
             segmenter.room_portal_cut_enabled,
             segmenter.room_portal_cut_margin_m,
             segmenter.room_portal_cut_thickness_cells,
+            getattr(segmenter.state, "portal_revision", 0),
             segmenter.room_id_overlap_ratio,
             segmenter.room_merge_confirmations,
             segmenter.room_grid_stability_frames,
@@ -1289,6 +1313,9 @@ class SemanticMappingNode:
         cache_hit = False
         with self._room_lock:
             cache_check_t0 = time.perf_counter()
+            sync_portals = getattr(self.room_segmenter, "sync_graph_portals", None)
+            if callable(sync_portals):
+                sync_portals(graph_payload)
             force_stable = bool(request.get("force_stable"))
             cached, cache_key, cache_categories = self._load_room_topology_cache(
                 room_occupancy,
@@ -1889,6 +1916,13 @@ class SemanticMappingNode:
             if isinstance(item, dict)
             and not bool(item.get("geometry_skipped", False))
         ]
+        # Budget-only 2-D receipts can preserve a matched visual streak. They
+        # must never be projected, counted as 3-D hits, or sent to the graph.
+        deferred = parsed.get("geometry_deferred_detections")
+        update_options = (
+            {"geometry_deferred_detections": deferred}
+            if isinstance(deferred, list) and deferred else {}
+        )
         # Keep processing an empty filtered frame.  ObjectMapStore uses the
         # receipt to advance miss/stale bookkeeping, while confirmed graph
         # nodes remain persistent according to their configured lifetime.
@@ -1913,7 +1947,7 @@ class SemanticMappingNode:
             room_epoch = int(getattr(self, "_room_epoch", 0))
             object_store_total_t0 = time.perf_counter()
             object_store_t0 = time.perf_counter()
-            if self.object_store.update(detections, stamp) is False:
+            if self.object_store.update(detections, stamp, **update_options) is False:
                 # Replayed/out-of-order capture cannot increase either the
                 # tracker count or the downstream graph's two-frame gate.
                 return
@@ -2011,6 +2045,7 @@ class SemanticMappingNode:
                 observations,
                 stamp=stamp,
                 source_mode="detector_online",
+                track_aliases=self.object_store.merged_track_aliases,
             )
             graph_update_ms = (time.perf_counter() - graph_update_t0) * 1000.0
             # Remove synthetic door-side rooms that were created before the
@@ -2342,6 +2377,7 @@ class SemanticMappingNode:
             else rospy.Time.now().to_sec()
         )
         changed = False
+        portal_changed = False
         with self.lock:
             accepted_epochs = {
                 str(self.graph_store.episode_id or ""),
@@ -2354,13 +2390,26 @@ class SemanticMappingNode:
                     accepted = self.graph_store.apply_attribute_patch(patch, stamp=stamp)
                     if accepted:
                         self._sync_confirmed_m1_track_label_locked(patch)
+                        object_id = str(patch.get("object_id") or "")
+                        for node in getattr(self.graph_store, "nodes", {}).values():
+                            if not self.graph_store._node_matches_identity(node, object_id):
+                                continue
+                            attrs = node.attributes or {}
+                            portal_changed = portal_changed or (
+                                node.type == "portal" or attrs.get("topology_type") == "portal"
+                                or attrs.get("observation_node_type") == "portal"
+                            )
                     changed = accepted or changed
             prune_rooms = getattr(
                 self.graph_store, "prune_unqualified_provisional_rooms", None
             )
             if callable(prune_rooms):
                 prune_rooms()
+            if portal_changed:
+                self._mark_room_inputs_dirty_locked(structural=True)
         if changed:
+            if portal_changed:
+                self._enqueue_room_refresh(reason="m1_portal_evidence")
             self._collect_and_publish_bundle()
 
     def _sync_confirmed_m1_track_label_locked(self, patch):
@@ -2374,10 +2423,12 @@ class SemanticMappingNode:
         if node is None:
             return
         attributes = node.attributes
+        track_id = str(attributes.get("instance_id") or "")
+        if track_id:
+            self.object_store.update_retention_evidence(track_id, attributes)
         if (not attributes.get("m1_name_override")
             or str(attributes.get("m1_observed_object_name") or "") != node.label):
             return
-        track_id = str(attributes.get("instance_id") or "")
         if track_id:
             self.object_store.set_m1_canonical_label(track_id, node.label)
 
@@ -2850,6 +2901,7 @@ class SemanticMappingNode:
                 "id": reference_id,
                 "name": "door",
                 "is_door": True,
+                "yaw": attributes.get("interaction_reference_yaw", attributes.get("yaw", 0.0)),
                 "box_3d": {"center": center, "size": size},
             }
         return None
@@ -2876,6 +2928,9 @@ class SemanticMappingNode:
     def _refresh_room_grid_locked(self, *, force_stable=False):
         if self.latest_occupancy_grid is None:
             return
+        sync_portals = getattr(self.room_segmenter, "sync_graph_portals", None)
+        if callable(sync_portals):
+            sync_portals(self.graph_store.as_graph_dict())
         room_occupancy = self._room_segmentation_occupancy_locked()
         room_ids, room_conf = self._segment_rooms_from_occupancy(
             room_occupancy,
@@ -3204,6 +3259,14 @@ class SemanticMappingNode:
                 node.get("aabb_center"), node.get("aabb_size")
             )
             active_rooms.append({"room_id": room_id, "room_box": room_box})
+            # Live observations win; expired tracks remain room-purpose evidence.
+            live = {item["object_id"]: item for item in evidence_by_room.get(room_id, [])}
+            for key, item in (attributes.get("large_object_memory") or {}).items():
+                if key not in live:
+                    live[key] = {field: item.get(field) for field in (
+                        "object_id", "node_id", "name", "category", "type", "confidence")}
+                    live[key]["currently_visible"] = False
+            evidence_by_room[room_id] = list(live.values())
             evidence = sorted(
                 evidence_by_room.get(room_id, []),
                 key=lambda item: (item["object_id"], item["node_id"]),

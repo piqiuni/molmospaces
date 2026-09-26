@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .interaction_scope import interaction_candidate_family, semantic_family
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -206,6 +208,7 @@ class ModelPolicyConfig:
     include_pre_scores: bool = False
     context_profile: str = "public_facts_v2"
     prompt_file: str = ""
+    nearby_exploration_enabled: bool = False
     recent_decision_limit: int = 30
     # A model may still overlook an observed route-critical portal.  The guard
     # only applies to deterministic high-priority hints and leaves ordinary
@@ -1486,7 +1489,7 @@ class ModelPolicyClient:
     ) -> BehaviorCandidate | None:
         candidates = list(candidates)
         allowed_interactions = {
-            str(value).strip().casefold()
+            semantic_family(value)
             for value in self.config.subgoal_interaction_semantic_types
             if str(value).strip()
         }
@@ -1594,23 +1597,7 @@ class ModelPolicyClient:
 
     @staticmethod
     def _interaction_candidate_family(candidate: BehaviorCandidate) -> str:
-        metadata = candidate.metadata or {}
-        text = " ".join(
-            str(value or "").casefold()
-            for value in (
-                candidate.target_name,
-                metadata.get("semantic_name"),
-                metadata.get("node_type"),
-                (candidate.interaction_command or {}).get("container_kind"),
-            )
-        )
-        if any(marker in text for marker in ("door", "portal", "gate")):
-            return "door"
-        if any(marker in text for marker in ("fridge", "refrigerator")):
-            return "fridge"
-        if any(marker in text for marker in ("drawer", "cabinet", "dresser")):
-            return "drawer_cabinet"
-        return str(metadata.get("node_type") or "").strip().casefold()
+        return interaction_candidate_family(candidate)
 
     @staticmethod
     def _sanitize_model_selection(
@@ -1917,6 +1904,18 @@ class ModelPolicyClient:
             )
         if self._prompt_override:
             instruction = self._prompt_override
+        if self.config.nearby_exploration_enabled:
+            instruction += (
+                " LOCAL EXPLORATION CONSTRAINT: For ordinary exploration, prefer the nearest "
+                "useful reachable frontier and finish nearby unknown space before distant frontiers. "
+                "Distance is a primary cost, not merely a tie-break after raw unknown area. "
+                "Compare recent outcomes and spatial positions, not only IDs: a renamed frontier "
+                "in the same already explored or repeatedly visited region is not new progress. "
+                "Avoid back-and-forth revisits without new information; choose a nearby alternative. "
+                "Preserve explicit target goals, necessary door interactions and post-interaction "
+                "traversal priority. Distant exploration is appropriate when local options are "
+                "exhausted, blocked or on cooldown; never invent unlisted options."
+            )
         self.last_request_context = {
             "m2_context_profile": self.config.context_profile,
             "m2_prompt_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),

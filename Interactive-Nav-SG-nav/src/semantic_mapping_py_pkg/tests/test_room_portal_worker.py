@@ -30,7 +30,9 @@ def make_node():
 
 def door(name="door1", x=1.0):
     return {"id": name, "name": "door", "position": [x, 2, 1],
-            "aabb_size": [1, 0.1, 2]}
+            "aabb_size": [1, 0.1, 2],
+            "attributes": {"attribute_status": "ready", "attribute_confidence": 0.9,
+                           "mllm_interaction_class": "portal", "m1_observed_object_name": "door"}}
 
 
 def test_detection_and_reset_do_not_wait_for_segmentation_lock():

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import threading
+import copy
 import time
 import socket
 import xmlrpc.client
@@ -125,6 +126,7 @@ from rospy.numpy_msg import numpy_msg
 from nav_msgs.srv import GetPlan
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from semantic_decision_py_pkg.progress_pause import ExecutionEnableState, ProgressPause
 
 
 TERMINAL_STATES = {
@@ -382,6 +384,13 @@ class SemanticBehaviorExecutor:
         rospy.init_node("semantic_behavior_executor")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~executor", {}) or {}
+        self.progress_execution_state = ExecutionEnableState(rospy, config)
+        self.execution_pause_enabled = bool(config.get("execution_pause_enabled", False))
+        self._execution_pause_clock = ProgressPause()
+        self._execution_was_paused = False
+        self._execution_pause_generation = 0
+        self._execution_worker_context = threading.local()
+        self._deferred_execution_commands = []
         ablation_config = rospy.get_param("~ablation", {}) or {}
         self.ablation = AblationConfig(
             module1=str(ablation_config.get("module1", "dynamic_rule")),
@@ -1580,6 +1589,13 @@ class SemanticBehaviorExecutor:
             String, queue_size=1, latch=True,
         )
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+        self.paused_plan_preview_enabled = bool(config.get("paused_plan_preview_enabled", False))
+        self._paused_plan_preview_busy = False
+        self._paused_plan_preview_next = 0.0
+        self._paused_plan_preview_status = {}
+        self.paused_plan_pub = rospy.Publisher(
+            "/semantic_decision/paused_global_plan", Path, queue_size=1,
+        ) if self.paused_plan_preview_enabled else None
         rospy.Subscriber(
             topics.get("move_base_status", "/move_base/status"),
             GoalStatusArray,
@@ -1755,6 +1771,7 @@ class SemanticBehaviorExecutor:
             if self.machine.state != STATE_IDLE or self.selection is not None:
                 self._publish_feedback(selection, "REJECTED", False, {"reason": "executor_busy"})
                 return
+            self._update_execution_pause_locked()
             self.selection = selection
             self.active_skill_plan = {}
             self.pending_skill_actions = []
@@ -3554,6 +3571,9 @@ class SemanticBehaviorExecutor:
             self._latest_step_sync_received_at = received_at
             action_source = str(payload.get("action_source") or "")
             supervisor = getattr(self, "_semantic_navigation_progress", None)
+            execution_enabled = getattr(getattr(self, "progress_execution_state", None), "enabled", True)
+            if supervisor is not None:
+                supervisor.set_execution_enabled(execution_enabled, step_index)
             if supervisor is not None and self.machine.state in {STATE_INTERACTING, STATE_VERIFYING}:
                 supervisor.pause(step_index)
             if self.startup_scan_enabled:
@@ -3682,6 +3702,8 @@ class SemanticBehaviorExecutor:
         return ""
 
     def _effective_timeout_reason_locked(self, now: float | None = None) -> str:
+        if self._execution_is_paused():
+            return ""
         if (
             self.machine.state == STATE_INTERACTING
             and getattr(self, "_interaction_command_sent_id", "")
@@ -3698,7 +3720,8 @@ class SemanticBehaviorExecutor:
             if (
                 request and request.get("request_status", "waiting_for_view") == "waiting_for_view"
                 and started is not None and latest is not None
-                and latest - started >= getattr(self, "interaction_observation_view_wait_task_steps", 6)
+                and latest - started - int(request.get("execution_paused_steps", 0))
+                >= getattr(self, "interaction_observation_view_wait_task_steps", 6)
             ):
                 return "interaction_observation_timeout"
         reason = self.machine.timeout_reason(
@@ -3727,6 +3750,7 @@ class SemanticBehaviorExecutor:
         with self.lock:
             command_id = str(getattr(self, "_interaction_command_sent_id", "") or "")
             if command_id and str(payload.get("command_id") or "") == command_id:
+                self._update_execution_pause_locked()
                 self._interaction_execution_progress = {
                     **payload, "received_at": time.monotonic(),
                 }
@@ -4711,9 +4735,143 @@ class SemanticBehaviorExecutor:
             )
         return []
 
+    def _execution_is_paused(self) -> bool:
+        return bool(getattr(self, "execution_pause_enabled", False) and not
+                    getattr(getattr(self, "progress_execution_state", None), "enabled", False))
+
+    def _update_execution_pause_locked(self) -> bool:
+        if not getattr(self, "execution_pause_enabled", False):
+            return False
+        paused = self._execution_is_paused()
+        clock = self._execution_pause_clock
+        steps, seconds = clock.advance(
+            not paused, self._public_step_or_none(getattr(self, "_latest_step_sync_index", None)),
+            time.monotonic(),
+        )
+        if self.selection is not None:
+            self.machine.started_at += seconds
+            self.machine.state_started_at += seconds
+            if self.machine.state_started_task_step_index is not None:
+                self.machine.state_started_task_step_index += steps
+            if self.machine._interaction_step_updated_at > 0:
+                self.machine._interaction_step_updated_at += seconds
+            if getattr(self, "_interaction_command_sent_at", 0) > 0:
+                self._interaction_command_sent_at += seconds
+            command_id = str(getattr(self, "_interaction_command_sent_id", "") or "")
+            progress = getattr(self, "_interaction_execution_progress", {}) or {}
+            if command_id and progress.get("command_id") == command_id:
+                if progress.get("received_at") is not None:
+                    progress["received_at"] += seconds
+            context = getattr(self, "_drawer_scan_execution_wait", {}) or {}
+            if command_id and context.get("command_id") == command_id:
+                if context.get("started_step_index") is not None:
+                    context["started_step_index"] += steps
+                if context.get("started_at_monotonic_s") is not None:
+                    context["started_at_monotonic_s"] += seconds
+            for request in getattr(self, "_interaction_observation_requests", {}).values():
+                if request.get("minimum_capture_step") is not None:
+                    request["execution_paused_steps"] = int(request.get("execution_paused_steps", 0)) + steps
+        if paused and not self._execution_was_paused:
+            self._execution_pause_generation += 1
+            # Invalidate results before cancel: a PREEMPTED from this cancel is
+            # a pause, not a failed subgoal or a new recovery attempt.
+            getattr(self, "_active_navigation_run_tokens", {}).clear()
+            if self.selection is not None:
+                self._send_owned_base_stop()
+        self._execution_was_paused = paused
+        return paused
+
+    def _defer_execution_command_locked(self, command: dict) -> bool:
+        if not self._execution_is_paused() or command.get("kind") in {"terminal", "finalize_frontier"}:
+            return False
+        candidate = command.get("candidate") or {}
+        if self.selection is None or candidate.get("decision_id") != self.selection.get("decision_id"):
+            return True
+        pending = getattr(self, "_deferred_execution_commands", [])
+        if command not in pending:
+            pending.append(command)
+        self._deferred_execution_commands = pending
+        return True
+
+    def _schedule_paused_plan_locked(self) -> None:
+        """Read-only planning: never send an action goal or advance the machine."""
+        if (not getattr(self, "paused_plan_preview_enabled", False)
+                or self._paused_plan_preview_busy or self.selection is None
+                or time.monotonic() < self._paused_plan_preview_next):
+            return
+        candidate = copy.deepcopy(self.selection)
+        if len(candidate.get("goal_xyyaw") or []) < 3:
+            return
+        self._paused_plan_preview_busy = True
+        self._paused_plan_preview_next = time.monotonic() + 2.0
+        self._paused_plan_preview_status = {
+            "status": "planning", "planning_only": True,
+            "candidate_id": candidate.get("candidate_id"), "timestamp": time.time(),
+        }
+        generation = self._execution_pause_generation
+        threading.Thread(target=self._paused_plan_preview_worker,
+                         args=(candidate, generation), daemon=True).start()
+
+    def _paused_plan_preview_worker(self, candidate: dict, generation: int) -> None:
+        frame = str((candidate.get("metadata") or {}).get("frame_id") or self.map_frame)
+        plan = Path()
+        plan.header.frame_id = frame
+        status = "unavailable"
+        try:
+            pose = self._current_pose(frame)
+            if pose is None:
+                raise ValueError("pose_unavailable")
+            def stamped_pose(values):
+                message = PoseStamped()
+                message.header.frame_id = frame
+                message.header.stamp = rospy.Time.now()
+                message.pose.position.x, message.pose.position.y = map(float, values[:2])
+                message.pose.orientation.z = math.sin(float(values[2]) / 2)
+                message.pose.orientation.w = math.cos(float(values[2]) / 2)
+                return message
+            rospy.wait_for_service(self.make_plan_service, timeout=0.5)
+            # A separate nonpersistent client cannot race the actuator worker's socket.
+            client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+            plan = client(start=stamped_pose(pose),
+                          goal=stamped_pose(candidate["goal_xyyaw"]),
+                          tolerance=self.make_plan_tolerance_m).plan
+            status = "ready" if plan.poses else "no_path"
+        except Exception as exc:
+            status = str(exc) or type(exc).__name__
+        finally:
+            with self.lock:
+                self._paused_plan_preview_busy = False
+                current = self.selection or {}
+                if (not self._execution_is_paused()
+                        or generation != self._execution_pause_generation
+                        or current.get("decision_id") != candidate.get("decision_id")
+                        or current.get("candidate_id") != candidate.get("candidate_id")
+                        or current.get("goal_xyyaw") != candidate.get("goal_xyyaw")):
+                    return
+                plan.header.stamp = rospy.Time.now()
+                self._paused_plan_preview_status = {
+                    "status": status, "planning_only": True,
+                    "candidate_id": candidate.get("candidate_id"),
+                    "pose_count": len(plan.poses), "timestamp": time.time(),
+                }
+                self.paused_plan_pub.publish(plan)
+
     def _tick(self, _event) -> None:
         reservation_retry = None
         with self.lock:
+            paused = self._update_execution_pause_locked()
+            if paused:
+                self._schedule_paused_plan_locked()
+                self.state_pub.publish(String(data=json.dumps({
+                    **self.machine.summary(), "execution_paused": True,
+                    "pause_reason": "execution_disabled",
+                    "paused_plan_preview": getattr(self, "_paused_plan_preview_status", {}),
+                    "decision_id": str((self.selection or {}).get("decision_id") or ""),
+                    "timestamp": time.time(),
+                }, ensure_ascii=False, separators=(",", ":"))))
+                return
+            deferred = list(getattr(self, "_deferred_execution_commands", []))
+            self._deferred_execution_commands = []
             reason = self._effective_timeout_reason_locked()
             latest_task_step_index = self._public_step_or_none(
                 getattr(self, "_latest_step_sync_index", None)
@@ -4826,6 +4984,7 @@ class SemanticBehaviorExecutor:
                     reservation_retry = dict(self.selection)
             state_payload = {
                 **self.machine.summary(),
+                "execution_paused": False,
                 "navigation_transport": {
                     "client_generation": getattr(self, "_move_base_client_generation", 0),
                     "reconnect_attempts": getattr(self, "_move_base_reconnect_attempts", 0),
@@ -4892,12 +5051,31 @@ class SemanticBehaviorExecutor:
         )
         if cancel_navigation:
             self.move_base.cancel_goal()
-        self._dispatch(commands)
+        self._dispatch(deferred + commands)
         if reservation_retry is not None:
             self._publish_explore_command(reservation_retry, action="reserve_frontier")
 
     def _dispatch(self, commands: list[dict]) -> None:
         for command in commands:
+            if getattr(self, "execution_pause_enabled", False):
+                with self.lock:
+                    self._update_execution_pause_locked()
+                    if self._defer_execution_command_locked(command):
+                        continue
+                    candidate = command.get("candidate") or {}
+                    if self.selection is None or candidate.get("decision_id") != self.selection.get("decision_id"):
+                        continue
+                    expected_states = {
+                        "reserve_frontier": {STATE_PREPARING_EXPLORE},
+                        "navigate": {STATE_NAVIGATING, STATE_APPROACH_INTERACTION},
+                        "scan": {STATE_SCANNING},
+                        "interact": {STATE_INTERACTING},
+                        "publish_drawer_scan": {STATE_INTERACTING},
+                        "request_interaction_observation": {STATE_WAITING_FOR_INTERACTION_OBSERVATION},
+                        "wait_for_drawer_scan": {STATE_WAITING_FOR_DRAWER_SCAN},
+                    }.get(command.get("kind"))
+                    if expected_states and self.machine.state not in expected_states:
+                        continue
             kind = command.get("kind")
             if getattr(self, "_move_base_transport_terminal", {}) and kind not in {"terminal", "finalize_frontier"}:
                 continue
@@ -5335,6 +5513,10 @@ class SemanticBehaviorExecutor:
         self._dispatch(commands)
 
     def _publish_interaction_command(self, candidate: dict) -> None:
+        if self._execution_is_paused():
+            with self.lock:
+                if self._defer_execution_command_locked({"kind": "interact", "candidate": candidate}):
+                    return
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
         drawer_kind = str(interaction.get("container_kind") or metadata.get("container_kind") or "").casefold()
@@ -5374,6 +5556,12 @@ class SemanticBehaviorExecutor:
             opaque_open_only=self.evaluator_opaque_open_only,
         )
         with self.lock:
+            if self._defer_execution_command_locked({"kind": "interact", "candidate": candidate}):
+                return
+            if getattr(self, "execution_pause_enabled", False) and (
+                self.selection is None or candidate.get("decision_id") != self.selection.get("decision_id")
+            ):
+                return
             self.pre_interaction_image_sequence = self.latest_image_sequence
             if drawer_sequence_type == "drawer_scan":
                 self._arm_drawer_scan_execution_wait_locked(payload)
@@ -5388,9 +5576,9 @@ class SemanticBehaviorExecutor:
             self._interaction_command_sent_id = str(payload.get("command_id") or "")
             self._interaction_execution_progress = {}
             self._interaction_execution_terminal = {}
-        self.interaction_command_pub.publish(
-            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        )
+            self.interaction_command_pub.publish(
+                String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            )
 
     def _start_drawer_fallback_bbox_wait(self, candidate: dict, reason: str) -> None:
         decision_id = str(candidate.get("decision_id") or "")
@@ -6495,7 +6683,35 @@ class SemanticBehaviorExecutor:
     def _publish_rotation(self, angular_z: float) -> None:
         command = Twist()
         command.angular.z = float(angular_z)
-        self.cmd_vel_pub.publish(command)
+        self._publish_execution_twist(command)
+
+    def _publish_execution_twist(self, command) -> None:
+        if not getattr(self, "execution_pause_enabled", False):
+            self.cmd_vel_pub.publish(command)
+            return
+        with self.lock:
+            if self._execution_is_paused() or not self._execution_worker_is_current():
+                command = Twist()
+            self.cmd_vel_pub.publish(command)
+
+    def _execution_worker_is_current(self) -> bool:
+        context = getattr(self, "_execution_worker_context", None)
+        generation = getattr(context, "generation", None)
+        return generation is None or generation == getattr(self, "_execution_pause_generation", 0)
+
+    def _send_navigation_goal(self, goal, decision_id: str, run_token: int | None = None) -> bool:
+        with self.lock:
+            if self._execution_is_paused():
+                self._update_execution_pause_locked()
+                return False
+            if getattr(self, "execution_pause_enabled", False) and (
+                self.selection is None or self.selection.get("decision_id") != decision_id
+                or not self._execution_worker_is_current()
+                or (run_token is not None and not self._navigation_run_is_active(decision_id, run_token))
+            ):
+                return False
+            self.move_base.send_goal(goal)
+            return True
 
     def _run_post_interaction_exit_observation(
         self, decision_id: str, candidate: dict, *, navigation_run_token: int | None = None,
@@ -7155,7 +7371,7 @@ class SemanticBehaviorExecutor:
                     continue
                 command = Twist()
                 command.linear.x = -speed
-                self.cmd_vel_pub.publish(command)
+                self._publish_execution_twist(command)
                 sent += 1
                 last_sent_at = now
                 time.sleep(0.05)
@@ -7469,6 +7685,14 @@ class SemanticBehaviorExecutor:
                 not rospy.is_shutdown()
                 and self._startup_scan_is_current(decision_id)
             ):
+                if self._execution_is_paused():
+                    pause_started = time.monotonic()
+                    time.sleep(0.05)
+                    paused_s = max(0.0, time.monotonic() - pause_started)
+                    started_at += paused_s
+                    if last_command_sent_at is not None:
+                        last_command_sent_at += paused_s
+                    continue
                 now = time.monotonic()
                 pose = self._current_pose(self.map_frame)
                 if pose is not None:
@@ -9875,11 +10099,35 @@ class SemanticBehaviorExecutor:
         if worker_lock is None:
             worker_lock = self._move_base_worker_lock = threading.RLock()
         with worker_lock:
-            if hasattr(self, "_move_base_action_name") and not self._navigation_is_current(decision_id):
-                return
-            self._run_navigation_serialized(
-                decision_id, candidate, start_goal_option_index, interaction_approach_attempts,
-            )
+            while True:
+                while self._execution_is_paused() and not rospy.is_shutdown():
+                    with self.lock:
+                        if self.selection is None or self.selection.get("decision_id") != decision_id:
+                            return
+                    time.sleep(0.05)
+                if getattr(self, "execution_pause_enabled", False):
+                    with self.lock:
+                        self._update_execution_pause_locked()
+                generation = getattr(self, "_execution_pause_generation", 0)
+                if getattr(self, "execution_pause_enabled", False):
+                    context = getattr(self, "_execution_worker_context", None)
+                    if context is None:
+                        context = self._execution_worker_context = threading.local()
+                    context.generation = generation
+                if hasattr(self, "_move_base_action_name") and not self._navigation_is_current(decision_id):
+                    return
+                self._run_navigation_serialized(
+                    decision_id, candidate, start_goal_option_index, interaction_approach_attempts,
+                )
+                if generation == getattr(self, "_execution_pause_generation", 0) or rospy.is_shutdown():
+                    return
+                # The same serialized worker owns resume. No second thread or
+                # failed-result callback may dispatch a competing successor.
+                with self.lock:
+                    if (self.selection is None or self.selection.get("decision_id") != decision_id
+                        or self.machine.state not in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}):
+                        return
+                    candidate = dict(self.machine.candidate or self.selection)
 
     def _run_navigation_serialized(
         self, decision_id: str, candidate: dict,
@@ -11031,7 +11279,8 @@ class SemanticBehaviorExecutor:
                 return
             goal.target_pose.pose.position.x = held_pose[0]
             goal.target_pose.pose.position.y = held_pose[1]
-        self.move_base.send_goal(goal)
+        if not self._send_navigation_goal(goal, decision_id, navigation_run_token):
+            return
         self._record_move_base_goal_dispatch()
         self._publish_dispatched_subgoal(goal_frame, x, y)
         # The two ROS callbacks may race by one scheduling turn: if ExplorePy
@@ -11206,6 +11455,12 @@ class SemanticBehaviorExecutor:
                 latest_step_sync_received_at = float(
                     getattr(self, "_latest_step_sync_received_at", 0.0) or 0.0
                 )
+            execution_enabled = getattr(getattr(self, "progress_execution_state", None), "enabled", True)
+            paused_steps, _ = progress_watchdog.set_execution_enabled(
+                execution_enabled, now, latest_task_step_index
+            )
+            if interaction_dwa_terminal_yaw_last_progress_step_index is not None:
+                interaction_dwa_terminal_yaw_last_progress_step_index += paused_steps
             if (
                 state not in TERMINAL_STATES
                 and
@@ -11266,7 +11521,8 @@ class SemanticBehaviorExecutor:
                     # Replan the same pose on the current costmap; never
                     # change the anchor or reset a terminal position latch.
                     goal.target_pose.header.stamp = rospy.Time.now()
-                    self.move_base.send_goal(goal)
+                    if not self._send_navigation_goal(goal, decision_id, navigation_run_token):
+                        return
                     self._record_move_base_goal_dispatch()
                     path_replan_count += 1
                     path_replan_step = latest_task_step_index
@@ -11694,7 +11950,8 @@ class SemanticBehaviorExecutor:
                         report_result(False, terminal_yaw_detail)
                         return
                     if (
-                        interaction_dwa_terminal_yaw_last_progress_step_index is not None
+                        execution_enabled
+                        and interaction_dwa_terminal_yaw_last_progress_step_index is not None
                         and latest_task_step_index is not None
                         and latest_task_step_index
                         - interaction_dwa_terminal_yaw_last_progress_step_index
@@ -11843,7 +12100,8 @@ class SemanticBehaviorExecutor:
                 if not navigation_is_current():
                     return
                 goal.target_pose.header.stamp = rospy.Time.now()
-                self.move_base.send_goal(goal)
+                if not self._send_navigation_goal(goal, decision_id, navigation_run_token):
+                    return
                 self._record_move_base_goal_dispatch()
                 self._publish_dispatched_subgoal(goal_frame, x, y)
                 navigation_started_at = time.monotonic()
@@ -11908,8 +12166,9 @@ class SemanticBehaviorExecutor:
                         # a valid interaction approach look stalled at k=60,
                         # before the configured DWA settle budget could finish.
                         if (
-                            capture_dwa_final_yaw_in_progress
-                            or interaction_dwa_final_yaw_in_progress
+                            execution_enabled
+                            and (capture_dwa_final_yaw_in_progress
+                                 or interaction_dwa_final_yaw_in_progress)
                         ):
                             supervisor.pause(latest_task_step_index)
                             semantic_progress_detail = {
@@ -11922,6 +12181,7 @@ class SemanticBehaviorExecutor:
                             }
                         else:
                             semantic_progress_detail = supervisor.observe(
+                                execution_enabled=execution_enabled,
                                 subgoal_key=semantic_subgoal_key,
                                 pose=pose,
                                 task_step_index=latest_task_step_index,
@@ -11966,7 +12226,7 @@ class SemanticBehaviorExecutor:
                     return
                 report_result(False, semantic_stall_detail)
                 return
-            if now < stagnation_not_before:
+            if execution_enabled and now < stagnation_not_before:
                 # The executor's rear-safe turn has completed, but DWA may need
                 # several more yaw-only actions before it begins translation.
                 # Rebase rather than merely skip: at the end of this bounded
@@ -13572,6 +13832,10 @@ class SemanticBehaviorExecutor:
         source_candidate: dict | None = None,
         navigation_run_token: int | None = None,
     ) -> None:
+        with self.lock:
+            if self._execution_is_paused():
+                self._update_execution_pause_locked()
+                return
         detail = dict(detail or {})
         terminal = getattr(self, "_move_base_transport_terminal", {})
         if terminal:
@@ -13871,7 +14135,7 @@ class SemanticBehaviorExecutor:
                     return False
                 command = Twist()
                 command.linear.x = float(linear_x)
-                self.cmd_vel_pub.publish(command)
+                self._publish_execution_twist(command)
                 time.sleep(0.05)
         finally:
             self.cmd_vel_pub.publish(Twist())
@@ -13939,6 +14203,11 @@ class SemanticBehaviorExecutor:
 
     def _navigation_is_current(self, decision_id: str) -> bool:
         with self.lock:
+            if self._execution_is_paused():
+                self._update_execution_pause_locked()
+                return False
+            if not self._execution_worker_is_current():
+                return False
             return bool(
                 self.selection is not None
                 and str(self.selection.get("decision_id") or "") == decision_id

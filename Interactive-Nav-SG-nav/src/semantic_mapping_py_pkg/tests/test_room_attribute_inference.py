@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
@@ -13,6 +15,36 @@ from semantic_mapping_py_pkg.room_inference_backends import (
     normalized_room_box,
     room_evidence_signature,
 )
+
+
+@pytest.mark.parametrize("status", ["fallback", "ready"])
+def test_room_rule_fallback_never_grants_m1_confirmation(status) -> None:
+    store = InteractionGraphStore(scene_id="room_fallback")
+    room = store._ensure_room_node(1)
+    room.attributes["room_observation_count"] = 2
+    assert store.apply_room_attribute_patch({
+        "room_id": 1, "room_node_id": room.id,
+        "room_attribute_status": status, "room_attribute": "kitchen",
+        "confidence": 0.95, "fallback": True,
+        "source": "weighted_object_types_fallback", "error": "ReadError",
+    })
+    assert room.attributes["room_attribute_status"] == "fallback"
+    assert room.attributes["room_attribute_fallback"] is True
+    assert room.attributes["room_attribute_error"] == "ReadError"
+    assert not room.attributes.get("room_mllm_attribute")
+    assert not room.attributes.get("persistent_semantic_node")
+
+    # A later genuine model result is still allowed to confirm this room.
+    assert store.apply_room_attribute_patch({
+        "room_id": 1, "room_node_id": room.id,
+        "room_attribute_status": "ready", "room_attribute": "kitchen",
+        "confidence": 0.9, "source": "mllm_room_attribute_inference",
+    })
+    assert room.attributes["room_attribute_status"] == "ready"
+    assert room.attributes["room_attribute_fallback"] is False
+    assert room.attributes["room_attribute_error"] == ""
+    assert room.attributes["room_mllm_attribute"] == "kitchen"
+    assert room.attributes["persistent_semantic_node"] is True
 
 
 def test_room_evidence_signature_tracks_box_and_members_not_visibility() -> None:

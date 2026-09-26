@@ -26,6 +26,15 @@ def portal_candidate():
     }
 
 
+def test_physical_portal_arrival_is_point_three_without_changing_default():
+    candidate = portal_candidate()
+    candidate["metadata"]["portal_approach_base_tolerances"] = [.3, .2]
+    assert portal_approach_profile(candidate, [1., 0., math.pi])["distance_tolerance_m"] < .3
+    candidate["metadata"]["portal_shrink_arrival_disc"] = False
+    assert portal_approach_profile(candidate, [1., 0., math.pi])["distance_tolerance_m"] == .3
+    assert portal_approach_profile(candidate, [-1., 0., 0.]) is None
+
+
 @pytest.mark.parametrize("offset", [-.15, -.10, 0.0, .10, .15])
 def test_portal_profile_reserves_the_whole_arrival_disc_and_yaw_interval(offset):
     goal = [1.5, offset, math.atan2(-offset, -1.5)]

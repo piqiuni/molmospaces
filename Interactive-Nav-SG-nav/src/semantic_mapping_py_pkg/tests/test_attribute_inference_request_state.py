@@ -197,7 +197,7 @@ def test_failed_room_call_uses_rule_fallback_and_waits_for_refresh():
 
     assert patches[0]["room_attribute"] == "kitchen"
     assert patches[0]["fallback"] is True
-    assert patches[0]["room_attribute_status"] == "ready"
+    assert patches[0]["room_attribute_status"] == "fallback"
     assert node.room_failures["room_1"]["error"] == "timeout"
     assert node._try_reserve_room("room_1", "box-and-members") is None
     node.room_failures["room_1"]["failed_at"] -= 31.0
@@ -573,6 +573,28 @@ def test_targeted_portal_refresh_rejects_border_clipped_view_without_m1() -> Non
     )
     assert readiness["ready"] is False
     assert "truncated" in readiness["reason"]
+
+
+@pytest.mark.parametrize("targeted", [False, True])
+def test_physical_portal_can_be_clipped_but_still_requires_stable_detection(targeted):
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.portal_m1_require_full_frame = False
+    node.portal_m1_border_margin_px = 2
+    node.portal_m1_required_consecutive_observations = 2
+    node.portal_observation_streaks = {}
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    detection = {"name": "door", "bbox_2d": [0, 0, 160, 99],
+                 "consecutive_observations": 2}
+    readiness = node._portal_m1_visual_readiness(
+        "door_1", image, detection, capture_step=10, image_sequence=10,
+        targeted_refresh=targeted)
+    assert readiness["ready"] is True
+    if not targeted:
+        detection["consecutive_observations"] = 1
+        assert not node._portal_m1_visual_readiness(
+            "door_new", image, detection, capture_step=11, image_sequence=11,
+            targeted_refresh=False)["ready"]
 
 
 def test_uncertain_portal_result_retries_after_short_refresh_interval(
@@ -1116,6 +1138,8 @@ def test_m1_inference_only_exposes_opted_in_detector_hypothesis(include_hypothes
     }
     assert "private_gt_category" not in json.dumps(request["context"])
     assert "若不是冰箱，保留 locker" not in request["instruction"]
+    assert "wall panel, decorative rectangle" in request["instruction"]
+    assert "Partial framing alone does not reject a real door" in request["instruction"]
     if include_hypothesis:
         assert "name-disambiguation recheck" in request["instruction"]
         assert "MUST replace it" in request["instruction"]

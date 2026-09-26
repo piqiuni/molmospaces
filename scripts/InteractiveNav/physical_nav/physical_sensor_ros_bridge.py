@@ -2345,9 +2345,9 @@ def main() -> None:
     parser.add_argument("--camera-parent", default="tf_frame_base_link")
     parser.add_argument("--camera-x", type=float, default=0.03)
     parser.add_argument("--camera-y", type=float, default=0.0)
-    parser.add_argument("--camera-z", type=float, default=0.98)
+    parser.add_argument("--camera-z", type=float, default=0.885)
     parser.add_argument("--camera-roll", type=float, default=0.0)
-    parser.add_argument("--camera-pitch", type=float, default=0.1396263)
+    parser.add_argument("--camera-pitch", type=float, default=0.157079633)
     parser.add_argument("--camera-yaw", type=float, default=0.0)
     # The D435i stream is optional on older Go2 firmware.  Keep correction
     # enabled by default here so a valid calibrated sample is used whenever

@@ -853,6 +853,30 @@ def extend_world_bounds_lower(
     return (min_x, min_y - margin, max_x, max_y)
 
 
+def idle_subgoal_status(step: dict) -> tuple[str, str]:
+    """Explain a missing selection without mistaking cooldown for completion."""
+    trace = step.get("semantic_decision_trace") or {}
+    rejected = trace.get("eligibility_rejections") or {}
+    recovery = trace.get("no_eligible_candidate_recovery") or {}
+    if trace.get("execution_eligible_candidate_count", 0) > 0:
+        if trace.get("model_error"):
+            return "WAIT:", "M2 request failed"
+        return "WAIT:", "selecting subgoal"
+    if any(str(key).startswith("interaction:") and reason == "candidate_cooldown"
+           for key, reason in rejected.items()):
+        return "WAIT:", "interaction retry cooldown"
+    reasons = set(rejected.values())
+    if "interaction_approach_terminal_unreachable" in reasons:
+        return "STOP:", "interaction approach unreachable"
+    if "frontier_region_failed_requires_topology_change" in reasons:
+        return "STOP:", "frontiers blocked; need new route"
+    if recovery.get("blocked"):
+        return "STOP:", "no reachable subgoals"
+    if rejected:
+        return "WAIT:", str(next(iter(rejected.values()))).replace("_", " ")
+    return "WAIT:", "no eligible subgoals yet"
+
+
 def draw_task_subgoal_header(
     panel: np.ndarray,
     step: dict,
@@ -867,6 +891,9 @@ def draw_task_subgoal_header(
     target = (candidates.get("target_context") or {}).get("target_name")
     behavior = selection.get("behavior_type")
     name = selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id")
+    if not selection:
+        behavior, name = idle_subgoal_status(step)
+        box_width_px = panel.shape[1] - 4
     SubgoalOverlay.draw_header(panel, target, behavior, name, box_width_px=box_width_px, background_alpha=background_alpha)
 
 
@@ -1368,6 +1395,44 @@ def _interaction_display_state(node: dict) -> str:
             return "unavail/closed"
         return "unavail/?"
     return state
+
+
+def aggregate_room_cabinets(graph: dict) -> dict:
+    """Group cabinets and boxes per room for display, preserving raw identities."""
+    groups = {}
+    room_by_child = {
+        str(e.get("dst_id")): str(e.get("src_id"))
+        for e in graph.get("edges", [])
+        if e.get("relation") == "has_child" and str(e.get("src_id", "")).startswith("room_")
+    }
+    for node in graph.get("nodes", []):
+        label = _node_label(node).casefold()
+        if str(node.get("type")) != "container" or label not in {"cabinet", "box"}:
+            continue
+        room = node.get("room_id")
+        parent = f"room_{room}" if room is not None else room_by_child.get(str(node.get("id")))
+        if parent and parent not in {"room_-1", "room_unknown"}:
+            groups.setdefault((parent, label), []).append(node)
+    aliases, summaries = {}, []
+    for (room, label), members in groups.items():
+        if len(members) < 2:
+            continue
+        summary_id = f"display_{'cabinets' if label == 'cabinet' else 'boxes'}:{room}"
+        for member in members:
+            aliases[str(member["id"])] = summary_id
+        summaries.append({**members[0], "id": summary_id, "label": label,
+                          "display_count": len(members),
+                          "display_member_ids": [str(m["id"]) for m in members]})
+    edges, seen = [], set()
+    for edge in graph.get("edges", []):
+        src, dst = str(edge.get("src_id", "")), str(edge.get("dst_id", ""))
+        src, dst = aliases.get(src, src), aliases.get(dst, dst)
+        key = (src, dst, edge.get("relation"))
+        if src != dst and key not in seen:
+            edges.append({**edge, "src_id": src, "dst_id": dst})
+            seen.add(key)
+    return {**graph, "nodes": [n for n in graph.get("nodes", []) if str(n.get("id")) not in aliases] + summaries,
+            "edges": edges}
 
 
 def _bounded_nodes(
@@ -1955,6 +2020,8 @@ class OfflineSixPanelRenderer:
             panel = cv2.addWeighted(occ_layer, 0.72, panel, 0.28, 0.0)
         room_layer = self._warp_grid(panel_size, room, self._grid_base(room, "room"), to_px, (246, 246, 246))
         if room_layer is not None:
+            # Virtual doorway cuts belong to the segmentation underlay, never
+            # a foreground stroke covering interaction boxes or captions.
             panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
         if draw_global_plan:
             global_plan = self._plan_poses(step.get("global_plan"), reference, step_index)
@@ -2027,6 +2094,7 @@ class OfflineSixPanelRenderer:
             room_labels.append(
                 (to_px(*center), f"Room {room_id}: {_node_label(node)}")
             )
+        object_labels = []
         for node in bounded_nodes:
             if str(node.get("type") or "") not in {"portal", "container"}:
                 continue
@@ -2053,7 +2121,12 @@ class OfflineSixPanelRenderer:
                 4 if is_target else 2,
                 cv2.LINE_AA,
             )
-            cv2.putText(panel, f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}", (center_px[0] + 3, center_px[1] - half_h - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
+            object_labels.append((
+                f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}",
+                (center_px[0] + 3, center_px[1] - half_h - 3), color,
+            ))
+        for text, origin, color in object_labels:
+            cv2.putText(panel, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
         for center_px, label in room_labels:
             text = label[:36]
             text_size = cv2.getTextSize(
@@ -2367,10 +2440,16 @@ class OfflineSixPanelRenderer:
     def render_topology(self, panel_size: tuple[int, int], step: dict, step_index: int) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), (220, 248, 255), dtype=np.uint8)
-        graph = step.get("unified_graph") or {}
+        graph = aggregate_room_cabinets(step.get("unified_graph") or {})
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
+        for node in graph.get("nodes", []):
+            members = set(node.get("display_member_ids") or [])
+            if members & observed:
+                observed.add(str(node["id"]))
+            if members & target_ids:
+                target_ids.add(str(node["id"]))
         all_nodes = _bounded_nodes(graph, observed, target_ids)
         contains = [edge for edge in graph.get("edges") or [] if str(edge.get("relation") or "") == "contains"]
         contained = {str(edge.get("dst_id") or "") for edge in contains}
@@ -2438,6 +2517,10 @@ class OfflineSixPanelRenderer:
                 cv2.putText(panel, f"Room {room_id}"[:22], (x1 + 4, y1 + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (25, 25, 25), 1, cv2.LINE_AA)
                 cv2.putText(panel, _node_label(node)[:22], (x1 + 4, y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (25, 25, 25), 1, cv2.LINE_AA)
             else:
+                if node.get("display_count"):
+                    cv2.putText(panel, _node_label(node), (x1 + 4, y1 + 13), cv2.FONT_HERSHEY_SIMPLEX, .29, (25, 25, 25), 1, cv2.LINE_AA)
+                    cv2.putText(panel, f"count: {node['display_count']}", (x1 + 4, y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, .25, (25, 25, 25), 1, cv2.LINE_AA)
+                    continue
                 if node_type == "portal" and state.startswith("unavail/"):
                     # Keep the two unavailable portal states readable inside the
                     # compact topology node instead of truncating the qualifier.

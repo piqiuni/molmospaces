@@ -378,6 +378,7 @@ class PhysicalRosGateway:
             ("/semantic_decision/execution_state", "execution_state"),
             ("/semantic_decision/behavior_feedback", "behavior_feedback"),
             ("/semantic_decision/decision_trace", "decision_trace"),
+            ("/semantic_decision/goal_status", "goal_status"),
             ("/physical_nav/interaction_result", "interaction_result"),
             ("/physical_nav/mllm_events", "mllm_events"),
         ):
@@ -385,6 +386,7 @@ class PhysicalRosGateway:
         rospy.Subscriber("/explore_py/current_subgoal", PointStamped, self._subgoal_callback, queue_size=2)
         for topic, name in (
             (self.args.global_plan_topic, "global_plan"),
+            ("/semantic_decision/paused_global_plan", "global_plan"),
             (self.args.local_global_plan_topic, "local_global_plan"),
             (self.args.local_plan_topic, "local_plan"),
         ):
@@ -980,10 +982,9 @@ class PhysicalRosGateway:
                 with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/ros-state", timeout=.6) as response: state = json.loads(response.read().decode())
             else:
                 state = state_override
-            detection_meta = state.get("detection_meta") or {
-                "seq": state.get("seq", -1),
-                "stamp": state.get("stamp", 0.0),
-            }
+            detection_meta = state.get("detection_meta")
+            if not isinstance(detection_meta, dict) or not detection_meta:
+                detection_meta = state
             receipt = (
                 detection_meta.get("seq", -1),
                 detection_meta.get("stamp", 0.0),
@@ -1054,7 +1055,31 @@ class PhysicalRosGateway:
                 "seq": receipt[0],
                 "stamp": receipt[1],
                 "detections": mapping_detections,
+                # Budget omissions are 2-D presence evidence, never new 3-D
+                # measurements. Keep them separate to avoid origin ghosts.
+                "geometry_deferred_detections": [
+                    {key: item[key] for key in (
+                        "semantic_class", "semantic_class_raw", "bbox", "bbox_2d",
+                        "confidence", "geometry_skipped", "geometry_skip_reason",
+                        "capture_seq", "stamp",
+                    ) if key in item}
+                    for item in detections
+                    if bool(item.get("geometry_skipped"))
+                    and item.get("geometry_skip_reason") in {
+                        "max_geometry_instances", "geometry_budget_ms", "geometry_workers_busy",
+                    }
+                ],
             }
+            # M1 must assess the view at capture time, not the latest robot
+            # pose. Keep identity/pose from this report together through the
+            # mapper; missing source evidence must never be fabricated.
+            for key in (
+                "capture_step", "stamp_sec", "stamp_nsec",
+                "capture_stamp_sec", "capture_stamp_nsec", "image_sequence",
+                "source_image_sequence", "image_size", "observation_pose_xyyaw",
+            ):
+                if key in detection_meta:
+                    detection_envelope[key] = detection_meta[key]
             self.detection_pub.publish(json.dumps(detection_envelope, ensure_ascii=False, separators=(",", ":")))
             if self._publisher_has_subscribers(self.attribute_detection_pub):
                 attribute_envelope = dict(detection_envelope)
@@ -2728,9 +2753,9 @@ def main() -> None:
     p.add_argument("--camera-parent", default="tf_frame_base_link")
     p.add_argument("--camera-x", type=float, default=.03)
     p.add_argument("--camera-y", type=float, default=0.)
-    p.add_argument("--camera-z", type=float, default=.62)
+    p.add_argument("--camera-z", type=float, default=.885)
     p.add_argument("--camera-roll", type=float, default=0.)
-    p.add_argument("--camera-pitch", type=float, default=0.)
+    p.add_argument("--camera-pitch", type=float, default=.157079633)
     p.add_argument("--camera-yaw", type=float, default=0.)
     p.add_argument("--box-hold-s", type=float, default=3.0)
     p.add_argument("--box-match-distance-m", type=float, default=.60)

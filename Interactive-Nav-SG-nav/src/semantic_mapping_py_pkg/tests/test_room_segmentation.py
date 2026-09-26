@@ -646,7 +646,7 @@ def test_post_open_reference_refresh_replaces_an_active_portal_anchor():
     assert hint["size"] == [1.0, 0.15, 2.0]
 
 
-def test_detector_portal_hint_requires_stable_confirmations_and_freezes_anchor():
+def test_detector_portal_hint_requires_m1_then_tracks_corrected_geometry():
     grid = _grid()
     segmenter = _segmenter(
         room_portal_detector_min_confirmations=3,
@@ -661,19 +661,98 @@ def test_detector_portal_hint_requires_stable_confirmations_and_freezes_anchor()
     room_ids_before, _ = segmenter.segment(grid)
     assert _room_count(room_ids_before) == 1
 
-    assert segmenter.update_portal_hints(
+    assert not segmenter.update_portal_hints(
         [_door_observation(center_x=2.95)],
         source_mode="detector_online",
     )
-    frozen_center = list(segmenter.state.portal_hints["door_1"]["center"])
+    assert not segmenter.state.portal_hints["door_1"]["active"]
+    graph = _confirmed_portal_graph()
+    assert segmenter.sync_graph_portals(graph)
+    room_ids_after, _ = segmenter.segment(grid)
+    assert _room_count(room_ids_after) == 2
+    graph["nodes"][0]["aabb_center"][0] = 3.1
+    graph["nodes"][0]["attributes"]["yaw"] = 0.1
+    assert segmenter.sync_graph_portals(graph)
+    assert segmenter.state.portal_hints["door_1"]["center"][0] == 3.1
+    assert segmenter.state.portal_hints["door_1"]["yaw"] == 0.1
+    # Raw detections cannot replace accepted stable graph geometry.
     assert not segmenter.update_portal_hints(
         [_door_observation(center_x=4.0)],
         source_mode="detector_online",
     )
-    assert segmenter.state.portal_hints["door_1"]["center"] == frozen_center
+    assert segmenter.state.portal_hints["door_1"]["center"][0] == 3.1
 
-    room_ids_after, _ = segmenter.segment(grid)
-    assert _room_count(room_ids_after) == 2
+
+def _confirmed_portal_graph():
+    return {"nodes": [{
+        "id": "portal_door_1", "type": "portal", "observation_count": 3,
+        "aabb_center": [3.0, 1.875, 1.0], "aabb_size": [0.15, 1.0, 2.0],
+        "attributes": {"instance_id": "door_1", "yaw": 0.0,
+                       "attribute_status": "ready", "attribute_confidence": 0.9,
+                       "mllm_interaction_class": "portal", "m1_observed_object_name": "door"},
+    }]}
+
+
+def test_graph_rejection_and_removal_revoke_cut_but_transport_failure_does_not():
+    segmenter = _segmenter()
+    graph = _confirmed_portal_graph()
+    assert segmenter.sync_graph_portals(graph)
+    attrs = graph["nodes"][0]["attributes"]
+    accepted = dict(attrs)
+    attrs.update(attribute_status="failed", attribute_last_ready=accepted)
+    assert not segmenter.sync_graph_portals(graph)
+    assert segmenter.state.portal_hints["door_1"]["active"]
+    attrs.update(attribute_status="ready", m1_observed_object_name="cabinet", mllm_interaction_class="container")
+    assert segmenter.sync_graph_portals(graph)
+    assert "door_1" not in segmenter.state.portal_hints
+    attrs.update(accepted)
+    assert segmenter.sync_graph_portals(graph)
+    assert segmenter.sync_graph_portals({"nodes": []})
+    assert not segmenter.state.portal_hints
+
+
+def test_successful_open_reference_stays_fixed_when_leaf_rotates_or_is_occluded():
+    segmenter = _segmenter()
+    segmenter.sync_graph_portals(_confirmed_portal_graph())
+    door = _door_observation()
+    door["yaw"] = 0.2
+    segmenter.update_portal_hints([door], "realtime_gt_observation", refresh_active=True)
+    graph = _confirmed_portal_graph()
+    graph["nodes"][0]["attributes"]["yaw"] = 1.5
+    assert not segmenter.sync_graph_portals(graph)
+    assert not segmenter.sync_graph_portals({"nodes": []})
+    assert segmenter.state.portal_hints["door_1"]["yaw"] == 0.2
+
+
+def test_post_open_source_alias_does_not_create_an_additional_rotated_leaf_cut():
+    segmenter = _segmenter()
+    graph = _confirmed_portal_graph()
+    segmenter.sync_graph_portals(graph)
+    graph["nodes"][0]["attributes"].update(source_object_name="door_source", yaw=1.5)
+    reference = _door_observation(instance_id="door_source")
+    reference["yaw"] = 0.2
+    segmenter.update_portal_hints([reference], "realtime_gt_observation", refresh_active=True)
+    assert segmenter.sync_graph_portals(graph)
+    assert set(segmenter.state.portal_hints) == {"door_source"}
+    assert segmenter.state.portal_hints["door_source"]["yaw"] == 0.2
+
+
+def test_obb_yaw_not_world_axis_splits_a_diagonal_doorway():
+    cv2 = pytest.importorskip("cv2")
+    grid = _grid(width=41, height=41, resolution=0.1)
+    values = np.full((41, 41), 100, np.int8)
+    values[1:-1, 1:-1] = 0
+    cv2.line(values, (1, 1), (39, 39), 100, 3)
+    cv2.circle(values, (20, 20), 6, 0, -1)
+    grid.data = values.ravel().tolist()
+    segmenter = _segmenter(room_portal_cut_margin_m=0.25, room_boundary_margin_cells=0)
+    assert _room_count(segmenter.segment(grid)[0]) == 1
+    door = _door_observation(center_x=2.05, center_y=2.05, size_xy=(1.6, 0.15))
+    door["yaw"] = math.pi / 4
+    segmenter.update_portal_hints([door], "realtime_gt_observation")
+    ids = np.asarray(segmenter.segment(grid)[0]).reshape(41, 41)
+    assert _room_count(ids.ravel()) == 2
+    assert ids[5, 30] >= 0 and ids[30, 5] >= 0 and ids[5, 30] != ids[30, 5]
 
 
 def test_room_merge_requires_stable_confirmations_before_report() -> None:

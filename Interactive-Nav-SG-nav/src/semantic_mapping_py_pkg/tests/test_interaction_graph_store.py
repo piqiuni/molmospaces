@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import math
 import sys
 from pathlib import Path
@@ -15,6 +16,31 @@ from semantic_mapping_py_pkg.geometry_utils import grid_to_world
 from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
+
+
+def test_tracker_alias_merges_persistent_node_and_keeps_history_and_parent():
+    store = InteractionGraphStore(scene_id="merge_test")
+    store.update_observations([observation(instance_id="track_1", semantic_name="fridge",
+        category="fridge", is_receptacle=True, aabb_size=[.7, .6, 1.6])], stamp=1)
+    keeper = next(n for n in store.nodes.values() if n.type == "container")
+    duplicate = copy.deepcopy(keeper)
+    duplicate.id = "container_track_2"
+    duplicate.attributes["instance_id"] = "track_2"
+    duplicate.attributes.update(attribute_status="ready", attribute_updated_at=2,
+                                m1_observed_object_name="smart_vending_refrigerator")
+    duplicate.interaction["operation_history"] = [{"action": "open", "success": True}]
+    child = copy.deepcopy(keeper)
+    child.id = "object_bottle"
+    child.type = "object"
+    child.attributes["instance_id"] = "bottle"
+    child.parent_id = duplicate.id
+    store.nodes[duplicate.id] = duplicate
+    store.nodes[child.id] = child
+    store._merge_tracker_aliases({"track_2": "track_1"})
+    assert duplicate.id not in store.nodes
+    assert child.parent_id == keeper.id
+    assert keeper.attributes["m1_observed_object_name"] == "smart_vending_refrigerator"
+    assert keeper.interaction["operation_history"] == [{"action": "open", "success": True}]
 
 
 def observation(**kwargs):
@@ -165,6 +191,82 @@ def test_tracking_confirmed_one_frame_does_not_admit_interaction_object():
     assert not store.nodes[node_id].attributes.get("persistent_semantic_node", False)
 
 
+@pytest.mark.parametrize("name", ["wooden door", "glass door", "metal-door", "white wooden door", "sliding door"])
+def test_descriptive_m1_door_name_preserves_portal_across_observations(name):
+    store = InteractionGraphStore(scene_id="door_alias")
+    detected = observation(instance_id="door_1", semantic_name="door", category="door",
+                           aabb_size=[0.9, 0.15, 1.8])
+    for stamp in (1, 2):
+        store.update_observations([detected], stamp=stamp, source_mode="detector_online")
+    assert store.apply_attribute_patch({"object_id": "portal_door_1",
+        "attribute_status": "ready", "source": "mllm_attribute_inference",
+        "confidence": 0.95, "interaction_class": "portal", "interactable": True,
+        "observed_object_name": name, "coarse_state": "closed"}, stamp=3)
+    for stamp in (4, 5, 6):
+        store.update_observations([detected], stamp=stamp, source_mode="detector_online")
+        node = store.nodes["portal_door_1"]
+        assert node.type == "portal" and node.label == "door"
+        assert node.interaction["interaction_mode"] == "open_close"
+        assert node.interaction["state"] == "closed"
+        assert not node.attributes["mllm_portal_promotion_rejected"]
+        assert node.attributes["m1_observed_object_description"] == name.lower().replace(" ", "_")
+
+
+@pytest.mark.parametrize("name", ["cabinet door", "refrigerator door", "fridge door", "door handle", "door poster"])
+def test_door_parts_do_not_become_room_portals(name):
+    store = InteractionGraphStore(scene_id="door_negative")
+    store.update_observations([observation(instance_id="door_1", semantic_name="door",
+        category="door", aabb_size=[0.9, 0.15, 1.8])], stamp=1, source_mode="detector_online")
+    store.apply_attribute_patch({"object_id": "portal_door_1", "attribute_status": "ready",
+        "source": "mllm_attribute_inference", "confidence": 0.95,
+        "interaction_class": "portal", "interactable": True,
+        "observed_object_name": name, "coarse_state": "closed"}, stamp=2)
+    assert store.nodes["portal_door_1"].attributes["mllm_portal_promotion_rejected"]
+
+
+def test_room_large_object_memory_survives_expiry_and_tracks_corrections():
+    store = InteractionGraphStore(scene_id="room_memory", room_large_object_memory={
+        "enabled": True, "labels": ["chair", "desk"], "min_extent_m": .4})
+    obs = observation(instance_id="chair1", semantic_name="chair", category="chair",
+                      room_id=1, aabb_size=[.6, .5, .8])
+    store.update_observations([obs], stamp=1, source_mode="detector_online")
+    assert not store.nodes["room_1"].attributes.get("large_object_memory")
+    store.update_observations([obs], stamp=2, source_mode="detector_online")
+    store._refresh_room_attributes()
+    memory = store.nodes["room_1"].attributes["large_object_memory"]
+    assert memory["chair1"]["category"] == "chair"
+    node = store.nodes["object_chair1"]
+    store._ensure_room_node(2)
+    node.room_id = 2
+    store._refresh_room_attributes()
+    assert not store.nodes["room_1"].attributes["large_object_memory"]
+    assert "chair1" in store.nodes["room_2"].attributes["large_object_memory"]
+    store.prune_stale_nodes(10, now=1000)
+    store._refresh_room_attributes()
+    assert "object_chair1" not in store.nodes
+    assert store.nodes["room_2"].attributes["large_object_memory"]["chair1"]["currently_visible"] is False
+    store.nodes[node.id] = node
+    node.label = "cup"
+    node.attributes["m1_name_override"] = True
+    store._refresh_room_attributes()
+    assert not store.nodes["room_2"].attributes["large_object_memory"]
+    store.reset(episode_id="new")
+    assert not any(n.attributes.get("large_object_memory") for n in store.nodes.values())
+
+
+def test_room_large_object_memory_follows_room_merge_and_track_alias():
+    store = InteractionGraphStore(room_large_object_memory={"enabled": True})
+    room = store._ensure_room_node(1)
+    store._ensure_room_node(2)
+    room.attributes["large_object_memory"] = {"old": {
+        "object_id": "old", "category": "chair", "name": "chair", "room_id": 1}}
+    store._merge_tracker_aliases({"old": "new"})
+    store.room_redirects[1] = 2
+    store._refresh_room_large_object_memory()
+    assert not room.attributes["large_object_memory"]
+    assert store.nodes["room_2"].attributes["large_object_memory"]["new"]["object_id"] == "new"
+
+
 def test_portal_child_room_waits_for_two_frames_and_m1():
     store = InteractionGraphStore(scene_id="test_scene")
     detected = observation(
@@ -179,6 +281,8 @@ def test_portal_child_room_waits_for_two_frames_and_m1():
     store.update_observations([detected], stamp=1.0, source_mode="detector_online")
     store.update_observations([detected], stamp=2.0, source_mode="detector_online")
     portal = store.nodes["portal_door_1"]
+    # A detector-to-portal promotion can retain the object's old mode.
+    portal.interaction["interaction_mode"] = "none"
     assert store.ensure_provisional_room_for_portal(portal) is None
     assert not portal.attributes.get("potential_room_ids")
 
@@ -198,6 +302,8 @@ def test_portal_child_room_waits_for_two_frames_and_m1():
         stamp=2.1,
     )
     child = store.ensure_provisional_room_for_portal(portal)
+    assert portal.interaction["interaction_mode"] == "open_close"
+    assert portal.attributes["interaction_state_override"]["interaction_mode"] == "open_close"
     assert child is not None
     assert portal.attributes["potential_room_ids"] == [child.room_id]
 
@@ -4064,6 +4170,27 @@ def test_clipped_portal_visual_closed_does_not_create_closed_state() -> None:
         "reason": "truncated_visual_evidence",
         "observation_capture_step": 8,
     }
+
+
+@pytest.mark.parametrize("state", ["open", "closed"])
+def test_physical_portal_clipping_does_not_block_valid_m1_state(state):
+    store = InteractionGraphStore(scene_id="physical", portal_require_full_frame=False)
+    store.update_observations([observation(
+        instance_id="clipped_physical", semantic_name="door", is_door=True,
+        frame_index=7, connected_room_ids=[1, 2],
+    )], stamp=1.0, source_mode="gt_replay")
+    assert store.apply_attribute_patch({
+        "object_id": "clipped_physical", "attribute_status": "ready",
+        "observation_frame_index": 8, "interactable": True,
+        "interaction_class": "portal", "coarse_state": state,
+        "portal_aperture_evidence": {"open_aperture": "visible", "confidence": 0.95},
+        "visual_evidence_truncated": True, "visual_evidence_truncated_edges": ["top"],
+        "confidence": 0.95, "source": "mllm_attribute_inference",
+    }, stamp=2.0)
+    portal = store.nodes["portal_clipped_physical"]
+    assert portal.interaction["state"] == state
+    assert portal.attributes["visual_evidence_truncated"] is True
+    assert portal.attributes["portal_state_gate"]["accepted"] is True
 
 
 def test_portal_open_without_visible_aperture_does_not_override_closed_state():

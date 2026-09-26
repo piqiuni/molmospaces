@@ -242,7 +242,7 @@ show_logs() {
 case "${1:-}" in
   start) start_service ;;
   stop) stop_service ;;
-  restart) stop_service; start_service ;;
+  restart) stop_service; PHYSICAL_NAV_FORCE_GATEWAY_RESTART=1 start_service ;;
   status) status_service ;;
   logs) show_logs ;;
   web-stop) stop_web_gateway ;;

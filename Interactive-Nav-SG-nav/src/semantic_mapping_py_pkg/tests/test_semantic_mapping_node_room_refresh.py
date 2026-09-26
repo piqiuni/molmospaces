@@ -148,6 +148,39 @@ class _AlreadyOpenGraphStore(_GraphStore):
         return False
 
 
+def test_open_doorway_reference_retains_yaw_not_rotated_leaf():
+    node = object.__new__(SemanticMappingNode)
+    graph = _GraphStore.as_graph_dict()
+    attrs = graph["nodes"][0]["attributes"]
+    attrs["yaw"] = 1.9
+    attrs["interaction_reference_yaw"] = 0.4
+    node.graph_store = SimpleNamespace(as_graph_dict=lambda: graph)
+    reference = node._confirmed_open_portal_reference_locked({"node_id": "portal_door_1"})
+    assert reference["yaw"] == 0.4
+
+
+def test_accepted_portal_m1_schedules_room_refresh_without_waiting_for_new_occ():
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node.ablation = SimpleNamespace(module1="dynamic_mllm")
+    portal = SimpleNamespace(type="portal", attributes={"topology_type": "portal"})
+    node.graph_store = SimpleNamespace(
+        episode_id="run", nodes={"portal_door_1": portal},
+        apply_attribute_patch=lambda patch, stamp: True,
+        _node_matches_identity=lambda candidate, identity: identity == "door_1",
+    )
+    node._sync_confirmed_m1_track_label_locked = lambda patch: None
+    events = []
+    node._enqueue_room_refresh = lambda **kwargs: events.append(kwargs)
+    node._collect_and_publish_bundle = lambda: None
+    node.attribute_updates_callback(SimpleNamespace(data=json.dumps({
+        "episode_id": "run", "stamp_sec": 10.0,
+        "updates": [{"object_id": "door_1", "attribute_status": "ready"}],
+    })))
+    assert node._room_topology_revision == 1
+    assert events == [{"reason": "m1_portal_evidence"}]
+
+
 class _GraphObservationRecorder:
     def __init__(self) -> None:
         self.observations = []
@@ -155,7 +188,7 @@ class _GraphObservationRecorder:
     def has_confirmed_open_refrigerator(self):
         return True
 
-    def update_observations(self, observations, *, stamp=None, source_mode=None):
+    def update_observations(self, observations, *, stamp=None, source_mode=None, track_aliases=None):
         self.observations.append(
             {
                 "observations": list(observations),
@@ -241,6 +274,7 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
             "id": "door_source",
             "name": "door",
             "is_door": True,
+            "yaw": 0.0,
             "box_3d": {
                 "center": [2.0, 3.0, 1.0],
                 "size": [0.2, 1.2, 2.0],
@@ -887,6 +921,16 @@ def test_room_mllm_request_contains_only_room_and_member_object_metadata():
     for forbidden in ("image", "crop", "aabb", "geometry", "pose"):
         assert forbidden not in serialized
 
+    # After the live node expires, its room-owned memory still enters M1.
+    graph_payload["nodes"][0]["attributes"]["large_object_memory"] = {
+        "stove_1": {"object_id": "stove_1", "node_id": "object_stove_1", "name": "Stove",
+                    "category": "appliance", "type": "object", "confidence": .9}}
+    graph_payload["nodes"].pop(1)
+    node._room_robot_xy = lambda: (1., 2.)
+    request = node._build_room_attribute_request_locked(graph_payload)
+    assert request["rooms"][0]["objects"][0]["object_id"] == "stove_1"
+    assert request["rooms"][0]["objects"][0]["currently_visible"] is False
+
 
 def test_room_requests_stay_near_robot_and_refresh_after_box_or_member_change():
     node = object.__new__(SemanticMappingNode)
@@ -1250,6 +1294,14 @@ def test_exact_room_topology_cache_reuses_content_but_not_source():
     )
     assert cached is not None
     assert cached["room_ids"] == tuple(room_ids)
+
+    # A corrected doorway yaw is a topology change even with identical OCC.
+    node.room_segmenter.state.portal_revision += 1
+    cached, _key, _categories = SemanticMappingNode._load_room_topology_cache(
+        node, same_content_new_source, topology_revision=2, epoch=4,
+        force_stable=False,
+    )
+    assert cached is None
 
     changed = _raw_occupancy(31.4)
     changed.data[0] = 100

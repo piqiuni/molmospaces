@@ -185,6 +185,70 @@ python molmo_spaces/evaluation/eval_main.py <POLICY_CONFIG> --benchmark_dir <BEN
 如果只修改某个模块，应优先运行相关测试文件或更小范围的测试。若因为依赖、资产、GPU、模拟器或网络限制无法运行测试，需要在最终说明中明确写出。
 
 ROS / 语义决策 / 实物相关回归通常依赖 `PYTHONPATH`、ROS master、Node 或本地编译链，命令与验收步骤一律以 `test.md` 原文为准，不要自行删减环境前置条件。
+
+## 云端 `ml_task` 提交与检查
+
+详细教程见 [test.md](test.md) 的「2026-09-16: 双卡自定义任务评测 smoke」和
+「2026-09-22：M2 在线 Mixed 0–29 配对实验」。以下为 Agent 操作摘要；具体实验参数以
+对应章节及配置为准。提交会启动云端评测，应在用户已授权运行该任务后执行。
+
+### 配置与提交入口
+
+- 双卡 smoke：入口 `scripts/InteractiveNav/run_v3_custom_task_smoke.sh`，内部调用统一
+  评测入口 `scripts/InteractiveNav/run_benchmark_eval.py`；资源配置为
+  `scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml`。
+  该 YAML 含本机云端队列、挂载信息，不纳入 Git；新 checkout 不应假定它存在。
+- 此 smoke 使用一个 `ml.pni2.7xlarge` 双卡实例，GPU 0/1 各启动一个 Qwen 35B FP8
+  后端（8000/8001），8010 负载均衡器供 10 个隔离的 ROS/MuJoCo worker 使用。
+  共 10 个 episode、每场固定 100 applied steps、`--no-recording`，仅验证运行链路。
+- 提交前确认 YAML 的队列、挂载、代码路径和运行入口与目标环境一致。
+  不要用 CLI `--set TaskRoleSpecs[0]...` 修改副本数：文档记录该 CLI 会将数组覆盖
+  解析成无效规格，应直接检查并修改对应 YAML。
+
+从包含上述本地资源配置的仓库根目录提交，记录返回的 task ID：
+
+```bash
+volc ml_task submit \
+  -c scripts/InteractiveNav/configs/custom_task/v3_qwen_10worker_10scene_100step.yaml \
+  -n interactive_nav_v3_qwen_10w10s100_$(date +%Y%m%d_%H%M%S)
+
+volc ml_task get -i TASK_ID --output json
+volc ml_task instance list -i TASK_ID --output json
+volc ml_task logs -i TASK_ID
+```
+
+### 云端环境与结果验收
+
+- 文档中的云端挂载位于 `/home/ldl`；这些是容器路径，不是当前 checkout 路径。
+  必须显式设置 `MLSPACES_CACHE_DIR=/home/ldl/molmo-spaces-resources`、
+  `MLSPACES_ASSETS_DIR=/home/ldl/molmospaces/assets`、`NLTK_DATA=/home/ldl/nltk_data`，
+  复用已有资产与 WordNet，避免默认 home 下重新下载、资源锁阻塞及向 `/root/nltk_data` 下载。
+- smoke 环境的 Python 3.10 编译头位于 `/home/ldl/.cache/python3.10-dev`；
+  EGL loader 所需 `libegl1`/`libglvnd0` 位于 `/home/ldl/.cache/egl-runtime`。
+  复用入口中的 MuJoCo EGL context 预检，在启动 Qwen 前检查；NVIDIA 驱动库由实例注入，
+  不复制本机驱动，不修改系统 Python 或 Qwen 虚拟环境。
+- smoke 共享输出为 `/home/ldl/outputs/interactive-nav/custom-task-TASK_ID/evaluation`。
+  检查 `resource_telemetry.csv`、`summary.csv`、各 episode 的 `eval.log` 及任务的
+  `task-state/evaluation.exit_code`；episode、Qwen、环境预检或 batch runner 的进程失败
+  必须传播到任务状态，不能仅凭平台显示 Success 判定评测有效。smoke 通过不代表性能回归通过。
+
+### M2 配对实验的远端任务
+
+- 实验模板为 `scripts/InteractiveNav/configs/evaluation/m2_online_mixed0_29_8arm.json`。
+  先按 `test.md` 使用 `run_m2_experiment_lane.py --prepare-experiment` 冻结 manifest，
+  再启动各 lane；输出和缓存放在云端约定的 `/home/ldl` 下。
+- 本机 lane0/1 共用已有 8000 端口的 TP=2 Qwen，不加 `--start-qwen`，不重启共享模型服务。
+  远端 lane2 在单卡任务内启动 TP=1 Qwen 与仿真，每 lane 为 15 workers / 80 jobs。
+  远端提交命令（仓库根目录）：
+
+```bash
+volc ml_task submit \
+  -c scripts/InteractiveNav/configs/custom_task/m2_online_mixed0_29_8arm_remote.yaml
+```
+
+- 保持各 lane 的模型上下文、预算和推理参数一致，具体数值见 `test.md` 对应章节。
+  正常算法失败不重试择优；基础设施故障或不完整结果进入 `failure_queue`，保留原 attempt。
+
 ## `interactive-nav/full` 集成与 ROS 端到端回归
 
 当任务要求从 `codex/exp-setting` 创建或更新 `interactive-nav/full`、合入最新 `main` 并证明交互导航性能没有下降时，按以下流程执行。不要因为 `/opt/ros/noetic/setup.bash` 不存在就判定本机没有 ROS：本机使用 Conda ROS Noetic，前缀为 `/home/ldl/conda_envs/ros-noetic`；MolmoSpaces 仿真 Python 环境则是独立的 `/home/ldl/conda_envs/mlspaces`。

@@ -16,7 +16,7 @@ from PIL import Image as PILImage
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from interaction_policy import InteractionRequest, build_interaction_policy
+from interaction_policy import InteractionRequest, InteractionResult, build_interaction_policy
 from qwen_client import QwenClient
 
 
@@ -27,6 +27,7 @@ class PhysicalInteractionPolicyNode:
         self._encoded_image_message = None
         self._encoded_sample = None
         self._active_command = ""
+        self._policy_deadline = 0.0
         # Commands are one-shot events.  Keep a bounded process-local replay
         # guard in addition to using a non-latched result topic so a duplicate
         # ROS delivery cannot execute the same physical request twice.
@@ -151,7 +152,14 @@ class PhysicalInteractionPolicyNode:
             return None
 
     def _emit(self, event: dict[str, Any]) -> None:
+        if self._active_command and getattr(self, "_policy_deadline", 0.0):
+            event = {**event, "policy_deadline_at": time.time() + max(0.0, self._policy_deadline - time.monotonic())}
         self._event_pub.publish(String(data=json.dumps(event, ensure_ascii=False, separators=(",", ":"))))
+
+    def _policy_cancelled(self) -> bool:
+        return self._cancel.is_set() or (
+            bool(getattr(self, "_policy_deadline", 0.0)) and time.monotonic() >= self._policy_deadline
+        )
 
     def _speak(self, text: str, wait: bool) -> dict[str, Any]:
         with self._speech_condition:
@@ -169,7 +177,7 @@ class PhysicalInteractionPolicyNode:
             0.0, float(self._param("speech_subscriber_wait_s", 2.0))
         )
         while self._speech_pub.get_num_connections() <= 0 and time.monotonic() < deadline:
-            if rospy.is_shutdown():
+            if rospy.is_shutdown() or self._policy_cancelled():
                 break
             time.sleep(0.05)
         if self._speech_pub.get_num_connections() <= 0:
@@ -178,10 +186,14 @@ class PhysicalInteractionPolicyNode:
                 "topic": self._speech_pub.name,
                 "reason": "no_speech_subscriber",
             }
+        if self._policy_cancelled():
+            return {"accepted": False, "reason": "policy_cancelled"}
         self._speech_pub.publish(String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))))
         ack_deadline = time.monotonic() + max(0.1, float(self._param("speech_ack_timeout_s", 4.0)))
         with self._speech_condition:
             while request_id not in self._speech_status and time.monotonic() < ack_deadline:
+                if self._policy_cancelled():
+                    break
                 self._speech_condition.wait(timeout=min(0.1, ack_deadline - time.monotonic()))
             status = self._speech_status.pop(request_id, None)
         if not status:
@@ -201,11 +213,14 @@ class PhysicalInteractionPolicyNode:
             self._speech_condition.notify_all()
 
     def _qwen_request(self, prompt: str, *, image_data_url: str, max_tokens: int) -> dict[str, Any]:
+        if self._policy_cancelled():
+            return {"error": "interaction_policy_cancelled"}
         return self._qwen.chat(
             prompt,
             image_data_url=image_data_url,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            timeout_s=max(0.01, self._policy_deadline - time.monotonic()) if self._policy_deadline else None,
         )
 
     def _cancel_callback(self, _message: String) -> None:
@@ -288,13 +303,15 @@ class PhysicalInteractionPolicyNode:
 
     def _run(self, request: InteractionRequest) -> None:
         try:
+            self._policy_deadline = time.monotonic() + max(1.0, float(self._param("policy_timeout_s", 60.0)))
             profile = str(self._param("profile", "physical_human"))
             policy = build_interaction_policy(
                 profile,
                 speak=self._speak,
                 image_provider=self._image_provider,
                 request_json=self._qwen_request,
-                emit=self._emit,
+                emit=lambda event: self._emit({**event, "decision_id": request.decision_id,
+                    "candidate_id": request.candidate_id}) if event.get("stage") != "FINISHED" else None,
                 options={
                     "speech_retry_count": int(self._param("speech_retry_count", 2)),
                     "speech_retry_interval_s": float(self._param("speech_retry_interval_s", 12.0)),
@@ -313,7 +330,14 @@ class PhysicalInteractionPolicyNode:
                     "capture_clock": lambda: rospy.Time.now().to_sec(),
                 },
             )
-            result = policy.execute(request, self._cancel.is_set)
+            result = policy.execute(request, self._policy_cancelled)
+            if time.monotonic() >= self._policy_deadline:
+                result = InteractionResult(request.command_id, False, "TIMEOUT", request.target_id,
+                    request.target_kind, detail={"reason": "interaction_policy_timeout"},
+                    verification={"temporary_skip_s": float(self._param("temporary_skip_s", 30.0))})
+            self._emit({"module": "POLICY", "stage": "FINISHED", "command_id": request.command_id,
+                        "decision_id": request.decision_id, "candidate_id": request.candidate_id,
+                        "target_id": request.target_id, "timestamp": time.time(), "result": result.to_dict()})
             temporary_skip_s = float(result.verification.get("temporary_skip_s", 0.0) or 0.0)
             identity = self._result_identity(request)
             self._result_pub.publish(String(data=json.dumps({
@@ -343,6 +367,7 @@ class PhysicalInteractionPolicyNode:
         finally:
             with self._lock:
                 self._active_command = ""
+                self._policy_deadline = 0.0
 
 
 if __name__ == "__main__":

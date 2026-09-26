@@ -5,6 +5,55 @@ the gateway and is independent of browser repainting or navigation restarts.
 
 ## Start/stop
 
+One-command launch with recording (does not enable robot motion):
+
+The port 8765 home page also has **开始录制 / 停止录制** buttons for the same
+`raw_plus_panels` session, with duration, destination, queue depth and drop/error
+counters. Status polling runs at 1 Hz. All recorder ingress is non-blocking,
+including model/state events; overflow marks the session degraded. Explicit stop
+may wait for queued disk writes to finish. Recording does not bypass the normal
+six-panel rendering rate or unchanged-state cache.
+
+```bash
+PHYSICAL_NAV_YOLO_GPU=2 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh restart --record
+```
+
+`--record` can also be combined with the existing `enable_motion` argument.
+Without this option recording remains off by default. Set `PHYSICAL_NAV_RECORD_DIR`
+to choose the destination. The launcher checks that recording is active and prints
+the session directory; `stop`/`restart` drain the old session even when the web
+gateway is retained. A browser is not required, but the visualization service is.
+
+New recordings also store the exact six-panel JPEG shown on port 8765 as panel 0,
+all individual panels including panel 5, and `raw/camera/first_person.mjpeg`:
+the original JPEG frames concatenated without live re-encoding. This native RGB
+video has no detection overlays; its authoritative timing and depth/calibration
+are in `raw/camera/manifest.jsonl`. MJPEG has no embedded timestamps; use the
+offline exporter for correctly timed MP4 playback. Queue drops/write failures
+remain visible in session statistics; recording is best-effort and must not block
+navigation when storage is slow.
+
+After stopping, export the original six-panel layout (not the dark showcase theme)
+and first-person MP4 with a separate offline command:
+
+```bash
+conda run -n mlspaces python scripts/InteractiveNav/build_physical_six_panel_video.py \
+  /home/user/ldl/recordings/go2_physical/SESSION_ID --fps 10
+```
+
+Outputs: `derived/six-panel/overview_6panel.mp4`, `first_person.mp4`, and a manifest
+containing source quality statistics. Existing outputs are never overwritten;
+use `--output /new/directory` for another export. Each output frame uses only
+the latest preceding receipt, preserving real elapsed time and holding frames
+during source gaps. The six-panel image content/layout matches the live JPEG;
+browser controls/chrome are not recorded. Export is silent, uses MP4 encoding,
+and does not invoke ROS, Qwen or a running web server.
+
+For a review copy, add `--step-overlay --overview-only --output /new/preview-directory`.
+The exporter adds a separate top strip containing the recorded step and source
+time without covering the six panels. Steps are matched to panel receipts in
+order, including multiple steps captured from the same camera frame.
+
 The default root is:
 
 ```text

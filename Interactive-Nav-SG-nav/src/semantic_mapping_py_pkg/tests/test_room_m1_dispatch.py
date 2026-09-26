@@ -33,6 +33,16 @@ class ClockEvent:
         return self.stopped
 
 
+def test_room_input_excludes_structural_labels_without_losing_furniture():
+    labels = ["door", "wooden door", "bay_window", "office-window", "combination_lock",
+              "chair", "office_desk", "fridge", "window_air_conditioner"]
+    objects = [{"object_id": str(i), "name": "track_" + str(i), "category": label}
+               for i, label in enumerate(labels)]
+    filtered = InteractionAttributeInferenceNode._room_objects(
+        objects, excluded_labels=["door", "window", "lock"])
+    assert {x["category"] for x in filtered} == set(labels[5:])
+    assert len(InteractionAttributeInferenceNode._room_objects(objects)) == len(objects)
+
 @pytest.fixture
 def runtime(monkeypatch):
     node = object.__new__(InteractionAttributeInferenceNode)
@@ -104,6 +114,28 @@ def test_different_rooms_share_dispatch_budget_and_remain_text_only(runtime):
         assert call["role"] == "room_attribute_inference"
         assert set(call["context"]) == {"room_id", "room_box", "capture_step", "objects", "episode_id"}
         assert not any("image" in key for key in call)
+
+
+def test_failed_room_model_publishes_explicit_fallback_not_m1_ready(runtime):
+    from semantic_mapping_py_pkg.room_inference_backends import WeightedRoomAttributeInferencer
+
+    node, clock = runtime
+    node.room_fallback_enabled = True
+    node.room_fallback_inferencer = WeightedRoomAttributeInferencer(
+        {"kitchen": {"stove": 1.0}}
+    )
+    node.client.request_json = lambda **kwargs: SimpleNamespace(
+        error="ReadError", payload=None
+    )
+    node._infer_room(**reserve(node, clock))
+
+    assert node.room_counts["failed"] == 1
+    assert node.room_counts["completed"] == 0
+    assert node.updates[-1]["room_attribute_status"] == "fallback"
+    assert node.updates[-1]["fallback"] is True
+    assert node.updates[-1]["error"] == "ReadError"
+    assert node.updates[-1]["source"] == "weighted_object_types_fallback"
+    assert "room_1" not in node.room_completed
 
 
 def test_replaced_evidence_while_waiting_never_calls_model(runtime):

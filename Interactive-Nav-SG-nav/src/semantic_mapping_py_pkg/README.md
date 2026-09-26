@@ -188,6 +188,27 @@ RViz fixed frame can be set to `semantic_test_camera`. Published topics:
 `semantic_mapping_node.py` now maintains the legacy semantic mapping outputs and an incremental
 interaction-aware scene graph in parallel.
 
+### Configurable tracking memory
+
+`semantic_map.object_persistent_classes` controls which temporally confirmed
+detector classes retain their identity and last measured box after leaving view.
+`object_persistence_requires_m1` defaults to `true`; the physical deployment uses
+`false` so a slow/unavailable M1 service cannot erase established tracks after
+`object_stale_after_sec`. Confirmation still requires at least two consecutive
+source frames and respects the per-class confirmation threshold. Single-frame
+and nonpersistent detections retain their normal TTL. Reappearance does not
+reset a retained track to an unconfirmed identity.
+
+These settings are independent of the interaction-goal whitelist. The graph
+marks detector memory as `attributes.persistent_tracking_node`; it does not
+grant `persistent_semantic_node`, M1 approval, or a synthetic room behind a door.
+Accepted semantic corrections can revoke class-based retention; explicit reset
+and duplicate merging still work. Include normalized aliases in the list
+(for example both `door` and graph label `portal`). Omitting these parameters
+preserves the original simulation/M1-confirmed lifetime policy. Graph markers
+and the physical semantic-map panels display retained boxes even when
+`is_currently_visible` is false; raw YOLO debug boxes remain current observations.
+
 Additional topics:
 
 - `/semantic_mapping/unified_graph`

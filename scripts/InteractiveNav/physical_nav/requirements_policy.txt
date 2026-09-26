@@ -4,3 +4,5 @@ websockets>=12,<17
 websocket-client>=1.8,<2
 numpy>=1.23
 opencv-python>=4.8
+# rospy/rosgraph imports this in subscriber connection threads, including Conda.
+netifaces==0.11.0

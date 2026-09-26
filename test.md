@@ -1,5 +1,27 @@
 # 交互导航开发测试手册
 
+## 实物网页导航 step 归零（2026-09-26）
+
+在仓库根目录运行 `PHYSICAL_NAV_YOLO_GPU=2 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh restart`。
+显式 `restart` 会重启 8765 网页 gateway，使网页导航 step 从 0 重新计数；普通 `start` 可复用原 gateway。
+`frame_seq` 是 Go2 相机原始帧序号，独立于网页导航 step。
+
+## 实物六面板录制与独立导出（2026-09-26）
+
+```bash
+PHYSICAL_NAV_YOLO_GPU=2 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh restart --record
+# 停止并排空录制，再离线导出；SESSION_ID 替换为启动时打印的目录名。
+bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh stop
+conda run -n mlspaces python scripts/InteractiveNav/build_physical_six_panel_video.py \
+  /home/user/ldl/recordings/go2_physical/SESSION_ID --fps 10
+```
+
+详见 `scripts/InteractiveNav/physical_nav/physical_recording.md`。导出不在启动链路中执行；
+保存原始 RGB MJPEG/深度/时间戳、网页六面板整帧与分面板、地图和状态事件。
+最小回归使用本文实物测试的 PYTHONPATH 前置环境，运行
+`test_six_panel_recording_export.py`、`test_physical_raw_recorder.py`、
+`test_physical_platform.py` 及 `test_addon_architecture.py`。
+
 最后更新：2026-09-10
 
 ## YOLO 统一启动入口回归（2026-09-15）
@@ -3735,6 +3757,26 @@ conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
 门状态冷却和采集位姿/精确图像身份传递。原有实物身份隔离、安全停止、外参和
 latest-only 数据链回归继续运行。
 
+实物 M1 审核范围、观测元数据和房间推理的定向回归：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:scripts/InteractiveNav/physical_nav:Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:." \
+conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
+  scripts/InteractiveNav/physical_nav/tests/test_m1_review_scope.py \
+  scripts/InteractiveNav/physical_nav/tests/test_m1_capture_envelope.py \
+  scripts/InteractiveNav/physical_nav/tests/test_qwen_tunnel.py \
+  scripts/InteractiveNav/physical_nav/tests/test_addon_architecture.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_room_m1_dispatch.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_room_attribute_inference.py \
+  Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/tests/test_mllm_protocol.py
+```
+
+这些测试不调用真实模型、不启动 SSH 或机器人。现场核查 M1 时分别检查
+`attribute_inference_status.filter_counts` 与 `room_counts`；规则兜底的
+`room_attribute_status=fallback` 不应计作模型成功。当前实物 Qwen 默认远端
+端口为 `8100`，本机为 `18080`；修改源码后需重载对应进程才会生效。
+
 已有 ROS/Catkin 环境中编译（不启动节点）：
 
 ```bash
@@ -3828,3 +3870,147 @@ conda run -n mlspaces python -m pytest -q -p no:cacheprovider \
 与命令字段隔离。执行器测试同时检查发送前绑定结果 ID，以及无效抽屉命令既不
 分配序号也不发布。最小检查 388 项、全量 2041 项通过（2026-09-25）。
 本阶段不改 C++、运行配置或服务，不需要重启、连接机器人或加载 GPU 模型。
+
+### D435i 倒装 180° 与 ROS 订阅依赖检查（2026-09-25）
+
+当前实物启动器默认 `PHYSICAL_NAV_GO2_IMAGE_ROTATION_DEG=180`，在 Go2 编码前
+同时旋转原生 RGB/depth、更新主点及双目外参；主机 TF 的 RPY 仍描述正立虚拟
+相机，不再额外叠加 180°。相机恢复正装时覆盖为 `0`。相机 IMU 目前保持关闭，
+倒装模式与原生 IMU 同开会明确拒绝，避免混用坐标轴。
+
+使用前文完整 PYTHONPATH 环境运行 `scripts/InteractiveNav/physical_nav/tests`：
+本次 557 项通过，其中 `test_camera_inverted.py` 验证原生分辨率/深度值保留、
+主点和畸变变换、RGB-mask 投影与点云 TF 一致，以及标定输入不被修改。
+运行前检查实际算法解释器中的 `netifaces`，不能复用系统 Python 3.10 的二进制：
+
+```bash
+/home/user/miniconda3/envs/mlspaces/bin/python -c 'import netifaces; print(netifaces.__file__)'
+```
+
+若节点存活但图像以外面板为空，检查 `yoloe.log` 和 `roslaunch.log` 的订阅线程
+是否报 `ModuleNotFoundError: netifaces`；依赖已加入 `requirements_policy.txt`，
+监督脚本在启动前检查，避免出现节点存活但无法订阅的假正常状态。
+本次保持运动关闭重启后，12 秒采样：RGB/depth/points/OCC/YOLO 约 10 Hz，
+房间分割约 1.8 Hz、语义图约 3.4 Hz；六面板已有对应内容。该频率为现场样本，
+不是长期性能保证，也不代替硬件高度/俯仰发生变化后的重新标定。
+
+### 运动关闭暂停无进展计时（2026-09-25）
+
+使用前文完整 PYTHONPATH 运行 `test_progress_pause.py`、
+`test_behavior_execution.py`、`test_target_revision.py`、
+`test_semantic_behavior_executor_static.py`（均在语义决策 tests 下），以及
+`scripts/InteractiveNav/uni_control/test_speech_control.py`。单独运行
+uni_control 测试时在 PYTHONPATH 追加 `scripts/InteractiveNav/uni_control`。
+覆盖墙钟/步数两种预算、暂停后保留已用额度、启动未使能、心跳过期、
+控制桥断线和 IDLE 时的任务级停滞暂停。
+
+部署后只读检查 `/physical_nav/execution_enabled`：运动关闭应持续为 false；
+不要为测试主动开启机器人运动。实物进一步启用 `execution_pause_enabled`：
+允许后台选择但暂停动作与动作超时；地图未就绪不计无候选预算，该类停滞在
+候选恢复后可恢复。真正成功/安全终态不解除，独立模型/网络超时不取消。
+
+本次补充回归（沿用上文完整 `PYTHONPATH`）：
+
+- `semantic_decision_py_pkg/tests/test_progress_pause.py`、
+  `test_rule_decision_navigation_recovery.py`、`test_semantic_behavior_executor_static.py`：
+  无地图/无使能不超时，关闭仍选择，动作发布门控及恢复时的 worker 归属。
+- `semantic_mapping_py_pkg/tests/test_room_segmentation.py`、`test_room_portal_worker.py`、
+  `test_semantic_mapping_node_room_refresh.py`：斜向门切成两房间、M1确认/撤销、缓存失效。
+- `semantic_mapping_py_pkg/tests/test_object_geometry_recovery.py`：错误首框纠偏、
+  预算遗漏不冒充新3D观测、已确认目标刷新且首次两帧要求不变。
+- `scripts/InteractiveNav/physical_nav/tests/test_room_render_layers.py`、
+  `test_container_box_bounds.py`、`test_qwen_tunnel.py`、`test_m1_capture_envelope.py`：
+  图层顺序、柜子几何上限、精确隧道替换/健康检查、预算元数据传递。
+
+这些回归不调用模型、不控制机器人。真实 M1/M2 验证须得到当前远端数据发送授权，
+并同时确认执行状态为 paused、没有 move_base 新目标或非零速度输出。
+
+### 实物交互白名单与跟踪记忆（2026-09-25）
+
+使用上文完整 ROS/PYTHONPATH 环境运行：
+
+- `semantic_decision_py_pkg/tests/test_interaction_scope.py`：单一白名单、空列表拒绝、
+  任意配置类别、locker 待确认/提交冰箱重命名/饮水机纠错、持久候选年龄豁免。
+- `semantic_decision_py_pkg/tests/test_rule_decision_navigation_recovery.py`：
+  规则选择及模型解析失败回退都拒绝白名单外对象。
+- `semantic_mapping_py_pkg/tests/test_tracking_persistence.py`：两帧确认后失踪
+  300/1000 秒仍保留 ID/box，单帧和零散噪声过期，M1 显式纠错、重置、可视化。
+- `scripts/InteractiveNav/physical_nav/tests/test_addon_architecture.py` 和
+  `test_exp_setting_merge_contract.py`：公共算法/实物依赖边界和唯一配置来源。
+
+前三项路径均相对 `Interactive-Nav-SG-nav/src/`。运行时只读验收需区分规划速度
+与 Go2 实际里程计速度，不要为了验收白名单或持久化自动开启运动。
+
+### 实物停滞恢复与 M1 输出预算（2026-09-26）
+
+实物 `semantic_shadow_override.yaml` 将导航无进展窗口设为 5 秒/25 个
+0.2 秒进度步，转向后宽限为 2 秒。新 local plan 本身不算进展；运动关闭
+仍暂停计时。`global_no_progress_terminal: false` 使全局停滞取消当前目标并
+保留后续选择能力，仿真默认的终止语义不变。网页通过 ROS `goal_status`
+显示 `EXPLORATION_STALLED` 或 `NAVIGATION_RECOVERY`，不参与决策。
+
+实物 M1 输出上限从 384 增至 768；客户端保存 `finish_reason`，拒绝
+`length` 截断结果。使用当前 ROS RGB 的同一帧（非历史裁剪图）、历史门提示词
+和相同 schema，从本机请求现用远端 Qwen，交替 384/768 各两次：
+384 返回 350/384 tokens，后者 `length` 且 JSON 不完整；768 返回
+605/393 tokens，均 `stop` 且 JSON 完整。耗时依次为 2.60、3.94、2.58、2.76 秒。
+这些有限样本不代表所有容器提示词均不会截断；未写入 graph 或发送运动指令。
+
+沿用上文完整 PYTHONPATH 运行以下测试，375 项通过：
+
+- `semantic_decision_py_pkg/tests/test_rule_decision_navigation_recovery.py`
+- `semantic_decision_py_pkg/tests/test_behavior_execution.py`
+- `semantic_decision_py_pkg/tests/test_progress_pause.py`
+- `semantic_mapping_py_pkg/tests/test_interaction_graph_store.py`
+- `semantic_mllm_py_pkg/tests/test_mllm_protocol.py`
+- `scripts/InteractiveNav/physical_nav/tests/test_m3_dashboard_status.py`
+- `scripts/InteractiveNav/physical_nav/tests/test_addon_architecture.py`
+
+前五项相对 `Interactive-Nav-SG-nav/src/`。修改尚需重启加载；测试不自动开启运动。
+
+门名称归一化补充：M1 的 `wooden door`、`glass door` 等限定描述归一为
+`door`，原描述保留在 `m1_observed_object_description`；`cabinet door`、
+`fridge door`、`door handle` 不按房间门处理。对应 graph store、白名单和
+addon 边界回归共 168 项通过，包含后续多帧检测不降级及负例测试。
+
+### 运动关闭时只规划（2026-09-26）
+
+实物 `executor.paused_plan_preview_enabled: true`：暂停执行时继续保留 M2
+选择，并在独立单工作线程中每 2 秒调用 GetPlan。只发布
+`/semantic_decision/paused_global_plan`，网页 gateway 将其展示为 global path；
+不发送 action goal、速度或交互指令。规划失败只报告预览状态，不让 subgoal
+失败或消费执行超时。恢复运动/更换 decision 后丢弃旧规划回复。
+公共仿真默认关闭这一功能，服务等待与工作线程不阻塞执行器 tick。
+
+沿用前文完整 PYTHONPATH，运行 `test_semantic_behavior_executor_static.py`、
+`test_progress_pause.py` 和 `test_addon_architecture.py`，250 项通过。
+覆盖暂停规划成功/空路径/服务错误/恢复运动/切换目标时的结果归属。
+运行中的运动未被关闭或重启；部署后仍需验收暂停状态的真实 ROS 路径。
+
+当日只读 OCC 诊断：映射约 10 Hz、数据年龄约 0.22–0.32 秒；当前
+0.5° 波束最近簇门槛为 8 点。前方 2 米内 80 个波束只有 14 个满足门槛，
+以 3 点模拟则为 58 个；约 0.62–0.75 米的近点多数为 1–4 点簇。
+这些点会进入 clear-only 而不标记占据，现场 221 个前方点所在栅格为 free。
+本轮未直接修改 OCC 参数；降低点数门槛应同时验证邻角/时序支持及噪声误标。
+
+### 房间 M1 输入筛选与网页标注（2026-09-26）
+
+实物 `room_mllm.excluded_object_labels` 排除门窗、锁、墙地顶、插座、温控器
+等房间用途弱证据；只过滤房间请求，不删除 graph 节点或改变物体 M1。
+支持 `bay_window`、`wooden door` 等后缀，不排除 `window_air_conditioner`。
+公共默认不排除任何类别。网页房间 M1 标注为纯文本、无图像，展示请求物体
+及可见性、真实提示词、原始回答和证据 ID 对应标签，说明置信度为模型自报。
+房间推理/调度、网页标注、addon 回归共 42 项通过；部署需重新加载相关服务。
+
+### 房间大件物体记忆（2026-09-26）
+
+实物 `room_inference.large_object_memory` 开启后，房间节点的
+`attributes.large_object_memory` 独立保存两帧、confidence>=0.5、最长边>=0.4m
+的大件白名单物体。保存标签、实例、尺寸位置、观测次数与首末观测时间。
+没有 TTL；检测节点过期后仍作为房间 M1 历史证据（非当前可见）。
+明确的 M1 类别纠错可撤销记录，房间归属更新/合并及已确认的 track alias
+会迁移记录。新 episode/reset 清空；此功能不是跨进程磁盘存档。
+公共默认关闭，不把历史记录重新生成障碍物或交互候选。
+
+沿用完整 PYTHONPATH 运行 `test_interaction_graph_store.py`、
+`test_semantic_mapping_node_room_refresh.py`、`test_addon_architecture.py`：204 项通过。

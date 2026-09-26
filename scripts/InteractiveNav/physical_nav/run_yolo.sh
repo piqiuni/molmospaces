@@ -56,8 +56,8 @@ YOLO_COMMAND=("${YOLO_PYTHON}" "${YOLO_ROOT}/physical_yoloe_bridge.py"
   --detector-config "${PHYSICAL_NAV_DETECTOR_CONFIG:-${YOLO_ROOT}/config/physical_nav.yaml}"
   --device "${YOLO_DEVICE}" --rate "${PHYSICAL_NAV_YOLO_RATE:-10}"
   --camera-x "${PHYSICAL_NAV_CAMERA_X:-0.03}" --camera-y "${PHYSICAL_NAV_CAMERA_Y:-0}"
-  --camera-z "${PHYSICAL_NAV_CAMERA_Z:-0.98}" --camera-roll "${PHYSICAL_NAV_CAMERA_ROLL:-0}"
-  --camera-pitch "${PHYSICAL_NAV_CAMERA_PITCH:-0.1396263}" --camera-yaw "${PHYSICAL_NAV_CAMERA_YAW:-0}"
+  --camera-z "${PHYSICAL_NAV_CAMERA_Z:-0.885}" --camera-roll "${PHYSICAL_NAV_CAMERA_ROLL:-0}"
+  --camera-pitch "${PHYSICAL_NAV_CAMERA_PITCH:-0.157079633}" --camera-yaw "${PHYSICAL_NAV_CAMERA_YAW:-0}"
   "${EXTRA_ARGS[@]}")
 echo "YOLO: gpu=${YOLO_GPU}, device=${YOLO_DEVICE}, rate=${PHYSICAL_NAV_YOLO_RATE:-10} Hz" >&2
 if (( DRY_RUN )); then

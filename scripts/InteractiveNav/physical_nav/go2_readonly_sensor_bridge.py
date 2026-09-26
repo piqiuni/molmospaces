@@ -2107,6 +2107,49 @@ class D435iSource:
             self._pipeline_stopped = True
 
 
+def _upright_rgbd_180(rgb, depth, rgb_intrinsics, depth_intrinsics, extrinsics):
+    """Rotate both native grids and their calibration into upright optical frames.
+
+    S = diag(-1, -1, 1): p_upright = S p_native. Thus R_dc becomes
+    S R_dc S and t_dc becomes S t_dc. The host mount remains the upright
+    virtual-camera mount; applying another 180-degree TF roll would double flip.
+    """
+    import numpy as np
+
+    def intrinsics_for(image, intrinsics):
+        result = dict(intrinsics)
+        height, width = image.shape[:2]
+        result.update(width=width, height=height,
+                      cx=width - 1 - float(intrinsics["cx"]),
+                      cy=height - 1 - float(intrinsics["cy"]))
+        coefficients = list(intrinsics.get("distortion") or [])
+        model = str(intrinsics.get("distortion_model") or "").casefold()
+        if len(coefficients) >= 4 and (
+            "brown" in model or model in {"plumb_bob", "rational_polynomial"}
+        ):
+            coefficients[2], coefficients[3] = -coefficients[2], -coefficients[3]
+        if "distortion" in intrinsics:
+            result["distortion"] = coefficients
+        return result
+
+    corrected_extrinsics = dict(extrinsics or {})
+    signs = np.array([-1., -1., 1.])
+    if "rotation" in corrected_extrinsics:
+        rotation = np.asarray(corrected_extrinsics["rotation"]).reshape(3, 3)
+        corrected_extrinsics["rotation"] = (signs[:, None] * rotation * signs).reshape(-1).tolist()
+    if "translation" in corrected_extrinsics:
+        corrected_extrinsics["translation"] = (
+            signs * np.asarray(corrected_extrinsics["translation"])
+        ).tolist()
+    return (
+        np.ascontiguousarray(rgb[::-1, ::-1]),
+        np.ascontiguousarray(depth[::-1, ::-1]),
+        intrinsics_for(rgb, rgb_intrinsics),
+        intrinsics_for(depth, depth_intrinsics),
+        corrected_extrinsics,
+    )
+
+
 def _encode(
     rgb: Any,
     depth: Any,
@@ -2297,7 +2340,17 @@ async def _publish_impl(args: argparse.Namespace, cleanup_callbacks: list[Any]) 
                 # The encoder owns these copies while capture immediately
                 # returns to wait_for_frames.
                 copy_started = time.monotonic()
-                rgb, depth = rgb.copy(), depth.copy()
+                rgb_intrinsics = source.intrinsics if source is not None else intr
+                depth_intrinsics = source.depth_intrinsics if source is not None else intr
+                extrinsics = source.depth_to_color_extrinsics if source is not None else {}
+                image_rotation_deg = int(getattr(args, "image_rotation_deg", 0))
+                if image_rotation_deg == 180:
+                    rgb, depth, rgb_intrinsics, depth_intrinsics, extrinsics = _upright_rgbd_180(
+                        rgb, depth, rgb_intrinsics, depth_intrinsics, extrinsics,
+                    )
+                else:
+                    rgb, depth = rgb.copy(), depth.copy()
+                capture_time["image_rotation_deg"] = image_rotation_deg
                 diagnostic_copy_s += time.monotonic() - copy_started
                 state_snapshot, state_delta = state.snapshot_at(
                     capture_stamp,
@@ -2328,10 +2381,10 @@ async def _publish_impl(args: argparse.Namespace, cleanup_callbacks: list[Any]) 
                     "capture_telemetry_delta_s": state_delta,
                     "rgb": rgb,
                     "depth": depth,
-                    "intrinsics": intr,
-                    "rgb_intrinsics": source.intrinsics if source is not None else intr,
-                    "depth_intrinsics": source.depth_intrinsics if source is not None else intr,
-                    "depth_to_color_extrinsics": source.depth_to_color_extrinsics if source is not None else {},
+                    "intrinsics": rgb_intrinsics,
+                    "rgb_intrinsics": rgb_intrinsics,
+                    "depth_intrinsics": depth_intrinsics,
+                    "depth_to_color_extrinsics": extrinsics,
                     "sync_ms": sync_ms,
                     "depth_scale": args.depth_scale if source is None else source.depth_scale,
                     "camera_imu": capture_motion,
@@ -2721,6 +2774,8 @@ def main() -> None:
     parser.add_argument("--depth-height", type=int, default=480)
     parser.add_argument("--depth-fps", type=int, default=10)
     parser.add_argument("--align-to", choices=("none", "color", "depth"), default="none")
+    parser.add_argument("--image-rotation-deg", type=int, choices=(0, 180), default=0,
+                        help="upright RGB-D virtual frames for a physically inverted camera")
     parser.add_argument("--publish-fps", type=float, default=10.0)
     parser.add_argument("--depth-png-compression", type=int, default=4)
     parser.add_argument(
@@ -2749,6 +2804,8 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.image_rotation_deg == 180 and args.enable_camera_imu:
+        parser.error("inverted image frames currently require camera IMU disabled; native IMU axes are not normalized")
     if not math.isfinite(args.imu_gravity_tau_s) or args.imu_gravity_tau_s <= 0.:
         parser.error("--imu-gravity-tau-s must be finite and positive")
     if args.publish_fps <= 0:

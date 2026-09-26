@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import time
 from typing import Any
+from .progress_pause import ProgressPause
 
 # Compatibility exports for existing planners, tests and recorded workflows.
 from .approach_geometry import normalize_angle
@@ -743,6 +744,15 @@ class NavigationProgressWatchdog:
     reference_goal_distance_m: float | None = None
     last_progress_at: float | None = None
     reference_step_index: int | None = None
+    progress_pause: ProgressPause = field(default_factory=ProgressPause)
+
+    def set_execution_enabled(self, enabled, now, task_step_index=None):
+        steps, seconds = self.progress_pause.advance(enabled, task_step_index, now)
+        if self.reference_step_index is not None:
+            self.reference_step_index += steps
+        if self.last_progress_at is not None:
+            self.last_progress_at += seconds
+        return steps, seconds
 
     def reset(
         self,
@@ -764,6 +774,8 @@ class NavigationProgressWatchdog:
         self.reference_step_index = (
             int(task_step_index) if task_step_index is not None else None
         )
+        self.progress_pause.last_step = task_step_index
+        self.progress_pause.last_time = float(now)
 
     def observe(
         self,
@@ -774,6 +786,9 @@ class NavigationProgressWatchdog:
         local_plan_fresh: bool = False,
         task_step_index: int | None = None,
     ) -> bool:
+        self.set_execution_enabled(self.progress_pause.enabled, now, task_step_index)
+        if not self.progress_pause.enabled:
+            return False
         if self.timeout_s <= 0.0 or pose is None:
             return False
         if self.reference_xy is None or self.last_progress_at is None:
@@ -854,6 +869,17 @@ class SemanticNavigationProgressSupervisor:
     mission_reference_xy: tuple[float, float] | None = None
     mission_reference_step_index: int | None = None
     mission_grace_deadline_step_index: int | None = None
+    progress_pause: ProgressPause = field(default_factory=ProgressPause)
+
+    def set_execution_enabled(self, enabled, task_step_index):
+        steps, _ = self.progress_pause.advance(enabled, task_step_index)
+        for name in (
+            "subgoal_reference_step_index", "subgoal_started_step_index",
+            "mission_reference_step_index", "mission_grace_deadline_step_index",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value + steps)
 
     @staticmethod
     def _finite(value: float | None) -> float | None:
@@ -864,6 +890,7 @@ class SemanticNavigationProgressSupervisor:
 
     def reset(self) -> None:
         self.subgoal_key = ""
+        self.progress_pause = ProgressPause()
         self.subgoal_reference_xy = None
         self.subgoal_reference_goal_distance_m = None
         self.subgoal_reference_yaw_error_rad = None
@@ -881,6 +908,7 @@ class SemanticNavigationProgressSupervisor:
             return
         xy = (float(pose[0]), float(pose[1]))
         step = int(task_step_index)
+        self.progress_pause.last_step = step
         self.subgoal_key = ""
         self.subgoal_reference_xy = None
         self.subgoal_reference_goal_distance_m = None
@@ -897,6 +925,7 @@ class SemanticNavigationProgressSupervisor:
         if task_step_index is None:
             return
         step = int(task_step_index)
+        self.progress_pause.last_step = step
         if self.subgoal_reference_step_index is not None:
             self.subgoal_reference_step_index = step
         if self.mission_reference_step_index is not None:
@@ -912,7 +941,13 @@ class SemanticNavigationProgressSupervisor:
         goal_distance_m: float | None = None,
         yaw_error_rad: float | None = None,
         allow_yaw_progress: bool = False,
+        execution_enabled: bool = True,
     ) -> dict:
+        self.set_execution_enabled(execution_enabled, task_step_index)
+        if not execution_enabled:
+            return {"subgoal_stalled": False, "mission_stalled": False,
+                    "semantic_progress_paused": True,
+                    "semantic_progress_pause_reason": "execution_disabled"}
         if pose is None or task_step_index is None or not str(subgoal_key):
             return {"subgoal_stalled": False, "mission_stalled": False}
         xy = (float(pose[0]), float(pose[1]))

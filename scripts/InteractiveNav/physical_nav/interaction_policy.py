@@ -130,8 +130,8 @@ class HumanAssistActuator:
     def execute(self, request: InteractionRequest, cancel: Callable[[], bool]) -> dict[str, Any]:
         if request.action not in {"open", "scan"}:
             return {"success": False, "status": "FAILED", "reason": "human_policy_only_opens"}
-        noun = {"door": "门", "fridge": "冰箱", "drawer": "抽屉"}.get(request.target_kind, request.target_kind)
-        text = f"您好，请帮我把前面的{noun}打开，谢谢。"
+        noun = {"door": "door", "fridge": "refrigerator", "drawer": "drawer"}.get(request.target_kind, request.target_kind)
+        text = f"Please open the {noun} in front of me. Thank you."
         attempts = []
         for attempt in range(self.retry_count + 1):
             if cancel():

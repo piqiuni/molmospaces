@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from semantic_decision_py_pkg.interaction_scope import InteractionGoalScope
+
 import json
 import math
 import threading
@@ -148,6 +150,10 @@ class SemanticCandidateNode:
                 ),
                 interaction_semantic_types=tuple(
                     config.get("interaction_semantic_types", [])
+                ),
+                interaction_goal_scope=InteractionGoalScope.from_config(
+                    rospy.get_param("~interaction_goals", None),
+                    legacy_types=config.get("interaction_semantic_types", []),
                 ),
                 container_require_same_room=bool(
                     config.get("container_require_same_room", False)
@@ -413,6 +419,8 @@ class SemanticCandidateNode:
                 interaction_ready_distance_m=float(
                     config.get("interaction_ready_distance_m", 0.45)
                 ),
+                portal_ready_distance_cap_m=max(0.05, float(config.get("portal_ready_distance_cap_m", 0.15))),
+                portal_shrink_arrival_disc=bool(config.get("portal_shrink_arrival_disc", True)),
                 interaction_ready_yaw_tolerance_rad=max(
                     0.05,
                     float(config.get("interaction_ready_yaw_tolerance_rad", 0.55)),

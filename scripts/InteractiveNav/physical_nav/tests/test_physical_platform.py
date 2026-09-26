@@ -584,6 +584,15 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert snapshot["navigation_step"] == 1
     assert SixPanelRenderer._physical_step(snapshot)["step_index"] == 1
 
+  def test_explicit_restart_replaces_gateway_to_reset_navigation_step(self):
+    all_launcher = (ROOT / "physical_nav_all.sh").read_text()
+    service = (ROOT / "physical_nav_service.sh").read_text()
+    launcher = (ROOT / "start_physical_nav.sh").read_text()
+    assert 'restart) stop_all; PHYSICAL_NAV_FORCE_GATEWAY_RESTART=1 start_all' in all_launcher
+    assert 'restart) stop_service; PHYSICAL_NAV_FORCE_GATEWAY_RESTART=1 start_service' in service
+    assert '"${PHYSICAL_NAV_FORCE_GATEWAY_RESTART:-0}" != "1"' in launcher
+    assert 'explicit restart resets navigation step' in launcher
+
   def test_panel_two_keeps_pending_post_interaction_subgoal_visible(self):
     snapshot = RuntimeState().snapshot()
     snapshot["navigation"] = {
@@ -1762,7 +1771,7 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert 'nohup setsid "${GATEWAY_PYTHON}"' in start
     assert '*"start_physical_nav.sh"*' in service
     assert service.index('cleanup_pipeline_residuals\n  rm -f "${PID_FILE}"') > service.index('start_service()')
-    assert 'interaction_semantic_types: ["door", "fridge"]' in override
+    assert 'allowed_semantic_types: ["door", "fridge"]' in override
     assert 'drawer_cabinet' not in override
     assert 'min_obstacle_clearance_m: 0.80' in override
     assert 'portal_traversal_clearance_margin_m: 0.55' in override
@@ -1770,7 +1779,7 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert 'start_go2_control.py ${motion_flag} --no-restart' in all_launcher
     assert 'start_motion_control' in all_launcher
     assert '--bridge-ready-file "${ready_file}"' in all_launcher
-    assert 'MOTION_MAX_VX="${PHYSICAL_NAV_MOTION_MAX_VX:-0.6}"' in all_launcher
+    assert 'MOTION_MAX_VX="${PHYSICAL_NAV_MOTION_MAX_VX:-0.5}"' in all_launcher
     assert 'MOTION_MAX_WZ="${PHYSICAL_NAV_MOTION_MAX_WZ:-1.3}"' in all_launcher
     assert '--bridge-arg=--max-vx --bridge-arg="${max_vx}"' in all_launcher
     assert '--bridge-arg=--max-wz --bridge-arg="${max_wz}"' in all_launcher
@@ -1799,9 +1808,10 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert local_override["local_costmap"]["obstacle_layer"]["local_obstacles"]["observation_persistence"] == 0.0
     assert local_override["local_costmap"]["obstacle_layer"]["footprint_clearing_enabled"] is True
     assert local_override["local_costmap"]["obstacle_layer"]["obstacle_reset_interval"] == 2.0
-    assert local_override["DWAPlannerROS"]["max_vel_x"] == 0.56
+    assert local_override["DWAPlannerROS"]["max_vel_x"] == 0.50
     assert local_override["DWAPlannerROS"]["min_vel_x"] == 0.05
-    assert local_override["DWAPlannerROS"]["max_vel_trans"] == 0.60
+    assert local_override["DWAPlannerROS"]["max_vel_trans"] == 0.50
+    assert local_override["DWAPlannerROS"]["rear_path_rotate_speed"] == 0.80
     assert local_override["DWAPlannerROS"]["min_vel_trans"] == 0.05
     assert local_override["DWAPlannerROS"]["max_vel_theta"] == 1.30
     assert local_override["DWAPlannerROS"]["min_vel_theta"] == 0.05
@@ -1821,11 +1831,11 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert semantic_override["executor"]["explore_terminal_xy_tolerance_m"] == 0.30
     assert semantic_override["executor"]["explore_terminal_yaw_tolerance_rad"] == 0.15
     assert physical_config["semantic_map"]["object_portal_cross_view_match_enabled"] is True
-    assert physical_config["velocity_safety"]["max_linear_mps"] == 0.60
+    assert physical_config["velocity_safety"]["max_linear_mps"] == 0.50
     assert physical_config["velocity_safety"]["min_linear_mps"] == 0.30
     assert physical_config["velocity_safety"]["linear_deadband_mps"] == 0.05
     assert physical_config["velocity_safety"]["max_angular_rps"] == 1.30
-    assert physical_config["velocity_safety"]["min_angular_rps"] == 0.40
+    assert physical_config["velocity_safety"]["min_angular_rps"] == 0.80
     assert '--continuous-ttl-ms "${PHYSICAL_NAV_MOTION_TTL_MS:-500}"' in all_launcher
     assert '--ros-command-refresh-hz "${PHYSICAL_NAV_MOTION_REFRESH_HZ:-20}"' in all_launcher
     assert physical_config["interaction_policy"]["speech_subscriber_wait_s"] == 60.0

@@ -28,6 +28,9 @@ GO2_DEPTH_WIDTH="${PHYSICAL_NAV_GO2_DEPTH_WIDTH:-848}"
 GO2_DEPTH_HEIGHT="${PHYSICAL_NAV_GO2_DEPTH_HEIGHT:-480}"
 GO2_DEPTH_FPS="${PHYSICAL_NAV_GO2_DEPTH_FPS:-10}"
 GO2_ALIGN_TO="${PHYSICAL_NAV_GO2_ALIGN_TO:-none}"
+# Camera is physically upside down. Source rotates both images AND calibration.
+# Host camera RPY describes the resulting upright virtual optical frames.
+GO2_IMAGE_ROTATION_DEG="${PHYSICAL_NAV_GO2_IMAGE_ROTATION_DEG:-180}"
 GO2_CAMERA_IMU="${PHYSICAL_NAV_GO2_CAMERA_IMU:-0}"
 GO2_SENSOR_QUEUE_CAPACITY="${PHYSICAL_NAV_GO2_SENSOR_QUEUE_CAPACITY:-128}"
 GO2_TELEMETRY_PERIOD="${PHYSICAL_NAV_GO2_TELEMETRY_PERIOD:-0.05}"
@@ -49,13 +52,13 @@ MOTION_REMOTE_PID_FILE="${PHYSICAL_NAV_MOTION_REMOTE_PID_FILE:-/home/unitree/uni
 MOTION_REMOTE_READY_FILE="${PHYSICAL_NAV_MOTION_REMOTE_READY_FILE:-/home/unitree/uni_control/go2_control.ready}"
 MOTION_OWNED_FILE="${STATE_DIR}/motion_control.owned"
 MOTION_STATUS_FILE="${STATE_DIR}/motion_control.status"
-MOTION_MAX_VX="${PHYSICAL_NAV_MOTION_MAX_VX:-0.6}"
+MOTION_MAX_VX="${PHYSICAL_NAV_MOTION_MAX_VX:-0.5}"
 MOTION_MAX_WZ="${PHYSICAL_NAV_MOTION_MAX_WZ:-1.3}"
 MOTION_ENABLED=0
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") {start|start_control|stop_control|stop|restart|status|logs} [enable_motion] [obj_goal]
+Usage: $(basename "$0") {start|start_control|stop_control|stop|restart|status|logs} [enable_motion] [obj_goal] [--record]
 
 Starts the Go2 read-only sensor bridge, Go2 SSH tunnel, Qwen SSH tunnel and
 the local physical navigation stack. Motion control is started only when the
@@ -115,20 +118,16 @@ wait_ros_command_subscriber() {
 }
 
 start_qwen_tunnel() {
-  if [[ -f "${QWEN_PID_FILE}" ]] && pid_alive "$(<"${QWEN_PID_FILE}")"; then
-    echo "Qwen tunnel already running (pid=$(<"${QWEN_PID_FILE}"))"
-    return 0
-  fi
-  rm -f "${QWEN_PID_FILE}"
-  nohup setsid python3 "${QWEN_TUNNEL_SCRIPT}" \
+  python3 "${QWEN_TUNNEL_SCRIPT}" --ensure \
+    --pid-file "${QWEN_PID_FILE}" --log-file "${QWEN_LOG}" \
     --ssh-port "${PHYSICAL_NAV_QWEN_SSH_PORT:-41051}" \
     --user "${PHYSICAL_NAV_QWEN_USER:-root}" \
     --host "${PHYSICAL_NAV_QWEN_HOST:-115.190.90.101}" \
     --local-port "${PHYSICAL_NAV_QWEN_LOCAL_PORT:-18080}" \
-    --remote-port "${PHYSICAL_NAV_QWEN_REMOTE_PORT:-8000}" \
-    >>"${QWEN_LOG}" 2>&1 </dev/null &
-  echo $! >"${QWEN_PID_FILE}"
-  echo "Qwen tunnel started (pid=$(<"${QWEN_PID_FILE}"))"
+    --remote-port "${PHYSICAL_NAV_QWEN_REMOTE_PORT:-8100}" \
+    --verify-inference \
+    --model "${PHYSICAL_NAV_QWEN_MODEL:-qwen3.6-35b-a3b-fp8}" \
+    --inference-timeout "${PHYSICAL_NAV_QWEN_HEALTH_TIMEOUT_S:-8}"
 }
 
 start_go2_components() {
@@ -141,7 +140,7 @@ start_go2_components() {
     "${GO2_INTERFACE}" "${GO2_FPS}" "${GO2_TELEMETRY_PERIOD}" \
     "${GO2_SENSOR_URL}" "${GO2_COLOR_WIDTH}" "${GO2_COLOR_HEIGHT}" "${GO2_COLOR_FPS}" \
     "${GO2_DEPTH_WIDTH}" "${GO2_DEPTH_HEIGHT}" "${GO2_DEPTH_FPS}" "${GO2_ALIGN_TO}" "${GO2_CAMERA_IMU}" \
-    "${GO2_SENSOR_QUEUE_CAPACITY}" <<'REMOTE'
+    "${GO2_SENSOR_QUEUE_CAPACITY}" "${GO2_IMAGE_ROTATION_DEG}" <<'REMOTE'
 set -u
 tunnel_pid="0"
 tunnel_owned=0
@@ -182,6 +181,7 @@ if [ -n "${bridge_pid}" ]; then
     if ! has_bridge_arg "${key}" "${value}"; then bridge_matches=0; break; fi
   done
   if ! has_bridge_arg "--sensor-queue-capacity" "${16}"; then bridge_matches=0; fi
+  if ! has_bridge_arg "--image-rotation-deg" "${17}"; then bridge_matches=0; fi
   if [ "${15}" = 1 ]; then
     case " ${bridge_args} " in *" --enable-camera-imu "*) ;; *) bridge_matches=0 ;; esac
   else
@@ -203,6 +203,7 @@ if [ -z "${bridge_pid}" ]; then
     --color-width "$8" --color-height "$9" --color-fps "${10}" \
     --depth-width "${11}" --depth-height "${12}" --depth-fps "${13}" --align-to "${14}" \
     --sensor-queue-capacity "${16}" \
+    --image-rotation-deg "${17}" \
     --telemetry-period "$6" \
     $(if [ "${15}" = 1 ]; then echo --enable-camera-imu; fi) \
     >>"$3" 2>&1 </dev/null &
@@ -461,8 +462,11 @@ REMOTE
 }
 
 start_all() {
-  if [[ "${PHYSICAL_NAV_START_QWEN_TUNNEL:-1}" == 1 ]]; then
-    start_qwen_tunnel
+  # This top-level entry always needs remote inference, even if it inherits
+  # the child launcher's internal tunnel-suppression environment variable.
+  if ! start_qwen_tunnel; then
+    echo "physical navigation startup FAILED: Qwen health check failed; remaining services were not started" >&2
+    return 1
   fi
   # Keep a generous grace period: the Go2 bridge may need to initialise the
   # D435i before the first frame reaches the watchdog.
@@ -477,6 +481,10 @@ start_all() {
   wait_local_port "${SENSOR_WS_PORT}" 200
   if [[ "${PHYSICAL_NAV_START_WEB:-1}" == "1" ]]; then
     wait_local_port "${PHYSICAL_NAV_WS_PORT:-12334}" 100
+  fi
+  if [[ "${PHYSICAL_NAV_RECORD_ON_START:-0}" == 1 ]]; then
+    wait_local_port "${PHYSICAL_NAV_WEB_PORT:-8765}" 100
+    python3 "${ROOT_DIR}/recording_control.py" start --port "${PHYSICAL_NAV_WEB_PORT:-8765}"
   fi
   start_go2_components
   publish_object_goal
@@ -567,6 +575,12 @@ REMOTE
 
 stop_all() {
   stop_motion_control
+  # The visualization gateway can survive an algorithm restart. Explicitly
+  # drain its recording so the next run never appends to the previous session.
+  if ss -Hltn "sport = :${PHYSICAL_NAV_WEB_PORT:-8765}" | grep -q .; then
+    python3 "${ROOT_DIR}/recording_control.py" stop --port "${PHYSICAL_NAV_WEB_PORT:-8765}" || \
+      echo "warning: recording could not be finalized; inspect its session status" >&2
+  fi
   bash "${SERVICE}" stop || true
   stop_remote_owned "${GO2_BRIDGE_PID_FILE}" "${GO2_BRIDGE_OWNED_FILE}" "sensor bridge"
   stop_remote_owned "${GO2_TUNNEL_PID_FILE}" "${GO2_TUNNEL_OWNED_FILE}" "SSH tunnel"
@@ -618,6 +632,28 @@ show_logs() {
 }
 
 ACTION="${1:-}"
+# Remove the named option before parsing the legacy positional arguments.
+declare -a POSITIONAL_ARGS=()
+for argument in "$@"; do
+  if [[ "${argument}" == "--record" ]]; then
+    if [[ "${ACTION}" != "start" && "${ACTION}" != "restart" ]]; then
+      echo "--record requires start or restart" >&2
+      exit 2
+    fi
+    export PHYSICAL_NAV_RECORD_ON_START=1
+    export PHYSICAL_NAV_RECORD_MODE=raw_plus_panels
+  else
+    POSITIONAL_ARGS+=("${argument}")
+  fi
+done
+set -- "${POSITIONAL_ARGS[@]}"
+if [[ "${PHYSICAL_NAV_RECORD_ON_START:-0}" == 1 ]]; then
+  if [[ "${PHYSICAL_NAV_START_WEB:-1}" != 1 ]]; then
+    echo "recording the six-panel output requires PHYSICAL_NAV_START_WEB=1 (no browser needed)" >&2
+    exit 2
+  fi
+  echo "Recording enabled: ${PHYSICAL_NAV_RECORD_DIR:-/home/user/ldl/recordings/go2_physical} (raw RGB-D + six-panel frames + state/events)"
+fi
 if [[ "${2:-}" == "enable_motion" ]]; then
   MOTION_ENABLED=1
 elif [[ -n "${2:-}" ]]; then
@@ -647,7 +683,7 @@ case "${ACTION}" in
     printf '%s\n' speech_only >"${MOTION_STATUS_FILE}"
     ;;
   stop) stop_all ;;
-  restart) stop_all; start_all ;;
+  restart) stop_all; PHYSICAL_NAV_FORCE_GATEWAY_RESTART=1 start_all ;;
   status) status_all ;;
   logs) show_logs ;;
   *) usage; exit 2 ;;

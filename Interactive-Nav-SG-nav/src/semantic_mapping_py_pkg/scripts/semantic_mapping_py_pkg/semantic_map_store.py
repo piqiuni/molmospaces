@@ -4,6 +4,7 @@ from statistics import median
 from collections import defaultdict
 
 from .geometry_utils import euclidean_2d, grid_index, normalize_label, point_dict, world_to_grid
+from .semantic_evidence import _accepted_semantic_evidence
 
 
 def _detection_yaw(detection):
@@ -53,6 +54,7 @@ _APPLIANCE_DUPLICATE_LABELS = frozenset(
     {
         "fridge",
         "refrigerator",
+        "smart_vending_refrigerator",
         "freezer",
         "locker",
         "safe",
@@ -85,9 +87,28 @@ class ObjectMapStore:
         portal_cross_view_yaw_tolerance_rad=0.35,
         portal_cross_view_min_tangent_overlap_ratio=0.20,
         portal_cross_view_min_vertical_overlap_ratio=0.35,
+        persistent_classes=None,
+        persistence_requires_m1=True,
+        confirmed_geometry_reacquisition=False,
+        stable_box_recovery_confirmations=0,
+        stable_box_recovery_min_confidence=0.25,
+        stable_box_recovery_min_depth_points=64,
+        size_aware_xyz_matching=False,
     ):
         self.match_distance = float(match_distance)
+        self.size_aware_xyz_matching = bool(size_aware_xyz_matching)
         self.stale_after_sec = float(stale_after_sec)
+        # None preserves the historical M1-only lifetime policy. An explicit
+        # list selects deployment-specific tracking memory, not action admission.
+        self.persistent_classes = (
+            None if persistent_classes is None else
+            frozenset(normalize_label(label) for label in persistent_classes)
+        )
+        self.persistence_requires_m1 = bool(persistence_requires_m1)
+        self.confirmed_geometry_reacquisition = bool(confirmed_geometry_reacquisition)
+        self.stable_box_recovery_confirmations = max(0, int(stable_box_recovery_confirmations))
+        self.stable_box_recovery_min_confidence = float(stable_box_recovery_min_confidence)
+        self.stable_box_recovery_min_depth_points = max(0, int(stable_box_recovery_min_depth_points))
         self.min_confirmations = max(1, int(min_confirmations))
         self.size_match_ratio = max(0.05, float(size_match_ratio))
         self.stable_history_size = max(1, int(stable_history_size))
@@ -120,6 +141,7 @@ class ObjectMapStore:
         self.next_id = 1
         self._last_update_stamp = None
         self.m1_canonical_labels = {}
+        self.merged_track_aliases = {}
         # Matching indexes are rebuilt at each update-batch boundary and then
         # maintained as tracks move/create.  They are deliberately secondary
         # to the exact matcher below: a missing/invalid index falls back to the
@@ -138,6 +160,7 @@ class ObjectMapStore:
         self.next_id = 1
         self._last_update_stamp = None
         self.m1_canonical_labels.clear()
+        self.merged_track_aliases.clear()
         self._invalidate_match_indexes()
 
     def set_m1_canonical_label(self, track_id, label):
@@ -152,11 +175,29 @@ class ObjectMapStore:
                 if str(obj.get("track_id") or "") != track_id:
                     continue
                 obj["m1_canonical_label"] = label
+                obj["m1_retention_label"] = label
                 obj["m1_confirmed"] = True
                 obj["semantic_name"] = label
                 obj["label_votes"] = {label: max(float(obj.get("conf", 0.0)), 0.05)}
                 break
             self._invalidate_match_indexes()
+
+    def update_retention_evidence(self, track_id, attributes):
+        """Allow an accepted M1 correction to revoke configured track memory."""
+        if self.persistent_classes is None:
+            return
+        evidence = _accepted_semantic_evidence(attributes)
+        label = normalize_label(evidence.get("m1_observed_object_name"))
+        confidence = float(evidence.get("attribute_confidence", 0.0) or 0.0)
+        if (not label or evidence.get("attribute_status") != "ready"
+                or not 0.5 <= confidence <= 1.0
+                or evidence.get("m1_refrigerator_pending_confirmation", False)):
+            return
+        for obj in self.objects:
+            if str(obj.get("track_id") or "") == str(track_id):
+                obj["m1_retention_label"] = label
+                obj["m1_confirmed"] = True
+                break
 
     def _required_confirmations(self, label):
         return self.class_min_confirmations.get(
@@ -209,7 +250,7 @@ class ObjectMapStore:
             return True
         return not math.isfinite(top_z) or top_z >= minimum
 
-    def update(self, detections, stamp):
+    def update(self, detections, stamp, *, geometry_deferred_detections=None):
         now = float(stamp if stamp is not None else time.time())
         if not math.isfinite(now):
             return False
@@ -221,14 +262,23 @@ class ObjectMapStore:
         self._last_update_stamp = now
         self._rebuild_match_indexes()
         matched_ids = set()
+        deferred = list(geometry_deferred_detections or [])
+        for obj in self.objects:
+            obj["geometry_observed_in_frame"] = False
         for det in detections:
             # A detector can deliberately retain a 2-D-only record for
             # visualization after skipping its expensive RGB-D lift.  It is
             # not an observation for tracking; accepting it here would make
             # the legacy fallbacks create a zero-sized track at the map
             # origin.
-            if not isinstance(det, dict) or bool(det.get("geometry_skipped", False)):
+            if not isinstance(det, dict):
                 continue
+            if bool(det.get("geometry_skipped", False)):
+                deferred.append(det)
+                continue
+            detector_label = normalize_label(
+                det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+            )
             source_instance_id = str(det.get("instance_id") or det.get("track_id") or "")
             canonical = self.m1_canonical_labels.get(source_instance_id, "")
             label = canonical or normalize_label(
@@ -270,7 +320,15 @@ class ObjectMapStore:
             if match is not None and int(match["object_id"]) in matched_ids:
                 # Several overlapping detector boxes in one image are not
                 # independent temporal confirmations of this physical track.
-                continue
+                if not self.size_aware_xyz_matching or self._bbox_iou_2d(
+                    det.get("bbox_2d") or det.get("bbox"),
+                    match.get("visual_bbox_2d") or match.get("bbox_2d"),
+                ) >= 0.85:
+                    continue
+                # A separate same-frame box cannot consume an already used
+                # track. Search remaining tracks before creating a new one.
+                match = self._find_match(label, pos, size, instance_id, yaw=yaw,
+                                         excluded_ids=matched_ids)
             if match is not None and match.get("m1_canonical_label"):
                 # Raw detector streams need not echo our generated track ID.
                 # Once geometry matches, retain the accepted M1 identity.
@@ -322,6 +380,7 @@ class ObjectMapStore:
             )
             match["coord"] = self._history_median(match.get("coord_history"))
             if match["observation_count"] <= 0 or self._should_update_stable_box(match, center, size):
+                match.pop("box_recovery_window", None)
                 blended_center, blended_size = self._blend_stable_box(
                     match.get("aabb_center", [center["x"], center["y"], center["z"]]),
                     match.get("aabb_size", [size["x"], size["y"], size["z"]]),
@@ -331,6 +390,8 @@ class ObjectMapStore:
                 )
                 match["aabb_center"] = blended_center
                 match["aabb_size"] = blended_size
+            else:
+                self._recover_stable_box(match, center, size, det, now)
             match["viz_aabb_center"] = [viz_center["x"], viz_center["y"], viz_center["z"]]
             match["viz_aabb_size"] = [viz_size["x"], viz_size["y"], viz_size["z"]]
             if yaw is not None:
@@ -367,7 +428,9 @@ class ObjectMapStore:
             has_visible_pixel_count = "visible_pixels" in det or "mask_area" in det
             if has_mask_evidence or has_visible_pixel_count:
                 visible_pixels = int(
-                    det.get("visible_pixels", mask_pixels or det.get("mask_area", 0)) or 0
+                    # Physical mask coordinates are capped debug samples;
+                    # mask_area retains the full segmentation pixel count.
+                    det.get("visible_pixels", det.get("mask_area", mask_pixels)) or 0
                 )
             else:
                 # The physical YOLO detector publishes boxes but no masks. In
@@ -382,6 +445,7 @@ class ObjectMapStore:
                 or 0.0
             )
             match["bbox_2d"] = bbox_2d
+            match["visual_bbox_2d"] = bbox_2d
             segmentation = (
                 det.get("segmentation")
                 or det.get("mask")
@@ -414,20 +478,79 @@ class ObjectMapStore:
             match["is_confirmed"] = bool(
                 int(match["hit_streak"])
                 >= self._required_confirmations(match["semantic_name"])
+                or self._has_configured_tracking_memory(match)
+                or (
+                    self.confirmed_geometry_reacquisition
+                    and self._has_temporal_confirmation(match)
+                )
             )
             match["last_seen"] = now
+            match["last_visual_seen"] = now
+            match["last_detector_label"] = detector_label
+            match["geometry_observed_in_frame"] = True
             matched_ids.add(int(match["object_id"]))
             self._index_match_object(match)
 
+        deferred_ids = self._associate_deferred_detections(deferred, now, matched_ids)
         for obj in self.objects:
-            if int(obj["object_id"]) in matched_ids:
+            if int(obj["object_id"]) in matched_ids or int(obj["object_id"]) in deferred_ids:
                 continue
             obj["hit_streak"] = 0
             obj["miss_streak"] = int(obj.get("miss_streak", 0)) + 1
+            obj.pop("box_recovery_window", None)
 
         self._merge_duplicate_tracks()
         self._purge_stale(now)
         return True
+
+    def _has_temporal_confirmation(self, obj, required=None):
+        required = max(2, int(required if required is not None else
+                              self._required_confirmations(obj.get("semantic_name"))))
+        return bool(
+            int(obj.get("observation_count", 0)) >= required
+            and int(obj.get("max_consecutive_observations", 0)) >= required
+        )
+
+    def _associate_deferred_detections(self, deferred, now, matched_ids):
+        """A budget omission can hold a visual streak, never create 3-D evidence."""
+        if not self.confirmed_geometry_reacquisition or not deferred:
+            return set()
+        by_label = defaultdict(list)
+        for obj in self.objects:
+            if int(obj["object_id"]) in matched_ids:
+                continue
+            if now - float(obj.get("last_visual_seen", obj.get("last_seen", now))) > 0.75:
+                continue
+            label = obj.get("last_detector_label") or obj.get("semantic_name")
+            by_label[normalize_label(label)].append(obj)
+        associated = set()
+        for det in deferred:
+            if not isinstance(det, dict) or not det.get("geometry_skipped"):
+                continue
+            if det.get("geometry_skip_reason") not in {
+                "max_geometry_instances", "geometry_budget_ms", "geometry_workers_busy",
+            }:
+                continue
+            label = normalize_label(det.get("semantic_class") or det.get("semantic_name"))
+            bbox = det.get("bbox_2d") or det.get("bbox") or []
+            candidates = []
+            for obj in by_label.get(label, []):
+                if int(obj["object_id"]) in associated:
+                    continue
+                try:
+                    iou = self._bbox_iou_2d(bbox, obj.get("visual_bbox_2d") or obj.get("bbox_2d"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(iou) and iou >= 0.6:
+                    candidates.append((iou, obj))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            if not candidates or (len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.15):
+                continue
+            obj = candidates[0][1]
+            obj["last_visual_seen"] = now
+            obj["visual_bbox_2d"] = list(bbox)
+            associated.add(int(obj["object_id"]))
+        return associated
 
     @staticmethod
     def _bbox_iou_2d(a, b):
@@ -590,6 +713,13 @@ class ObjectMapStore:
                         key=lambda key: (float(votes[key]), key == keeper.get("semantic_name")),
                     )
                     removed.add(duplicate_id)
+                    old_track = str(duplicate.get("track_id") or "")
+                    new_track = str(keeper.get("track_id") or "")
+                    if old_track and new_track:
+                        self.merged_track_aliases[old_track] = new_track
+                        for alias, target in list(self.merged_track_aliases.items()):
+                            if target == old_track:
+                                self.merged_track_aliases[alias] = new_track
         if removed:
             self.objects = [obj for obj in self.objects if int(obj.get("object_id", -1)) not in removed]
             self._invalidate_match_indexes()
@@ -649,9 +779,15 @@ class ObjectMapStore:
             if confirmed_only and not obj.get("is_confirmed"):
                 continue
             if currently_observed_only:
+                if not obj.get("geometry_observed_in_frame", True):
+                    continue
                 if int(obj.get("miss_streak", 0) or 0) != 0:
                     continue
-                if int(obj.get("hit_streak", 0) or 0) < required:
+                reacquired = (
+                    self.confirmed_geometry_reacquisition
+                    and self._has_temporal_confirmation(obj, required=required)
+                )
+                if int(obj.get("hit_streak", 0) or 0) < required and not reacquired:
                     continue
             elif int(obj.get("observation_count", 0)) < min_observations:
                 continue
@@ -874,13 +1010,13 @@ class ObjectMapStore:
             if object_id in self._match_object_index
         ]
 
-    def _find_match(self, label, pos, size, instance_id, yaw=None):
+    def _find_match(self, label, pos, size, instance_id, yaw=None, excluded_ids=()):
         best = None
         best_score = math.inf
         identity = str(instance_id or "")
         if identity and self._match_identity_index is not None:
             object_id = self._match_identity_index.get(identity)
-            if object_id is not None:
+            if object_id is not None and object_id not in excluded_ids:
                 obj = self._match_object_index.get(object_id)
                 if obj is not None:
                     return obj
@@ -888,6 +1024,8 @@ class ObjectMapStore:
         if candidates is None:
             candidates = self.objects
         for obj in candidates:
+            if int(obj["object_id"]) in excluded_ids:
+                continue
             if identity and obj.get("instance_id") == identity:
                 return obj
             obj_pos = point_dict(obj["coord"][0], obj["coord"][1], obj["coord"][2])
@@ -895,6 +1033,19 @@ class ObjectMapStore:
             portal_cross_view = self._portal_cross_view_match(obj, label, pos, size, yaw)
             if dist >= self.match_distance and not portal_cross_view:
                 continue
+            xyz_score = None
+            if self.size_aware_xyz_matching and not portal_cross_view:
+                old_size = obj.get("aabb_size", [0.0, 0.0, 0.0])
+                # Small objects need small gates; the old absolute radius
+                # remains an upper bound. A 4 cm floor tolerates depth noise.
+                gates = [min(self.match_distance, max(0.04, 0.5 * max(
+                    float(old_size[i]), float(size[axis]))))
+                    for i, axis in enumerate(("x", "y", "z"))]
+                deltas = [abs(float(pos[axis]) - float(obj_pos[axis]))
+                          for axis in ("x", "y", "z")]
+                if any(gate <= 0 or delta > gate for delta, gate in zip(deltas, gates)):
+                    continue
+                xyz_score = sum((delta / gate) ** 2 for delta, gate in zip(deltas, gates))
             if obj["semantic_name"] != label:
                 if not self._should_merge_cross_label(obj, pos, size):
                     continue
@@ -912,6 +1063,8 @@ class ObjectMapStore:
             score = dist if not portal_cross_view else self._portal_cross_view_score(
                 obj, pos, yaw
             )
+            if xyz_score is not None:
+                score = xyz_score
             if score < best_score:
                 best = obj
                 best_score = score
@@ -1005,6 +1158,50 @@ class ObjectMapStore:
         size_ratio = self._size_ratio(old_size, new_size)
         return overlap >= self.STABLE_BOX_MIN_OVERLAP and size_ratio >= self.STABLE_BOX_MIN_SIZE_RATIO
 
+    def _recover_stable_box(self, obj, center, size, detection, stamp):
+        """Replace a bad old box only after a bounded, agreeing RGB-D window."""
+        required = self.stable_box_recovery_confirmations
+        if required < 2:
+            return
+        try:
+            quality_ok = (
+                float(detection.get("confidence", detection.get("conf", 0.0)))
+                >= self.stable_box_recovery_min_confidence
+                and int(detection.get("depth_valid_points", 0))
+                >= self.stable_box_recovery_min_depth_points
+            )
+        except (TypeError, ValueError, OverflowError):
+            quality_ok = False
+        if not quality_ok:
+            obj.pop("box_recovery_window", None)
+            return
+        sample = {
+            "stamp": stamp,
+            "center": [float(center[axis]) for axis in ("x", "y", "z")],
+            "size": [float(size[axis]) for axis in ("x", "y", "z")],
+        }
+        window = list(obj.get("box_recovery_window") or [])
+        if window and (
+            stamp - window[-1]["stamp"] > 1.0
+            or any(
+                math.dist(sample["center"], previous["center"]) > 0.2
+                or any(
+                    min(a, b) / max(a, b, 0.01) < 0.75
+                    for a, b in zip(sample["size"], previous["size"])
+                )
+                for previous in window
+            )
+        ):
+            window = []
+        window.append(sample)
+        obj["box_recovery_window"] = window[-required:]
+        if len(window) < required:
+            return
+        obj["aabb_center"] = self._history_median([item["center"] for item in window])
+        obj["aabb_size"] = self._history_median([item["size"] for item in window])
+        obj["box_recovery_count"] = int(obj.get("box_recovery_count", 0)) + 1
+        obj.pop("box_recovery_window", None)
+
     def _candidate_labels(self, obj):
         label_votes = obj.get("label_votes") or {}
         return [
@@ -1044,6 +1241,21 @@ class ObjectMapStore:
         contained = inter / max(min(vol_a, vol_b), 1e-6)
         return max(iou, contained)
 
+    def _has_configured_tracking_memory(self, obj):
+        if self.persistent_classes is None:
+            return False
+        label = normalize_label(
+            obj.get("m1_retention_label") or obj.get("m1_canonical_label")
+            or obj.get("semantic_name")
+        )
+        return bool(
+            label in self.persistent_classes
+            and int(obj.get("observation_count", 0)) >= 2
+            and int(obj.get("max_consecutive_observations", 0))
+            >= max(2, self._required_confirmations(label))
+            and (not self.persistence_requires_m1 or obj.get("m1_confirmed"))
+        )
+
     def _purge_stale(self, now):
         if self.stale_after_sec <= 0.0:
             return
@@ -1066,11 +1278,14 @@ class ObjectMapStore:
                 normalize_label(obj.get("semantic_name")),
                 normalize_label(obj.get("m1_canonical_label")),
             }
-            persistent = bool(
-                obj.get("is_confirmed")
-                and obj.get("m1_confirmed")
-                and labels.intersection(persistent_labels)
-            )
+            if self.persistent_classes is not None:
+                persistent = self._has_configured_tracking_memory(obj)
+            else:
+                persistent = bool(
+                    obj.get("is_confirmed")
+                    and obj.get("m1_confirmed")
+                    and labels.intersection(persistent_labels)
+                )
             if age_ok or persistent:
                 retained.append(obj)
         changed = len(retained) != len(self.objects)
